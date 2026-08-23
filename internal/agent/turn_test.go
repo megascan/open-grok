@@ -236,3 +236,52 @@ func TestApproveRejectStopsTheTool(t *testing.T) {
 		t.Fatal("rejected write must not land")
 	}
 }
+
+func TestExitPlanModeAsksThenKeepsPlanOnChanges(t *testing.T) {
+	t.Setenv("OPENGROK_HOME", t.TempDir())
+	config.ResetHomeForTest()
+	cwd := t.TempDir()
+	model := catalog.Model{
+		ID: "mock", Model: "mock", Name: "mock",
+		Provider: types.ProviderFireworks, APIBackend: types.BackendChat,
+		BaseURL: "https://example.invalid/v1",
+	}
+	sess, err := agent.NewSession(cwd, model, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Plan.Enter(filepath.Join(sess.Dir, "plan.md"))
+	if err := os.WriteFile(sess.Plan.PlanFile, []byte("# Plan\n\ndo the thing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asked := false
+	n := 0
+	sseTool := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"exit_plan_mode","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n"
+	sseDone := `data: {"choices":[{"delta":{"content":"revising"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n"
+	httpDo := rt(func(r *http.Request) (*http.Response, error) {
+		n++
+		body := sseDone
+		if n == 1 {
+			body = sseTool
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	if err := agent.RunTurn(context.Background(), sess, agent.Runtime{
+		Model: model, Bearer: "k", HTTP: sampler.HTTPDoer(httpDo),
+		AskPlan: func(plan string) string {
+			asked = true
+			if !strings.Contains(plan, "do the thing") {
+				t.Fatalf("plan body %q", plan)
+			}
+			return "changes: add tests"
+		},
+	}, "finish plan", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !asked {
+		t.Fatal("exit_plan_mode must block on AskPlan")
+	}
+	if !sess.Plan.Active {
+		t.Fatal("requesting changes must keep plan mode active")
+	}
+}

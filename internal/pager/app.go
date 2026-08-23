@@ -24,11 +24,12 @@ import (
 
 // Options configure the interactive session.
 type Options struct {
-	CWD      string
-	Model    catalog.Model
-	YOLO     bool
-	Resume   string
-	Continue bool
+	CWD       string
+	Model     catalog.Model
+	YOLO      bool
+	Resume    string
+	Continue  bool
+	Dashboard bool
 }
 
 type (
@@ -43,6 +44,11 @@ type (
 		Options  []string
 		Reply    chan string
 	}
+	planAskMsg struct {
+		Plan    string
+		HasPlan bool
+		Reply   chan string
+	}
 	loopTickMsg struct{ id string }
 	queuedFlush struct{}
 )
@@ -53,6 +59,7 @@ const (
 	screenWelcome screen = iota
 	screenLogin
 	screenChat
+	screenDashboard
 )
 
 type overlay int
@@ -89,6 +96,9 @@ const (
 	overlayMCP
 	overlayTimeline
 	overlayQuestion
+	overlayFiles
+	overlayPlan
+	overlayCancelTurn
 )
 
 type permMode int
@@ -147,6 +157,16 @@ type model struct {
 	question                                                              *qAskMsg
 	qCursor                                                               int
 	qFree                                                                 string
+	qTyping                                                               bool
+	plan                                                                  *planAskMsg
+	planFocus                                                             string
+	planScroll                                                            int
+	planDraft                                                             string
+	planComments                                                          []string
+	cancel                                                                *cancelTurnState
+	cancelCursor                                                          int
+	turnCancel                                                            context.CancelFunc
+	alwaysStopKids, alwaysKeepKids                                        bool
 	focusScroll                                                           bool
 	vimMode, timestamps, compactUI, multiline, mouseOn, thinkingOn, swarm bool
 	permMode                                                              permMode
@@ -159,6 +179,16 @@ type model struct {
 	fastTier                                                              bool
 	copied                                                                string
 	skillCWD                                                              string
+	selectedBlock                                                         int
+	dashRows                                                              []dashRow
+	dashSearch                                                            bool
+	dashFilter, dashDraft, dashRename                                     string
+	renaming                                                              bool
+	dashArmed                                                             time.Time
+	fromDash                                                              screen
+	followUp, codeMode, imageGen                                          string
+	dashGroup                                                             string
+	dashIdleExpand                                                        bool
 }
 
 // Run starts the interactive TUI.
@@ -185,21 +215,34 @@ func newModel(opt Options) (*model, error) {
 	}
 	applyTheme(resolveTheme(themeName))
 	m := &model{
-		opts:       opt,
-		cfg:        cfg,
-		status:     "ready",
-		theme:      themeName,
-		screenMd:   cfg.ScreenModeName(),
-		vimMode:    cfg.UI.VimMode,
-		timestamps: cfg.UI.Timestamps,
-		compactUI:  cfg.UI.CompactMode,
-		multiline:  cfg.UI.Multiline,
-		mouseOn:    cfg.MouseReportingOn(),
-		thinkingOn: cfg.ShowThinkingOn(),
-		swarm:      cfg.UI.SwarmMode,
-		dashCWD:    opt.CWD,
-		skillCWD:   opt.CWD,
-		echoOn:     false,
+		opts:          opt,
+		cfg:           cfg,
+		status:        "ready",
+		theme:         themeName,
+		screenMd:      cfg.ScreenModeName(),
+		vimMode:       cfg.UI.VimMode,
+		timestamps:    cfg.UI.Timestamps,
+		compactUI:     cfg.UI.CompactMode,
+		multiline:     cfg.UI.Multiline,
+		mouseOn:       cfg.MouseReportingOn(),
+		thinkingOn:    cfg.ShowThinkingOn(),
+		swarm:         cfg.UI.SwarmMode,
+		dashCWD:       opt.CWD,
+		skillCWD:      opt.CWD,
+		echoOn:        false,
+		followUp:      cfg.UI.FollowUp,
+		codeMode:      cfg.UI.CodeMode,
+		imageGen:      cfg.UI.ImageGen,
+		selectedBlock: -1,
+	}
+	if m.followUp == "" {
+		m.followUp = "queue"
+	}
+	if m.codeMode == "" {
+		m.codeMode = "direct"
+	}
+	if m.imageGen == "" {
+		m.imageGen = "grok"
 	}
 	if opt.YOLO {
 		m.permMode = permAlways
@@ -218,7 +261,10 @@ func newModel(opt Options) (*model, error) {
 	m.spin = sp
 
 	skipWelcome := opt.Resume != "" || opt.Continue
-	if skipWelcome {
+	if opt.Dashboard {
+		m.screen = screenDashboard
+		m.refreshDashboard()
+	} else if skipWelcome {
 		if err := m.openSession(opt); err != nil {
 			return nil, err
 		}
@@ -303,9 +349,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshVP()
 	case turnDone:
 		m.busy = false
+		m.turnCancel = nil
 		m.status = "ready"
 		if msg.err != nil {
-			m.appendBlock(block{kind: blockSystem, body: "error: " + msg.err.Error(), err: true})
+			if msg.err == context.Canceled || strings.Contains(msg.err.Error(), "canceled") {
+				m.appendBlock(block{kind: blockSystem, body: "turn cancelled"})
+			} else {
+				m.appendBlock(block{kind: blockSystem, body: "error: " + msg.err.Error(), err: true})
+			}
 			m.refreshVP()
 		}
 		if len(m.queue) > 0 && !m.busy {
@@ -321,8 +372,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.question = &msg
 		m.qCursor = 0
 		m.qFree = ""
-		if m.overlay != overlayPermission {
+		m.qTyping = false
+		if m.overlay != overlayPermission && m.overlay != overlayCancelTurn {
 			m.overlay = overlayQuestion
+		}
+	case planAskMsg:
+		m.plan = &msg
+		m.planFocus = "preview"
+		m.planScroll = 0
+		m.planDraft = ""
+		m.planComments = nil
+		if m.overlay != overlayPermission && m.overlay != overlayCancelTurn {
+			m.overlay = overlayPlan
 		}
 	case loopTickMsg:
 		return m, m.onLoopTick(msg.id)
@@ -339,14 +400,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
-	if m.screen == screenChat && m.overlay == overlayNone && !m.focusScroll && m.perm == nil {
+	livePrompt := m.screen == screenChat && !m.focusScroll && m.perm == nil &&
+		(m.overlay == overlayNone || m.overlay == overlayPalette || m.overlay == overlayFiles)
+	if livePrompt {
 		var cmd tea.Cmd
 		m.ta, cmd = m.ta.Update(msg)
 		cmds = append(cmds, cmd)
-		if strings.HasPrefix(strings.TrimSpace(m.ta.Value()), "/") {
+		val := strings.TrimSpace(m.ta.Value())
+		if strings.HasPrefix(val, "/") {
 			m.overlay = overlayPalette
-			m.filter = strings.TrimSpace(m.ta.Value())
+			m.filter = m.ta.Value()
 			m.cursor = 0
+		} else if _, ok := parseAtToken(m.ta.Value()); ok {
+			m.refreshFileSearch()
+		} else if m.overlay == overlayPalette || m.overlay == overlayFiles {
+			m.overlay = overlayNone
 		}
 	}
 	if m.screen == screenChat && (m.focusScroll || m.overlay == overlayNone) {
@@ -361,10 +429,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayPermission && m.perm != nil && !m.permParked {
 		return m.handlePermissionKey(msg), true
 	}
+	if m.overlay == overlayCancelTurn && m.cancel != nil {
+		return m.handleCancelTurnKey(msg), true
+	}
 	if m.overlay == overlayQuestion && m.question != nil {
 		return m.handleQuestionKey(msg), true
 	}
-	if m.overlay != overlayNone && m.overlay != overlayPalette {
+	if m.overlay == overlayPlan && m.plan != nil {
+		return m.handlePlanKey(msg), true
+	}
+	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
 		return m.handleOverlayKey(msg)
 	}
 	if m.screen == screenWelcome {
@@ -373,29 +447,47 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.screen == screenLogin {
 		return m.handleLoginKey(msg), true
 	}
+	if m.screen == screenDashboard {
+		return m.handleDashboardKey(msg), true
+	}
 	if m.overlay == overlayPalette {
 		return m.handlePaletteKey(msg)
+	}
+	if m.overlay == overlayFiles {
+		return m.handleFileSearchKey(msg)
 	}
 	if m.screen != screenChat {
 		return nil, false
 	}
 	if m.busy && msg.Type == tea.KeyCtrlC {
-		return tea.Quit, true
+		return m.requestCancelTurn(), true
 	}
 	switch msg.String() {
 	case "ctrl+c":
+		if m.busy {
+			return m.requestCancelTurn(), true
+		}
 		if m.ta.Value() == "" {
 			return tea.Quit, true
 		}
 		m.ta.Reset()
 		return nil, true
 	case "esc":
+		if m.question != nil && m.overlay == overlayNone {
+			m.overlay = overlayQuestion
+			return nil, true
+		}
+		if m.perm != nil && m.permParked {
+			m.permParked = false
+			m.overlay = overlayPermission
+			return nil, true
+		}
 		if m.ta.Value() != "" {
 			m.ta.Reset()
 			return nil, true
 		}
 		if m.busy {
-			return nil, true
+			return m.requestCancelTurn(), true
 		}
 		return tea.Quit, true
 	case "ctrl+d":
@@ -412,9 +504,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			m.overlay = overlayPermission
 			return nil, true
 		}
+		if m.question != nil && m.overlay == overlayNone {
+			m.overlay = overlayQuestion
+			m.focusScroll = false
+			return nil, true
+		}
 		m.focusScroll = !m.focusScroll
 		if m.focusScroll {
 			m.ta.Blur()
+			if len(m.blocks) > 0 {
+				m.selectedBlock = len(m.blocks) - 1
+			}
+			m.refreshVP()
 		} else {
 			m.ta.Focus()
 		}
@@ -448,7 +549,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		if m.busy {
 			m.queue = append(m.queue, text)
-			m.appendBlock(block{kind: blockSystem, body: "queued follow-up (" + strconv.Itoa(len(m.queue)) + ")"})
+			kind := "queued follow-up"
+			if m.followUp == "steer" {
+				kind = "steer queued (injects at next safe gap)"
+			}
+			m.appendBlock(block{kind: blockSystem, body: kind + " (" + strconv.Itoa(len(m.queue)) + ")"})
 			m.refreshVP()
 			return nil, true
 		}
@@ -471,6 +576,8 @@ func (m *model) View() string {
 		body = m.viewWelcome()
 	case screenLogin:
 		body = m.viewLogin()
+	case screenDashboard:
+		body = m.viewDashboard()
 	default:
 		body = m.viewChat()
 	}
@@ -514,6 +621,15 @@ func (m *model) persistUI() {
 	m.cfg.UI.MouseReporting = &on
 	th := m.thinkingOn
 	m.cfg.UI.ShowThinking = &th
+	m.cfg.UI.CodeMode = m.codeMode
+	m.cfg.UI.FollowUp = m.followUp
+	m.cfg.UI.ImageGen = m.imageGen
+	m.cfg.UI.RememberApprovals = m.cfg.UI.RememberApprovals
+	m.cfg.Models.Recap = m.cfg.UI.RecapModel
+	m.cfg.Models.Memory = m.cfg.UI.MemoryModel
+	if m.cfg.Prefs == nil {
+		m.cfg.Prefs = config.Prefs{}
+	}
 	_ = config.Save(m.cfg)
 }
 
@@ -535,8 +651,15 @@ func (m *model) applyStream(ev agent.Event) {
 		}
 		m.appendBlock(block{kind: blockThinking, body: ev.Text, at: time.Now()})
 	case "tool":
-		title := ev.Tool
-		m.appendBlock(block{kind: blockTool, title: "▸ " + title, body: truncate(ev.Text, 400), at: time.Now()})
+		kind := blockTool
+		title := strings.ToLower(ev.Tool)
+		if strings.Contains(title, "image") || strings.EqualFold(ev.Tool, "imagine") {
+			kind = blockImage
+		}
+		if strings.Contains(title, "mermaid") {
+			kind = blockMermaid
+		}
+		m.appendBlock(block{kind: kind, title: "▸ " + ev.Tool, body: truncate(ev.Text, 400), at: time.Now()})
 	case "tool_result":
 		kind := blockToolResult
 		if strings.EqualFold(ev.Tool, "update_goal") {
@@ -562,7 +685,10 @@ func (m *model) submit(text string) tea.Cmd {
 	prog := m.prog
 	sess.YOLO = m.permMode == permAlways
 	sess.PermMode = m.permModeName()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.turnCancel = cancel
 	return func() tea.Msg {
+		defer cancel()
 		bearer, _, err := auth.ResolveBearer(model.Provider, auth.EnvKeys(model.Provider), kimiCode)
 		if err != nil {
 			return turnDone{err: err}
@@ -596,7 +722,19 @@ func (m *model) submit(text string) tea.Cmd {
 			}
 			return <-ch
 		}
-		err = agent.RunTurn(context.Background(), sess, rt, text, func(ev agent.Event) {
+		rt.AskPlan = func(plan string) string {
+			ch := make(chan string, 1)
+			if prog != nil {
+				prog.Send(planAskMsg{
+					Plan: plan, HasPlan: strings.TrimSpace(plan) != "" && !strings.HasPrefix(plan, "# No plan written yet"),
+					Reply: ch,
+				})
+			} else {
+				return "approve"
+			}
+			return <-ch
+		}
+		err = agent.RunTurn(ctx, sess, rt, text, func(ev agent.Event) {
 			if prog != nil {
 				prog.Send(streamDelta{ev: ev})
 			}

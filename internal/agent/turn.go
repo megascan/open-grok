@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -36,6 +37,7 @@ type Runtime struct {
 	Pack    []tools.Tool
 	Approve func(tools.Tool, json.RawMessage) bool
 	AskUser func(question string, options []string) string
+	AskPlan func(plan string) string
 }
 
 // RunTurn samples until the model stops or maxTurns, dispatching tools.
@@ -44,6 +46,7 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	sess.EnsureMCP(ctx)
 	sess.Approve = rt.Approve
 	sess.AskUser = rt.AskUser
+	sess.AskPlan = rt.AskPlan
 	if !rt.Model.ToolsEnabled() {
 		rt.Pack = nil
 	} else {
@@ -80,6 +83,9 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	}
 
 	for turn := 0; turn < maxTurns; turn++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		req := types.SampleRequest{
 			Model:     rt.Model.Model,
 			Messages:  sess.Messages,
@@ -133,6 +139,9 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 			return sess.Persist()
 		}
 		for _, call := range calls {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if emit != nil && call.Name != "exec" && call.Name != "wait" {
 				emit(Event{Kind: "tool", Tool: call.Name, ToolID: call.ID, Text: call.Arguments})
 			}
@@ -194,6 +203,8 @@ func bindTask(sess *Session, rt Runtime) []tools.Tool {
 				child.Deny = parent.Deny
 				child.ExtraDirs = append([]string(nil), parent.ExtraDirs...)
 				child.Approve = parent.Approve
+				child.AskUser = parent.AskUser
+				child.AskPlan = parent.AskPlan
 				child.PermMode = parent.PermMode
 				child.Plan = workspace.NewInactive()
 				child.Plan.PlanFile = filepath.Join(child.Dir, "plan.md")
@@ -206,7 +217,10 @@ func bindTask(sess *Session, rt Runtime) []tools.Tool {
 					parent.Children[child.ID] = child
 				}
 				var b strings.Builder
-				err = RunTurn(ctx, child, Runtime{Model: model, Bearer: bearer, HTTP: httpDo}, prompt, func(ev Event) {
+				err = RunTurn(ctx, child, Runtime{
+					Model: model, Bearer: bearer, HTTP: httpDo,
+					Approve: parent.Approve, AskUser: parent.AskUser, AskPlan: parent.AskPlan,
+				}, prompt, func(ev Event) {
 					if ev.Kind == "text" {
 						b.WriteString(ev.Text)
 					}
@@ -297,12 +311,6 @@ func dispatchTool(ctx context.Context, sess *Session, rt Runtime, call types.Too
 }
 
 func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args json.RawMessage) tools.Result {
-	if t.Name() == "enter_plan_mode" {
-		sess.Plan.Enter(filepath.Join(sess.Dir, "plan.md"))
-	}
-	if t.Name() == "exit_plan_mode" {
-		sess.Plan.Exit()
-	}
 	if deny, reason := hooks.PreToolUse(ctx, sess.CWD, sess.Dir, t.Name(), string(args)); deny {
 		return tools.Result{Content: reason, IsError: true}
 	}
@@ -331,6 +339,15 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}
 		}
 	}
+	if t.Name() == "enter_plan_mode" {
+		if !sess.YOLO && sess.Approve != nil && !sess.Approve(t, args) {
+			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}
+		}
+		sess.Plan.Enter(filepath.Join(sess.Dir, "plan.md"))
+	}
+	if t.Name() == "exit_plan_mode" {
+		return finishPlanMode(sess)
+	}
 	tc := tools.Context{
 		CWD:           sess.CWD,
 		SessionDir:    sess.Dir,
@@ -343,6 +360,48 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		AskUser:       sess.AskUser,
 	}
 	return t.Execute(ctx, tc, args)
+}
+
+const emptyPlanPlaceholder = `# No plan written yet
+
+The agent exited plan mode without writing a plan.
+
+- **Approve** — leave plan mode and start implementing
+- **Request changes** — send the agent back to planning
+- **Quit** — abandon and turn plan mode off
+`
+
+func finishPlanMode(sess *Session) tools.Result {
+	body := ""
+	if sess.Plan.PlanFile != "" {
+		if data, err := os.ReadFile(sess.Plan.PlanFile); err == nil {
+			body = string(data)
+		}
+	}
+	if strings.TrimSpace(body) == "" {
+		body = emptyPlanPlaceholder
+	}
+	decision := "approve"
+	if sess.AskPlan != nil {
+		decision = sess.AskPlan(body)
+	}
+	switch {
+	case decision == "quit":
+		sess.Plan.Exit()
+		return tools.Result{Content: "plan mode turned off without approving"}
+	case strings.HasPrefix(decision, "changes:"):
+		return tools.Result{Content: "The user requested changes to the plan:\n" + strings.TrimPrefix(decision, "changes:")}
+	default:
+		sess.Plan.Exit()
+		msg := "plan approved; start implementing"
+		rest := strings.TrimPrefix(decision, "approve:")
+		if rest != "" && rest != "approve" && rest != decision {
+			msg += "\n" + rest
+		} else if strings.HasPrefix(decision, "approve:") && len(decision) > len("approve:") {
+			msg += "\n" + strings.TrimPrefix(decision, "approve:")
+		}
+		return tools.Result{Content: msg}
+	}
 }
 
 func compact(s *Session) {

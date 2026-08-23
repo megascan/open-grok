@@ -20,6 +20,8 @@ const (
 	blockToolResult
 	blockSystem
 	blockGoal
+	blockMermaid
+	blockImage
 )
 
 type block struct {
@@ -60,7 +62,11 @@ func (m *model) renderTranscript() string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(m.renderBlock(bl, w))
+		body := m.renderBlock(bl, w)
+		if m.focusScroll && i == m.selectedBlock {
+			body = selStyle.Render("▌") + " " + body
+		}
+		b.WriteString(body)
 	}
 	return b.String()
 }
@@ -99,6 +105,12 @@ func (m *model) renderBlock(bl block, w int) string {
 	case blockGoal:
 		inner := goalTitle.Render("GOAL") + "\n" + bl.body
 		return goalCard.Width(w - 2).Render(inner)
+	case blockMermaid:
+		inner := toolStyle.Render("mermaid") + "\n" + dimStyle.Render(truncate(bl.body, 400))
+		return toolCard.Width(w - 2).Render(inner)
+	case blockImage:
+		inner := toolStyle.Render("image") + "\n" + dimStyle.Render(truncate(bl.body, 400))
+		return toolCard.Width(w - 2).Render(inner)
 	default:
 		return sysLabel.Render(bl.body)
 	}

@@ -61,6 +61,12 @@ func (m *model) renderOverlay() string {
 	switch m.overlay {
 	case overlayQuestion:
 		return m.renderQuestion(w)
+	case overlayPlan:
+		return m.renderPlanApproval(w)
+	case overlayCancelTurn:
+		return m.renderCancelTurn(w)
+	case overlayFiles:
+		return m.renderListModal("@ files", w)
 	case overlayPalette:
 		return m.renderPalette(w)
 	case overlayPermission:
@@ -142,7 +148,7 @@ func (m *model) overlayTitle() string {
 func (m *model) renderListModal(title string, w int) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(title) + "\n")
-	if m.filter != "" && m.overlay != overlaySettings {
+	if m.filter != "" {
 		b.WriteString(dimStyle.Render("filter: "+m.filter) + "\n")
 	}
 	b.WriteByte('\n')
@@ -315,7 +321,7 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "enter":
 		return m.pickOverlay(), true
 	}
-	if msg.Type == tea.KeyRunes && m.overlay != overlaySettings && m.overlay != overlayPrivacy {
+	if msg.Type == tea.KeyRunes && m.overlay != overlayPrivacy {
 		m.filter += string(msg.Runes)
 		m.applyOverlayFilter()
 		return nil, true
@@ -335,7 +341,26 @@ func (m *model) previewOverlay() {
 }
 
 func (m *model) applyOverlayFilter() {
-	// items already filled; filter visually by rebuilding from Keys in filter
+	if m.overlay == overlaySettings {
+		saved := m.cursor
+		m.fillSettings()
+		m.cursor = saved
+	}
+	if m.filter == "" {
+		return
+	}
+	f := strings.ToLower(strings.TrimSpace(m.filter))
+	var keep []listItem
+	for _, it := range m.items {
+		blob := strings.ToLower(it.Key + " " + it.Label + " " + it.Detail)
+		if strings.Contains(blob, f) {
+			keep = append(keep, it)
+		}
+	}
+	m.items = keep
+	if m.cursor >= len(m.items) {
+		m.cursor = 0
+	}
 }
 
 func (m *model) pickOverlay() tea.Cmd {
@@ -372,16 +397,44 @@ func (m *model) pickOverlay() tea.Cmd {
 		m.overlay = overlayNone
 		m.ta.Focus()
 	case overlayModel:
-		if mod, ok := catalog.Lookup(it.Key); ok {
-			m.opts.Model = mod
-			if m.sess != nil {
-				m.sess.ModelID = mod.ID
-				m.sess.Provider = mod.Provider
-				m.sess.Backend = mod.APIBackend
-				m.sess.CloseExportBoundary(mod.Provider)
-				_ = m.sess.Persist()
+		key := it.Key
+		switch {
+		case strings.HasPrefix(key, "recap:"):
+			id := strings.TrimPrefix(key, "recap:")
+			if id == "auto" {
+				id = ""
 			}
-			m.appendSys("model: " + mod.Name + " via " + mod.Provider.DisplayName())
+			m.cfg.UI.RecapModel = id
+			m.persistUI()
+			m.appendSys("recap model: " + emptyAuto(id))
+		case strings.HasPrefix(key, "memory:"):
+			id := strings.TrimPrefix(key, "memory:")
+			if id == "auto" {
+				id = ""
+			}
+			m.cfg.UI.MemoryModel = id
+			m.persistUI()
+			m.appendSys("memory model: " + emptyAuto(id))
+		case strings.HasPrefix(key, "fork:"):
+			id := strings.TrimPrefix(key, "fork:")
+			if id == "auto" {
+				id = ""
+			}
+			m.cfg.UI.ForkSecondary = id
+			m.persistUI()
+			m.appendSys("fork secondary model: " + emptyAuto(id))
+		default:
+			if mod, ok := catalog.Lookup(key); ok {
+				m.opts.Model = mod
+				if m.sess != nil {
+					m.sess.ModelID = mod.ID
+					m.sess.Provider = mod.Provider
+					m.sess.Backend = mod.APIBackend
+					m.sess.CloseExportBoundary(mod.Provider)
+					_ = m.sess.Persist()
+				}
+				m.appendSys("model: " + mod.Name + " via " + mod.Provider.DisplayName())
+			}
 		}
 		m.overlay = overlayNone
 	case overlayDocs, overlayTutorial:
@@ -411,80 +464,22 @@ func (m *model) appendSys(s string) {
 	m.refreshVP()
 }
 
-func (m *model) openSettings() {
-	m.overlay = overlaySettings
-	m.cursor = 0
-	m.items = []listItem{
-		{Key: "theme", Label: "Theme", Detail: m.theme},
-		{Key: "vim", Label: "Vim-mode scrollback", Detail: onOff(m.vimMode)},
-		{Key: "timestamps", Label: "Timestamps", Detail: onOff(m.timestamps)},
-		{Key: "compact", Label: "Compact display", Detail: onOff(m.compactUI)},
-		{Key: "multiline", Label: "Multiline input", Detail: onOff(m.multiline)},
-		{Key: "screen", Label: "Screen mode", Detail: m.screenMd},
-		{Key: "swarm", Label: "Swarm mode", Detail: onOff(m.swarm)},
-		{Key: "mouse", Label: "Mouse reporting", Detail: onOff(m.mouseOn)},
-		{Key: "thinking", Label: "Show thinking blocks", Detail: onOff(m.thinkingOn)},
-		{Key: "memory", Label: "Memory", Detail: onOff(m.cfg.MemoryEnabled())},
-		{Key: "yolo", Label: "Always-approve", Detail: onOff(m.permMode == permAlways)},
-		{Key: "plan", Label: "Plan mode", Detail: onOff(m.permMode == permPlan)},
+func emptyAuto(s string) string {
+	if s == "" {
+		return "automatic"
 	}
+	return s
 }
 
-func (m *model) toggleSetting(key string) tea.Cmd {
-	switch key {
-	case "theme":
-		m.openTheme()
-		return nil
-	case "vim":
-		m.vimMode = !m.vimMode
-	case "timestamps":
-		m.timestamps = !m.timestamps
-	case "compact":
-		m.compactUI = !m.compactUI
-	case "multiline":
-		m.multiline = !m.multiline
-	case "screen":
-		if m.screenMd == modeMinimal {
-			m.screenMd = modeFull
-		} else {
-			m.screenMd = modeMinimal
-		}
-	case "swarm":
-		m.swarm = !m.swarm
-		if m.sess != nil {
-			m.sess.Swarm = m.swarm
-		}
-	case "mouse":
-		m.mouseOn = !m.mouseOn
-	case "thinking":
-		m.thinkingOn = !m.thinkingOn
-	case "memory":
-		m.cfg.Features.Memory = !m.cfg.Features.Memory
-	case "yolo":
-		if m.permMode == permAlways {
-			m.permMode = permAsk
-		} else {
-			m.permMode = permAlways
-		}
-		if m.sess != nil {
-			m.sess.YOLO = m.permMode == permAlways
-		}
-	case "plan":
-		if m.permMode == permPlan {
-			m.permMode = permAsk
-			if m.sess != nil {
-				m.sess.Plan.Exit()
-			}
-		} else {
-			m.permMode = permPlan
-			if m.sess != nil {
-				m.sess.Plan.Enter(m.sess.Plan.PlanFile)
-			}
-		}
+func (m *model) openAuxModel(which string) {
+	m.overlay = overlayModel
+	m.cursor = 0
+	m.items = []listItem{{Key: which + ":auto", Label: "Automatic", Detail: "provider-aware default"}}
+	for _, mod := range catalog.All() {
+		m.items = append(m.items, listItem{
+			Key: which + ":" + mod.ID, Label: mod.Name, Detail: string(mod.Provider),
+		})
 	}
-	m.persistUI()
-	m.openSettings()
-	return nil
 }
 
 func (m *model) openTheme() {
@@ -495,19 +490,6 @@ func (m *model) openTheme() {
 		m.items = append(m.items, listItem{Key: t.Name, Label: t.Name, Detail: strings.Join(t.Aliases, ", ")})
 	}
 	m.items = append(m.items, listItem{Key: "auto", Label: "auto", Detail: "follow system appearance"})
-}
-
-func (m *model) openDashboard() {
-	if !m.cfg.DashboardEnabled() {
-		m.appendSys("dashboard disabled (GROK_AGENT_DASHBOARD=0 or [dashboard].enabled=false)")
-		return
-	}
-	if m.screenMd == modeMinimal {
-		m.appendSys("/dashboard isn't available in minimal mode. Run /fullscreen to switch this session.")
-		return
-	}
-	m.overlay = overlayDashboard
-	m.fillSessions("dashboard")
 }
 
 func (m *model) openResume() {

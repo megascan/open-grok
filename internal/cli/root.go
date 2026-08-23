@@ -76,6 +76,7 @@ func NewRoot() *cobra.Command {
 		newExportCmd(),
 		newMemoryCmd(),
 		newWrapCmd(),
+		newDashboardCmd(),
 	)
 	return root
 }

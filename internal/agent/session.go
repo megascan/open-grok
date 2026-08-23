@@ -54,6 +54,7 @@ type Session struct {
 	PermMode       string                                         `json:"-"`
 	Approve        func(tools.Tool, json.RawMessage) bool         `json:"-"`
 	AskUser        func(question string, options []string) string `json:"-"`
+	AskPlan        func(plan string) string                       `json:"-"`
 }
 
 // NewSession creates a session directory under ~/.opengrok/sessions/<cwd>/<id>.

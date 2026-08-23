@@ -81,6 +81,20 @@ func (b *TeamBox) SetFollowup(fn func(ctx context.Context, id, prompt string) Re
 	b.mu.Unlock()
 }
 
+// RunningCount is how many children still have status "running".
+func (b *TeamBox) RunningCount() int {
+	if b == nil {
+		return 0
+	}
+	n := 0
+	for _, a := range b.snapshot() {
+		if a.Status == "running" {
+			n++
+		}
+	}
+	return n
+}
+
 func (b *TeamBox) snapshot() []AgentInfo {
 	if b == nil {
 		return nil

@@ -53,6 +53,20 @@ func TestVersionAndInspectAndModels(t *testing.T) {
 	}
 }
 
+func TestDashboardCommandRegistered(t *testing.T) {
+	root := cli.NewRoot()
+	found := false
+	for _, c := range root.Commands() {
+		if c.Name() == "dashboard" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("open-grok dashboard must exist")
+	}
+}
+
 func TestLoginCompletionsIncludeProviders(t *testing.T) {
 	root := cli.NewRoot()
 	root.SetArgs([]string{"completions", "bash"})

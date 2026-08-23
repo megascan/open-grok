@@ -73,24 +73,51 @@ func (m *model) replyPerm(allow, always bool) {
 
 func (m *model) handleScrollKey(msg tea.KeyMsg) tea.Cmd {
 	s := msg.String()
+	move := func(d int) {
+		if len(m.blocks) == 0 {
+			return
+		}
+		if m.selectedBlock < 0 {
+			m.selectedBlock = len(m.blocks) - 1
+		}
+		m.selectedBlock += d
+		if m.selectedBlock < 0 {
+			m.selectedBlock = 0
+		}
+		if m.selectedBlock >= len(m.blocks) {
+			m.selectedBlock = len(m.blocks) - 1
+		}
+		if s == "j" || s == "down" {
+			m.vp.LineDown(1)
+		}
+		if s == "k" || s == "up" {
+			m.vp.LineUp(1)
+		}
+		m.refreshVP()
+	}
+	idx := m.selectedBlock
 	if m.vimMode {
 		switch s {
 		case "j":
-			m.vp.LineDown(1)
+			move(1)
 		case "k":
-			m.vp.LineUp(1)
+			move(-1)
 		case "g":
+			m.selectedBlock = 0
 			m.vp.GotoTop()
+			m.refreshVP()
 		case "G":
+			m.selectedBlock = len(m.blocks) - 1
 			m.vp.GotoBottom()
+			m.refreshVP()
 		case "ctrl+d":
 			m.vp.HalfViewDown()
 		case "ctrl+u":
 			m.vp.HalfViewUp()
 		case "y":
-			m.copyBlock(-1)
-		case "e":
-			m.toggleFold(-1)
+			m.copyBlock(idx)
+		case "e", "h", "l":
+			m.toggleFold(idx)
 		case "E":
 			m.foldAll()
 		case "i", "tab", " ":
@@ -101,18 +128,16 @@ func (m *model) handleScrollKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	switch s {
 	case "up":
-		m.vp.LineUp(1)
+		move(-1)
 	case "down":
-		m.vp.LineDown(1)
-	case "left":
-		m.toggleFold(-1)
-	case "right":
-		m.toggleFold(-1)
+		move(1)
+	case "left", "right":
+		m.toggleFold(idx)
 	case " ":
 		m.focusScroll = false
 		m.ta.Focus()
 	case "y":
-		m.copyBlock(-1)
+		m.copyBlock(idx)
 	}
 	return nil
 }

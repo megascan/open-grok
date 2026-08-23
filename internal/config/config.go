@@ -14,10 +14,12 @@ type File struct {
 	YOLO       bool           `toml:"always_approve"`
 	CLI        CLISection     `toml:"cli"`
 	UI         UISection      `toml:"ui"`
+	Models     ModelsSection  `toml:"models"`
 	Features   FeatSection    `toml:"features"`
 	Dashboard  DashSection    `toml:"dashboard"`
 	SessionBus SessionBusSec  `toml:"session_bus"`
 	MCP        map[string]MCP `toml:"mcp_servers"`
+	Prefs      Prefs          `toml:"prefs"`
 }
 
 // UISection is the interactive pager appearance and input contract.
@@ -33,6 +35,45 @@ type UISection struct {
 	ShowThinking      *bool  `toml:"show_thinking_blocks"`
 	PrivacyOptOut     bool   `toml:"privacy_opt_out"`
 	RememberApprovals bool   `toml:"remember_tool_approvals"`
+	CodeMode          string `toml:"code_mode"`
+	FollowUp          string `toml:"follow_up_behavior"`
+	ImageGen          string `toml:"image_generation_provider"`
+	RecapModel        string `toml:"-"`
+	MemoryModel       string `toml:"-"`
+	ShowTimeline      bool   `toml:"show_timeline"`
+	PageFlipOnSend    bool   `toml:"page_flip_on_send"`
+	CombineQueued     bool   `toml:"combine_queued_prompts"`
+	ConfirmRewind     bool   `toml:"confirm_before_rewind"`
+	EnterSteers       bool   `toml:"enter_steers"`
+	SimpleMode        bool   `toml:"simple_mode"`
+	RenderMermaid     bool   `toml:"render_mermaid"`
+	GroupToolVerbs    bool   `toml:"group_tool_verbs"`
+	CollapsedEdits    bool   `toml:"collapsed_edit_blocks"`
+	ShowTips          bool   `toml:"show_tips"`
+	AutoUpdate        bool   `toml:"auto_update"`
+	StreamToolCalls   bool   `toml:"stream_tool_calls"`
+	VoiceKeybind      bool   `toml:"voice_keybind_enabled"`
+	KeepSelection     bool   `toml:"keep_text_selection"`
+	RespectFolds      bool   `toml:"respect_manual_folds"`
+	InvertScroll      bool   `toml:"invert_scroll"`
+	KimiEndpoint      string `toml:"kimi_api_endpoint"`
+	ScrollMode        string `toml:"scroll_mode"`
+	HunkTracker       string `toml:"hunk_tracker_mode"`
+	DefaultPermChoice string `toml:"default_selected_permission"`
+	ForkSecondary     string `toml:"fork_secondary_model"`
+	AutoDarkTheme     string `toml:"auto_dark_theme"`
+	AutoLightTheme    string `toml:"auto_light_theme"`
+}
+
+// Prefs are extra settings-modal keys persisted as strings (Rust registry
+// rows that do not yet have a dedicated runtime field).
+type Prefs map[string]string
+
+// ModelsSection holds default and auxiliary model pins.
+type ModelsSection struct {
+	Default string `toml:"default"`
+	Recap   string `toml:"recap"`
+	Memory  string `toml:"memory"`
 }
 
 // FeatSection holds optional product features.
@@ -75,6 +116,18 @@ func Load() (File, error) {
 	}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
+	}
+	if cfg.Model == "" {
+		cfg.Model = cfg.Models.Default
+	}
+	if cfg.UI.RecapModel == "" {
+		cfg.UI.RecapModel = cfg.Models.Recap
+	}
+	if cfg.UI.MemoryModel == "" {
+		cfg.UI.MemoryModel = cfg.Models.Memory
+	}
+	if cfg.Prefs == nil {
+		cfg.Prefs = Prefs{}
 	}
 	return cfg, nil
 }
