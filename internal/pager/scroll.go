@@ -1,6 +1,11 @@
 package pager
 
-import tea "github.com/charmbracelet/bubbletea"
+import (
+	"strconv"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 // handleScrollKey is the vim-style scrollback walker (j/k, y copy, e expand)
 // matching the Rust pager when the prompt is blurred.
@@ -58,14 +63,69 @@ func (m *model) toggleFold(idx int) {
 }
 
 func (m *model) jumpFind(key string) {
-	for i, b := range m.blocks {
-		if b.body == key {
-			m.selectedBlock = i
-			m.focusScroll = true
-			m.ta.Blur()
-			m.scrollToBlock(i)
-			m.refreshVP()
-			return
+	idx, err := strconv.Atoi(key)
+	if err != nil {
+		for i, b := range m.blocks {
+			if b.body == key {
+				idx = i
+				err = nil
+				break
+			}
 		}
 	}
+	if err != nil || idx < 0 || idx >= len(m.blocks) {
+		return
+	}
+	m.selectedBlock = idx
+	m.focusScroll = true
+	m.ta.Blur()
+	m.scrollToBlock(idx)
+	m.refreshVP()
+}
+
+func (m *model) openFind(arg string) tea.Cmd {
+	if m.sess == nil {
+		m.appendSys("No active session")
+		return nil
+	}
+	m.overlay = overlayFind
+	m.filter = strings.TrimSpace(arg)
+	m.jumpRestore = m.vp.YOffset
+	m.jumpRestoreSet = true
+	m.rebuildFindItems()
+	m.previewFind()
+	return nil
+}
+
+func (m *model) rebuildFindItems() {
+	q := strings.ToLower(m.filter)
+	m.items = nil
+	for i, b := range m.blocks {
+		if q == "" || strings.Contains(strings.ToLower(b.body), q) {
+			m.items = append(m.items, listItem{Key: strconv.Itoa(i), Label: truncate(b.body, 70)})
+		}
+	}
+	if m.cursor >= len(m.items) {
+		m.cursor = 0
+	}
+}
+
+func (m *model) previewFind() {
+	if m.overlay != overlayFind || m.cursor >= len(m.items) {
+		return
+	}
+	idx, err := strconv.Atoi(m.items[m.cursor].Key)
+	if err != nil {
+		return
+	}
+	m.jumpToBlock(idx)
+}
+
+func (m *model) commitFind() {
+	if m.cursor < len(m.items) {
+		m.jumpFind(m.items[m.cursor].Key)
+	}
+	m.jumpRestoreSet = false
+	m.overlay = overlayNone
+	m.filter = ""
 }

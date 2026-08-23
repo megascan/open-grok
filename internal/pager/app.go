@@ -164,6 +164,7 @@ type model struct {
 	cursor                                                                int
 	filter                                                                string
 	items                                                                 []listItem
+	paletteSrc                                                            []listItem
 	loginP                                                                types.Provider
 	loginKimiCode                                                         bool
 	keyBuf                                                                string
@@ -646,6 +647,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			return cmd, true
 		}
 	}
+	if msg.String() == "ctrl+p" && m.screen == screenChat {
+		return m.toggleCommandPalette(), true
+	}
 	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
 		return m.handleOverlayKey(msg)
 	}
@@ -745,8 +749,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 	case "?":
 		if m.focusScroll {
-			m.openShortcuts()
-			return nil, true
+			return m.toggleCommandPalette(), true
 		}
 	case "[", "]":
 		if m.dashDetails {

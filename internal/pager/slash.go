@@ -25,7 +25,7 @@ const (
 
 var slashCatalog = []slashCmd{
 	{Name: "quit", Aliases: []string{"exit"}, Help: "quit the application", Category: "session"},
-	{Name: "help", Help: "list commands", Category: "session"},
+	{Name: "help", Help: "Browse commands and keyboard shortcuts", Category: "session"},
 	{Name: "docs", Aliases: []string{"howto", "guides"}, Help: "browse in-TUI how-to guides", Category: "help"},
 	{Name: "home", Aliases: []string{"welcome"}, Help: "return to the welcome screen", Category: "session"},
 	{Name: "delete", Help: "delete this session after confirm", Category: "session"},

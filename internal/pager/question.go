@@ -256,6 +256,9 @@ func (m *model) replyQuestion(ans string) tea.Cmd {
 	if kind == "fork-worktree" {
 		return m.resolveForkWorktree(ans, directive)
 	}
+	if kind == "new-worktree" {
+		return m.resolveNewWorktree(ans)
+	}
 	if ch != nil {
 		ch <- ans
 	}

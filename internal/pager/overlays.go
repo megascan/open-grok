@@ -17,6 +17,9 @@ import (
 )
 
 func (m *model) viewWithOverlay(base string) string {
+	if m.overlay == overlayPalette {
+		return base
+	}
 	box := m.renderOverlay()
 	if box == "" {
 		return base
@@ -96,7 +99,7 @@ func (m *model) renderOverlay() string {
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
-		return m.renderPalette(w)
+		return ""
 	case overlayPermission:
 		return m.renderPermission(w)
 	case overlayConfirm:
@@ -159,7 +162,7 @@ func (m *model) overlayTitle() string {
 	case overlayFind:
 		return "Find in scrollback"
 	case overlayHelp:
-		return "Slash commands"
+		return "Commands"
 	case overlayPrivacy:
 		return "Privacy"
 	case overlayAnnouncements:
@@ -220,6 +223,10 @@ func (m *model) renderListModal(title string, w int) string {
 		line := it.Label
 		if it.Detail != "" {
 			line += "  " + dimStyle.Render(it.Detail)
+		}
+		if it.Header {
+			b.WriteString(titleStyle.Render(it.Label) + "\n")
+			continue
 		}
 		if i == m.cursor {
 			line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
@@ -415,7 +422,7 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	switch msg.String() {
 	case "esc":
-		if m.overlay == overlayTimeline {
+		if m.overlay == overlayTimeline || m.overlay == overlayFind {
 			m.restoreJumpViewport()
 		}
 		m.overlay = overlayNone
@@ -425,13 +432,17 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	case "up", "k":
-		if m.cursor > 0 {
+		if m.overlay == overlayHelp {
+			m.stepSelectableCursor(-1)
+		} else if m.cursor > 0 {
 			m.cursor--
 		}
 		m.previewOverlay()
 		return nil, true
 	case "down", "j":
-		if m.cursor+1 < len(m.items) {
+		if m.overlay == overlayHelp {
+			m.stepSelectableCursor(1)
+		} else if m.cursor+1 < len(m.items) {
 			m.cursor++
 		}
 		m.previewOverlay()
@@ -471,9 +482,22 @@ func (m *model) previewOverlay() {
 	if m.overlay == overlayTimeline {
 		m.previewJump()
 	}
+	if m.overlay == overlayFind {
+		m.previewFind()
+	}
 }
 
 func (m *model) applyOverlayFilter() {
+	if m.overlay == overlayHelp {
+		m.items = filterPaletteEntries(m.filter, m.paletteSrc)
+		m.firstSelectableItem()
+		return
+	}
+	if m.overlay == overlayFind {
+		m.rebuildFindItems()
+		m.previewFind()
+		return
+	}
 	if m.overlay == overlayHistory {
 		saved := m.filter
 		m.items = fuzzyHistory(saved, m.history)
@@ -539,13 +563,8 @@ func (m *model) pickOverlay() tea.Cmd {
 				return cmd
 			}
 		} else if it.Key == "new" {
-			sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, m.permMode == permAlways)
-			if err == nil {
-				cmd := m.attachSession(sess)
-				m.layoutChat()
-				m.overlay = overlayNone
-				return cmd
-			}
+			m.overlay = overlayNone
+			return m.handleNew()
 		}
 		m.overlay = overlayNone
 	case overlayHistory:
@@ -615,8 +634,9 @@ func (m *model) pickOverlay() tea.Cmd {
 		}
 		return nil
 	case overlayFind:
-		m.jumpFind(it.Key)
-		m.overlay = overlayNone
+		m.commitFind()
+	case overlayHelp:
+		return m.runPaletteItem(it)
 	case overlayTimeline:
 		m.commitJump()
 	default:
@@ -952,16 +972,16 @@ func (m *model) openExtensions(tab int) {
 }
 
 func (m *model) openHelp() {
-	m.overlay = overlayHelp
-	m.cursor = 0
-	m.items = nil
-	for _, c := range visibleCatalog(m.screenMd, false) {
-		al := ""
-		if len(c.Aliases) > 0 {
-			al = strings.Join(c.Aliases, ", ")
-		}
-		m.items = append(m.items, listItem{Label: "/" + c.Name, Detail: c.Help + "  " + al})
+	if m.overlay == overlayHelp {
+		m.overlay = overlayNone
+		m.filter = ""
+		return
 	}
+	m.overlay = overlayHelp
+	m.filter = ""
+	m.paletteSrc = defaultPaletteEntries(m.screenMd)
+	m.items = m.paletteSrc
+	m.firstSelectableItem()
 }
 
 func dirListing(paths ...string) []listItem {

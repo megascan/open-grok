@@ -335,16 +335,20 @@ func (m *model) renderFooter() string {
 	}
 	val := strings.TrimSpace(m.ta.Value())
 	if strings.HasPrefix(val, "/") {
-		matches := FuzzySlash(val, m.screenMd)
-		if len(matches) > 0 {
-			var parts []string
-			for i, c := range matches {
-				if i >= 8 {
-					break
+		if m.overlay == overlayPalette {
+			hint = "tab complete  ·  enter run  ·  esc"
+		} else {
+			matches := FuzzySlash(val, m.screenMd)
+			if len(matches) > 0 {
+				var parts []string
+				for i, c := range matches {
+					if i >= 8 {
+						break
+					}
+					parts = append(parts, "/"+c.Name)
 				}
-				parts = append(parts, "/"+c.Name)
+				hint = strings.Join(parts, "  ")
 			}
-			hint = strings.Join(parts, "  ")
 		}
 	}
 	if m.copied != "" {
@@ -401,6 +405,9 @@ func (m *model) viewChat() string {
 	}
 	chips := m.renderChips()
 	input := m.renderPromptInput()
+	if dd := m.renderSlashDropdown(); dd != "" {
+		input = dd + "\n" + input
+	}
 	if panel := m.renderBtwPanel(); panel != "" {
 		input = panel + "\n" + input
 	}

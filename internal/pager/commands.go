@@ -95,17 +95,14 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.overlay = overlayNone
 		m.refreshWelcome()
 	case "delete":
+		if m.sess == nil {
+			m.appendSys("No active session to delete")
+			break
+		}
 		m.confirmKind = "delete"
 		m.overlay = overlayConfirm
 	case "new":
-		sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, m.permMode == permAlways)
-		if err != nil {
-			m.appendSys(err.Error())
-			break
-		}
-		cmd := m.attachSession(sess)
-		m.layoutChat()
-		return cmd
+		return m.handleNew()
 	case "fork":
 		return m.handleFork(arg)
 	case "compact":
@@ -132,32 +129,13 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		return m.copyAssistant(n, path)
 	case "find":
-		m.overlay = overlayFind
-		m.cursor = 0
-		m.items = nil
-		q := strings.ToLower(arg)
-		for _, b := range m.blocks {
-			if q == "" || strings.Contains(strings.ToLower(b.body), q) {
-				m.items = append(m.items, listItem{Key: b.body, Label: truncate(b.body, 70)})
-			}
-		}
+		return m.openFind(arg)
 	case "history":
 		m.openHistory()
 	case "export":
-		if m.sess == nil {
-			break
-		}
-		md := m.sess.ExportMarkdown()
-		if arg != "" {
-			_ = os.WriteFile(arg, []byte(md), 0o600)
-			m.appendSys("exported " + arg)
-			break
-		}
-		m.appendSys(md)
+		return m.exportConversation(arg)
 	case "transcript":
-		if m.sess != nil {
-			m.appendSys(m.sess.ExportMarkdown())
-		}
+		return m.openTranscriptPager()
 	case "edit-prompt":
 		return m.editPrompt()
 	case "expand":
@@ -199,8 +177,13 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		m.appendSys("switched to " + mod.Name + " via " + mod.Provider.DisplayName())
 	case "effort":
-		if m.sess != nil {
-			m.sess.Effort = strings.ToLower(arg)
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if msg, ok := applyEffort(m.sess, arg); !ok {
+			m.appendSys(msg)
+		} else {
 			m.appendSys("effort = " + m.sess.Effort)
 		}
 	case "fast":
@@ -279,11 +262,24 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		m.openUsage(2)
 	case "rename":
-		if m.sess != nil && arg != "" {
-			m.sess.Title = arg
-			_ = m.sess.Persist()
-			m.appendSys("title = " + arg)
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
 		}
+		title, auto, errMsg := parseRenameArg(arg)
+		if errMsg != "" {
+			m.appendSys(errMsg)
+			break
+		}
+		if auto {
+			m.sess.Title = ""
+			_ = m.sess.Persist()
+			m.appendSys("title reset to auto")
+			break
+		}
+		m.sess.Title = title
+		_ = m.sess.Persist()
+		m.appendSys("title = " + title)
 	case "dashboard":
 		m.openDashboard()
 	case "cd":
@@ -297,18 +293,34 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("new dashboard sessions will spawn in " + abs)
 		}
 	case "add-dir":
-		if m.sess != nil && arg != "" {
-			if err := m.sess.AddWorkingDir(arg); err != nil {
-				m.appendSys(err.Error())
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if strings.TrimSpace(arg) == "" {
+			m.appendSys("Usage: /add-dir <path>")
+			break
+		}
+		if err := m.sess.AddWorkingDir(arg); err != nil {
+			if os.IsNotExist(err) || strings.Contains(err.Error(), "not a directory") {
+				m.appendSys("Not a directory: " + strings.TrimSpace(arg))
 			} else {
-				m.appendSys("added working dir " + arg)
+				m.appendSys(err.Error())
 			}
+		} else {
+			m.appendSys("Adding working directory…")
 		}
 	case "remove-dir":
-		if m.sess != nil && arg != "" {
-			_ = m.sess.RemoveWorkingDir(arg)
-			m.appendSys("removed working dir " + arg)
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
 		}
+		if strings.TrimSpace(arg) == "" {
+			m.appendSys("Usage: /remove-dir <path>")
+			break
+		}
+		_ = m.sess.RemoveWorkingDir(arg)
+		m.appendSys("Removing working directory…")
 	case "theme":
 		if arg == "" {
 			m.openTheme()
