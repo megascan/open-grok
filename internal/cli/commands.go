@@ -8,28 +8,50 @@ import (
 	"github.com/megascan/open-grok/internal/acp"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
 	"github.com/spf13/cobra"
+	"strings"
 )
 
 func newModelsCmd() *cobra.Command {
-	var asJSON bool
+	var (
+		asJSON bool
+		live   bool
+		free   bool
+	)
 	cmd := &cobra.Command{
 		Use:   "models",
 		Short: "List available models and exit",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			models := catalog.All()
+			if live {
+				if extra := liveOverlay(); len(extra) > 0 {
+					models = append(models, extra...)
+				}
+			}
+			if free {
+				var filtered []catalog.Model
+				for _, m := range models {
+					if catalog.IsFree(m) || (m.Provider == types.ProviderOpenRouter && strings.Contains(m.ID, ":free")) {
+						filtered = append(filtered, m)
+					}
+				}
+				models = filtered
+			}
 			if asJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(models)
 			}
 			w := cmd.OutOrStdout()
 			for _, m := range models {
-				fmt.Fprintf(w, "%-28s  %-16s  %-18s  %s\n", m.ID, m.Provider, m.APIBackend, m.Name)
+				fmt.Fprintf(w, "%-40s  %-16s  %-18s  %s\n", m.ID, m.Provider, m.APIBackend, m.Name)
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "JSON output")
+	cmd.Flags().BoolVar(&live, "live", false, "Merge live /models from signed-in OpenRouter")
+	cmd.Flags().BoolVar(&free, "free", false, "Only show OpenRouter :free models")
 	return cmd
 }
 

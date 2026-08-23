@@ -41,14 +41,18 @@ type Runtime struct {
 func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, emit func(Event)) error {
 	ensureRuntime(sess, rt.Model)
 	sess.EnsureMCP(ctx)
-	if rt.Pack == nil {
-		rt.Pack = PackFor(rt.Model, sess.JS)
+	if !rt.Model.ToolsEnabled() {
+		rt.Pack = nil
+	} else {
+		if rt.Pack == nil {
+			rt.Pack = PackFor(rt.Model, sess.JS)
+		}
+		if len(sess.MCPTools) > 0 {
+			rt.Pack = append(rt.Pack, sess.MCPTools...)
+		}
+		rt.Pack = bindTask(sess, rt)
+		rt.Pack = bindCollab(sess, rt)
 	}
-	if len(sess.MCPTools) > 0 {
-		rt.Pack = append(rt.Pack, sess.MCPTools...)
-	}
-	rt.Pack = bindTask(sess, rt)
-	rt.Pack = bindCollab(sess, rt)
 	if len(sess.Messages) == 0 {
 		prompt := SystemPrompt(rt.Model, sess.CWD, LoadProjectInstructions(sess.CWD))
 		sess.Messages = append(sess.Messages, types.Message{Role: types.RoleSystem, Content: prompt})
@@ -78,6 +82,13 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 			TurnIndex: turn,
 		}
 		ch, err := ad.Stream(ctx, req)
+		if err != nil && len(req.Tools) > 0 && looksLikeNoToolSupport(err) {
+			rt.Pack = nil
+			req.Tools = nil
+			off := false
+			rt.Model.SupportsTools = &off
+			ch, err = ad.Stream(ctx, req)
+		}
 		if err != nil {
 			return err
 		}
@@ -350,6 +361,18 @@ func toolCommand(args json.RawMessage) string {
 	_ = json.Unmarshal(args, &m)
 	s, _ := m["command"].(string)
 	return s
+}
+
+func looksLikeNoToolSupport(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "tool") &&
+		(strings.Contains(s, "no endpoints") ||
+			strings.Contains(s, "not support") ||
+			strings.Contains(s, "unsupported") ||
+			strings.Contains(s, "does not support"))
 }
 
 func firstLine(s string) string {

@@ -2,11 +2,21 @@ package sampler
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/megascan/open-grok/internal/types"
 )
 
 func parseChatSSE(data []byte, st *sseState) []types.StreamEvent {
+	var errObj struct {
+		Error *struct {
+			Message string `json:"message"`
+			Code    any    `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(data, &errObj) == nil && errObj.Error != nil && errObj.Error.Message != "" {
+		return []types.StreamEvent{{Kind: types.StreamError, Err: fmt.Errorf("%s", errObj.Error.Message)}}
+	}
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
@@ -156,4 +166,48 @@ func parseMessagesSSE(data []byte, _ *sseState) []types.StreamEvent {
 		return []types.StreamEvent{{Kind: types.StreamDone, Finish: "stop"}}
 	}
 	return nil
+}
+
+func parseChatCompletion(body []byte) []types.StreamEvent {
+	var errObj struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errObj) == nil && errObj.Error != nil && errObj.Error.Message != "" {
+		return []types.StreamEvent{{Kind: types.StreamError, Err: fmt.Errorf("%s", errObj.Error.Message)}}
+	}
+	var full struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(body, &full) != nil || len(full.Choices) == 0 {
+		return nil
+	}
+	var out []types.StreamEvent
+	ch := full.Choices[0]
+	if ch.Message.Content != "" {
+		out = append(out, types.StreamEvent{Kind: types.StreamDelta, Text: ch.Message.Content})
+	}
+	for _, tc := range ch.Message.ToolCalls {
+		out = append(out, types.StreamEvent{
+			Kind: types.StreamToolCall,
+			ToolCall: &types.ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		})
+	}
+	return out
 }

@@ -25,6 +25,7 @@ import (
 var (
 	flagCWD      string
 	flagModel    string
+	flagProvider string
 	flagYOLO     bool
 	flagPrompt   string
 	flagResume   string
@@ -53,6 +54,7 @@ func NewRoot() *cobra.Command {
 	root.PersistentFlags().BoolVar(&flagYOLO, "always-approve", false, "Auto-approve all tool executions")
 	root.PersistentFlags().BoolVarP(&flagYOLO, "yolo", "y", false, "Auto-approve all tool executions")
 	root.PersistentFlags().StringVarP(&flagModel, "model", "m", "", "Model ID")
+	root.PersistentFlags().StringVar(&flagProvider, "provider", "", "Provider identity when the model id is not in the catalog (never guessed from a URL)")
 	root.Flags().StringVarP(&flagPrompt, "single", "p", "", "Headless single-turn prompt")
 	root.Flags().Lookup("single").Shorthand = "p"
 	root.Flags().StringVarP(&flagResume, "resume", "r", "", "Resume a session by id")
@@ -94,20 +96,73 @@ func selectedModel() (catalog.Model, error) {
 	if id == "" {
 		id = catalog.DefaultID()
 	}
-	m, ok := catalog.Lookup(id)
-	if !ok {
-		// Allow unknown ids as a BYOK Chat Completions model on OpenRouter-style hosts.
-		return catalog.Model{
-			ID:         id,
-			Model:      id,
-			Name:       id,
-			Provider:   types.ProviderXAI,
-			APIBackend: types.BackendChat,
-			BaseURL:    catalog.DefaultBaseURL(types.ProviderXAI),
-			ToolMode:   types.ToolModeDirect,
-		}, nil
+	if m, ok := catalog.Lookup(id); ok {
+		if flagProvider != "" {
+			p, pok := types.ParseProvider(flagProvider)
+			if !pok {
+				return catalog.Model{}, fmt.Errorf("unknown provider %q", flagProvider)
+			}
+			if m.Provider != p {
+				return catalog.Model{}, fmt.Errorf("model %s belongs to %s, not %s (identity comes from catalog metadata)", id, m.Provider, p)
+			}
+		}
+		return m, nil
 	}
-	return m, nil
+	if m, ok := catalog.LookupIn(id, liveOverlay()); ok {
+		return m, nil
+	}
+	if flagProvider == "" {
+		return catalog.Model{}, fmt.Errorf("unknown model %q — pass --provider (e.g. openrouter) or use `open-grok models --live`", id)
+	}
+	p, ok := types.ParseProvider(flagProvider)
+	if !ok {
+		return catalog.Model{}, fmt.Errorf("unknown provider %q", flagProvider)
+	}
+	tools := true
+	if strings.Contains(strings.ToLower(id), ":free") {
+		tools = false
+	}
+	return catalog.Model{
+		ID:            id,
+		Model:         id,
+		Name:          id,
+		Provider:      p,
+		APIBackend:    types.BackendChat,
+		BaseURL:       catalog.DefaultBaseURL(p),
+		EnvKey:        envKeyFor(p),
+		ToolMode:      types.ToolModeDirect,
+		SupportsTools: &tools,
+	}, nil
+}
+
+func envKeyFor(p types.Provider) string {
+	keys := auth.EnvKeys(p)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func liveOverlay() []catalog.Model {
+	p := types.ProviderOpenRouter
+	if flagProvider != "" {
+		if parsed, ok := types.ParseProvider(flagProvider); ok {
+			p = parsed
+		}
+	}
+	if p != types.ProviderOpenRouter {
+		return nil
+	}
+	bearer, _, err := auth.ResolveBearer(types.ProviderOpenRouter, auth.EnvKeys(types.ProviderOpenRouter), false)
+	if err != nil || bearer == "" {
+		return nil
+	}
+	c := catalog.LiveClient{}
+	list, err := c.FetchOpenAIModels(types.ProviderOpenRouter, catalog.DefaultBaseURL(types.ProviderOpenRouter), bearer)
+	if err != nil {
+		return nil
+	}
+	return list
 }
 
 func runRoot(cmd *cobra.Command, args []string) error {

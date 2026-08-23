@@ -46,6 +46,10 @@ func (c *LiveClient) FetchOpenAIModels(p types.Provider, baseURL, bearer string)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
+	if p == types.ProviderOpenRouter {
+		req.Header.Set("HTTP-Referer", "https://github.com/megascan/open-grok")
+		req.Header.Set("X-Title", "Open Grok")
+	}
 	resp, err := c.client().Do(req)
 	if err != nil {
 		return nil, err
@@ -57,6 +61,9 @@ func (c *LiveClient) FetchOpenAIModels(p types.Provider, baseURL, bearer string)
 	}
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s /models: HTTP %d", p, resp.StatusCode)
+	}
+	if p == types.ProviderOpenRouter {
+		return parseOpenRouterModels(baseURL, body)
 	}
 	var list modelsList
 	if err := json.Unmarshal(body, &list); err != nil {
@@ -83,8 +90,66 @@ func (c *LiveClient) FetchOpenAIModels(p types.Provider, baseURL, bearer string)
 			ContextWindow: ctx,
 			APIBackend:    types.BackendChat,
 			Provider:      p,
+			EnvKey:        defaultEnvKey(p),
 			ToolMode:      types.ToolModeDirect,
 		})
 	}
 	return out, nil
+}
+
+func parseOpenRouterModels(baseURL string, body []byte) ([]Model, error) {
+	var list struct {
+		Data []struct {
+			ID                  string   `json:"id"`
+			Name                string   `json:"name"`
+			Description         string   `json:"description"`
+			ContextLength       int      `json:"context_length"`
+			SupportedParameters []string `json:"supported_parameters"`
+			Pricing             *struct {
+				Prompt     string `json:"prompt"`
+				Completion string `json:"completion"`
+			} `json:"pricing"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	out := make([]Model, 0, len(list.Data))
+	for _, d := range list.Data {
+		if d.ID == "" {
+			continue
+		}
+		tools := false
+		for _, p := range d.SupportedParameters {
+			if strings.EqualFold(p, "tools") {
+				tools = true
+				break
+			}
+		}
+		name := d.Name
+		if name == "" {
+			name = d.ID
+		}
+		m := Model{
+			ID:            d.ID,
+			Model:         d.ID,
+			Name:          name,
+			Description:   d.Description,
+			BaseURL:       baseURL,
+			ContextWindow: d.ContextLength,
+			APIBackend:    types.BackendChat,
+			Provider:      types.ProviderOpenRouter,
+			EnvKey:        "OPENROUTER_API_KEY",
+			ToolMode:      types.ToolModeDirect,
+			SupportsTools: &tools,
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// IsFree reports whether a model id is an OpenRouter free-tier slug.
+func IsFree(m Model) bool {
+	id := strings.ToLower(m.ID + " " + m.Model + " " + m.Name)
+	return strings.Contains(id, ":free") || strings.Contains(id, "(free)")
 }

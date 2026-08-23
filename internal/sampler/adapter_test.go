@@ -73,6 +73,37 @@ func TestChatStreamParsesToolCallsAndText(t *testing.T) {
 	}
 }
 
+func TestOpenRouterAdapterSendsAttributionHeaders(t *testing.T) {
+	a := sampler.Adapter{
+		Provider: types.ProviderOpenRouter,
+		Backend:  types.BackendChat,
+		BaseURL:  "https://openrouter.ai/api/v1",
+		Bearer:   "or-key",
+		HTTP: roundTrip(func(r *http.Request) (*http.Response, error) {
+			if r.Header.Get("HTTP-Referer") == "" || r.Header.Get("X-Title") == "" {
+				t.Fatal("missing OpenRouter attribution headers")
+			}
+			if r.Header.Get("x-grok-session-id") != "" {
+				t.Fatal("OpenRouter must not send xAI private headers")
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	ch, err := a.Stream(context.Background(), types.SampleRequest{
+		Model:    "nvidia/nemotron-nano-9b-v2:free",
+		Messages: []types.Message{{Role: types.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+}
+
 func TestXAIAdapterSendsPrivateHeaders(t *testing.T) {
 	a := sampler.Adapter{
 		Provider: types.ProviderXAI,

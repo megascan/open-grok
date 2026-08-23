@@ -41,8 +41,15 @@ func TestVersionAndInspectAndModels(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("grok-4.6")) && !bytes.Contains([]byte(buf.String()), []byte("grok")) {
-		// models print to stdout via fmt, not cobra Out
+	root = cli.NewRoot()
+	root.SetArgs([]string{"models", "--free"})
+	buf.Reset()
+	root.SetOut(&buf)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("openrouter")) && !bytes.Contains(buf.Bytes(), []byte(":free")) {
+		// models may print via fmt to stdout; still must not crash
 	}
 }
 

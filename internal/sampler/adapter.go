@@ -99,6 +99,11 @@ func (a Adapter) streamSSE(ctx context.Context, url string, payload any, session
 		return nil, fmt.Errorf("%s: HTTP %d: %s", a.Provider, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "application/json") && !strings.Contains(ct, "event-stream") {
+		return a.completeJSON(resp, parse)
+	}
+
 	out := make(chan types.StreamEvent, 16)
 	go func() {
 		defer close(out)
@@ -128,6 +133,31 @@ func (a Adapter) streamSSE(ctx context.Context, url string, payload any, session
 		if err := sc.Err(); err != nil && ctx.Err() == nil {
 			out <- types.StreamEvent{Kind: types.StreamError, Err: err}
 			return
+		}
+		out <- types.StreamEvent{Kind: types.StreamDone}
+	}()
+	return out, nil
+}
+
+func (a Adapter) completeJSON(resp *http.Response, parse func([]byte, *sseState) []types.StreamEvent) (<-chan types.StreamEvent, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan types.StreamEvent, 16)
+	go func() {
+		defer close(out)
+		if evs := parseChatCompletion(body); len(evs) > 0 {
+			for _, ev := range evs {
+				out <- ev
+			}
+			out <- types.StreamEvent{Kind: types.StreamDone}
+			return
+		}
+		st := &sseState{}
+		for _, ev := range parse(body, st) {
+			out <- ev
 		}
 		out <- types.StreamEvent{Kind: types.StreamDone}
 	}()
