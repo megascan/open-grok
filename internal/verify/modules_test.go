@@ -263,6 +263,7 @@ func TestToolsModulePacksAndExecute(t *testing.T) {
 		"bash", "read_file", "write_file", "search_replace", "grep", "glob", "list_dir",
 		"web_search", "web_fetch", "apply_patch", "skill", "memory_search", "memory_save",
 		"ask_user_question", "enter_plan_mode", "exit_plan_mode", "task", "update_goal", "todo_write",
+		"scheduler_create", "scheduler_delete", "scheduler_list",
 		"list_sessions", "read_session", "message_session", "list_agents", "send_message",
 		"followup_task", "wait_agent",
 	}
@@ -277,6 +278,7 @@ func TestToolsModulePacksAndExecute(t *testing.T) {
 		"bash", "read_file", "write_file", "search_replace", "apply_patch",
 		"grep", "glob", "list_dir", "web_search", "web_fetch", "skill",
 		"memory_search", "memory_save", "todo_write",
+		"scheduler_create", "scheduler_delete", "scheduler_list",
 	})
 	if tools.Lookup(nested, "update_goal") != nil || tools.Lookup(nested, "task") != nil {
 		t.Fatal("nested pack must not expose harness/human tools")

@@ -124,17 +124,169 @@ func (m *model) openSettings() {
 	m.cursor = 0
 	m.filter = ""
 	m.fillSettings()
+	m.cursor = firstNonHeader(m.items)
+}
+
+func settingHeaderLabel(cat string) string {
+	switch cat {
+	case "Appearance":
+		return "Appearance"
+	case "Editor", "Input":
+		return "Editor & Input"
+	case "Agent":
+		return "Agent & Approval"
+	case "Privacy":
+		return "Privacy"
+	case "Models":
+		return "Models"
+	case "Memory":
+		return "Session"
+	case "Advanced":
+		return "Advanced"
+	default:
+		return cat
+	}
+}
+
+var settingsHeaderOrder = []string{
+	"Appearance",
+	"Editor & Input",
+	"Agent & Approval",
+	"Privacy",
+	"Models",
+	"Session",
+	"Advanced",
 }
 
 func (m *model) fillSettings() {
 	m.items = nil
-	for _, d := range rustSettingsCatalog() {
-		m.items = append(m.items, listItem{
-			Key:    d.Key,
-			Label:  d.Label,
-			Detail: d.Category + " · " + m.settingValue(d),
-		})
+	catalog := rustSettingsCatalog()
+	grouped := map[string][]settingDef{}
+	for _, d := range catalog {
+		h := settingHeaderLabel(d.Category)
+		grouped[h] = append(grouped[h], d)
 	}
+	filter := strings.ToLower(strings.TrimSpace(m.filter))
+	for _, header := range settingsHeaderOrder {
+		defs := grouped[header]
+		var rows []listItem
+		for _, d := range defs {
+			it := listItem{
+				Key:    d.Key,
+				Label:  d.Label,
+				Detail: m.settingValue(d),
+			}
+			if filter != "" {
+				blob := strings.ToLower(d.Key + " " + d.Label + " " + d.Category + " " + it.Detail)
+				if !strings.Contains(blob, filter) {
+					continue
+				}
+			}
+			rows = append(rows, it)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		m.items = append(m.items, listItem{Key: "header:" + header, Label: header, Header: true})
+		m.items = append(m.items, rows...)
+	}
+	if m.cursor >= len(m.items) {
+		m.cursor = firstNonHeader(m.items)
+	}
+}
+
+func firstNonHeader(items []listItem) int {
+	for i, it := range items {
+		if !it.Header {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m *model) moveSettings(delta int) {
+	if len(m.items) == 0 {
+		return
+	}
+	i := m.cursor + delta
+	for i >= 0 && i < len(m.items) {
+		if !m.items[i].Header {
+			m.cursor = i
+			return
+		}
+		i += delta
+	}
+}
+
+func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.overlay = overlayNone
+		m.filter = ""
+		return nil
+	case "up", "k":
+		m.moveSettings(-1)
+		return nil
+	case "down", "j":
+		m.moveSettings(1)
+		return nil
+	case "enter", " ":
+		if m.cursor < len(m.items) && !m.items[m.cursor].Header {
+			return m.toggleSetting(m.items[m.cursor].Key)
+		}
+		return nil
+	}
+	if msg.Type == tea.KeyBackspace && m.filter != "" {
+		m.filter = m.filter[:len(m.filter)-1]
+		m.fillSettings()
+		return nil
+	}
+	if msg.Type == tea.KeyRunes {
+		m.filter += string(msg.Runes)
+		m.fillSettings()
+		m.cursor = firstNonHeader(m.items)
+		return nil
+	}
+	return nil
+}
+
+func (m *model) renderSettings(w int) string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Settings") + "\n")
+	if m.filter != "" {
+		b.WriteString(dimStyle.Render("filter: "+m.filter) + "\n")
+	}
+	b.WriteByte('\n')
+	if len(m.items) == 0 {
+		b.WriteString(dimStyle.Render("(no matches)") + "\n")
+	}
+	start := 0
+	limit := 16
+	if m.cursor >= limit {
+		start = m.cursor - limit + 1
+	}
+	for i, it := range m.items {
+		if i < start || i >= start+limit {
+			continue
+		}
+		if it.Header {
+			sep := strings.Repeat("─", max(4, w-len(it.Label)-4))
+			b.WriteString(dimStyle.Bold(true).Render(" "+it.Label+" ") + dimStyle.Render(sep) + "\n")
+			continue
+		}
+		line := it.Label
+		if it.Detail != "" {
+			line += "  " + dimStyle.Render(it.Detail)
+		}
+		if i == m.cursor {
+			line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
+		} else {
+			line = "  " + line
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n" + dimStyle.Render("j/k  ·  space/enter  ·  type to filter  ·  esc"))
+	return modalBox.Width(w).Render(b.String())
 }
 
 func (m *model) settingValue(d settingDef) string {
@@ -288,7 +440,6 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 		"meta_api_key", "opencode_go_api_key", "wafer_api_key", "zai_api_key",
 		"runinfra_api_key", "gemini_api_key", "openrouter_api_key", "perplexity_api_key":
 		m.openLogin("")
-		m.overlay = overlayNone
 		return nil
 	case "vim_mode":
 		m.vimMode = !m.vimMode
@@ -403,7 +554,16 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 		}
 	}
 	m.persistUI()
-	m.openSettings()
+	cur := m.cursor
+	filt := m.filter
+	m.fillSettings()
+	m.filter = filt
+	if cur < len(m.items) {
+		m.cursor = cur
+	}
+	if m.cursor < len(m.items) && m.items[m.cursor].Header {
+		m.moveSettings(1)
+	}
 	return nil
 }
 

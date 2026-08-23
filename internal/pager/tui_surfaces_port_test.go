@@ -493,3 +493,156 @@ func TestMarketplaceLocalCatalogHint(t *testing.T) {
 		t.Fatalf("%+v", m.items)
 	}
 }
+
+func TestLoginOverlayStaysInSession(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	m.screen = screenChat
+	m.runSlash("login", "")
+	if m.screen != screenChat {
+		t.Fatalf("in-session /login must not leave chat, screen=%d", m.screen)
+	}
+	if m.overlay != overlayLogin {
+		t.Fatalf("overlay %d", m.overlay)
+	}
+	if len(m.items) == 0 || m.items[0].Label != "xAI Grok" {
+		t.Fatalf("picker labels %+v", m.items)
+	}
+	foundCodex := false
+	for _, it := range m.items {
+		if it.Label == "ChatGPT Codex" && strings.Contains(it.Detail, "Connect an OpenAI Codex account") {
+			foundCodex = true
+		}
+		if it.Label == "OpenRouter" && !strings.Contains(it.Detail, "API key ·") {
+			t.Fatalf("openrouter detail %q", it.Detail)
+		}
+	}
+	if !foundCodex {
+		t.Fatalf("%+v", m.items)
+	}
+	m.handleLoginKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.overlay != overlayNone || m.screen != screenChat {
+		t.Fatalf("esc must close overlay, overlay=%d screen=%d", m.overlay, m.screen)
+	}
+}
+
+func TestLoginUnknownProviderMessage(t *testing.T) {
+	m := testModel(t)
+	m.runSlash("login", "nope")
+	if m.overlay == overlayLogin || m.screen == screenLogin {
+		t.Fatal("unknown provider must not open login")
+	}
+	got := m.status
+	if got == "" && len(m.blocks) > 0 {
+		got = m.blocks[len(m.blocks)-1].body
+	}
+	if !strings.Contains(got, "Unknown provider: nope") || !strings.Contains(got, "/login opencode-go") {
+		t.Fatalf("%q", got)
+	}
+}
+
+func TestSettingsCategoryHeadersSkipAndFilter(t *testing.T) {
+	m := testModel(t)
+	m.openSettings()
+	if m.overlay != overlaySettings {
+		t.Fatal("overlay")
+	}
+	if len(m.items) == 0 || !m.items[0].Header || m.items[0].Label != "Appearance" {
+		t.Fatalf("first row must be Appearance header: %+v", m.items[0])
+	}
+	if m.items[m.cursor].Header {
+		t.Fatal("cursor must skip headers")
+	}
+	m.cursor = 0
+	m.moveSettings(1)
+	if m.items[m.cursor].Header {
+		t.Fatal("j/k must skip headers")
+	}
+	foundAgent := false
+	for _, it := range m.items {
+		if it.Header && it.Label == "Agent & Approval" {
+			foundAgent = true
+		}
+	}
+	if !foundAgent {
+		t.Fatal("missing Agent & Approval header")
+	}
+	m.filter = "compact"
+	m.fillSettings()
+	hasHeader, hasCompact := false, false
+	for _, it := range m.items {
+		if it.Header && it.Label == "Appearance" {
+			hasHeader = true
+		}
+		if it.Key == "compact_mode" {
+			hasCompact = true
+		}
+		if it.Key == "vim_mode" {
+			t.Fatal("filter must drop non-matching settings")
+		}
+	}
+	if !hasHeader || !hasCompact {
+		t.Fatalf("filter %+v", m.items)
+	}
+	body := stripANSI(m.renderSettings(72))
+	if !strings.Contains(body, "Appearance") || !strings.Contains(body, "space/enter") {
+		t.Fatalf("%s", body)
+	}
+}
+
+func TestLoopSlashInjectsSchedulerInstruction(t *testing.T) {
+	got := loopScheduleInstruction("5m check ci", loopFireDetached)
+	if !strings.Contains(got, "# /loop -- schedule a recurring prompt") {
+		t.Fatal(got)
+	}
+	if !strings.Contains(got, "scheduler_create") || !strings.Contains(got, "5m check ci") {
+		t.Fatal(got)
+	}
+	if strings.Contains(got, "10m") {
+		t.Fatal("must not invent a default interval")
+	}
+	if !strings.Contains(loopUsageMessage(), "Usage: /loop [interval] <prompt>") {
+		t.Fatal(loopUsageMessage())
+	}
+	display, wire := expandSubmit("/loop 30m check deploy")
+	if display != "/loop 30m check deploy" {
+		t.Fatalf("display %q", display)
+	}
+	if wire != loopScheduleInstruction("30m check deploy", loopFireDetached) {
+		t.Fatal("wire")
+	}
+	m := testModel(t)
+	m.runSlash("loop", "")
+	if !strings.Contains(m.status, "Usage: /loop") && (len(m.blocks) == 0 || !strings.Contains(m.blocks[len(m.blocks)-1].body, "Usage: /loop")) {
+		t.Fatalf("status %q blocks %+v", m.status, m.blocks)
+	}
+}
+
+func TestAllowAllEditsThisSessionChoice(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan bool, 1)
+	m.perm = &permAskMsg{Tool: "write_file", Access: "edit", Path: "/tmp/x.go", Reply: ch}
+	m.initPermCard()
+	choices := m.permChoices()
+	found := false
+	for _, c := range choices {
+		if c.ID == "allow-edits-session" && c.Label == "Allow all edits this session" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%+v", choices)
+	}
+	m.applyPermChoice(permChoice{ID: "allow-edits-session"})
+	if !<-ch {
+		t.Fatal("must allow")
+	}
+	if m.sess == nil || !m.sess.AllowEditsSession {
+		t.Fatal("session flag")
+	}
+}

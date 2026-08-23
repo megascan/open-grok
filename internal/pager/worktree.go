@@ -83,5 +83,5 @@ func (m *model) createWorktreeSession(label string) tea.Cmd {
 	m.attachSession(sess)
 	m.layoutChat()
 	m.appendSys("opened worktree " + dest)
-	return nil
+	return m.reloadLoops()
 }

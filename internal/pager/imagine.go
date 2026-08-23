@@ -88,6 +88,11 @@ func expandSubmit(text string) (display, wire string) {
 			return text, text
 		}
 		return "/imagine-video " + arg, imagineVideoInstruction(arg)
+	case "loop":
+		if arg == "" {
+			return text, text
+		}
+		return "/loop " + arg, loopScheduleInstruction(arg, loopFireDetached)
 	default:
 		return text, text
 	}

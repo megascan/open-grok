@@ -23,17 +23,18 @@ const (
 
 // Request is one tool invocation presented to the pipeline.
 type Request struct {
-	Tool       string
-	Access     types.AccessKind
-	Path       string
-	Command    string
-	AlwaysYOLO bool
-	AutoMode   bool
-	PlanActive bool
-	PlanFile   string
-	AllowRules []string
-	DenyRules  []string
-	ExtraRoots []string
+	Tool              string
+	Access            types.AccessKind
+	Path              string
+	Command           string
+	AlwaysYOLO        bool
+	AllowEditsSession bool
+	AutoMode          bool
+	PlanActive        bool
+	PlanFile          string
+	AllowRules        []string
+	DenyRules         []string
+	ExtraRoots        []string
 }
 
 // Check runs the permission pipeline. Deny wins over allow.
@@ -51,6 +52,9 @@ func Check(req Request) (Decision, string) {
 	}
 	if req.AlwaysYOLO {
 		return Allow, "always-approve"
+	}
+	if req.AllowEditsSession && req.Access == types.AccessEdit {
+		return Allow, "allow edits this session"
 	}
 	for _, rule := range req.AllowRules {
 		if matchRule(rule, req) {

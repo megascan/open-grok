@@ -316,17 +316,18 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 	}
 	path := toolPath(sess.CWD, args)
 	dec, reason := workspace.Check(workspace.Request{
-		Tool:       t.Name(),
-		Access:     t.Access(),
-		Path:       path,
-		Command:    toolCommand(args),
-		AlwaysYOLO: sess.YOLO,
-		AutoMode:   sess.PermMode == "auto",
-		PlanActive: sess.Plan.Active,
-		PlanFile:   sess.Plan.PlanFile,
-		AllowRules: sess.Allow,
-		DenyRules:  sess.Deny,
-		ExtraRoots: sess.ExtraDirs,
+		Tool:              t.Name(),
+		Access:            t.Access(),
+		Path:              path,
+		Command:           toolCommand(args),
+		AlwaysYOLO:        sess.YOLO,
+		AllowEditsSession: sess.AllowEditsSession,
+		AutoMode:          sess.PermMode == "auto",
+		PlanActive:        sess.Plan.Active,
+		PlanFile:          sess.Plan.PlanFile,
+		AllowRules:        sess.Allow,
+		DenyRules:         sess.Deny,
+		ExtraRoots:        sess.ExtraDirs,
 	})
 	if dec == workspace.Deny {
 		return tools.Result{Content: "permission denied: " + reason, IsError: true}

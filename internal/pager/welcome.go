@@ -281,8 +281,9 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 			m.status = err.Error()
 			return nil
 		}
-		m.attachSession(sess)
+		cmd := m.attachSession(sess)
 		m.layoutChat()
+		return cmd
 	case key == "resume":
 		m.openResume()
 	case key == "worktree":
@@ -305,8 +306,9 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 			m.status = err.Error()
 			return nil
 		}
-		m.attachSession(sess)
+		cmd := m.attachSession(sess)
 		m.layoutChat()
+		return cmd
 	case key == "login":
 		m.openLogin("")
 	case key == "settings":
@@ -317,124 +319,19 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 	return nil
 }
 
-func (m *model) openLogin(provider string) {
-	m.screen = screenLogin
-	m.overlay = overlayNone
-	m.keyBuf = ""
-	m.loginKimiCode = false
-	m.items = nil
-	if provider != "" {
-		p, ok := types.ParseProvider(provider)
-		if ok {
-			m.loginP = p
-			if provider == "kimi-code" || provider == "kimi_code" {
-				m.loginKimiCode = true
-			}
-			return
-		}
-	}
-	m.loginP = ""
-	for _, p := range types.AllProviders {
-		detail := "API key → " + config.AuthJSON()
-		if p == types.ProviderCodex {
-			detail = "OAuth or API key → " + config.CodexAuthJSON()
-		}
-		m.items = append(m.items, listItem{Key: string(p), Label: p.DisplayName(), Detail: detail})
-	}
-	m.cursor = 0
-}
-
 func (m *model) viewLogin() string {
 	var b strings.Builder
 	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Sign in  ·  ~/.entropy only") + "\n\n")
-	if m.loginP == "" {
-		b.WriteString(titleStyle.Render("  Choose a provider") + "\n\n")
-		for i, it := range m.items {
-			line := fmt.Sprintf("  %s  %s", it.Label, dimStyle.Render(it.Detail))
-			if i == m.cursor {
-				line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
-			}
-			b.WriteString(line + "\n")
+	body := m.loginBody()
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" {
+			b.WriteByte('\n')
+			continue
 		}
-		b.WriteString("\n" + dimStyle.Render("  enter select  ·  esc back"))
-		return b.String()
+		b.WriteString("  " + line + "\n")
 	}
-	b.WriteString(titleStyle.Render("  "+m.loginP.DisplayName()) + "\n")
-	if m.loginP == types.ProviderCodex {
-		b.WriteString(dimStyle.Render("  Codex OAuth needs a browser (entropy login --codex).") + "\n")
-		b.WriteString(dimStyle.Render("  Paste an API key here to store OPENAI_API_KEY in codex-auth.json.") + "\n\n")
-	} else {
-		b.WriteString(dimStyle.Render("  Paste an API key. It is written owner-only under ~/.entropy.") + "\n\n")
-	}
-	shown := strings.Repeat("•", len(m.keyBuf))
-	if shown == "" {
-		shown = dimStyle.Render("(hidden)")
-	}
-	b.WriteString("  key: " + shown + "\n\n")
-	b.WriteString(dimStyle.Render("  enter save  ·  esc back  ·  " + quitChord() + " quit  ·  never commit this key"))
+	b.WriteString("\n" + dimStyle.Render("  "+quitChord()+" quit"))
 	return b.String()
-}
-
-func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
-	if m.loginP == "" {
-		switch msg.String() {
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor+1 < len(m.items) {
-				m.cursor++
-			}
-		case "esc":
-			m.screen = screenWelcome
-			m.refreshWelcome()
-		case "enter":
-			if m.cursor < len(m.items) {
-				p, ok := types.ParseProvider(m.items[m.cursor].Key)
-				if ok {
-					m.loginP = p
-					m.keyBuf = ""
-				}
-			}
-		}
-		return nil
-	}
-	switch msg.Type {
-	case tea.KeyEsc:
-		m.loginP = ""
-		m.keyBuf = ""
-		return nil
-	case tea.KeyEnter:
-		key := strings.TrimSpace(m.keyBuf)
-		if key == "" {
-			return nil
-		}
-		if err := auth.SaveAPIKey(m.loginP, key, m.loginKimiCode); err != nil {
-			m.status = err.Error()
-			return nil
-		}
-		m.keyBuf = ""
-		m.status = "saved " + m.loginP.DisplayName() + " credentials"
-		if m.sess != nil {
-			m.screen = screenChat
-			m.appendBlock(block{kind: blockSystem, body: "signed in to " + m.loginP.DisplayName() + " — credentials under ~/.entropy, never ~/.grok"})
-			m.refreshVP()
-			return nil
-		}
-		m.screen = screenWelcome
-		m.refreshWelcome()
-		return nil
-	case tea.KeyBackspace, tea.KeyCtrlH:
-		if len(m.keyBuf) > 0 {
-			m.keyBuf = m.keyBuf[:len(m.keyBuf)-1]
-		}
-		return nil
-	}
-	if msg.Type == tea.KeyRunes {
-		m.keyBuf += string(msg.Runes)
-	}
-	return nil
 }
 
 func (m *model) confirmDelete(id string) {

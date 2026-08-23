@@ -71,6 +71,23 @@ func TestAskNeedsApproval(t *testing.T) {
 	}
 }
 
+func TestAllowEditsThisSession(t *testing.T) {
+	d, reason := workspace.Check(workspace.Request{
+		Tool: "write_file", Access: types.AccessEdit, Path: "/tmp/x.go",
+		AllowEditsSession: true,
+	})
+	if d != workspace.Allow {
+		t.Fatalf("got %s (%s)", d, reason)
+	}
+	d, _ = workspace.Check(workspace.Request{
+		Tool: "bash", Access: types.AccessBash, Command: "ls",
+		AllowEditsSession: true,
+	})
+	if d != workspace.Ask {
+		t.Fatalf("edits-session must not auto-allow bash, got %s", d)
+	}
+}
+
 func TestAutoModeAllowsEditsButNotBash(t *testing.T) {
 	d, _ := workspace.Check(workspace.Request{Tool: "write_file", Access: types.AccessEdit, Path: "/tmp/x", AutoMode: true})
 	if d != workspace.Allow {

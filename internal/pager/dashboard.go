@@ -650,18 +650,19 @@ func (m *model) sendPeekReply() tea.Cmd {
 		m.status = "queued follow-up"
 		return nil
 	}
-	m.bindSession(sess, false)
-	return m.submit(text)
+	arm := m.bindSession(sess, false)
+	return tea.Batch(arm, m.submit(text))
 }
 
-func (m *model) bindSession(sess *agent.Session, openChat bool) {
+func (m *model) bindSession(sess *agent.Session, openChat bool) tea.Cmd {
 	prev := m.screen
-	m.attachSession(sess)
+	cmd := m.attachSession(sess)
 	if openChat {
 		m.layoutChat()
-		return
+		return cmd
 	}
 	m.screen = prev
+	return cmd
 }
 
 func (m *model) newDashSession() tea.Cmd {
@@ -671,9 +672,9 @@ func (m *model) newDashSession() tea.Cmd {
 		return nil
 	}
 	m.dashDetails = true
-	m.attachSession(sess)
+	cmd := m.attachSession(sess)
 	m.layoutChat()
-	return nil
+	return cmd
 }
 
 func (m *model) attachableDashIDs() []string {
@@ -712,9 +713,9 @@ func (m *model) cycleDashDetails(delta int) tea.Cmd {
 		return nil
 	}
 	m.dashDetails = true
-	m.attachSession(sess)
+	cmd := m.attachSession(sess)
 	m.layoutChat()
-	return nil
+	return cmd
 }
 
 func (m *model) handleDashRename(msg tea.KeyMsg) tea.Cmd {
@@ -799,9 +800,9 @@ func (m *model) attachDashRow() tea.Cmd {
 		return nil
 	}
 	m.dashDetails = true
-	m.attachSession(sess)
+	cmd := m.attachSession(sess)
 	m.layoutChat()
-	return nil
+	return cmd
 }
 
 func (m *model) dispatchAgent(prompt string, attach bool) tea.Cmd {
@@ -813,11 +814,11 @@ func (m *model) dispatchAgent(prompt string, attach bool) tea.Cmd {
 	sess.Title = truncate(prompt, 40)
 	_ = sess.Persist()
 	m.dashDraft = ""
-	m.bindSession(sess, attach)
+	arm := m.bindSession(sess, attach)
 	if attach {
 		m.dashDetails = true
 	}
-	return m.submit(prompt)
+	return tea.Batch(arm, m.submit(prompt))
 }
 
 func (m *model) leaveDashboard() {

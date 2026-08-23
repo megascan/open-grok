@@ -111,6 +111,7 @@ const (
 	overlayGoal
 	overlayLineView
 	overlayVoice
+	overlayLogin
 )
 
 type permMode int
@@ -124,6 +125,7 @@ const (
 
 type listItem struct {
 	Key, Label, Detail string
+	Header             bool
 }
 
 type loopJob struct {
@@ -131,7 +133,9 @@ type loopJob struct {
 	Prompt  string
 	Every   time.Duration
 	Until   time.Time
+	Next    time.Time
 	stopped bool
+	ticking bool
 }
 
 type model struct {
@@ -377,7 +381,7 @@ func (m *model) openSession(opt Options) error {
 	return nil
 }
 
-func (m *model) attachSession(sess *agent.Session) {
+func (m *model) attachSession(sess *agent.Session) tea.Cmd {
 	m.sess = sess
 	m.sess.YOLO = m.permMode == permAlways
 	m.sess.PermMode = m.permModeName()
@@ -391,6 +395,7 @@ func (m *model) attachSession(sess *agent.Session) {
 	m.todos = tools.LoadTodos(sess.Dir)
 	m.screen = screenChat
 	m.overlay = overlayNone
+	return m.reloadLoops()
 }
 
 func (m *model) permModeName() string {
@@ -421,8 +426,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
 	case streamDelta:
-		m.applyStream(msg.ev)
+		cmd := m.applyStream(msg.ev)
 		m.refreshVP()
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case turnDone:
 		m.busy = false
 		m.turnCancel = nil
@@ -849,27 +857,30 @@ func (m *model) persistUI() {
 	_ = config.Save(m.cfg)
 }
 
-func (m *model) applyStream(ev agent.Event) {
+func (m *model) applyStream(ev agent.Event) tea.Cmd {
 	switch ev.Kind {
 	case "text":
 		if last := m.lastBlock(blockAgent); last != nil {
 			last.body += ev.Text
-			return
+			return nil
 		}
 		m.appendBlock(block{kind: blockAgent, body: ev.Text, at: time.Now()})
 	case "thinking":
 		if !m.thinkingOn {
-			return
+			return nil
 		}
 		if last := m.lastBlock(blockThinking); last != nil {
 			last.body += ev.Text
-			return
+			return nil
 		}
 		m.appendBlock(block{kind: blockThinking, body: ev.Text, at: time.Now()})
 	case "tool":
 		if strings.EqualFold(ev.Tool, "todo_write") {
 			m.reloadTodos()
-			return
+			return nil
+		}
+		if isSchedulerTool(ev.Tool) {
+			return m.reloadLoops()
 		}
 		kind := blockTool
 		title := strings.ToLower(ev.Tool)
@@ -883,13 +894,26 @@ func (m *model) applyStream(ev agent.Event) {
 	case "tool_result":
 		if strings.EqualFold(ev.Tool, "todo_write") {
 			m.reloadTodos()
-			return
+			return nil
+		}
+		if isSchedulerTool(ev.Tool) {
+			return m.reloadLoops()
 		}
 		kind := blockToolResult
 		if strings.EqualFold(ev.Tool, "update_goal") {
 			kind = blockGoal
 		}
 		m.appendBlock(block{kind: kind, title: ev.Tool, body: ev.Text, err: ev.IsError, at: time.Now()})
+	}
+	return nil
+}
+
+func isSchedulerTool(name string) bool {
+	switch strings.ToLower(name) {
+	case "scheduler_create", "scheduler_delete", "scheduler_list":
+		return true
+	default:
+		return false
 	}
 }
 

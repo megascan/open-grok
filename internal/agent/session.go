@@ -23,38 +23,39 @@ import (
 
 // Session is one persisted conversation.
 type Session struct {
-	ID             string                                         `json:"id"`
-	Title          string                                         `json:"title,omitempty"`
-	CWD            string                                         `json:"cwd"`
-	CreatedAt      time.Time                                      `json:"created_at"`
-	UpdatedAt      time.Time                                      `json:"updated_at"`
-	ModelID        string                                         `json:"model_id"`
-	Provider       types.Provider                                 `json:"provider"`
-	Backend        types.ApiBackend                               `json:"backend"`
-	Messages       []types.Message                                `json:"messages"`
-	EverUsedNonXAI bool                                           `json:"ever_used_codex"`
-	Dir            string                                         `json:"-"`
-	Plan           workspace.PlanTracker                          `json:"-"`
-	Goal           *goals.Tracker                                 `json:"-"`
-	YOLO           bool                                           `json:"-"`
-	Allow          []string                                       `json:"-"`
-	Deny           []string                                       `json:"-"`
-	JS             *codemode.Runtime                              `json:"-"`
-	SubagentDepth  int                                            `json:"-"`
-	Team           *tools.TeamBox                                 `json:"-"`
-	MCPClients     []*mcp.Client                                  `json:"-"`
-	MCPTools       []tools.Tool                                   `json:"-"`
-	Inbox          []sessionbus.Delivered                         `json:"-"`
-	inboxMu        sync.Mutex                                     `json:"-"`
-	Children       map[string]*Session                            `json:"-"`
-	mcpLoaded      bool                                           `json:"-"`
-	ExtraDirs      []string                                       `json:"-"`
-	Effort         string                                         `json:"effort,omitempty"`
-	Swarm          bool                                           `json:"-"`
-	PermMode       string                                         `json:"-"`
-	Approve        func(tools.Tool, json.RawMessage) bool         `json:"-"`
-	AskUser        func(question string, options []string) string `json:"-"`
-	AskPlan        func(plan string) string                       `json:"-"`
+	ID                string                                         `json:"id"`
+	Title             string                                         `json:"title,omitempty"`
+	CWD               string                                         `json:"cwd"`
+	CreatedAt         time.Time                                      `json:"created_at"`
+	UpdatedAt         time.Time                                      `json:"updated_at"`
+	ModelID           string                                         `json:"model_id"`
+	Provider          types.Provider                                 `json:"provider"`
+	Backend           types.ApiBackend                               `json:"backend"`
+	Messages          []types.Message                                `json:"messages"`
+	EverUsedNonXAI    bool                                           `json:"ever_used_codex"`
+	Dir               string                                         `json:"-"`
+	Plan              workspace.PlanTracker                          `json:"-"`
+	Goal              *goals.Tracker                                 `json:"-"`
+	YOLO              bool                                           `json:"-"`
+	AllowEditsSession bool                                           `json:"-"`
+	Allow             []string                                       `json:"-"`
+	Deny              []string                                       `json:"-"`
+	JS                *codemode.Runtime                              `json:"-"`
+	SubagentDepth     int                                            `json:"-"`
+	Team              *tools.TeamBox                                 `json:"-"`
+	MCPClients        []*mcp.Client                                  `json:"-"`
+	MCPTools          []tools.Tool                                   `json:"-"`
+	Inbox             []sessionbus.Delivered                         `json:"-"`
+	inboxMu           sync.Mutex                                     `json:"-"`
+	Children          map[string]*Session                            `json:"-"`
+	mcpLoaded         bool                                           `json:"-"`
+	ExtraDirs         []string                                       `json:"-"`
+	Effort            string                                         `json:"effort,omitempty"`
+	Swarm             bool                                           `json:"-"`
+	PermMode          string                                         `json:"-"`
+	Approve           func(tools.Tool, json.RawMessage) bool         `json:"-"`
+	AskUser           func(question string, options []string) string `json:"-"`
+	AskPlan           func(plan string) string                       `json:"-"`
 }
 
 // NewSession creates a session directory under ~/.entropy/sessions/<cwd>/<id>.

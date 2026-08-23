@@ -86,7 +86,7 @@ var slashCatalog = []slashCmd{
 	{Name: "privacy", Help: "coding data, retention, and training", Category: "config"},
 	{Name: "rewind", Aliases: []string{"undo"}, Help: "roll back the last exchange", Category: "session"},
 	{Name: "jump", Help: "jump to a turn in the scrollback", Mode: modeFull, Category: "view"},
-	{Name: "login", Help: "sign in without leaving the session", Category: "account"},
+	{Name: "login", Help: "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter", Category: "account"},
 	{Name: "logout", Help: "sign out and return to login", Category: "account"},
 	{Name: "import-claude", Help: "import ~/.claude settings into ~/.entropy", Category: "account"},
 	{Name: "usage", Aliases: []string{"cost"}, Help: "provider quota / billing summary", Category: "account"},

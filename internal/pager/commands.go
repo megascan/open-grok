@@ -103,8 +103,9 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys(err.Error())
 			break
 		}
-		m.attachSession(sess)
+		cmd := m.attachSession(sess)
 		m.layoutChat()
+		return cmd
 	case "fork":
 		if m.sess == nil {
 			break
@@ -114,8 +115,9 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys(err.Error())
 			break
 		}
-		m.attachSession(dst)
+		cmd := m.attachSession(dst)
 		m.appendSys("forked to " + dst.ID)
+		return cmd
 	case "compact":
 		if m.sess != nil {
 			agent.CompactNow(m.sess, arg)
@@ -382,7 +384,11 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "voice":
 		return m.toggleVoice()
 	case "loop":
-		return m.startLoop(arg)
+		if arg == "" {
+			m.appendSys(loopUsageMessage())
+			break
+		}
+		return m.submitDisplay("/loop "+arg, loopScheduleInstruction(arg, m.loopFireMode()))
 	case "imagine":
 		if arg == "" {
 			m.appendSys(imagineUsageMessage())
@@ -442,6 +448,12 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			}
 		}
 	case "login":
+		if arg != "" {
+			if _, ok := parseLoginProvider(arg); !ok {
+				m.appendSys(unknownLoginProvider(arg))
+				break
+			}
+		}
 		m.openLogin(arg)
 	case "logout":
 		p := m.opts.Model.Provider
@@ -739,20 +751,61 @@ type editDone struct {
 	err  error
 }
 
-func (m *model) startLoop(arg string) tea.Cmd {
-	every, prompt := parseLoop(arg)
-	if prompt == "" {
-		m.appendSys("usage: /loop [interval] <prompt>   e.g. /loop 30m check deploy")
+func (m *model) loopFireMode() loopFireMode {
+	if m.cfg.Prefs != nil {
+		v := strings.ToLower(strings.TrimSpace(m.cfg.Prefs["scheduler.background_loops"]))
+		if v == "false" || v == "off" || v == "0" {
+			return loopFireInSession
+		}
+	}
+	return loopFireDetached
+}
+
+func (m *model) reloadLoops() tea.Cmd {
+	if m.sess == nil {
+		m.loops = nil
 		return nil
 	}
-	if every < time.Minute {
-		every = time.Minute
+	tasks := tools.LoadScheduledTasks(m.sess.Dir)
+	now := time.Now()
+	seen := map[string]bool{}
+	var next []loopJob
+	var cmds []tea.Cmd
+	for _, t := range tasks {
+		seen[t.ID] = true
+		job := loopJob{
+			ID:     t.ID,
+			Prompt: t.Prompt,
+			Every:  time.Duration(t.IntervalSecs) * time.Second,
+			Next:   t.NextFireAt,
+		}
+		if t.ExpiresAt != nil {
+			job.Until = *t.ExpiresAt
+		}
+		for _, old := range m.loops {
+			if old.ID == t.ID {
+				job.ticking = old.ticking
+				job.stopped = old.stopped
+			}
+		}
+		if !job.stopped && (job.Until.IsZero() || now.Before(job.Until)) && !job.ticking {
+			job.ticking = true
+			delay := time.Until(job.Next)
+			if delay < 0 {
+				delay = 0
+			}
+			id := job.ID
+			cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg { return loopTickMsg{id: id} }))
+		}
+		next = append(next, job)
 	}
-	id := fmt.Sprintf("loop-%d", time.Now().Unix()%100000)
-	job := loopJob{ID: id, Prompt: prompt, Every: every, Until: time.Now().Add(7 * 24 * time.Hour)}
-	m.loops = append(m.loops, job)
-	m.appendSys("loop " + id + " every " + every.String() + " (expires in 7 days)")
-	return tea.Tick(every, func(t time.Time) tea.Msg { return loopTickMsg{id: id} })
+	for _, old := range m.loops {
+		if !seen[old.ID] {
+			old.stopped = true
+		}
+	}
+	m.loops = next
+	return tea.Batch(cmds...)
 }
 
 func (m *model) onLoopTick(id string) tea.Cmd {
@@ -763,23 +816,25 @@ func (m *model) onLoopTick(id string) tea.Cmd {
 			break
 		}
 	}
-	if job == nil || job.stopped || time.Now().After(job.Until) {
+	if job == nil || job.stopped || (!job.Until.IsZero() && time.Now().After(job.Until)) {
+		if job != nil {
+			job.ticking = false
+		}
 		return nil
 	}
-	cmd := m.submit("[loop " + id + "] " + job.Prompt)
-	return tea.Batch(cmd, tea.Tick(job.Every, func(t time.Time) tea.Msg { return loopTickMsg{id: id} }))
-}
-
-func parseLoop(arg string) (time.Duration, string) {
-	arg = strings.TrimSpace(arg)
-	if arg == "" {
-		return 0, ""
+	if m.sess != nil {
+		_ = tools.MarkScheduledFire(m.sess.Dir, id, time.Now())
 	}
-	fields := strings.Fields(arg)
-	if d, err := time.ParseDuration(fields[0]); err == nil {
-		return d, strings.TrimSpace(strings.TrimPrefix(arg, fields[0]))
+	job.ticking = false
+	prompt := job.Prompt
+	arm := m.reloadLoops()
+	var fire tea.Cmd
+	if m.busy {
+		m.queue = append(m.queue, prompt)
+	} else {
+		fire = m.submit(prompt)
 	}
-	return time.Hour, arg
+	return tea.Batch(fire, arm)
 }
 
 func (m *model) usageItems() []listItem {

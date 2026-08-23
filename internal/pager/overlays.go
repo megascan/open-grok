@@ -92,6 +92,8 @@ func (m *model) renderOverlay() string {
 		return m.renderWorkflows(w)
 	case overlayVoice:
 		return ""
+	case overlayLogin:
+		return m.renderLoginOverlay(w)
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -108,7 +110,7 @@ func (m *model) renderOverlay() string {
 	case overlayFeedback:
 		return modalBox.Width(w).Render(titleStyle.Render("Feedback") + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
 	case overlaySettings:
-		return m.renderListModal("Settings", w)
+		return m.renderSettings(w)
 	case overlayTheme:
 		return m.renderListModal("Theme (live preview)", w)
 	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
@@ -295,6 +297,12 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayLogin {
+		return m.handleLoginKey(msg), true
+	}
+	if m.overlay == overlaySettings {
+		return m.handleSettingsKey(msg), true
+	}
 	if m.overlay == overlayWorkflows {
 		return m.handleWorkflowsKey(msg), true
 	}
@@ -441,11 +449,6 @@ func (m *model) applyOverlayFilter() {
 			m.cursor = 0
 		}
 	}
-	if m.overlay == overlaySettings {
-		saved := m.cursor
-		m.fillSettings()
-		m.cursor = saved
-	}
 	if m.overlay == overlayHistory {
 		return
 	}
@@ -473,6 +476,9 @@ func (m *model) pickOverlay() tea.Cmd {
 	it := m.items[m.cursor]
 	switch m.overlay {
 	case overlaySettings:
+		if it.Header {
+			return nil
+		}
 		return m.toggleSetting(it.Key)
 	case overlayTheme:
 		m.theme = it.Key
@@ -495,14 +501,18 @@ func (m *model) pickOverlay() tea.Cmd {
 				sess, err = agent.LoadSession(m.opts.CWD, strings.TrimPrefix(it.Key, "resume:"))
 			}
 			if err == nil {
-				m.attachSession(sess)
+				cmd := m.attachSession(sess)
 				m.layoutChat()
+				m.overlay = overlayNone
+				return cmd
 			}
 		} else if it.Key == "new" {
 			sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, m.permMode == permAlways)
 			if err == nil {
-				m.attachSession(sess)
+				cmd := m.attachSession(sess)
 				m.layoutChat()
+				m.overlay = overlayNone
+				return cmd
 			}
 		}
 		m.overlay = overlayNone

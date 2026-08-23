@@ -112,6 +112,9 @@ func (m *model) permChoices() []permChoice {
 	if mcp {
 		out = append(out, permChoice{ID: "always", Label: m.permAlwaysLabel()})
 	}
+	if m.perm.Access == "edit" {
+		out = append(out, permChoice{ID: "allow-edits-session", Label: "Allow all edits this session"})
+	}
 	out = append(out, permChoice{ID: "allow", Label: "Yes, proceed"})
 	if bash {
 		out = append(out, permChoice{ID: "never-cmd", Label: "Never allow: " + cmd})
@@ -351,6 +354,11 @@ func (m *model) applyPermChoice(c permChoice) tea.Cmd {
 			m.sess.Allow = append(m.sess.Allow, rule)
 		}
 		m.rememberPermRule(rule, false)
+		m.replyPerm(true, false, false)
+	case "allow-edits-session":
+		if m.sess != nil {
+			m.sess.AllowEditsSession = true
+		}
 		m.replyPerm(true, false, false)
 	case "never":
 		if m.sess != nil {

@@ -22,6 +22,9 @@ var (
 	_ Tool = TaskSpawn{}
 	_ Tool = UpdateGoal{}
 	_ Tool = TodoWrite{}
+	_ Tool = SchedulerCreate{}
+	_ Tool = SchedulerDelete{}
+	_ Tool = SchedulerList{}
 	_ Tool = ListSessions{}
 	_ Tool = ReadSession{}
 	_ Tool = MessageSession{}

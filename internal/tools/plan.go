@@ -109,6 +109,9 @@ func DefaultPack() []Tool {
 		TaskSpawn{},
 		UpdateGoal{},
 		TodoWrite{},
+		SchedulerCreate{},
+		SchedulerDelete{},
+		SchedulerList{},
 	}
 	return append(pack, DirectCollabPack()...)
 }
@@ -142,6 +145,9 @@ func NestedPack() []Tool {
 		MemorySearch{},
 		MemorySave{},
 		TodoWrite{},
+		SchedulerCreate{},
+		SchedulerDelete{},
+		SchedulerList{},
 	}
 }
 
