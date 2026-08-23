@@ -159,6 +159,34 @@ func ConfigTOML() string {
 	return filepath.Join(Home(), "config.toml")
 }
 
+// ProjectConfigTOML is <git-root>/.entropy/config.toml, falling back to cwd.
+func ProjectConfigTOML(cwd string) string {
+	dir, err := filepath.Abs(cwd)
+	if err != nil {
+		dir = cwd
+	}
+	start := dir
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return filepath.Join(dir, projectDirName, "config.toml")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return filepath.Join(start, projectDirName, "config.toml")
+		}
+		dir = parent
+	}
+}
+
+// ClaudeImported is true when [claude_compat] imported = true in user config.
+func ClaudeImported() bool {
+	cfg, err := Load()
+	if err != nil {
+		return false
+	}
+	return cfg.ClaudeCompat.Imported
+}
+
 // LeaderSock is the Unix-domain leader socket (unused on Windows).
 func LeaderSock() string {
 	return filepath.Join(Home(), "leader.sock")

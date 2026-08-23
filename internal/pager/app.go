@@ -15,10 +15,12 @@ import (
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
+	"github.com/megascan/open-grok/internal/claudeimport"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
+	"github.com/megascan/open-grok/internal/workspace"
 )
 
 // Options configure the interactive session.
@@ -98,6 +100,8 @@ const (
 	overlayFiles
 	overlayPlan
 	overlayCancelTurn
+	overlayWorktree
+	overlayMemory
 )
 
 type permMode int
@@ -201,6 +205,11 @@ type model struct {
 	escArmed                                                              time.Time
 	copyToast                                                             string
 	headerH, promptY                                                      int
+	trustPending                                                          bool
+	claudeDismissed                                                       bool
+	worktreeLabel                                                         string
+	importPlan                                                            claudeimport.Plan
+	importSel                                                             []bool
 }
 
 // Run starts the interactive TUI.
@@ -292,6 +301,11 @@ func newModel(opt Options) (*model, error) {
 			m.ta.Blur()
 		}
 	} else {
+		m.screen = screenWelcome
+		m.refreshWelcome()
+	}
+	if workspace.ShouldPrompt(opt.CWD) {
+		m.trustPending = true
 		m.screen = screenWelcome
 		m.refreshWelcome()
 	}

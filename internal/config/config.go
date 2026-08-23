@@ -10,16 +10,38 @@ import (
 
 // File is the user-level Entropy configuration (~/.entropy/config.toml).
 type File struct {
-	Model      string         `toml:"model"`
-	YOLO       bool           `toml:"always_approve"`
-	CLI        CLISection     `toml:"cli"`
-	UI         UISection      `toml:"ui"`
-	Models     ModelsSection  `toml:"models"`
-	Features   FeatSection    `toml:"features"`
-	Dashboard  DashSection    `toml:"dashboard"`
-	SessionBus SessionBusSec  `toml:"session_bus"`
-	MCP        map[string]MCP `toml:"mcp_servers"`
-	Prefs      Prefs          `toml:"prefs"`
+	Model        string            `toml:"model"`
+	YOLO         bool              `toml:"always_approve"`
+	CLI          CLISection        `toml:"cli"`
+	UI           UISection         `toml:"ui"`
+	Models       ModelsSection     `toml:"models"`
+	Features     FeatSection       `toml:"features"`
+	Dashboard    DashSection       `toml:"dashboard"`
+	SessionBus   SessionBusSec     `toml:"session_bus"`
+	MCP          map[string]MCP    `toml:"mcp_servers"`
+	Prefs        Prefs             `toml:"prefs"`
+	Env          map[string]string `toml:"env"`
+	Paths        PathsSection      `toml:"paths"`
+	Permission   PermSection       `toml:"permission"`
+	ClaudeCompat ClaudeCompatSec   `toml:"claude_compat"`
+}
+
+// PathsSection is extra skill/rule search roots (Claude import PathEntry).
+type PathsSection struct {
+	ExtraSkillDirs []string `toml:"extra_skill_dirs"`
+	ExtraRuleDirs  []string `toml:"extra_rule_dirs"`
+}
+
+// PermSection is compact allow/deny/ask rule strings, including Claude Tool(*) form.
+type PermSection struct {
+	Allow []string `toml:"allow"`
+	Deny  []string `toml:"deny"`
+	Ask   []string `toml:"ask"`
+}
+
+// ClaudeCompatSec is the Rust [claude_compat] imported marker.
+type ClaudeCompatSec struct {
+	Imported bool `toml:"imported"`
 }
 
 // UISection is the interactive pager appearance and input contract.
@@ -104,10 +126,15 @@ type MCP struct {
 	URL     string            `toml:"url"`
 }
 
-// Load reads config.toml if present; missing files yield defaults.
+// Load reads ~/.entropy/config.toml if present; missing files yield defaults.
 func Load() (File, error) {
+	return LoadAt(ConfigTOML())
+}
+
+// LoadAt reads a config.toml at path. Missing files yield defaults.
+func LoadAt(path string) (File, error) {
 	var cfg File
-	data, err := os.ReadFile(ConfigTOML())
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return cfg, nil

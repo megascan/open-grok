@@ -417,18 +417,31 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "settings":
 		m.openSettings()
 	case "privacy":
-		m.overlay = overlayPrivacy
-		m.cursor = 0
-		m.items = []listItem{
-			{Key: "opt-in", Label: "Opt in", Detail: "allow coding-data retention/training where the provider offers it"},
-			{Key: "opt-out", Label: "Opt out", Detail: "do not share coding data for training"},
+		switch strings.ToLower(strings.TrimSpace(arg)) {
+		case "opt-in":
+			m.ackPrivacyBanner(true)
+			m.appendSys("privacy: opted in")
+		case "opt-out":
+			m.ackPrivacyBanner(false)
+			m.appendSys("privacy: opted out")
+		default:
+			m.overlay = overlayPrivacy
+			m.cursor = 0
+			m.items = []listItem{
+				{Key: "opt-in", Label: "Opt in", Detail: "allow coding-data retention/training where the provider offers it"},
+				{Key: "opt-out", Label: "Opt out", Detail: "do not share coding data for training"},
+			}
 		}
 	case "rewind":
-		if m.sess != nil && len(m.sess.Messages) > 2 {
-			m.sess.Messages = m.sess.Messages[:len(m.sess.Messages)-2]
-			_ = m.sess.Persist()
-			m.appendSys("rewound last exchange")
+		if m.sess == nil || len(m.sess.Messages) <= 2 {
+			break
 		}
+		if m.cfg.UI.ConfirmRewind {
+			m.overlay = overlayConfirm
+			m.confirmKind = "rewind"
+			break
+		}
+		m.doRewind()
 	case "jump":
 		m.overlay = overlayTimeline
 		m.cursor = 0
@@ -452,9 +465,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.screen = screenLogin
 		m.openLogin("")
 	case "import-claude":
-		m.overlay = overlayImportClaude
-		m.items = m.importClaudePreview()
-		m.cursor = 0
+		m.openImportClaude()
 	case "usage":
 		m.overlay = overlayUsage
 		m.items = m.usageItems()
@@ -499,9 +510,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		m.cursor = 0
 	case "release-notes":
-		m.overlay = overlayReleaseNotes
-		m.items = []listItem{{Label: "Entropy " + version.String(), Detail: "Native Go pager with the Rust slash catalog, permission card, themes, and session surfaces."}}
-		m.cursor = 0
+		m.openReleaseNotes()
 	case "tutorial":
 		m.openTutorial()
 	case "config-agents":
@@ -545,6 +554,15 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	}
 	m.refreshVP()
 	return nil
+}
+
+func (m *model) doRewind() {
+	if m.sess == nil || len(m.sess.Messages) <= 2 {
+		return
+	}
+	m.sess.Messages = m.sess.Messages[:len(m.sess.Messages)-2]
+	_ = m.sess.Persist()
+	m.appendSys("rewound last exchange")
 }
 
 func (m *model) sessionInfo() string {
@@ -626,9 +644,26 @@ func (m *model) handleMemory(arg string) tea.Cmd {
 			m.appendSys("memory is off — /memory on or ENTROPY_MEMORY=1")
 			break
 		}
-		body, _ := json.Marshal(map[string]string{"query": arg})
-		res := tools.MemorySearch{}.Execute(context.Background(), tools.Context{}, body)
-		m.appendSys(res.Content)
+		m.overlay = overlayMemory
+		m.cursor = 0
+		m.items = nil
+		dir := filepath.Join(config.Home(), "memory")
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+			if arg != "" && !strings.Contains(strings.ToLower(e.Name()+string(data)), strings.ToLower(arg)) {
+				continue
+			}
+			m.items = append(m.items, listItem{Key: e.Name(), Label: e.Name(), Detail: truncate(string(data), 80)})
+		}
+		if len(m.items) == 0 {
+			body, _ := json.Marshal(map[string]string{"query": arg})
+			res := tools.MemorySearch{}.Execute(context.Background(), tools.Context{}, body)
+			m.items = []listItem{{Label: res.Content}}
+		}
 	}
 	m.refreshVP()
 	return nil
@@ -843,13 +878,4 @@ func (m *model) usageItems() []listItem {
 		items = append(items, listItem{Label: p.DisplayName(), Detail: mark})
 	}
 	return items
-}
-
-func (m *model) importClaudePreview() []listItem {
-	home, _ := os.UserHomeDir()
-	root := filepath.Join(home, ".claude")
-	if _, err := os.Stat(root); err != nil {
-		return []listItem{{Label: "~/.claude not found"}}
-	}
-	return dirListing(root, filepath.Join(root, "projects"))
 }

@@ -58,6 +58,28 @@ func TestPreToolUseCrashFailsOpen(t *testing.T) {
 	}
 }
 
+func TestImportedJSONHookDenies(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell hook")
+	}
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".entropy", "hooks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"exit 2"}]}]}}`
+	if err := os.WriteFile(filepath.Join(dir, "imported-from-claude.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deny, reason := hooks.PreToolUse(context.Background(), cwd, cwd, "bash", `{}`)
+	if !deny {
+		t.Fatal("imported-from-claude.json exit 2 must deny")
+	}
+	if reason == "" {
+		t.Fatal("deny reason")
+	}
+}
+
 func TestPreToolUseReadsLegacyOpenGrokDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell hook")

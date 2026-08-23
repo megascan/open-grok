@@ -122,7 +122,27 @@ func matchRule(rule string, req Request) bool {
 	if strings.HasPrefix(rule, "bash:") && req.Access == types.AccessBash {
 		return strings.Contains(req.Command, strings.TrimPrefix(rule, "bash:"))
 	}
+	name, pat, ok := splitToolPattern(rule)
+	if ok && strings.EqualFold(name, req.Tool) {
+		if pat == "" || pat == "*" {
+			return true
+		}
+		hay := req.Command
+		if hay == "" {
+			hay = req.Path
+		}
+		return strings.Contains(strings.ToLower(hay), strings.ToLower(strings.TrimSuffix(pat, "*")))
+	}
 	return false
+}
+
+// splitToolPattern parses Claude/Open Grok compact rules like Bash(*) or Read(src/**).
+func splitToolPattern(rule string) (name, pat string, ok bool) {
+	open := strings.IndexByte(rule, '(')
+	if open <= 0 || !strings.HasSuffix(rule, ")") {
+		return "", "", false
+	}
+	return rule[:open], strings.TrimSpace(rule[open+1 : len(rule)-1]), true
 }
 
 // PlanTracker is a fresh Inactive tracker per session (including subagents).

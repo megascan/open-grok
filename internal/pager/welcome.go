@@ -13,6 +13,7 @@ import (
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
+	"github.com/megascan/open-grok/internal/workspace"
 )
 
 func (m *model) unsignedIn() bool {
@@ -24,7 +25,7 @@ func (m *model) unsignedIn() bool {
 
 func (m *model) refreshWelcome() {
 	m.items = nil
-	if m.unsignedIn() {
+	if m.unsignedIn() && !m.trustPending {
 		m.items = []listItem{
 			{Key: "codex", Label: "c  Continue with ChatGPT Codex", Detail: "Codex OAuth or API key"},
 			{Key: "xai", Label: "x  Continue with xAI Grok", Detail: "xAI API key"},
@@ -35,26 +36,24 @@ func (m *model) refreshWelcome() {
 		}
 		return
 	}
-	m.items = append(m.items, listItem{Key: "new", Label: "New session", Detail: "start chatting in " + m.opts.CWD})
-	list, _ := agent.ListSessions(m.opts.CWD)
-	for i, s := range list {
-		if i >= 12 {
-			break
+	if m.trustPending {
+		m.items = []listItem{
+			{Key: "trust-yes", Label: "y  Yes, proceed", Detail: m.opts.CWD},
+			{Key: "trust-no", Label: "n  No, quit", Detail: "leave without trusting this folder"},
 		}
-		title := s.Title
-		if title == "" {
-			title = "(untitled)"
+		if m.cursor >= len(m.items) {
+			m.cursor = 0
 		}
-		m.items = append(m.items, listItem{
-			Key:    "resume:" + s.ID,
-			Label:  shortID(s.ID) + "  " + title,
-			Detail: s.UpdatedAt.Format("2006-01-02 15:04") + "  " + s.ModelID,
-		})
+		return
+	}
+	if m.hasClaudeImport() {
+		m.items = append(m.items, listItem{Key: "import-claude", Label: "Import Claude settings", Detail: "ctrl+i   [x]"})
 	}
 	m.items = append(m.items,
-		listItem{Key: "login", Label: "Login", Detail: "API key or Codex OAuth — stored under ~/.entropy"},
-		listItem{Key: "settings", Label: "Settings", Detail: "theme, vim, timestamps, screen mode"},
-		listItem{Key: "quit", Label: "Quit", Detail: "leave Entropy"},
+		listItem{Key: "worktree", Label: "New worktree", Detail: "ctrl+w"},
+		listItem{Key: "resume", Label: "Resume session", Detail: "ctrl+s"},
+		listItem{Key: "changelog", Label: "Changelog", Detail: ""},
+		listItem{Key: "quit", Label: "Quit", Detail: "ctrl+q"},
 	)
 	if m.cursor >= len(m.items) {
 		m.cursor = 0
@@ -64,6 +63,9 @@ func (m *model) refreshWelcome() {
 func (m *model) viewWelcome() string {
 	var b strings.Builder
 	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Entropy  "+version.String()) + "\n\n")
+	if logo := m.welcomeLogo(); logo != "" {
+		b.WriteString(logo)
+	}
 	b.WriteString(titleStyle.Render("  Welcome") + "\n")
 	b.WriteString(dimStyle.Render("  State: "+config.Home()+"   never ~/.grok") + "\n")
 	b.WriteString(dimStyle.Render("  Model: "+m.opts.Model.Name+" via "+m.opts.Model.Provider.DisplayName()) + "\n\n")
@@ -74,7 +76,12 @@ func (m *model) viewWelcome() string {
 			signed = append(signed, p.DisplayName())
 		}
 	}
-	if m.unsignedIn() {
+	if m.trustPending {
+		b.WriteString(claimStyle.Render("  Do you trust the contents of this directory?") + "\n")
+		b.WriteString(titleStyle.Render("  "+m.opts.CWD) + "\n\n")
+		b.WriteString(dimStyle.Render("  Entropy may run or modify contents in this directory,") + "\n")
+		b.WriteString(dimStyle.Render("  posing security risks.") + "\n\n")
+	} else if m.unsignedIn() {
 		b.WriteString(claimStyle.Render("  Choose the account that will power this session.") + "\n\n")
 	} else if len(signed) == 0 {
 		b.WriteString(errStyle.Render("  Not signed in — pick Login or run entropy login") + "\n\n")
@@ -88,15 +95,48 @@ func (m *model) viewWelcome() string {
 		}
 		b.WriteString(line + "\n")
 	}
-	hint := "  ↑↓ move  ·  enter  ·  d delete session  ·  q quit"
-	if m.unsignedIn() {
+	if !m.unsignedIn() && !m.trustPending {
+		b.WriteString("\n")
+		if m.showPrivacyBanner() {
+			b.WriteString(privacyBanner() + "\n")
+		}
+		for _, bullet := range changelogBullets() {
+			b.WriteString(dimStyle.Render("  • "+bullet) + "\n")
+		}
+		b.WriteString("\n" + dimStyle.Render("  type to start  ·  enter  ·  shift+tab new session"))
+	}
+	hint := "  ↑↓ move  ·  enter  ·  q quit"
+	if m.unsignedIn() && !m.trustPending {
 		hint = "  c Codex  ·  x xAI  ·  q quit  ·  ↑↓ enter"
+	}
+	if m.trustPending {
+		hint = "  y proceed  ·  n quit"
 	}
 	b.WriteString("\n" + dimStyle.Render(hint))
 	return b.String()
 }
 
 func (m *model) handleWelcomeKey(msg tea.KeyMsg) tea.Cmd {
+	if m.trustPending {
+		switch msg.String() {
+		case "y", "enter":
+			if msg.String() == "enter" && m.cursor < len(m.items) && m.items[m.cursor].Key == "trust-no" {
+				return tea.Quit
+			}
+			return m.acceptFolderTrust()
+		case "n", "q", "ctrl+c", "ctrl+d":
+			return tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor+1 < len(m.items) {
+				m.cursor++
+			}
+		}
+		return nil
+	}
 	if m.unsignedIn() {
 		switch msg.String() {
 		case "c":
@@ -123,28 +163,76 @@ func (m *model) handleWelcomeKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
-	switch msg.String() {
+	s := msg.String()
+	switch s {
+	case "ctrl+s":
+		m.openResume()
+		return nil
+	case "ctrl+w":
+		m.openWorktreeDialog()
+		return nil
+	case "ctrl+i":
+		if m.hasClaudeImport() {
+			m.openImportClaude()
+		}
+		return nil
+	case "ctrl+I":
+		if m.hasClaudeImport() {
+			m.dismissClaudeImport()
+		}
+		return nil
+	case "ctrl+p":
+		if m.showPrivacyBanner() {
+			m.ackPrivacyBanner(false)
+			m.refreshWelcome()
+		}
+		return nil
+	case "shift+tab":
+		return m.pickWelcome("new")
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		return nil
 	case "down", "j":
 		if m.cursor+1 < len(m.items) {
 			m.cursor++
 		}
-	case "q", "ctrl+c":
+		return nil
+	case "q", "ctrl+q", "ctrl+c", "ctrl+d":
 		return tea.Quit
-	case "d":
-		if m.cursor < len(m.items) && strings.HasPrefix(m.items[m.cursor].Key, "resume:") {
-			m.confirmKind = "delete-welcome:" + strings.TrimPrefix(m.items[m.cursor].Key, "resume:")
-			m.overlay = overlayConfirm
-		}
 	case "enter":
 		if m.cursor >= len(m.items) {
-			return nil
+			return m.pickWelcome("new")
 		}
 		return m.pickWelcome(m.items[m.cursor].Key)
 	}
+	if msg.Type == tea.KeyRunes && s != "k" && s != "j" && s != "q" {
+		cmd := m.pickWelcome("new")
+		m.ta.SetValue(string(msg.Runes))
+		m.ta.Focus()
+		return cmd
+	}
+	return nil
+}
+
+func (m *model) acceptFolderTrust() tea.Cmd {
+	_ = workspace.GrantFolderTrust(m.opts.CWD)
+	m.trustPending = false
+	if m.opts.Dashboard {
+		m.openDashboard()
+		return nil
+	}
+	if m.opts.Resume != "" || m.opts.Continue {
+		if err := m.openSession(m.opts); err != nil {
+			m.status = err.Error()
+			m.refreshWelcome()
+			return nil
+		}
+		m.layoutChat()
+		return nil
+	}
+	m.refreshWelcome()
 	return nil
 }
 
@@ -173,6 +261,18 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 		}
 		m.attachSession(sess)
 		m.layoutChat()
+	case key == "resume":
+		m.openResume()
+	case key == "worktree":
+		m.openWorktreeDialog()
+	case key == "import-claude":
+		m.openImportClaude()
+	case key == "changelog":
+		m.openReleaseNotes()
+	case key == "trust-yes":
+		return m.acceptFolderTrust()
+	case key == "trust-no":
+		return tea.Quit
 	case strings.HasPrefix(key, "resume:"):
 		id := strings.TrimPrefix(key, "resume:")
 		sess, err := agent.LoadSession(m.opts.CWD, id)

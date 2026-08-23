@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/megascan/open-grok/internal/config"
@@ -27,17 +28,23 @@ type Event struct {
 // PreToolUse looks for executable hooks and runs them. A hook that exits 2
 // denies the tool; any other failure (missing, crash, timeout) is ignored.
 func PreToolUse(ctx context.Context, cwd, sessionDir, tool, args string) (deny bool, reason string) {
+	ev := Event{Hook: "PreToolUse", Tool: tool, CWD: cwd, Session: sessionDir, ArgsJSON: args}
 	for _, dir := range hookDirs(cwd) {
 		if dir == "" {
 			continue
 		}
 		path := filepath.Join(dir, "PreToolUse")
-		code, out, err := runHook(ctx, path, Event{Hook: "PreToolUse", Tool: tool, CWD: cwd, Session: sessionDir, ArgsJSON: args})
+		code, out, err := runHook(ctx, path, ev)
 		if err != nil {
 			continue
 		}
 		if code == 2 {
 			return true, "hook denied: " + out
+		}
+	}
+	for _, dir := range hookDirs(cwd) {
+		if deny, reason := runImportedJSON(ctx, dir, ev); deny {
+			return true, reason
 		}
 	}
 	return false, ""
@@ -74,6 +81,72 @@ func List(cwd string) []string {
 		}
 	}
 	return out
+}
+
+func runImportedJSON(ctx context.Context, dir string, ev Event) (bool, string) {
+	raw, err := os.ReadFile(filepath.Join(dir, "imported-from-claude.json"))
+	if err != nil {
+		return false, ""
+	}
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil {
+		return false, ""
+	}
+	hooks, _ := root["hooks"].(map[string]any)
+	groups, _ := hooks[ev.Hook].([]any)
+	if len(groups) == 0 {
+		// Claude events are PreToolUse; also try case variants.
+		groups, _ = hooks["PreToolUse"].([]any)
+	}
+	for _, g := range groups {
+		gm, _ := g.(map[string]any)
+		if gm == nil {
+			continue
+		}
+		matcher, _ := gm["matcher"].(string)
+		if matcher != "" && matcher != "*" && !strings.EqualFold(matcher, ev.Tool) {
+			continue
+		}
+		handlers, _ := gm["hooks"].([]any)
+		for _, h := range handlers {
+			hm, _ := h.(map[string]any)
+			if hm == nil {
+				continue
+			}
+			cmd, _ := hm["command"].(string)
+			if cmd == "" {
+				continue
+			}
+			code, out, err := runCommandHook(ctx, cmd, ev)
+			if err != nil {
+				continue
+			}
+			if code == 2 {
+				return true, "hook denied: " + out
+			}
+		}
+	}
+	return false, ""
+}
+
+func runCommandHook(ctx context.Context, command string, ev Event) (int, string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "sh", "-c", command)
+	body, _ := json.Marshal(ev)
+	cmd.Stdin = bytes.NewReader(body)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+			err = nil
+		}
+	}
+	return code, buf.String(), err
 }
 
 func runHook(ctx context.Context, path string, ev Event) (int, string, error) {

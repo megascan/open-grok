@@ -54,6 +54,16 @@ func TestDenyRuleBeatsAllow(t *testing.T) {
 	}
 }
 
+func TestClaudeCompactAllowRule(t *testing.T) {
+	d, _ := workspace.Check(workspace.Request{
+		Tool: "bash", Access: types.AccessBash, Command: "ls",
+		AllowRules: []string{"Bash(*)"},
+	})
+	if d != workspace.Allow {
+		t.Fatalf("Bash(*) must allow bash, got %s", d)
+	}
+}
+
 func TestAskNeedsApproval(t *testing.T) {
 	d, _ := workspace.Check(workspace.Request{Tool: "write_file", Access: types.AccessEdit, Path: "/tmp/x"})
 	if d != workspace.Ask {

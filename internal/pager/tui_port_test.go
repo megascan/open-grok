@@ -1,11 +1,14 @@
 package pager
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/agent"
+	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/types"
@@ -149,5 +152,110 @@ func TestRememberChipSkipsDirs(t *testing.T) {
 	m.rememberChip("main.go", false)
 	if len(m.chips) != 1 || m.chips[0] != "main.go" {
 		t.Fatalf("%v", m.chips)
+	}
+}
+
+func TestSignedInWelcomeResumeWorktreeChangelog(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "")
+	t.Setenv("GROK_API_KEY", "")
+	m := testModel(t)
+	if err := auth.SaveAPIKey(types.ProviderXAI, "xai-test-not-real", false); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshWelcome()
+	if m.unsignedIn() {
+		t.Fatal("expected signed in")
+	}
+	keys := map[string]bool{}
+	for _, it := range m.items {
+		keys[it.Key] = true
+	}
+	for _, want := range []string{"resume", "worktree", "changelog", "quit"} {
+		if !keys[want] {
+			t.Fatalf("missing %s in %+v", want, m.items)
+		}
+	}
+	m.handleWelcomeKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if m.overlay != overlayResume {
+		t.Fatalf("ctrl+s must open resume picker, overlay=%d", m.overlay)
+	}
+}
+
+func TestWelcomePrintableStartsSession(t *testing.T) {
+	m := testModel(t)
+	if err := auth.SaveAPIKey(types.ProviderXAI, "xai-test-not-real", false); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshWelcome()
+	m.handleWelcomeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	if m.screen != screenChat {
+		t.Fatalf("printable must start a session, screen=%d", m.screen)
+	}
+	if m.ta.Value() != "h" {
+		t.Fatalf("prompt got %q", m.ta.Value())
+	}
+}
+
+func TestFolderTrustYesPersists(t *testing.T) {
+	t.Setenv("ENTROPY_HOME", t.TempDir())
+	config.ResetHomeForTest()
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, ".mcp.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := newModel(Options{CWD: cwd, Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.trustPending {
+		t.Fatal("trust prompt required")
+	}
+	out := m.viewWelcome()
+	if !strings.Contains(stripANSI(out), "Do you trust the contents of this directory") {
+		t.Fatalf("trust copy missing: %s", stripANSI(out))
+	}
+	m.handleWelcomeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if m.trustPending {
+		t.Fatal("y must grant")
+	}
+}
+
+func TestImportClaudeToggleAndApply(t *testing.T) {
+	user := t.TempDir()
+	t.Setenv("HOME", user)
+	entropy := t.TempDir()
+	t.Setenv("ENTROPY_HOME", entropy)
+	config.ResetHomeForTest()
+	claude := filepath.Join(user, ".claude")
+	if err := os.MkdirAll(claude, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(claude, "settings.json"), []byte(`{"permissions":{"allow":["Bash(*)"]}}`), 0o600)
+	m, err := newModel(Options{CWD: t.TempDir(), Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.hasClaudeImport() {
+		t.Fatal("pending import")
+	}
+	m.openImportClaude()
+	if m.overlay != overlayImportClaude {
+		t.Fatal("overlay")
+	}
+	if len(m.importPlan.Items) == 0 {
+		t.Fatal("scan")
+	}
+	m.handleImportClaudeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	if m.importSel[0] {
+		t.Fatal("space toggles off when starting selected")
+	}
+	m.handleImportClaudeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m.handleImportClaudeKey(tea.KeyMsg{Type: tea.KeyEnter})
+	cfg, _ := config.Load()
+	if !cfg.ClaudeCompat.Imported {
+		t.Fatal("imported marker")
+	}
+	if len(cfg.Permission.Allow) == 0 {
+		t.Fatal("allow rules")
 	}
 }

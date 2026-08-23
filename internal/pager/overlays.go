@@ -65,6 +65,10 @@ func (m *model) renderOverlay() string {
 		return m.renderPlanApproval(w)
 	case overlayCancelTurn:
 		return m.renderCancelTurn(w)
+	case overlayWorktree:
+		return m.renderWorktreeDialog(w)
+	case overlayImportClaude:
+		return m.renderImportClaude(w)
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -72,7 +76,12 @@ func (m *model) renderOverlay() string {
 	case overlayPermission:
 		return m.renderPermission(w)
 	case overlayConfirm:
-		return modalBox.Width(w).Render(titleStyle.Render("Confirm") + "\n\nDelete this session?  y yes  ·  n cancel")
+		title := "Confirm"
+		body := "Delete this session?  y yes  ·  n cancel"
+		if m.confirmKind == "rewind" {
+			body = "Rewind the last exchange?  y yes  ·  n cancel"
+		}
+		return modalBox.Width(w).Render(titleStyle.Render(title) + "\n\n" + body)
 	case overlayFeedback:
 		return modalBox.Width(w).Render(titleStyle.Render("Feedback") + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
 	case overlaySettings:
@@ -83,8 +92,8 @@ func (m *model) renderOverlay() string {
 		overlayDoctor, overlayDocs, overlayTutorial, overlayExtensions,
 		overlayWorkflows, overlayPersonas, overlayAgents, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
-		overlayUsage, overlayQueue, overlayTasks, overlayCache, overlayImportClaude,
-		overlayMCP, overlayTimeline:
+		overlayUsage, overlayQueue, overlayTasks, overlayCache,
+		overlayMCP, overlayTimeline, overlayMemory:
 		return m.renderListModal(m.overlayTitle(), w)
 	default:
 		return ""
@@ -137,10 +146,14 @@ func (m *model) overlayTitle() string {
 		return "Prompt cache"
 	case overlayImportClaude:
 		return "Import Claude settings"
+	case overlayMemory:
+		return "Memory"
 	case overlayMCP:
 		return "MCP servers"
 	case overlayTimeline:
 		return "Timeline"
+	case overlayWorktree:
+		return "New worktree"
 	}
 	return "Entropy"
 }
@@ -246,6 +259,12 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayWorktree {
+		return m.handleWorktreeKey(msg), true
+	}
+	if m.overlay == overlayImportClaude {
+		return m.handleImportClaudeKey(msg), true
+	}
 	switch m.overlay {
 	case overlayFeedback:
 		switch msg.Type {
@@ -280,6 +299,8 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 				m.screen = screenWelcome
 				m.refreshWelcome()
 				_ = id
+			} else if kind == "rewind" {
+				m.doRewind()
 			}
 		case "n", "esc":
 			m.overlay = overlayNone
@@ -443,6 +464,7 @@ func (m *model) pickOverlay() tea.Cmd {
 		m.refreshVP()
 	case overlayPrivacy:
 		m.cfg.UI.PrivacyOptOut = it.Key == "opt-out"
+		m.ackPrivacyBanner(it.Key == "opt-in")
 		_ = config.Save(m.cfg)
 		m.overlay = overlayNone
 		m.appendSys("privacy: " + it.Key)

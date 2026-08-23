@@ -196,6 +196,7 @@ func (s *Session) attach() {
 	if s.Children == nil {
 		s.Children = map[string]*Session{}
 	}
+	s.applyConfigRules()
 	if s.SubagentDepth > 0 {
 		return
 	}
@@ -234,6 +235,21 @@ func (s *Session) attach() {
 		Title:       titlePtr,
 		Status:      "idle",
 	})
+}
+
+func (s *Session) applyConfigRules() {
+	appendRules := func(f config.File) {
+		s.Allow = append(s.Allow, f.Permission.Allow...)
+		s.Deny = append(s.Deny, f.Permission.Deny...)
+	}
+	if f, err := config.Load(); err == nil {
+		appendRules(f)
+	}
+	if s.CWD != "" {
+		if f, err := config.LoadAt(config.ProjectConfigTOML(s.CWD)); err == nil {
+			appendRules(f)
+		}
+	}
 }
 
 // EnsureMCP connects configured MCP servers once per session (fail-open).

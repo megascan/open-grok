@@ -62,19 +62,25 @@ type SkillInfo struct {
 // skills under their vendor dirs are dropped.
 func DiscoverSkills(cwd string) []SkillInfo {
 	roots := []string{
-		filepath.Join(cwd, ".entropy"),
-		filepath.Join(cwd, ".opengrok"),
-		filepath.Join(cwd, ".agents"),
-		filepath.Join(cwd, ".claude"),
-		filepath.Join(cwd, ".cursor"),
+		filepath.Join(cwd, ".entropy", "skills"),
+		filepath.Join(cwd, ".opengrok", "skills"),
+		filepath.Join(cwd, ".agents", "skills"),
+		filepath.Join(cwd, ".claude", "skills"),
+		filepath.Join(cwd, ".cursor", "skills"),
 	}
 	if home, ok := config.UserHome(); ok {
-		roots = append(roots, home)
+		roots = append(roots, filepath.Join(home, "skills"))
+	}
+	roots = append(roots, filepath.Join(config.Home(), "skills"))
+	if cfg, err := config.Load(); err == nil {
+		roots = append(roots, cfg.Paths.ExtraSkillDirs...)
+	}
+	if cfg, err := config.LoadAt(config.ProjectConfigTOML(cwd)); err == nil {
+		roots = append(roots, cfg.Paths.ExtraSkillDirs...)
 	}
 	var out []SkillInfo
 	seen := map[string]bool{}
-	for _, root := range roots {
-		skillsDir := filepath.Join(root, "skills")
+	for _, skillsDir := range roots {
 		_ = filepath.WalkDir(skillsDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
