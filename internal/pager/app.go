@@ -222,6 +222,9 @@ type model struct {
 	vimMode, timestamps, compactUI, multiline, mouseOn, thinkingOn, swarm bool
 	rememberMode, settingsFilter, autoModeGate                            bool
 	modeBanner                                                            string
+	settingsEnumKey, settingsEnumOrig                                     string
+	settingsEnumIdx                                                       int
+	settingsSecretKey, settingsSecret                                     string
 	permMode                                                              permMode
 	queue                                                                 []string
 	loops                                                                 []loopJob

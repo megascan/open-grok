@@ -124,7 +124,7 @@ func (m *model) permChoices() []permChoice {
 		}
 		out = append(out, permChoice{ID: "never", Label: "Never allow this tool"})
 	}
-	out = append(out, permChoice{ID: "followup", Label: "Tell Entropy what to do differently"})
+	out = append(out, permChoice{ID: "followup", Label: permFollowupLabel})
 	return out
 }
 
@@ -157,6 +157,44 @@ func (m *model) initPermCard() {
 	}
 }
 
+func (m *model) permTitle() string {
+	if m.perm == nil {
+		return "Allow?"
+	}
+	switch m.perm.Access {
+	case "edit":
+		if p := strings.TrimSpace(m.perm.Path); p != "" {
+			return "Allow Edit to " + p + "?"
+		}
+		return "Allow Edit?"
+	case "bash":
+		words := m.permWords()
+		if len(words) > 0 {
+			bin := words[0]
+			if i := strings.LastIndex(bin, "/"); i >= 0 && i+1 < len(bin) {
+				bin = bin[i+1:]
+			}
+			return "Allow `" + bin + "`?"
+		}
+		return "Allow Execute?"
+	case "mcp":
+		server := m.permMCPServerName()
+		name := workspace.MCPToolDisplayName(m.permMCPQualified(), server)
+		if name != "" {
+			return "Allow " + name + "?"
+		}
+		if m.perm.Tool != "" {
+			return "Allow " + m.perm.Tool + "?"
+		}
+		return "Allow?"
+	default:
+		if m.perm.Tool != "" {
+			return "Allow " + m.perm.Tool + "?"
+		}
+		return "Allow?"
+	}
+}
+
 func (m *model) renderPermission(w int) string {
 	if m.perm == nil {
 		return ""
@@ -166,14 +204,17 @@ func (m *model) renderPermission(w int) string {
 		park = "\n" + dimStyle.Render("keyboard parked in scrollback — Tab returns")
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Permission") + "\n\n")
-	b.WriteString("Allow " + toolStyle.Render(m.perm.Tool) + " (" + m.perm.Access + ")?\n")
-	if m.perm.Path != "" {
-		b.WriteString(dimStyle.Render("path: "+m.perm.Path) + "\n")
+	writePerm := func(s string) {
+		b.WriteString(titleStyle.Render(permAccentBar) + "  " + s + "\n")
+	}
+	writePerm(titleStyle.Render(m.permTitle()))
+	writePerm("")
+	if m.perm.Path != "" && m.perm.Access == "edit" {
+		writePerm(dimStyle.Render(m.perm.Path))
 	}
 	cmd := m.permCommand()
 	if cmd != "" {
-		contentW := w - 8
+		contentW := w - 10
 		if contentW < 8 {
 			contentW = 8
 		}
@@ -182,44 +223,71 @@ func (m *model) renderPermission(w int) string {
 			maxRows = permissionCollapsedRows
 		}
 		rows, trunc := bashDisplayRows(cmd, contentW, maxRows)
-		b.WriteString("\n")
 		for _, row := range rows {
-			b.WriteString(highlightBashCommand(row) + "\n")
+			writePerm(highlightBashCommand(row))
 		}
 		if trunc {
-			b.WriteString(truncationIndicator() + "\n")
+			writePerm(truncationIndicator())
 		}
 	}
-	b.WriteByte('\n')
+	if m.perm.Access == "bash" || (m.perm.Access == "mcp" && m.permMCPServerName() != "") {
+		hint := ""
+		if m.perm.Access == "bash" && len(m.permWords()) > 1 {
+			hint = "\u2190 \u2192 narrow scope"
+			if strings.TrimSpace(m.permCommand()) != "" {
+				hint += "  \u00b7  e edit pattern"
+			}
+		} else if m.perm.Access == "mcp" {
+			hint = "\u2190 \u2192 narrow scope"
+		} else if m.perm.Access == "bash" {
+			hint = "e edit pattern"
+		}
+		if hint != "" {
+			writePerm(dimStyle.Render(hint))
+		}
+	}
+	writePerm("")
 	choices := m.permChoices()
 	if m.permCursor >= len(choices) {
 		m.permCursor = 0
 	}
 	for i, c := range choices {
-		marker := "(○)"
+		marker := "(" + pickerDotEmpty + ")"
 		label := c.Label
 		if i == m.permCursor {
-			marker = "(●)"
+			marker = "(" + pickerDotFilled + ")"
 		}
-		if c.ID == "followup" && m.permFollowupMode {
-			label = "Tell Entropy what to do differently"
-			if m.permFollowup != "" {
-				label += "  ❯ " + m.permFollowup
-			} else {
-				label += "  ❯ "
+		if c.ID == "followup" {
+			if m.permFollowupMode && m.permFollowup != "" {
+				first := m.permFollowup
+				if j := strings.IndexByte(first, '\n'); j >= 0 {
+					first = first[:j]
+				}
+				label = first
+			} else if m.permFollowupMode {
+				label = permFollowupLabel
 			}
 		}
 		if c.ID == "always-cmd" && m.permPatternMode {
-			label = "Always allow: " + m.permPattern + "█"
+			label = "Always allow: " + m.permPattern + "\u2588"
 		}
-		line := fmt.Sprintf(" %d %s %s", i+1, marker, label)
+		sc := permShortcut(i)
+		line := fmt.Sprintf("%s %s %s", sc, marker, label)
 		if i == m.permCursor {
 			line = selStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		writePerm(line)
 	}
-	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ scope  ·  e edit glob  ·  x followup  ·  Ctrl-F expand  ·  esc park") + park)
-	return modalBox.Width(w).Render(b.String())
+	writePerm("")
+	writePerm(dimStyle.Render("1–9  ·  j/k  ·  enter  ·  esc park") + park)
+	return modalBox.Width(w).Render(strings.TrimRight(b.String(), "\n"))
+}
+
+func permShortcut(index int) string {
+	if index >= 0 && index < 9 {
+		return string(rune('1' + index))
+	}
+	return " "
 }
 
 func (m *model) handlePermissionKey(msg tea.KeyMsg) tea.Cmd {

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
 )
 
@@ -128,6 +129,11 @@ func (m *model) openSettingsFocus(key string) {
 	m.cursor = 0
 	m.filter = ""
 	m.settingsFilter = false
+	m.settingsEnumKey = ""
+	m.settingsEnumOrig = ""
+	m.settingsEnumIdx = 0
+	m.settingsSecretKey = ""
+	m.settingsSecret = ""
 	m.fillSettings()
 	m.cursor = firstNonHeader(m.items)
 	if key == "" {
@@ -234,19 +240,21 @@ func (m *model) moveSettings(delta int) {
 
 func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 	if isSettingsCloseKey(msg) {
-		m.overlay = overlayNone
-		m.filter = ""
-		m.settingsFilter = false
+		m.closeSettings()
 		return nil
+	}
+	if m.settingsEnumKey != "" {
+		return m.handleSettingsEnumKey(msg)
+	}
+	if m.settingsSecretKey != "" {
+		return m.handleSettingsSecretKey(msg)
 	}
 	if m.settingsFilter {
 		return m.handleSettingsFilterKey(msg)
 	}
 	switch msg.String() {
 	case "esc":
-		m.overlay = overlayNone
-		m.filter = ""
-		m.settingsFilter = false
+		m.closeSettings()
 		return nil
 	case "up", "k":
 		m.moveSettings(-1)
@@ -254,9 +262,16 @@ func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 	case "down", "j":
 		m.moveSettings(1)
 		return nil
-	case "enter", " ":
+	case " ":
 		if m.cursor < len(m.items) && !m.items[m.cursor].Header {
-			return m.toggleSetting(m.items[m.cursor].Key)
+			if def, ok := lookupSetting(m.items[m.cursor].Key); ok && def.Kind == "bool" {
+				return m.toggleSetting(def.Key)
+			}
+		}
+		return nil
+	case "enter":
+		if m.cursor < len(m.items) && !m.items[m.cursor].Header {
+			return m.activateSetting(m.items[m.cursor].Key)
 		}
 		return nil
 	case "/", "i":
@@ -264,6 +279,44 @@ func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+func (m *model) closeSettings() {
+	if m.settingsEnumKey != "" {
+		m.revertSettingsEnumPreview()
+	}
+	m.overlay = overlayNone
+	m.filter = ""
+	m.settingsFilter = false
+	m.settingsEnumKey = ""
+	m.settingsSecretKey = ""
+	m.settingsSecret = ""
+}
+
+func lookupSetting(key string) (settingDef, bool) {
+	for _, d := range rustSettingsCatalog() {
+		if d.Key == key {
+			return d, true
+		}
+	}
+	return settingDef{}, false
+}
+
+func (m *model) activateSetting(key string) tea.Cmd {
+	def, ok := lookupSetting(key)
+	if !ok {
+		return m.toggleSetting(key)
+	}
+	switch def.Kind {
+	case "enum":
+		m.enterSettingsEnum(def)
+		return nil
+	case "secret":
+		m.enterSettingsSecret(def)
+		return nil
+	default:
+		return m.toggleSetting(key)
+	}
 }
 
 func (m *model) handleSettingsFilterKey(msg tea.KeyMsg) tea.Cmd {
@@ -310,6 +363,12 @@ func isSettingsCloseKey(msg tea.KeyMsg) bool {
 }
 
 func (m *model) renderSettings(w int) string {
+	if m.settingsEnumKey != "" {
+		return m.renderSettingsEnum(w)
+	}
+	if m.settingsSecretKey != "" {
+		return m.renderSettingsSecret(w)
+	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Settings") + "\n")
 	if m.filter != "" || m.settingsFilter {
@@ -465,7 +524,12 @@ func (m *model) settingValue(d settingDef) string {
 		return onOff(m.cfg.MemoryEnabled())
 	}
 	if strings.HasSuffix(d.Key, "_api_key") || d.Kind == "secret" {
-		return "(set via /login)"
+		if p, kimiCode, ok := settingSecretProvider(d.Key); ok {
+			if _, found := auth.Lookup(p, kimiCode); found {
+				return "saved"
+			}
+		}
+		return "not set"
 	}
 	if m.cfg.Prefs != nil {
 		if v, ok := m.cfg.Prefs[d.Key]; ok && v != "" {
@@ -508,7 +572,7 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 	case "kimi_api_key", "kimi_code_api_key", "fireworks_api_key", "deepseek_api_key",
 		"meta_api_key", "opencode_go_api_key", "wafer_api_key", "zai_api_key",
 		"runinfra_api_key", "gemini_api_key", "openrouter_api_key", "perplexity_api_key":
-		m.openLogin("")
+		m.enterSettingsSecret(def)
 		return nil
 	case "vim_mode":
 		m.vimMode = !m.vimMode
