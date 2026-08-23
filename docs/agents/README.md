@@ -10,6 +10,7 @@ This directory is for **contributors and AI coding agents** working on the Open 
 
 | Document | Audience / use |
 | --- | --- |
+| [golang.md](golang.md) | Native Go app layout, packages, cross-compile |
 | [architecture.md](architecture.md) | Crate map, layering, binary entry, request flow |
 | [agent-runtime.md](agent-runtime.md) | Session actor, turns, tools, permissions, plan, subagents, sessions |
 | [acp.md](acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader, headless |

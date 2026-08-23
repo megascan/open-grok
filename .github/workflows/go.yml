@@ -1,0 +1,68 @@
+name: Go native app
+
+on:
+  push:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "scripts/build-go-release.sh"
+      - ".github/workflows/go.yml"
+      - "OPEN_GROK_VERSION"
+  pull_request:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "scripts/build-go-release.sh"
+      - ".github/workflows/go.yml"
+      - "OPEN_GROK_VERSION"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build -o open-grok${{ matrix.os == 'windows-latest' && '.exe' || '' }} ./cmd/open-grok
+      - name: Smoke
+        shell: bash
+        run: |
+          bin="./open-grok"
+          if [[ "${{ matrix.os }}" == windows-latest ]]; then
+            bin="./open-grok.exe"
+          fi
+          "$bin" version
+          "$bin" inspect --json
+          "$bin" models | head -n 5
+          "$bin" completions bash | head -n 5
+
+  cross:
+    name: Cross-compile all platforms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+      - name: Release matrix
+        run: bash scripts/build-go-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-grok-go-binaries
+          path: dist/*

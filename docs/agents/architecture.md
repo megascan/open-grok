@@ -1,6 +1,13 @@
 # Architecture
 
-Open Grok is a Rust monorepo. The product surface is the **`open-grok`** binary, composed in `xai-grok-pager-bin`, which wires the **pager TUI** (`xai-grok-pager`) to the **agent runtime** (`xai-grok-shell`) over ACP.
+The shipping **`open-grok`** binary is the native Go app in `cmd/open-grok`
+(see [golang.md](golang.md)). This page documents the historical Rust crate
+map, which remains the behavioral reference for providers, ACP, and tools.
+
+Open Grok was originally a Rust monorepo. The reference product surface is the
+**`open-grok`** binary, composed in `xai-grok-pager-bin`, which wires the
+**pager TUI** (`xai-grok-pager`) to the **agent runtime** (`xai-grok-shell`)
+over ACP.
 
 ## Top-level layout
 

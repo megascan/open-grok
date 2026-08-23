@@ -15,8 +15,9 @@ Instructions for AI coding agents (and humans) working in this repository.
 | Public binary | `open-grok` (not `grok`) |
 | User state | `$OPENGROK_HOME` or `~/.opengrok` — **never** `~/.grok` |
 | Project config | `.opengrok/` in the repo |
-| Language | Rust (edition 2024), Rust 1.94.0 pin in `rust-toolchain.toml` |
-| Root `Cargo.toml` | **Generated / read-only** — edit per-crate `Cargo.toml` only |
+| Language | **Go 1.22** (`cmd/open-grok`, `internal/`) is the native product. Rust crates under `crates/` are the historical reference. |
+| Go module | `github.com/megascan/open-grok` — edit per-package files under `internal/` |
+| Root `Cargo.toml` | **Generated / read-only** (Rust reference only) — edit per-crate `Cargo.toml` only |
 
 Open Grok is **not** affiliated with xAI or OpenAI. Credentials, sessions, skills, plugins, and caches are **fully isolated** from upstream Grok Build installs.
 
@@ -279,6 +280,7 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 | Doc | Contents |
 | --- | --- |
 | [`docs/agents/README.md`](docs/agents/README.md) | Index of agent developer docs |
+| [`docs/agents/golang.md`](docs/agents/golang.md) | Native Go app layout, packages, cross-compile |
 | [`docs/agents/architecture.md`](docs/agents/architecture.md) | Crate map, layering, request flow |
 | [`docs/agents/agent-runtime.md`](docs/agents/agent-runtime.md) | Turns, tools, sessions, subagents, plan, permissions |
 | [`docs/agents/acp.md`](docs/agents/acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader |

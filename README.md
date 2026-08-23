@@ -18,6 +18,11 @@ OpenAI Codex provider path and Codex-compatible execution behavior.
 The public command is `open-grok`. It can be installed beside the upstream
 `grok` command without replacing it.
 
+The shipping application is a **native Go** binary (`cmd/open-grok`) that
+cross-compiles to Linux, macOS, Windows, and FreeBSD on amd64 and arm64.
+User state stays under `$OPENGROK_HOME` or `~/.opengrok`. Rust crates under
+`crates/` remain as the historical reference implementation.
+
 ## What this fork adds
 
 - **Codex Code Mode and Code Mode Only.** Open Grok includes the persistent
@@ -232,23 +237,32 @@ Grok; existing persisted sessions retain their resolved mode when resumed.
 
 ## Build from source
 
-Requirements:
+The product is Go 1.22+. `./bin/open-grok-dev` runs `go run ./cmd/open-grok`.
+
+```sh
+go test ./...
+go build -o open-grok ./cmd/open-grok
+./open-grok version
+./bin/open-grok-dev --version
+```
+
+Cross-compile every published platform (Linux, macOS, Windows, FreeBSD ×
+amd64/arm64) into `dist/`:
+
+```sh
+bash scripts/build-go-release.sh
+```
+
+See [`docs/agents/golang.md`](docs/agents/golang.md) for the Go package map.
+
+The previous Rust implementation remains under `crates/` as a reference. A
+Rust-only build still needs:
 
 - Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml)
 - `protoc`, resolved through [`bin/protoc`](bin/protoc) and its
   [Dotslash](https://dotslash-cli.com) launcher, or provided through `PATH` /
   `PROTOC`
 - Xcode Command Line Tools when producing the signed macOS release artifacts
-
-Prepare a checkout and run it without touching an installed release:
-
-```sh
-./bin/setup-dev
-./bin/open-grok-dev --version
-./bin/open-grok-dev
-```
-
-For a focused local build:
 
 ```sh
 cargo build --locked -p xai-grok-pager-bin --bin open-grok

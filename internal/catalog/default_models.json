@@ -1,0 +1,403 @@
+{
+  "default": "grok-4.6",
+  "web_search": "grok-4.6",
+  "image_description": "grok-4.6",
+  "session_summary": "grok-4.6",
+  "models": [
+    {
+      "id": "grok-4.6",
+      "model": "grok-4.6",
+      "name": "Grok 4.6",
+      "description": "SpaceXAI's latest frontier model",
+      "context_window": 500000,
+      "api_backend": "responses",
+      "supports_backend_search": true,
+      "system_prompt_label": "Grok 4.6",
+      "show_model_fingerprint": true,
+      "supports_reasoning_effort": true,
+      "reasoning_effort": "high",
+      "auto_compact_threshold_percent": 80,
+      "compaction_at_tokens": true,
+      "compactions_remaining": 1,
+      "reasoning_efforts": [
+        {
+          "value": "xhigh",
+          "label": "Extra High Effort",
+          "description": "Highest effort and reasoning level"
+        },
+        {
+          "value": "high",
+          "label": "High Effort",
+          "description": "Higher implementation quality with extensive reasoning",
+          "default": true
+        },
+        {
+          "value": "medium",
+          "label": "Medium Effort",
+          "description": "Balanced effort with standard implementation and testing"
+        },
+        {
+          "value": "low",
+          "label": "Low Effort",
+          "description": "Quick, fast implementations"
+        }
+      ]
+    },
+    {
+      "id": "grok-4.5",
+      "model": "grok-4.5",
+      "name": "Grok 4.5",
+      "context_window": 500000,
+      "api_backend": "responses",
+      "supports_backend_search": false,
+      "system_prompt_label": "Grok 4.5",
+      "show_model_fingerprint": true,
+      "supports_reasoning_effort": true,
+      "reasoning_effort": "high",
+      "auto_compact_threshold_percent": 80,
+      "compaction_at_tokens": true,
+      "compactions_remaining": 1,
+      "reasoning_efforts": [
+        {
+          "value": "high",
+          "label": "High Effort",
+          "description": "Highest implementation quality with extensive reasoning",
+          "default": true
+        },
+        {
+          "value": "medium",
+          "label": "Medium Effort",
+          "description": "Balanced effort with standard implementation and testing"
+        },
+        {
+          "value": "low",
+          "label": "Low Effort",
+          "description": "Quick, fast implementations"
+        }
+      ]
+    },
+    {
+      "model": "kimi-k3",
+      "name": "Kimi K3",
+      "description": "Kimi's frontier coding and agent model",
+      "base_url": "https://api.moonshot.ai/v1",
+      "context_window": 1048576,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "MOONSHOT_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_efforts": [
+        { "value": "max", "description": "Kimi K3's supported reasoning level", "default": true }
+      ]
+    },
+    {
+      "model": "k3",
+      "name": "Kimi K3",
+      "description": "Kimi Code's flagship coding and agent model (up to 1M context)",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 1048576,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "Balanced reasoning depth for everyday coding", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for hard problems" }
+      ]
+    },
+    {
+      "model": "k3-256k",
+      "name": "Kimi K3 256K",
+      "description": "Kimi Code's K3 model with a fixed 256K context window",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "Balanced reasoning depth for everyday coding", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for hard problems" }
+      ]
+    },
+    {
+      "model": "kimi-for-coding",
+      "name": "Kimi for Coding",
+      "description": "Kimi Code's K2.7 coding and agent model",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "model": "kimi-for-coding-highspeed",
+      "name": "Kimi for Coding Highspeed",
+      "description": "Kimi Code's low-latency K2.7 coding and agent model",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "glm-5.2",
+      "model": "accounts/fireworks/models/glm-5p2",
+      "name": "GLM 5.2",
+      "description": "Zhipu's GLM 5.2 frontier model on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 1040000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "glm-5.2-fast",
+      "model": "accounts/fireworks/routers/glm-5p2-fast",
+      "name": "GLM 5.2 Fast",
+      "description": "GLM 5.2 on Fireworks AI's low-latency router",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 1040000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "model": "accounts/fireworks/models/deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "description": "DeepSeek V4 Pro on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 1040000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "model": "accounts/fireworks/models/kimi-k2p7-code",
+      "name": "Kimi K2.7 Code",
+      "description": "Moonshot's Kimi K2.7 coding model on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "fireworks:kimi-k3",
+      "model": "accounts/fireworks/models/kimi-k3",
+      "name": "Kimi K3",
+      "description": "Moonshot's Kimi K3 flagship model on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 1040000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "fireworks:kimi-k3-fast",
+      "model": "accounts/fireworks/routers/kimi-k3-fast",
+      "name": "Kimi K3 Fast",
+      "description": "Kimi K3 on Fireworks AI's low-latency router",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 1040000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "deepseek:deepseek-v4-pro",
+      "model": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "description": "DeepSeek V4 Pro through the direct DeepSeek API",
+      "base_url": "https://api.deepseek.com",
+      "context_window": 1000000,
+      "max_completion_tokens": 384000,
+      "api_backend": "chat_completions",
+      "provider": "deepseek",
+      "env_key": "DEEPSEEK_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_effort": "high",
+      "supports_reasoning_effort": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "DeepSeek's default reasoning level", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for difficult tasks" }
+      ]
+    },
+    {
+      "id": "deepseek:deepseek-v4-flash",
+      "model": "deepseek-v4-flash",
+      "name": "DeepSeek V4 Flash 0731",
+      "description": "DeepSeek-V4-Flash-0731 through the direct DeepSeek Responses API",
+      "base_url": "https://api.deepseek.com",
+      "context_window": 1000000,
+      "max_completion_tokens": 384000,
+      "api_backend": "responses",
+      "provider": "deepseek",
+      "env_key": "DEEPSEEK_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_effort": "high",
+      "supports_reasoning_effort": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "high", "description": "DeepSeek's default reasoning level", "default": true },
+        { "value": "max", "description": "Maximum reasoning depth for difficult tasks" }
+      ],
+      "supports_backend_search": true
+    },
+    {
+      "id": "meta:muse-spark-1.2",
+      "model": "muse-spark-1.2",
+      "name": "Muse Spark 1.2",
+      "description": "Meta's Muse Spark 1.2 agentic reasoning model",
+      "base_url": "https://api.meta.ai/v1",
+      "context_window": 1000000,
+      "api_backend": "responses",
+      "provider": "meta",
+      "env_key": "META_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_effort": "medium",
+      "supports_reasoning_effort": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "medium", "description": "Balanced reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra-high reasoning depth for difficult tasks" }
+      ],
+      "supports_backend_search": true
+    },
+    {
+      "id": "meta:muse-spark-1.1",
+      "model": "muse-spark-1.1",
+      "name": "Muse Spark 1.1",
+      "description": "Meta's Muse Spark 1.1 multimodal reasoning model",
+      "base_url": "https://api.meta.ai/v1",
+      "context_window": 1000000,
+      "api_backend": "responses",
+      "provider": "meta",
+      "env_key": "META_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_effort": "medium",
+      "supports_reasoning_effort": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "medium", "description": "Balanced reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra-high reasoning depth for difficult tasks" }
+      ],
+      "supports_backend_search": true
+    },
+    {
+      "id": "meta:muse-spark-1.2-contributor",
+      "model": "muse-spark-1.2-contributor",
+      "name": "Muse Spark 1.2 Contributor",
+      "description": "Meta's contributor-tuned Muse Spark 1.2 model",
+      "base_url": "https://api.meta.ai/v1",
+      "context_window": 1000000,
+      "api_backend": "responses",
+      "provider": "meta",
+      "env_key": "META_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true,
+      "reasoning_effort": "medium",
+      "supports_reasoning_effort": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Faster responses with lighter reasoning" },
+        { "value": "medium", "description": "Balanced reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra-high reasoning depth for difficult tasks" }
+      ],
+      "supports_backend_search": true
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "name": "GPT-5.6 Sol",
+      "description": "Latest frontier agentic coding model",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "subagent_context_default": "forked",
+      "multi_agent_version": "v2",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "name": "GPT-5.6 Terra",
+      "description": "Balanced agentic coding model for everyday work",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "name": "GPT-5.6 Luna",
+      "description": "Fast and affordable agentic coding model",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v1",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" }
+      ]
+    }
+  ]
+}

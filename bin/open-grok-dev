@@ -5,4 +5,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+if [[ -f go.mod ]]; then
+  exec go run ./cmd/open-grok "$@"
+fi
+
 exec cargo run --locked --quiet -p xai-grok-pager-bin --bin open-grok -- "$@"
