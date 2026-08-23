@@ -21,8 +21,8 @@ type Message struct {
 
 // ToolCall is a model-requested client tool invocation.
 type ToolCall struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
 
@@ -35,13 +35,13 @@ type ToolSpec struct {
 
 // StreamEvent is one sampler increment (text, thinking, or tool call).
 type StreamEvent struct {
-	Kind      StreamKind
-	Text      string
-	Thinking  string
-	ToolCall  *ToolCall
-	Usage     *Usage
-	Finish    string
-	Err       error
+	Kind     StreamKind
+	Text     string
+	Thinking string
+	ToolCall *ToolCall
+	Usage    *Usage
+	Finish   string
+	Err      error
 }
 
 // StreamKind classifies a StreamEvent.
@@ -64,15 +64,15 @@ type Usage struct {
 
 // SampleRequest is the provider-neutral request the sampler adapters consume.
 type SampleRequest struct {
-	Model            string
-	Messages         []Message
-	Tools            []ToolSpec
-	Temperature      *float32
-	MaxTokens        *int
-	ReasoningEffort  string
-	ConversationID   string
-	SessionID        string
-	TurnIndex        int
+	Model           string
+	Messages        []Message
+	Tools           []ToolSpec
+	Temperature     *float32
+	MaxTokens       *int
+	ReasoningEffort string
+	ConversationID  string
+	SessionID       string
+	TurnIndex       int
 }
 
 // AccessKind classifies a tool for the permission / plan-mode pipeline.

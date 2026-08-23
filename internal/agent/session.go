@@ -15,21 +15,21 @@ import (
 
 // Session is one persisted conversation.
 type Session struct {
-	ID           string          `json:"id"`
-	Title        string          `json:"title,omitempty"`
-	CWD          string          `json:"cwd"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
-	ModelID      string          `json:"model_id"`
-	Provider     types.Provider  `json:"provider"`
-	Backend      types.ApiBackend `json:"backend"`
-	Messages     []types.Message `json:"messages"`
-	EverUsedNonXAI bool          `json:"ever_used_codex"`
-	Dir          string          `json:"-"`
-	Plan         workspace.PlanTracker `json:"-"`
-	YOLO         bool            `json:"-"`
-	Allow        []string        `json:"-"`
-	Deny         []string        `json:"-"`
+	ID             string                `json:"id"`
+	Title          string                `json:"title,omitempty"`
+	CWD            string                `json:"cwd"`
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
+	ModelID        string                `json:"model_id"`
+	Provider       types.Provider        `json:"provider"`
+	Backend        types.ApiBackend      `json:"backend"`
+	Messages       []types.Message       `json:"messages"`
+	EverUsedNonXAI bool                  `json:"ever_used_codex"`
+	Dir            string                `json:"-"`
+	Plan           workspace.PlanTracker `json:"-"`
+	YOLO           bool                  `json:"-"`
+	Allow          []string              `json:"-"`
+	Deny           []string              `json:"-"`
 }
 
 // NewSession creates a session directory under ~/.opengrok/sessions/<cwd>/<id>.

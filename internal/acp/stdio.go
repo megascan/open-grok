@@ -46,12 +46,12 @@ type note struct {
 
 // Options configure the ACP agent.
 type Options struct {
-	CWD     string
-	Model   string
-	YOLO    bool
-	Bearer  string
-	In      io.Reader
-	Out     io.Writer
+	CWD    string
+	Model  string
+	YOLO   bool
+	Bearer string
+	In     io.Reader
+	Out    io.Writer
 }
 
 // ServeStdio runs JSON-RPC ACP on in/out until EOF.

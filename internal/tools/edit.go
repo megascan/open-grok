@@ -19,10 +19,10 @@ func (SearchReplace) Description() string {
 func (SearchReplace) Access() types.AccessKind { return types.AccessEdit }
 func (SearchReplace) Parameters() map[string]any {
 	return objectSchema(map[string]any{
-		"path":           map[string]any{"type": "string"},
-		"old_string":     map[string]any{"type": "string"},
-		"new_string":     map[string]any{"type": "string"},
-		"replace_all":    map[string]any{"type": "boolean"},
+		"path":        map[string]any{"type": "string"},
+		"old_string":  map[string]any{"type": "string"},
+		"new_string":  map[string]any{"type": "string"},
+		"replace_all": map[string]any{"type": "boolean"},
 	}, []string{"path", "old_string", "new_string"})
 }
 

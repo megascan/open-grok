@@ -244,9 +244,9 @@ func messagesBody(req types.SampleRequest) map[string]any {
 		})
 	}
 	body := map[string]any{
-		"model":    req.Model,
-		"messages": msgs,
-		"stream":   true,
+		"model":      req.Model,
+		"messages":   msgs,
+		"stream":     true,
 		"max_tokens": 8192,
 	}
 	if system != "" {

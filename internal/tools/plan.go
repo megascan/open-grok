@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	hunkMu    sync.Mutex
+	hunkMu      sync.Mutex
 	agentWrites = map[string]struct{}{}
 )
 

@@ -18,21 +18,21 @@ import (
 )
 
 var (
-	titleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	userStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("219")).Bold(true)
-	agentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
-	toolStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
+	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	userStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("219")).Bold(true)
+	agentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	toolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	barStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
 // Options configure the interactive session.
 type Options struct {
-	CWD     string
-	Model   catalog.Model
-	YOLO    bool
-	Resume  string
+	CWD      string
+	Model    catalog.Model
+	YOLO     bool
+	Resume   string
 	Continue bool
 }
 
@@ -45,17 +45,17 @@ type streamDelta struct {
 }
 
 type model struct {
-	opts     Options
-	sess     *agent.Session
-	vp       viewport.Model
-	ta       textarea.Model
-	ready    bool
-	busy     bool
-	status   string
-	log      strings.Builder
-	width    int
-	height   int
-	slash    []string
+	opts   Options
+	sess   *agent.Session
+	vp     viewport.Model
+	ta     textarea.Model
+	ready  bool
+	busy   bool
+	status string
+	log    strings.Builder
+	width  int
+	height int
+	slash  []string
 }
 
 // Run starts the interactive TUI.

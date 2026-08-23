@@ -17,13 +17,13 @@ const defaultFeed = "https://api.github.com/repos/megascan/open-grok/releases/la
 
 // Result is a --check payload.
 type Result struct {
-	Current   string `json:"current"`
-	Latest    string `json:"latest"`
-	Newer     bool   `json:"newer"`
-	Asset     string `json:"asset,omitempty"`
-	GoOS      string `json:"goos"`
-	GoArch    string `json:"goarch"`
-	AssetURL  string `json:"asset_url,omitempty"`
+	Current  string `json:"current"`
+	Latest   string `json:"latest"`
+	Newer    bool   `json:"newer"`
+	Asset    string `json:"asset,omitempty"`
+	GoOS     string `json:"goos"`
+	GoArch   string `json:"goarch"`
+	AssetURL string `json:"asset_url,omitempty"`
 }
 
 // Check queries the public release feed. It never overwrites the running binary.

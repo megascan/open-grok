@@ -23,13 +23,13 @@ import (
 )
 
 var (
-	flagCWD     string
-	flagModel   string
-	flagYOLO    bool
-	flagPrompt  string
-	flagResume  string
+	flagCWD      string
+	flagModel    string
+	flagYOLO     bool
+	flagPrompt   string
+	flagResume   string
 	flagContinue bool
-	flagDebug bool
+	flagDebug    bool
 )
 
 // Execute runs the root command.

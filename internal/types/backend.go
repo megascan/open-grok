@@ -95,14 +95,14 @@ func (b Backends) Supports(backend ApiBackend) bool {
 
 // Profile is the complete behavior policy for one built-in provider.
 type Profile struct {
-	Provider           Provider
-	Backends           Backends
-	CodeModeTransport  CodeModeTransport
-	HostedToolDialect  HostedToolDialect
-	NativeWebSearch    bool
-	RequestMetadata    RequestMetadataPolicy
-	SessionAuth        SessionAuthKind
-	XAIServices        XAIServicePolicy
+	Provider          Provider
+	Backends          Backends
+	CodeModeTransport CodeModeTransport
+	HostedToolDialect HostedToolDialect
+	NativeWebSearch   bool
+	RequestMetadata   RequestMetadataPolicy
+	SessionAuth       SessionAuthKind
+	XAIServices       XAIServicePolicy
 }
 
 // Profile returns the built-in policy. Identity never comes from a URL or slug.

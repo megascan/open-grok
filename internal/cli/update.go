@@ -11,7 +11,7 @@ import (
 
 func newUpdateCmd() *cobra.Command {
 	var (
-		check bool
+		check  bool
 		asJSON bool
 	)
 	cmd := &cobra.Command{
