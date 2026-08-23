@@ -73,3 +73,21 @@ func TestDefaultPackAccessKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestAskUserQuestionUsesCallback(t *testing.T) {
+	asked := false
+	tc := tools.Context{
+		AskUser: func(q string, opts []string) string {
+			asked = true
+			if q != "pick" || len(opts) != 2 {
+				t.Fatalf("%q %v", q, opts)
+			}
+			return opts[1]
+		},
+	}
+	args, _ := json.Marshal(map[string]any{"question": "pick", "options": []string{"a", "b"}})
+	res := tools.AskUserQuestion{}.Execute(context.Background(), tc, args)
+	if !asked || res.Content != "b" || res.IsError {
+		t.Fatalf("%+v asked=%v", res, asked)
+	}
+}

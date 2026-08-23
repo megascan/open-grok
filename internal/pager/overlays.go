@@ -59,6 +59,8 @@ func placeOverlay(base, box string, x, y, width, height int) string {
 func (m *model) renderOverlay() string {
 	w := min(72, max(40, m.width-8))
 	switch m.overlay {
+	case overlayQuestion:
+		return m.renderQuestion(w)
 	case overlayPalette:
 		return m.renderPalette(w)
 	case overlayPermission:

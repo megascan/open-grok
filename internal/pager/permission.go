@@ -63,6 +63,9 @@ func (m *model) replyPerm(allow, always bool) {
 	m.perm = nil
 	m.overlay = overlayNone
 	m.permParked = false
+	if m.question != nil {
+		m.overlay = overlayQuestion
+	}
 	if ch != nil {
 		ch <- allow
 	}

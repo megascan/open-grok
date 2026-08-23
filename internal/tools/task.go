@@ -23,9 +23,19 @@ func (AskUserQuestion) Parameters() map[string]any {
 	}, []string{"question"})
 }
 
-func (AskUserQuestion) Execute(_ context.Context, _ Context, args json.RawMessage) Result {
+func (AskUserQuestion) Execute(_ context.Context, tc Context, args json.RawMessage) Result {
 	m := unmarshal(args)
-	return okResult("USER_QUESTION: " + str(m["question"]))
+	q := str(m["question"])
+	var opts []string
+	if raw, ok := m["options"].([]any); ok {
+		for _, o := range raw {
+			opts = append(opts, str(o))
+		}
+	}
+	if tc.AskUser != nil {
+		return okResult(tc.AskUser(q, opts))
+	}
+	return okResult("USER_QUESTION: " + q)
 }
 
 // TaskSpawn starts a depth-1 subagent. Nested spawns are rejected.

@@ -38,6 +38,11 @@ type (
 		Tool, Access, Path, Args string
 		Reply                    chan bool
 	}
+	qAskMsg struct {
+		Question string
+		Options  []string
+		Reply    chan string
+	}
 	loopTickMsg struct{ id string }
 	queuedFlush struct{}
 )
@@ -83,6 +88,7 @@ const (
 	overlayImportClaude
 	overlayMCP
 	overlayTimeline
+	overlayQuestion
 )
 
 type permMode int
@@ -138,6 +144,9 @@ type model struct {
 	feedback                                                              string
 	perm                                                                  *permAskMsg
 	permParked                                                            bool
+	question                                                              *qAskMsg
+	qCursor                                                               int
+	qFree                                                                 string
 	focusScroll                                                           bool
 	vimMode, timestamps, compactUI, multiline, mouseOn, thinkingOn, swarm bool
 	permMode                                                              permMode
@@ -308,6 +317,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.perm = &msg
 		m.overlay = overlayPermission
 		m.permParked = false
+	case qAskMsg:
+		m.question = &msg
+		m.qCursor = 0
+		m.qFree = ""
+		if m.overlay != overlayPermission {
+			m.overlay = overlayQuestion
+		}
 	case loopTickMsg:
 		return m, m.onLoopTick(msg.id)
 	case editDone:
@@ -344,6 +360,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayPermission && m.perm != nil && !m.permParked {
 		return m.handlePermissionKey(msg), true
+	}
+	if m.overlay == overlayQuestion && m.question != nil {
+		return m.handleQuestionKey(msg), true
 	}
 	if m.overlay != overlayNone && m.overlay != overlayPalette {
 		return m.handleOverlayKey(msg)
@@ -567,6 +586,15 @@ func (m *model) submit(text string) tea.Cmd {
 			}
 			ok := <-ch
 			return ok
+		}
+		rt.AskUser = func(q string, opts []string) string {
+			ch := make(chan string, 1)
+			if prog != nil {
+				prog.Send(qAskMsg{Question: q, Options: opts, Reply: ch})
+			} else {
+				return ""
+			}
+			return <-ch
 		}
 		err = agent.RunTurn(context.Background(), sess, rt, text, func(ev agent.Event) {
 			if prog != nil {

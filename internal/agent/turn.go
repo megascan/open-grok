@@ -35,6 +35,7 @@ type Runtime struct {
 	HTTP    sampler.HTTPDoer
 	Pack    []tools.Tool
 	Approve func(tools.Tool, json.RawMessage) bool
+	AskUser func(question string, options []string) string
 }
 
 // RunTurn samples until the model stops or maxTurns, dispatching tools.
@@ -42,6 +43,7 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	ensureRuntime(sess, rt)
 	sess.EnsureMCP(ctx)
 	sess.Approve = rt.Approve
+	sess.AskUser = rt.AskUser
 	if !rt.Model.ToolsEnabled() {
 		rt.Pack = nil
 	} else {
@@ -338,6 +340,7 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		WorkspaceRoot: sess.CWD,
 		SubagentDepth: sess.SubagentDepth,
 		Goal:          sess.Goal,
+		AskUser:       sess.AskUser,
 	}
 	return t.Execute(ctx, tc, args)
 }

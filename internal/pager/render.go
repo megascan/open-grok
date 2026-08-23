@@ -20,7 +20,11 @@ func renderMarkdown(src string, width int) string {
 		trim := strings.TrimSpace(line)
 		if strings.HasPrefix(trim, "```") {
 			inFence = !inFence
-			out = append(out, dimStyle.Render(trim))
+			if inFence && strings.HasPrefix(strings.ToLower(trim), "```mermaid") {
+				out = append(out, toolCard.Width(width-2).Render(toolStyle.Render("mermaid")+"\n"+dimStyle.Render("diagram source in scrollback — native mermaid worker is not in this Go pager")))
+			} else {
+				out = append(out, dimStyle.Render(trim))
+			}
 			continue
 		}
 		if inFence {

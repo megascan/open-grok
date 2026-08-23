@@ -20,6 +20,7 @@ type Context struct {
 	SubagentDepth  int
 	DispatchNested func(ctx context.Context, name string, args json.RawMessage) Result
 	Goal           *goals.Tracker
+	AskUser        func(question string, options []string) string
 }
 
 // Result is a tool's model-facing output.
