@@ -24,6 +24,8 @@ var (
 	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
 	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
 	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
+	insertStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen))
+	deleteStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
 	claimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colClaim)).Bold(true)
 	barStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colBar))
 	userLabel        = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink)).Bold(true).PaddingRight(1)

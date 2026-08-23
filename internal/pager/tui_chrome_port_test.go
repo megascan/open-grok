@@ -280,6 +280,33 @@ func TestDashboardPeekPermissionAndQuestionChrome(t *testing.T) {
 	}
 }
 
+func TestDashboardPeekUsesPromptArrowNotRoleLabels(t *testing.T) {
+	m := testModel(t)
+	m.openDashboard()
+	m.dashRows = []dashRow{{
+		Sess: agent.Session{
+			ID: "sess-1",
+			Messages: []types.Message{
+				{Role: types.RoleUser, Content: "hello from user"},
+				{Role: types.RoleAssistant, Content: "hello from agent"},
+			},
+		},
+		State: "working",
+	}}
+	m.cursor = 0
+	m.fillDashPeek()
+	view := stripANSI(m.renderDashPeekPanel())
+	if strings.Contains(view, "YOU") || strings.Contains(view, "ENTROPY") {
+		t.Fatalf("role labels leaked:\n%s", view)
+	}
+	if !strings.Contains(view, strings.TrimSpace(promptArrow)) {
+		t.Fatalf("missing prompt arrow:\n%s", view)
+	}
+	if !strings.Contains(view, "hello from user") || !strings.Contains(view, "hello from agent") {
+		t.Fatalf("bodies:\n%s", view)
+	}
+}
+
 func TestFeedbackPaneQuestionChromeAndPlaceholder(t *testing.T) {
 	m := testModel(t)
 	sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, false)

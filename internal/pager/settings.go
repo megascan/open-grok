@@ -647,7 +647,14 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 		m.cfg.UI.GroupToolVerbs = m.groupTools
 		m.expandedGroups = map[string]bool{}
 	case "collapsed_edit_blocks":
-		m.cfg.UI.CollapsedEdits = !m.cfg.UI.CollapsedEdits
+		m.cfg.UI.CollapsedEdits = !m.collapsedEditBlocks()
+		m.cfg.SetPrefBool("collapsed_edit_blocks", m.cfg.UI.CollapsedEdits)
+		fold := m.cfg.UI.CollapsedEdits
+		for i := range m.blocks {
+			if m.blocks[i].kind == blockTool && classifyTool(m.blocks[i].title) == verbEdit {
+				m.blocks[i].folded = fold
+			}
+		}
 	case "invert_scroll":
 		m.cfg.UI.InvertScroll = !m.cfg.UI.InvertScroll
 	case "keep_text_selection":

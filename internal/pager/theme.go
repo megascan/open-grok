@@ -173,6 +173,8 @@ func rebuildStyles(t Theme) {
 	toolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Gold))
 	errStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Red))
 	okStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Green)).Bold(true)
+	insertStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Green))
+	deleteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Red))
 	claimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Claim)).Bold(true)
 	barStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Bar))
 	userLabel = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Pink)).Bold(true).PaddingRight(1)

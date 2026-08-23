@@ -237,36 +237,17 @@ func (m *model) renderToolBlock(idx, w int) string {
 		return ""
 	}
 	bl := m.blocks[idx]
-	header := toolCallHeader(bl.title, bl.body)
 	result := ""
 	failed := bl.err
 	if idx+1 < len(m.blocks) && m.blocks[idx+1].kind == blockToolResult {
 		rb := m.blocks[idx+1]
-		result = truncateResultBody(rb.body)
+		result = rb.body
 		failed = failed || rb.err
 	} else if strings.TrimSpace(bl.body) != "" && parseToolArgs(bl.body) == nil {
-		result = truncateResultBody(bl.body)
-	}
-	if classifyTool(bl.title) == verbCommand {
-		cmd := strings.TrimPrefix(header, "Run ")
-		if cmd != "" && cmd != header {
-			var b strings.Builder
-			writeAccent(&b, toolStyle.Render("Run ")+highlightBashCommand(cmd))
-			if result != "" {
-				st := dimStyle
-				if failed {
-					st = errStyle
-				}
-				for _, line := range strings.Split(result, "\n") {
-					writeAccent(&b, st.Render(line))
-				}
-			}
-			_ = w
-			return strings.TrimRight(b.String(), "\n")
-		}
+		result = bl.body
 	}
 	_ = w
-	return renderAccentBlock(header, result, failed)
+	return renderToolCard(bl.title, bl.body, result, failed, bl.folded)
 }
 
 func (m *model) mermaidOn() bool {
@@ -610,7 +591,18 @@ func (m *model) appendBlock(bl block) {
 			bl.folded = true
 		}
 	}
+	if bl.kind == blockTool {
+		if classifyTool(bl.title) == verbEdit {
+			bl.folded = m.collapsedEditBlocks()
+		} else {
+			bl.folded = true
+		}
+	}
 	m.blocks = append(m.blocks, bl)
+}
+
+func (m *model) collapsedEditBlocks() bool {
+	return m.cfg.PrefBool("collapsed_edit_blocks", m.cfg.UI.CollapsedEdits, false)
 }
 
 func (m *model) lastBlock(kind blockKind) *block {

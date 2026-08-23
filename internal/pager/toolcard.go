@@ -9,8 +9,13 @@ import (
 
 const (
 	userCollapsedMaxLines = 3
-	toolResultFirstLines  = 8
-	toolResultLastLines   = 4
+	// Execute truncated mode matches Rust ExecuteConfig defaults.
+	toolResultFirstLines = 2
+	toolResultLastLines  = 3
+	// Read truncated mode matches ReadToolCallBlock::FIRST_LINES/LAST_LINES.
+	readFirstLines = 5
+	readLastLines  = 3
+	fetchMaxInline = 10
 )
 
 type verbKind int
@@ -186,88 +191,6 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	return strings.TrimSpace(s)
-}
-
-func toolCallHeader(title, body string) string {
-	kind := classifyTool(title)
-	args := parseToolArgs(body)
-	switch kind {
-	case verbFile:
-		path := toolArgValue(args, "path", "file_path", "target_file")
-		if path == "" {
-			path = firstLine(body)
-		}
-		if skill := skillNameFromPath(path); skill != "" {
-			return "Skill " + skill
-		}
-		if path == "" || strings.HasPrefix(path, "{") {
-			return "Read"
-		}
-		return "Read " + path
-	case verbSkill:
-		name := toolArgValue(args, "skill", "name", "path")
-		if name == "" {
-			name = firstLine(body)
-		}
-		return "Skill " + name
-	case verbEdit:
-		path := toolArgValue(args, "path", "file_path", "target_file")
-		if path == "" || strings.HasPrefix(path, "{") {
-			return "Edit"
-		}
-		return "Edit " + path
-	case verbCommand:
-		cmd := toolArgValue(args, "command", "cmd")
-		if cmd == "" {
-			cmd = firstLine(body)
-		}
-		if cmd == "" || strings.HasPrefix(cmd, "{") {
-			return "Run"
-		}
-		return "Run " + cmd
-	case verbSearch:
-		q := toolArgValue(args, "pattern", "query", "glob", "regex")
-		if q == "" || strings.HasPrefix(q, "{") {
-			return "Search"
-		}
-		return "Search " + q
-	case verbDir:
-		path := toolArgValue(args, "path", "target_directory", "dir")
-		if path == "" || strings.HasPrefix(path, "{") {
-			return "List"
-		}
-		return "List " + path
-	case verbWebFetch:
-		url := toolArgValue(args, "url")
-		if url == "" || strings.HasPrefix(url, "{") {
-			return "Fetch"
-		}
-		return "Fetch " + url
-	case verbWebSearch:
-		q := toolArgValue(args, "query", "q", "search")
-		if q == "" || strings.HasPrefix(q, "{") {
-			return "Search"
-		}
-		return "Search " + q
-	case verbMemory:
-		q := toolArgValue(args, "query", "q")
-		if q == "" {
-			return "Search"
-		}
-		return "Search " + q
-	case verbMCP, verbMCPSearch:
-		name := strings.TrimLeft(strings.TrimSpace(title), "▸ ")
-		if name == "" {
-			name = toolName(title)
-		}
-		return name
-	default:
-		name := strings.TrimLeft(strings.TrimSpace(title), "▸ ")
-		if name == "" {
-			name = "tool"
-		}
-		return name
-	}
 }
 
 func truncateResultBody(s string) string {

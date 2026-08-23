@@ -199,11 +199,11 @@ func (m *model) fillDashPeek() {
 		if msg.Role != types.RoleUser && msg.Role != types.RoleAssistant {
 			continue
 		}
-		label := "YOU"
-		if msg.Role == types.RoleAssistant {
-			label = "ENTROPY"
+		if msg.Role == types.RoleUser {
+			m.items = append([]listItem{{Label: strings.TrimSpace(promptArrow), Detail: truncate(msg.Content, 120)}}, m.items...)
+		} else {
+			m.items = append([]listItem{{Detail: truncate(msg.Content, 120)}}, m.items...)
 		}
-		m.items = append([]listItem{{Label: label, Detail: truncate(msg.Content, 120)}}, m.items...)
 		n++
 	}
 	if len(m.items) == 0 {
@@ -411,7 +411,11 @@ func (m *model) renderDashPeekPanel() string {
 			return b.String()
 		}
 		for _, it := range m.items {
-			b.WriteString("  " + it.Label + "  " + dimStyle.Render(it.Detail) + "\n")
+			if it.Label == "" {
+				b.WriteString("  " + dimStyle.Render(it.Detail) + "\n")
+				continue
+			}
+			b.WriteString("  " + it.Label + " " + dimStyle.Render(it.Detail) + "\n")
 		}
 		b.WriteString("❯ reply " + m.peekReply + "█\n")
 		b.WriteString(dimStyle.Render("enter send  ·  ctrl+s send+open  ·  empty enter opens  ·  esc clears reply") + "\n")
