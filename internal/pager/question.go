@@ -80,7 +80,11 @@ func (m *model) renderQuestion(w int) string {
 	if len(opts) == 0 {
 		opts = []string{"yes", "no"}
 	}
-	rowCount := len(opts) + 1 // sticky Other
+	local := m.question != nil && m.question.Kind != ""
+	rowCount := len(opts)
+	if !local {
+		rowCount++ // sticky Other
+	}
 	if m.qCursor >= rowCount {
 		m.qCursor = rowCount - 1
 	}
@@ -101,23 +105,25 @@ func (m *model) renderQuestion(w int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	otherMarker := "(○)"
-	otherLabel := "Other"
-	if m.qCursor == len(opts) {
-		otherMarker = "(●)"
-		if m.qTyping {
-			otherLabel = "Other  ❯ " + m.qFree + "█"
+	if !local {
+		otherMarker := "(○)"
+		otherLabel := "Other"
+		if m.qCursor == len(opts) {
+			otherMarker = "(●)"
+			if m.qTyping {
+				otherLabel = "Other  ❯ " + m.qFree + "█"
+			} else if m.qFree != "" {
+				otherLabel = "Other  ❯ " + m.qFree
+			}
 		} else if m.qFree != "" {
 			otherLabel = "Other  ❯ " + m.qFree
 		}
-	} else if m.qFree != "" {
-		otherLabel = "Other  ❯ " + m.qFree
+		otherLine := fmt.Sprintf(" z %s %s", otherMarker, otherLabel)
+		if m.qCursor == len(opts) {
+			otherLine = selStyle.Render(otherLine)
+		}
+		b.WriteString(otherLine + "\n")
 	}
-	otherLine := fmt.Sprintf(" z %s %s", otherMarker, otherLabel)
-	if m.qCursor == len(opts) {
-		otherLine = selStyle.Render(otherLine)
-	}
-	b.WriteString(otherLine + "\n")
 	b.WriteString("\n" + dimStyle.Render("1–9 a–f pick  ·  j/k  ·  tab wrap  ·  enter  ·  ←/→ questions  ·  shift+x dismiss  ·  esc park"))
 	_ = maxQuestionPreviewLines
 	return modalBox.Width(w).Render(b.String())
@@ -155,9 +161,13 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 	if len(opts) == 0 {
 		opts = []string{"yes", "no"}
 	}
-	rowCount := len(opts) + 1
+	local := m.question.Kind != ""
+	rowCount := len(opts)
+	if !local {
+		rowCount++
+	}
 	s := msg.String()
-	if s == "z" && !m.qTyping {
+	if s == "z" && !m.qTyping && !local {
 		m.qCursor = len(opts)
 		m.qTyping = true
 		return nil
@@ -168,7 +178,7 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 			m.qTyping = false
 		case tea.KeyEnter:
 			m.qTyping = false
-			m.replyQuestion(strings.TrimSpace(m.qFree))
+			return m.replyQuestion(strings.TrimSpace(m.qFree))
 		case tea.KeyBackspace:
 			if len(m.qFree) > 0 {
 				m.qFree = m.qFree[:len(m.qFree)-1]
@@ -208,31 +218,33 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 			m.qFree = ""
 		}
 	case "enter":
-		if m.qCursor == len(opts) {
+		if !local && m.qCursor == len(opts) {
 			m.qTyping = true
 			return nil
 		}
 		if m.qCursor >= 0 && m.qCursor < len(opts) {
-			m.replyQuestion(opts[m.qCursor])
+			return m.replyQuestion(opts[m.qCursor])
 		}
 	case "shift+x":
-		m.replyQuestion("")
+		return m.replyQuestion("")
 	case "esc":
 		m.overlay = overlayNone
 		m.focusScroll = true
 		m.ta.Blur()
 	default:
 		if idx := optionIndexFromKey(s, len(opts)); idx >= 0 {
-			m.replyQuestion(opts[idx])
+			return m.replyQuestion(opts[idx])
 		}
 	}
 	return nil
 }
 
-func (m *model) replyQuestion(ans string) {
+func (m *model) replyQuestion(ans string) tea.Cmd {
 	if m.question == nil {
-		return
+		return nil
 	}
+	kind := m.question.Kind
+	directive := m.question.Directive
 	ch := m.question.Reply
 	m.question = nil
 	m.qTyping = false
@@ -241,7 +253,11 @@ func (m *model) replyQuestion(ans string) {
 	if m.overlay == overlayQuestion {
 		m.overlay = overlayNone
 	}
+	if kind == "fork-worktree" {
+		return m.resolveForkWorktree(ans, directive)
+	}
 	if ch != nil {
 		ch <- ans
 	}
+	return nil
 }

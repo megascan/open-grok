@@ -107,44 +107,30 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.layoutChat()
 		return cmd
 	case "fork":
+		return m.handleFork(arg)
+	case "compact":
 		if m.sess == nil {
+			m.appendSys("No active session")
 			break
 		}
-		dst, err := agent.ForkSession(m.sess)
+		agent.CompactNow(m.sess, arg)
+		m.appendSys("compacted" + func() string {
+			if arg != "" {
+				return " (keep: " + arg + ")"
+			}
+			return ""
+		}())
+	case "copy":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		n, path, err := parseCopyArg(arg)
 		if err != nil {
 			m.appendSys(err.Error())
 			break
 		}
-		cmd := m.attachSession(dst)
-		m.appendSys("forked to " + dst.ID)
-		return cmd
-	case "compact":
-		if m.sess != nil {
-			agent.CompactNow(m.sess, arg)
-			m.appendSys("compacted" + func() string {
-				if arg != "" {
-					return " (keep: " + arg + ")"
-				}
-				return ""
-			}())
-		}
-	case "copy":
-		n, path := parseCopyArg(arg)
-		if path != "" {
-			var body string
-			if m.sess != nil {
-				body = m.sess.ExportMarkdown()
-			}
-			if n > 1 {
-				return m.copyNthAgent(n)
-			}
-			if body != "" {
-				_ = os.WriteFile(path, []byte(body), 0o600)
-				m.appendSys("wrote " + path)
-				break
-			}
-		}
-		return m.copyNthAgent(n)
+		return m.copyAssistant(n, path)
 	case "find":
 		m.overlay = overlayFind
 		m.cursor = 0
@@ -416,14 +402,10 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.persistUI()
 		m.appendSys("timestamps = " + onOff(m.timestamps))
 	case "timeline":
-		m.overlay = overlayTimeline
-		m.cursor = 0
-		m.items = nil
-		for i, b := range m.blocks {
-			if b.kind == blockUser {
-				m.items = append(m.items, listItem{Key: strconv.Itoa(i), Label: truncate(b.body, 70)})
-			}
-		}
+		m.cfg.UI.ShowTimeline = !m.cfg.UI.ShowTimeline
+		m.persistUI()
+		m.layoutChat()
+		m.appendSys("\u2713 Timeline sidebar: " + onOff(m.cfg.UI.ShowTimeline))
 	case "toggle-mouse-reporting":
 		m.mouseOn = !m.mouseOn
 		m.persistUI()
@@ -449,14 +431,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "rewind":
 		m.openRewindPicker()
 	case "jump":
-		m.overlay = overlayTimeline
-		m.cursor = 0
-		m.items = nil
-		for i, b := range m.blocks {
-			if b.kind == blockUser {
-				m.items = append(m.items, listItem{Key: strconv.Itoa(i), Label: truncate(b.body, 70)})
-			}
-		}
+		m.openJump()
 	case "login":
 		if arg != "" {
 			if _, ok := parseLoginProvider(arg); !ok {
@@ -505,7 +480,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "scroll-debug":
 		m.scrollHUD = !m.scrollHUD
 	case "debug":
-		m.appendSys(fmt.Sprintf("debug overlay: screen=%s theme=%s vim=%v yolo=%s busy=%v", m.screenMd, m.theme, m.vimMode, m.permModeName(), m.busy))
+		m.handleDebug(arg)
 	case "goal":
 		return m.handleGoal(arg)
 	case "memory":

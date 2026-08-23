@@ -333,9 +333,18 @@ func (s *Session) EnsureMCP(ctx context.Context) {
 	s.MCPClients = clients
 }
 
-// ForkSession copies this conversation into a new session id.
+// ForkSession copies this conversation into a new session id in the same cwd.
 func ForkSession(src *Session) (*Session, error) {
-	dst, err := NewSession(src.CWD, catalog.Model{
+	return ForkSessionInto(src, src.CWD)
+}
+
+// ForkSessionInto copies this conversation into a new session rooted at cwd.
+// A worktree fork passes the new tree path so tools and persistence follow it.
+func ForkSessionInto(src *Session, cwd string) (*Session, error) {
+	if cwd == "" {
+		cwd = src.CWD
+	}
+	dst, err := NewSession(cwd, catalog.Model{
 		ID:         src.ModelID,
 		Model:      src.ModelID,
 		Provider:   src.Provider,

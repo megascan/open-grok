@@ -191,7 +191,7 @@ func (m *model) overlayTitle() string {
 	case overlayMCP:
 		return "MCP servers"
 	case overlayTimeline:
-		return "Timeline"
+		return "Jump to which turn?"
 	case overlayWorktree:
 		return "New worktree"
 	}
@@ -415,6 +415,9 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	switch msg.String() {
 	case "esc":
+		if m.overlay == overlayTimeline {
+			m.restoreJumpViewport()
+		}
 		m.overlay = overlayNone
 		m.filter = ""
 		if m.screen == screenWelcome {
@@ -448,7 +451,7 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "enter":
 		return m.pickOverlay(), true
 	}
-	if msg.Type == tea.KeyRunes && m.overlay != overlayPrivacy {
+	if msg.Type == tea.KeyRunes && m.overlay != overlayPrivacy && m.overlay != overlayTimeline {
 		m.filter += string(msg.Runes)
 		m.applyOverlayFilter()
 		return nil, true
@@ -464,6 +467,9 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 func (m *model) previewOverlay() {
 	if m.overlay == overlayTheme && m.cursor < len(m.items) {
 		applyTheme(resolveTheme(m.items[m.cursor].Key))
+	}
+	if m.overlay == overlayTimeline {
+		m.previewJump()
 	}
 }
 
@@ -611,6 +617,8 @@ func (m *model) pickOverlay() tea.Cmd {
 	case overlayFind:
 		m.jumpFind(it.Key)
 		m.overlay = overlayNone
+	case overlayTimeline:
+		m.commitJump()
 	default:
 		m.overlay = overlayNone
 	}

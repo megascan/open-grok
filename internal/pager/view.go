@@ -40,6 +40,7 @@ func (m *model) transcriptWidth() int {
 	if m.showSidebar() {
 		w -= m.sidebarWidth() + 1
 	}
+	w -= m.timelineRailWidth()
 	if w < 24 {
 		return 24
 	}
@@ -192,7 +193,7 @@ func (m *model) renderHeader() string {
 	left := titleStyle.Render(" Entropy ") + dimStyle.Render(" "+version.String())
 	mid := fmt.Sprintf(" %s  ·  %s", m.opts.Model.Name, m.opts.Model.Provider.DisplayName())
 	status := m.status
-	if m.busy {
+	if m.busy && !m.turnStatusVisible() {
 		status = m.spin.View() + " " + m.status
 	}
 	right := " " + status + " "
@@ -363,9 +364,40 @@ func (m *model) viewChat() string {
 	if m.dashDetails {
 		head = m.renderDashDetailsHeader() + "\n" + head
 	}
-	body := m.vp.View()
+	privacy := ""
+	if m.showPrivacyBanner() {
+		privacy = privacyBanner()
+		if !strings.HasSuffix(privacy, "\n") {
+			privacy += "\n"
+		}
+	}
+	hud := ""
+	if m.scrollHUD {
+		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
+	}
+	prefix := head + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n"
+	m.privacyY = -1
+	if privacy != "" {
+		m.privacyY = strings.Count(prefix, "\n")
+		prefix += privacy
+	}
+	prefix += hud
+	m.transcriptTop = strings.Count(prefix, "\n")
+
+	vpView := m.vp.View()
+	if rail := m.renderTimelineRail(); rail != "" {
+		vpView = lipgloss.JoinHorizontal(lipgloss.Top, rail, vpView)
+	}
+	body := vpView
 	if m.showSidebar() {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, m.vp.View(), m.renderSidebar())
+		body = lipgloss.JoinHorizontal(lipgloss.Top, vpView, m.renderSidebar())
+	}
+	turn := m.renderTurnStatus()
+	if turn != "" {
+		m.turnStatusY = m.transcriptTop + m.vp.Height
+		turn += "\n"
+	} else {
+		m.turnStatusY = -1
 	}
 	chips := m.renderChips()
 	input := m.renderPromptInput()
@@ -375,12 +407,7 @@ func (m *model) viewChat() string {
 	if banner := m.renderVoiceBanner(); banner != "" {
 		input = banner + "\n" + input
 	}
-	hud := ""
-	if m.scrollHUD {
-		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
-	}
-	return head + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n" +
-		hud + body + "\n" + chips + input + "\n" + m.renderFooter()
+	return prefix + body + "\n" + turn + chips + input + "\n" + m.renderFooter()
 }
 
 func (m *model) renderDashDetailsHeader() string {
@@ -409,20 +436,28 @@ func (m *model) renderDashDetailsHeader() string {
 }
 
 func (m *model) scrollToBlock(idx int) {
+	m.jumpToBlock(idx)
+}
+
+// jumpToBlock scrolls the transcript so block idx is at the viewport top.
+// Unlike send-time page-flip, this is used by /jump live preview and the
+// timeline rail and is not gated on page_flip_on_send.
+func (m *model) jumpToBlock(idx int) {
 	m.vp.SetContent(m.renderTranscript())
-	if idx <= 0 || !m.pageFlip {
-		if m.pageFlip {
-			m.vp.GotoTop()
-		} else {
-			m.vp.GotoBottom()
-		}
+	if idx <= 0 {
+		m.vp.GotoTop()
 		return
 	}
+	m.vp.SetYOffset(m.blockLineOffset(idx))
+}
+
+func (m *model) blockLineOffset(idx int) int {
 	lines := 0
+	w := m.transcriptWidth()
 	for i := 0; i < idx && i < len(m.blocks); i++ {
-		lines += strings.Count(m.renderBlock(m.blocks[i], m.transcriptWidth()), "\n") + 2
+		lines += strings.Count(m.renderBlock(m.blocks[i], w), "\n") + 2
 	}
-	m.vp.SetYOffset(lines)
+	return lines
 }
 
 func (m *model) appendBlock(bl block) {

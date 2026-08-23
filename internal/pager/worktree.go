@@ -55,20 +55,9 @@ func (m *model) handleWorktreeKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *model) createWorktreeSession(label string) tea.Cmd {
-	root, ok := workspace.GitRoot(m.opts.CWD)
-	if !ok {
-		m.status = "not a git repository"
-		return nil
-	}
-	safe := workspace.SanitizeWorktreeLabel(label)
-	if safe == "" {
-		safe = time.Now().Format("20060102-150405")
-	}
-	dest := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+safe)
-	cmd := exec.Command("git", "-C", root, "worktree", "add", dest)
-	out, err := cmd.CombinedOutput()
+	dest, err := m.addGitWorktree(label)
 	if err != nil {
-		m.status = fmt.Sprintf("git worktree add: %v\n%s", err, strings.TrimSpace(string(out)))
+		m.status = err.Error()
 		return nil
 	}
 	m.opts.CWD = dest
@@ -78,10 +67,33 @@ func (m *model) createWorktreeSession(label string) tea.Cmd {
 		m.status = err.Error()
 		return nil
 	}
+	safe := workspace.SanitizeWorktreeLabel(label)
+	if safe == "" {
+		safe = filepath.Base(dest)
+	}
 	sess.Title = "worktree " + safe
 	_ = sess.Persist()
 	m.attachSession(sess)
 	m.layoutChat()
 	m.appendSys("opened worktree " + dest)
 	return m.reloadLoops()
+}
+
+// addGitWorktree creates a sibling git worktree and returns its path.
+func (m *model) addGitWorktree(label string) (string, error) {
+	root, ok := workspace.GitRoot(m.opts.CWD)
+	if !ok {
+		return "", fmt.Errorf("not a git repository")
+	}
+	safe := workspace.SanitizeWorktreeLabel(label)
+	if safe == "" {
+		safe = time.Now().Format("20060102-150405")
+	}
+	dest := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-"+safe)
+	cmd := exec.Command("git", "-C", root, "worktree", "add", dest)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git worktree add: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return dest, nil
 }

@@ -6,17 +6,28 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+const emptyPlanPlaceholder = `# No plan written yet
+
+The agent exited plan mode without writing a plan.
+
+- **Approve** — leave plan mode and start implementing
+- **Request changes** — send the agent back to planning
+- **Quit** — abandon and turn plan mode off
+`
+
 func (m *model) renderPlanApproval(w int) string {
 	if m.plan == nil {
 		return ""
 	}
 	var b strings.Builder
 	title := "Plan approval"
-	if !m.plan.HasPlan {
+	body := m.plan.Plan
+	if !m.plan.HasPlan || strings.TrimSpace(body) == "" {
 		title = "No plan written — approve or request changes"
+		body = emptyPlanPlaceholder
 	}
 	b.WriteString(titleStyle.Render(title) + "\n\n")
-	lines := strings.Split(m.plan.Plan, "\n")
+	lines := strings.Split(body, "\n")
 	start := m.planScroll
 	if start < 0 {
 		start = 0
@@ -81,7 +92,11 @@ func (m *model) handlePlanKey(msg tea.KeyMsg) tea.Cmd {
 	case "c":
 		m.planFocus = "comment"
 	case "y":
-		return m.copyText(m.plan.Plan, true)
+		text := m.plan.Plan
+		if !m.plan.HasPlan || strings.TrimSpace(text) == "" {
+			text = emptyPlanPlaceholder
+		}
+		return m.copyText(text, true)
 	case "q":
 		m.replyPlan("quit")
 	case "tab":

@@ -34,22 +34,57 @@ func (m *model) copyBlock(idx int) tea.Cmd {
 }
 
 func (m *model) copyNthAgent(n int) tea.Cmd {
-	var agents []string
-	for _, b := range m.blocks {
-		if b.kind == blockAgent && strings.TrimSpace(b.body) != "" {
-			agents = append(agents, b.body)
-		}
-	}
-	if n <= 0 {
-		n = 1
-	}
-	if n > len(agents) {
-		n = len(agents)
-	}
-	if n == 0 {
+	body, err := m.nthAssistantBody(n)
+	if err != nil {
+		m.appendSys(err.Error())
 		return nil
 	}
-	return m.copyText(agents[len(agents)-n], true)
+	return m.copyText(body, true)
+}
+
+func (m *model) copyAssistant(n int, path string) tea.Cmd {
+	body, err := m.nthAssistantBody(n)
+	if err != nil {
+		m.appendSys(err.Error())
+		return nil
+	}
+	if path != "" {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			m.appendSys("Failed to write file: " + err.Error())
+			return nil
+		}
+		lines := strings.Count(body, "\n") + 1
+		if strings.TrimSpace(body) == "" {
+			lines = 0
+		}
+		m.appendSys(fmt.Sprintf("Copied to %s (%d chars, %d lines)", path, utf8.RuneCountInString(body), lines))
+		return nil
+	}
+	return m.copyText(body, true)
+}
+
+func (m *model) nthAssistantBody(n int) (string, error) {
+	var agents []string
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		if m.blocks[i].kind == blockAgent && strings.TrimSpace(m.blocks[i].body) != "" {
+			agents = append(agents, m.blocks[i].body)
+		}
+	}
+	if len(agents) == 0 {
+		return "", errString("No assistant messages to copy")
+	}
+	if n > len(agents) {
+		word := "messages"
+		if len(agents) == 1 {
+			word = "message"
+		}
+		return "", errString(fmt.Sprintf("Only %d assistant %s available to copy", len(agents), word))
+	}
+	text := agents[n-1]
+	if strings.TrimSpace(text) == "" {
+		return "", errString("Assistant message is empty")
+	}
+	return text, nil
 }
 
 func (m *model) copyText(s string, withStats bool) tea.Cmd {
@@ -107,15 +142,26 @@ func osc52(s string) string {
 	return "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(s)) + "\a"
 }
 
-func parseCopyArg(arg string) (n int, path string) {
+func parseCopyArg(arg string) (n int, path string, err error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		return 1, ""
+		return 1, "", nil
 	}
-	fields := strings.Fields(arg)
-	if n, err := strconv.Atoi(fields[0]); err == nil {
-		path = strings.TrimSpace(strings.TrimPrefix(arg, fields[0]))
-		return n, path
+	var first, rest string
+	if i := strings.IndexFunc(arg, unicodeIsSpace); i >= 0 {
+		first, rest = arg[:i], strings.TrimSpace(arg[i+1:])
+	} else {
+		first = arg
 	}
-	return 1, arg
+	if n, e := strconv.ParseUint(first, 10, 32); e == nil {
+		if n == 0 {
+			return 0, "", errString("Usage: /copy [N] [file] where N is 1 (latest), 2, 3, ...")
+		}
+		return int(n), rest, nil
+	}
+	return 1, arg, nil
+}
+
+func unicodeIsSpace(r rune) bool {
+	return r == ' ' || r == '\t'
 }

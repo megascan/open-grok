@@ -627,9 +627,9 @@ func (m *model) answerPeekQuestion() tea.Cmd {
 	}
 	ans := opts[m.peekQSel]
 	m.peekQSel = -1
-	m.replyQuestion(ans)
+	cmd := m.replyQuestion(ans)
 	m.refreshDashboard()
-	return nil
+	return cmd
 }
 
 func (m *model) sendPeekReply() tea.Cmd {

@@ -80,7 +80,7 @@ var slashCatalog = []slashCmd{
 	{Name: "imagine", Help: "generate an image from a description", Category: "media"},
 	{Name: "imagine-video", Help: "generate a video from a description", Category: "media"},
 	{Name: "timestamps", Help: "toggle message timestamps", Category: "view"},
-	{Name: "timeline", Help: "jump the scrollback by turn", Mode: modeFull, Category: "view"},
+	{Name: "timeline", Help: "toggle the timeline sidebar", Mode: modeFull, Category: "view"},
 	{Name: "toggle-mouse-reporting", Help: "toggle mouse cell-motion reporting", Category: "input"},
 	{Name: "settings", Aliases: []string{"config", "preferences", "prefs"}, Help: "open the settings modal", Category: "config"},
 	{Name: "privacy", Help: "coding data, retention, and training", Category: "config"},

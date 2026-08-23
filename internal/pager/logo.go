@@ -68,4 +68,5 @@ func (m *model) ackPrivacyBanner(optIn bool) {
 		m.cfg.UI.PrivacyOptOut = true
 	}
 	_ = config.Save(m.cfg)
+	m.layoutChat()
 }

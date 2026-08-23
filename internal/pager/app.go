@@ -48,6 +48,8 @@ type (
 		Questions []questionItem
 		Index     int
 		Reply     chan string
+		Kind      string
+		Directive string
 	}
 	planAskMsg struct {
 		Plan    string
@@ -99,7 +101,7 @@ const (
 	overlayCache
 	overlayImportClaude
 	overlayMCP
-	overlayTimeline
+	overlayTimeline // /jump picker (live-scrolls transcript)
 	overlayQuestion
 	overlayFiles
 	overlayPlan
@@ -224,6 +226,25 @@ type model struct {
 	histIdx                                                               int
 	dashCWD                                                               string
 	scrollHUD                                                             bool
+	fpsOn                                                                 bool
+	fpsSamples                                                            []time.Duration
+	fpsBody                                                               string
+	fpsRefresh                                                            time.Time
+	lastViewAt                                                            time.Time
+	scrollLogPath                                                         string
+	turnStarted                                                           time.Time
+	phaseStarted                                                          time.Time
+	turnActivity                                                          string
+	turnToolTitle                                                         string
+	jumpRestore                                                           int
+	jumpRestoreSet                                                        bool
+	stopHover                                                             bool
+	railHover                                                             timelineHit
+	transcriptTop                                                         int
+	turnStatusY                                                           int
+	privacyY                                                              int
+	stopBtnX, stopBtnW                                                    int
+	lastRail                                                              *timelineRail
 	fastTier                                                              bool
 	copied                                                                string
 	skillCWD                                                              string
@@ -311,6 +332,12 @@ func newModel(opt Options) (*model, error) {
 		expandedGroups:    map[string]bool{},
 		wfDetail:          -1,
 		suggest:           promptSuggestion{enabled: promptSuggestionsEnabled(cfg)},
+		fpsOn:             envFlagOn("ENTROPY_FPS", "GROK_FPS"),
+		scrollHUD:         envFlagOn("ENTROPY_SCROLL_DEBUG", "GROK_SCROLL_DEBUG"),
+		railHover:         timelineHitNone,
+	}
+	if path, ok := envScrollLogStart(); ok {
+		m.scrollLogPath = path
 	}
 	if m.followUp == "" {
 		m.followUp = "queue"
@@ -441,7 +468,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case turnDone:
 		m.busy = false
 		m.turnCancel = nil
+		m.turnActivity = ""
+		m.turnToolTitle = ""
+		m.turnStarted = time.Time{}
+		m.phaseStarted = time.Time{}
 		m.status = "ready"
+		m.layoutChat()
 		m.finishWorkflow(msg.err)
 		if msg.err != nil {
 			if msg.err == context.Canceled || strings.Contains(msg.err.Error(), "canceled") {
@@ -836,6 +868,18 @@ func (m *model) View() string {
 	if m.overlay != overlayNone {
 		body = m.viewWithOverlay(body)
 	}
+	if m.fpsOn {
+		now := time.Now()
+		if !m.lastViewAt.IsZero() {
+			m.recordFPS(now.Sub(m.lastViewAt))
+		}
+		m.lastViewAt = now
+		panel := m.renderFPSPanel()
+		if panel != "" {
+			x := max(0, m.width-fpsPanelWidth)
+			body = placeOverlay(body, panel, x, 0, m.width, m.height)
+		}
+	}
 	return body
 }
 
@@ -844,6 +888,12 @@ func (m *model) layoutChat() {
 	footer := 7
 	if m.compactUI {
 		header, footer = 2, 5
+	}
+	if m.showPrivacyBanner() {
+		header += strings.Count(privacyBanner(), "\n")
+	}
+	if m.turnStatusVisible() {
+		footer++
 	}
 	h := m.height - header - footer
 	if h < 4 {
@@ -894,12 +944,14 @@ func (m *model) persistUI() {
 func (m *model) applyStream(ev agent.Event) tea.Cmd {
 	switch ev.Kind {
 	case "text":
+		m.setTurnActivity("responding", "")
 		if last := m.lastBlock(blockAgent); last != nil {
 			last.body += ev.Text
 			return nil
 		}
 		m.appendBlock(block{kind: blockAgent, body: ev.Text, at: time.Now()})
 	case "thinking":
+		m.setTurnActivity("thinking", "")
 		if !m.thinkingOn {
 			return nil
 		}
@@ -924,6 +976,7 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 		if strings.Contains(title, "mermaid") {
 			kind = blockMermaid
 		}
+		m.setTurnActivity("tool", ev.Tool)
 		m.appendBlock(block{kind: kind, title: "▸ " + ev.Tool, body: truncate(ev.Text, 400), at: time.Now()})
 	case "tool_result":
 		if strings.EqualFold(ev.Tool, "todo_write") {
@@ -937,6 +990,7 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 		if strings.EqualFold(ev.Tool, "update_goal") {
 			kind = blockGoal
 		}
+		m.setTurnActivity("thinking", "")
 		m.appendBlock(block{kind: kind, title: ev.Tool, body: ev.Text, err: ev.IsError, at: time.Now()})
 	}
 	return nil
@@ -975,7 +1029,13 @@ func (m *model) submitDisplay(display, wire string) tea.Cmd {
 	m.appendBlock(block{kind: blockUser, body: display, at: time.Now()})
 	m.appendBlock(block{kind: blockAgent, body: "", at: time.Now()})
 	m.busy = true
-	m.status = "sampling"
+	m.status = "Thinking…"
+	m.turnActivity = "thinking"
+	m.turnToolTitle = ""
+	now := time.Now()
+	m.turnStarted = now
+	m.phaseStarted = now
+	m.layoutChat()
 	m.refreshVP()
 	if m.pageFlip {
 		m.scrollToBlock(userIdx)

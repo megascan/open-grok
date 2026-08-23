@@ -500,6 +500,7 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 		m.cfg.UI.PrivacyOptOut = !m.cfg.UI.PrivacyOptOut
 	case "show_timeline":
 		m.cfg.UI.ShowTimeline = !m.cfg.UI.ShowTimeline
+		m.layoutChat()
 	case "page_flip_on_send":
 		m.pageFlip = !m.pageFlip
 		m.cfg.UI.PageFlipOnSend = m.pageFlip
