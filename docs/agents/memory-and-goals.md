@@ -289,6 +289,14 @@ cargo test --locked -p xai-grok-shell -- goal
 cargo test --locked -p xai-grok-shell -- memory
 ```
 
+Go native port (`internal/goals`, `tools.UpdateGoal`, pager `/goal`):
+
+```sh
+go test ./internal/goals ./internal/tools ./internal/pager ./internal/agent -count=1
+```
+
+The Go tracker persists `session_dir/goal/orchestration.json`, registers `update_goal` in DefaultPack and DirectOnlyPack, and treats `completed:true` as a claim until `/goal complete`. The host-owned planner / strategist / skeptic panel is not ported.
+
 ---
 
 ## Gotchas

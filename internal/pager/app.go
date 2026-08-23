@@ -3,10 +3,9 @@ package pager
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,18 +14,7 @@ import (
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
-	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/version"
-)
-
-var (
-	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	userStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("219")).Bold(true)
-	agentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
-	toolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	barStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
 // Options configure the interactive session.
@@ -51,13 +39,14 @@ type model struct {
 	sess   *agent.Session
 	vp     viewport.Model
 	ta     textarea.Model
+	spin   spinner.Model
+	prog   *tea.Program
 	ready  bool
 	busy   bool
 	status string
-	log    strings.Builder
 	width  int
 	height int
-	slash  []string
+	blocks []block
 }
 
 // Run starts the interactive TUI.
@@ -66,7 +55,8 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx), tea.WithMouseCellMotion())
+	m.prog = p
 	_, err = p.Run()
 	return err
 }
@@ -95,20 +85,29 @@ func newModel(opt Options) (*model, error) {
 	}
 	sess.YOLO = opt.YOLO
 	ta := textarea.New()
-	ta.Placeholder = "Message Open Grok…  (/help for commands)"
+	ta.Placeholder = "Message Open Grok…  (/goal  /help)"
 	ta.Focus()
 	ta.Prompt = "▎ "
 	ta.CharLimit = 32 * 1024
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
-	m := &model{opts: opt, sess: sess, ta: ta, status: "ready"}
-	m.append(dimStyle.Render("Open Grok " + version.String() + "  ·  native Go  ·  " + opt.Model.Provider.DisplayName() + " / " + opt.Model.Name))
-	m.append(dimStyle.Render("State: " + config.Home() + "  ·  session " + sess.ID))
-	m.append("")
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan))
+	m := &model{opts: opt, sess: sess, ta: ta, spin: sp, status: "ready"}
+	m.appendBlock(block{kind: blockSystem, body: "Open Grok " + version.String() + "  ·  native Go  ·  " + opt.Model.Provider.DisplayName() + " / " + opt.Model.Name})
+	m.appendBlock(block{kind: blockSystem, body: "State: " + config.Home() + "  ·  session " + sess.ID})
+	if snap := sess.Goal.Snapshot(); snap != nil {
+		m.appendBlock(block{kind: blockGoal, body: "restored goal (" + string(snap.Status) + "):\n" + snap.Objective + "\n\nActive goals pause across restart. /goal resume to continue."})
+	} else {
+		m.appendBlock(block{kind: blockSystem, body: "Set an autonomous goal with /goal <objective>. The rail on the right tracks it."})
+	}
 	return m, nil
 }
 
-func (m *model) Init() tea.Cmd { return textarea.Blink }
+func (m *model) Init() tea.Cmd {
+	return tea.Batch(textarea.Blink, m.spin.Tick)
+}
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -116,16 +115,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		header := 3
-		footer := 6
+		footer := 7
+		h := msg.Height - header - footer
+		if h < 4 {
+			h = 4
+		}
+		vw := m.transcriptWidth()
 		if !m.ready {
-			m.vp = viewport.New(msg.Width, msg.Height-header-footer)
+			m.vp = viewport.New(vw, h)
 			m.ready = true
 		} else {
-			m.vp.Width = msg.Width
-			m.vp.Height = msg.Height - header - footer
+			m.vp.Width = vw
+			m.vp.Height = h
 		}
-		m.ta.SetWidth(msg.Width - 2)
-		m.vp.SetContent(m.log.String())
+		m.ta.SetWidth(max(20, msg.Width-6))
+		m.refreshVP()
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		return m, cmd
 	case tea.KeyMsg:
 		if m.busy {
 			if msg.Type == tea.KeyCtrlC {
@@ -156,40 +164,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.submit(text)
 		}
 	case streamDelta:
-		switch msg.ev.Kind {
-		case "text":
-			m.appendChunk(agentStyle.Render(msg.ev.Text))
-		case "thinking":
-			m.appendChunk(dimStyle.Render(msg.ev.Text))
-		case "tool":
-			m.append(toolStyle.Render("▸ " + msg.ev.Tool))
-		case "tool_result":
-			body := msg.ev.Text
-			if len(body) > 400 {
-				body = body[:400] + "…"
-			}
-			style := dimStyle
-			if msg.ev.IsError {
-				style = errStyle
-			}
-			m.append(style.Render(body))
-		}
-		m.vp.SetContent(m.log.String())
-		m.vp.GotoBottom()
-	case streamThenDone:
-		if msg.text != "" {
-			m.append("\n" + agentStyle.Render(msg.text))
-		}
-		m.busy = false
-		m.status = "ready"
-		m.vp.SetContent(m.log.String())
-		m.vp.GotoBottom()
+		m.applyStream(msg.ev)
+		m.refreshVP()
 	case turnDone:
 		m.busy = false
 		m.status = "ready"
 		if msg.err != nil {
-			m.append(errStyle.Render("error: " + msg.err.Error()))
-			m.vp.SetContent(m.log.String())
+			m.appendBlock(block{kind: blockSystem, body: "error: " + msg.err.Error(), err: true})
+			m.refreshVP()
 		}
 	}
 	var cmd tea.Cmd
@@ -202,164 +184,67 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) View() string {
 	if !m.ready {
-		return "Open Grok…"
+		return titleStyle.Render("Open Grok…")
 	}
-	head := titleStyle.Render(" Open Grok ") + dimStyle.Render(fmt.Sprintf(" %s  %s  %s", version.String(), m.opts.Model.Name, m.status))
-	foot := dimStyle.Render(" enter send  ·  ctrl+c quit  ·  /login /model /help")
+	head := m.renderHeader()
+	body := m.vp.View()
+	if m.showSidebar() {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, m.vp.View(), m.renderSidebar())
+	}
+	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
 	return head + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n" +
-		m.vp.View() + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n" +
-		m.ta.View() + "\n" + foot
+		body + "\n" + input + "\n" + m.renderFooter()
 }
 
-func (m *model) append(line string) {
-	if m.log.Len() > 0 {
-		m.log.WriteByte('\n')
+func (m *model) applyStream(ev agent.Event) {
+	switch ev.Kind {
+	case "text":
+		if last := m.lastBlock(blockAgent); last != nil {
+			last.body += ev.Text
+			return
+		}
+		m.appendBlock(block{kind: blockAgent, body: ev.Text})
+	case "thinking":
+		if last := m.lastBlock(blockThinking); last != nil {
+			last.body += ev.Text
+			return
+		}
+		m.appendBlock(block{kind: blockThinking, body: ev.Text})
+	case "tool":
+		title := ev.Tool
+		if strings.EqualFold(ev.Tool, "update_goal") {
+			title = "update_goal"
+		}
+		m.appendBlock(block{kind: blockTool, title: "▸ " + title, body: truncate(ev.Text, 400)})
+	case "tool_result":
+		kind := blockToolResult
+		if strings.EqualFold(ev.Tool, "update_goal") {
+			kind = blockGoal
+		}
+		m.appendBlock(block{kind: kind, title: ev.Tool, body: ev.Text, err: ev.IsError})
 	}
-	m.log.WriteString(line)
-}
-
-func (m *model) appendChunk(s string) {
-	m.log.WriteString(s)
 }
 
 func (m *model) submit(text string) tea.Cmd {
-	m.append(userStyle.Render("you") + "  " + text)
-	m.append(agentStyle.Render("open-grok"))
+	m.appendBlock(block{kind: blockUser, body: text})
+	m.appendBlock(block{kind: blockAgent, body: ""})
 	m.busy = true
 	m.status = "sampling"
-	m.vp.SetContent(m.log.String())
-	m.vp.GotoBottom()
+	m.refreshVP()
 	sess := m.sess
 	model := m.opts.Model
 	kimiCode := model.EnvKey == "KIMI_CODE_API_KEY"
+	prog := m.prog
 	return func() tea.Msg {
 		bearer, _, err := auth.ResolveBearer(model.Provider, auth.EnvKeys(model.Provider), kimiCode)
 		if err != nil {
 			return turnDone{err: err}
 		}
 		err = agent.RunTurn(context.Background(), sess, agent.Runtime{Model: model, Bearer: bearer}, text, func(ev agent.Event) {
-			// Bubble Tea programs are not thread-safe for Update; stream via commands.
+			if prog != nil {
+				prog.Send(streamDelta{ev: ev})
+			}
 		})
-		_ = err
-		// Collecting via direct RunTurn then returning one done event keeps the TUI simple
-		// and race-free. Token streaming is used in headless/ACP paths.
-		if err == nil {
-			last := lastAssistant(sess)
-			return streamThenDone{text: last}
-		}
 		return turnDone{err: err}
 	}
-}
-
-type streamThenDone struct{ text string }
-
-func lastAssistant(s *agent.Session) string {
-	for i := len(s.Messages) - 1; i >= 0; i-- {
-		if s.Messages[i].Role == "assistant" {
-			return s.Messages[i].Content
-		}
-	}
-	return ""
-}
-
-func (m *model) handleSlash(text string) tea.Cmd {
-	fields := strings.Fields(text)
-	cmd := strings.TrimPrefix(fields[0], "/")
-	arg := ""
-	if len(fields) > 1 {
-		arg = strings.Join(fields[1:], " ")
-	}
-	switch cmd {
-	case "help":
-		m.append(dimStyle.Render("/help  /login  /model [id]  /quit  /clear  /yolo  /compact  /plan  /sessions  /export  /memory  /mcp  /status  /fork  /rewind"))
-	case "quit", "exit":
-		return tea.Quit
-	case "clear":
-		m.log.Reset()
-		m.vp.SetContent("")
-	case "yolo":
-		m.sess.YOLO = !m.sess.YOLO
-		m.append(fmt.Sprintf("always-approve = %v", m.sess.YOLO))
-	case "compact":
-		_ = m.sess.AppendUpdate(map[string]any{"type": "auto_compact_started", "manual": true})
-		m.append("compaction runs automatically when the transcript is large; a checkpoint was recorded")
-	case "plan":
-		if m.sess.Plan.Active {
-			m.sess.Plan.Exit()
-			m.append("plan mode off")
-		} else {
-			m.sess.Plan.Enter(m.sess.Plan.PlanFile)
-			m.append("plan mode on — only " + m.sess.Plan.PlanFile + " may be edited")
-		}
-	case "sessions":
-		list, _ := agent.ListSessions(m.opts.CWD)
-		for _, s := range list {
-			m.append(fmt.Sprintf("%s  %s  %s", s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Title))
-		}
-	case "export":
-		m.append(m.sess.ExportMarkdown())
-	case "memory":
-		res := memorySearch(arg)
-		m.append(res)
-	case "mcp":
-		cfg, _ := config.Load()
-		if len(cfg.MCP) == 0 {
-			m.append("(no mcp_servers)")
-			break
-		}
-		for name, s := range cfg.MCP {
-			m.append(name + "  " + s.Command)
-		}
-	case "status":
-		m.append(fmt.Sprintf("session %s  model %s  provider %s  yolo %v  plan %v", m.sess.ID, m.opts.Model.ID, m.opts.Model.Provider, m.sess.YOLO, m.sess.Plan.Active))
-	case "fork":
-		dst, err := agent.ForkSession(m.sess)
-		if err != nil {
-			m.append(errStyle.Render(err.Error()))
-			break
-		}
-		m.sess = dst
-		m.append("forked to " + dst.ID)
-	case "rewind":
-		if len(m.sess.Messages) > 2 {
-			m.sess.Messages = m.sess.Messages[:len(m.sess.Messages)-2]
-			_ = m.sess.Persist()
-			m.append("rewound last exchange")
-		}
-	case "model":
-		if arg == "" {
-			m.append("current model: " + m.opts.Model.ID + " (" + m.opts.Model.Provider.DisplayName() + ")")
-			break
-		}
-		mod, ok := catalog.Lookup(arg)
-		if !ok {
-			m.append(errStyle.Render("unknown model " + arg))
-			break
-		}
-		m.opts.Model = mod
-		m.sess.ModelID = mod.ID
-		m.sess.Provider = mod.Provider
-		m.sess.Backend = mod.APIBackend
-		m.sess.CloseExportBoundary(mod.Provider)
-		m.append("switched to " + mod.Name + " via " + mod.Provider.DisplayName())
-	case "login":
-		m.append("use `open-grok login [provider]` from a TTY to store credentials under ~/.opengrok")
-	default:
-		m.append(errStyle.Render("unknown command " + cmd))
-	}
-	m.vp.SetContent(m.log.String())
-	m.vp.GotoBottom()
-	return nil
-}
-
-func memorySearch(q string) string {
-	body, _ := json.Marshal(map[string]string{"query": q})
-	return tools.MemorySearch{}.Execute(context.Background(), tools.Context{}, body).Content
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

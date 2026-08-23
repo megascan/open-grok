@@ -11,14 +11,15 @@ New product work lands in Go.
 ```text
 cmd/open-grok          composition root
 internal/cli           Cobra CLI
-internal/pager         Bubble Tea TUI
-internal/agent         turn loop, sessions, tool-mode, compaction, subagents
+internal/pager         Bubble Tea TUI (streaming transcript, tool cards, goal rail)
+internal/agent         turn loop, sessions, tool-mode, compaction, subagents, goals
+internal/goals         GoalTracker + session_dir/goal/orchestration.json
 internal/acp           ACP stdio, WebSocket serve, leader socket
 internal/codemode      persistent goja JS session (exec/wait + tools.*)
 internal/sampler       Chat Completions / Responses / Messages adapters
 internal/catalog       curated models + live /models
 internal/auth          provider-isolated auth.json / codex-auth.json
-internal/tools         bash, files, apply_patch, grep, glob, web, plan, skills, memory, task, session bus, flat-team mailbox
+internal/tools         bash, files, apply_patch, grep, glob, web, plan, skills, memory, task, update_goal, session bus, flat-team mailbox
 internal/workspace     plan-mode edit gate + permission manager
 internal/hooks         PreToolUse fail-open
 internal/config        OPENGROK_HOME / ~/.opengrok (never ~/.grok)
@@ -42,6 +43,19 @@ internal/update        GitHub release check and install into OPENGROK_HOME/bin
 10. Hooks fail open.
 11. Session bus is root-session only; peer bodies are untrusted model input.
 12. Codex OAuth tokens live in `codex-auth.json` in the Codex-rs shape (`tokens` / `OPENAI_API_KEY`).
+13. Goals: `/goal` starts a persisted tracker; `update_goal` is always registered and rejects with `goal_harness_disabled` outside goal mode. `completed:true` is a claim — the user confirms with `/goal complete`. Unknown wire statuses restore as `user_paused`. Active goals pause across restart.
+
+## TUI (Go pager)
+
+The native TUI is a Charmbracelet Bubble Tea app (`internal/pager`), not a port of the Rust pager's Elm dispatch loop. It is the interactive product surface:
+
+- Full-screen chrome with a live streaming transcript (token deltas via `tea.Program.Send`)
+- Tool cards; `update_goal` uses a distinct goal card
+- Right-hand **Goals** rail (wide terminals) showing status, objective, progress, and history
+- Slash palette (`/goal`, `/plan`, `/model`, …) with prefix hints in the footer
+- Status badges for YOLO, plan mode, and goal lifecycle
+
+`/goal <objective> [--budget <tokens>]` creates the goal and starts a turn. `/goal pause|resume|complete|clear|status` match the user-guide verbs. There is no host-owned classifier/strategist stack in Go; completion is user-verified.
 
 ## Packages used (not reimplemented)
 
