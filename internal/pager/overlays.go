@@ -116,11 +116,13 @@ func (m *model) renderOverlay() string {
 		return m.renderSettings(w)
 	case overlayTheme:
 		return m.renderListModal("Theme (live preview)", w)
+	case overlayCache:
+		return m.renderCache(w)
 	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
 		overlayDocs, overlayTutorial, overlayExtensions,
 		overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
-		overlayQueue, overlayTasks, overlayCache,
+		overlayQueue, overlayTasks,
 		overlayMCP, overlayTimeline:
 		return m.renderListModal(m.overlayTitle(), w)
 	default:
@@ -173,7 +175,7 @@ func (m *model) overlayTitle() string {
 	case overlayQueue:
 		return "Follow-up queue"
 	case overlayTasks:
-		return "Background tasks"
+		return "Tasks"
 	case overlayCache:
 		return "Prompt cache"
 	case overlayImportClaude:
@@ -319,8 +321,11 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	}
-	if m.overlay == overlaySettings {
-		return m.handleSettingsKey(msg), true
+	if m.overlay == overlayCache {
+		if msg.String() == "esc" {
+			m.overlay = overlayNone
+		}
+		return nil, true
 	}
 	if m.overlay == overlayWorkflows {
 		return m.handleWorkflowsKey(msg), true

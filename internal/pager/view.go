@@ -222,10 +222,12 @@ func (m *model) renderHeader() string {
 		if win == 0 {
 			win = 128_000
 		}
-		ctx = fmt.Sprintf("%s / %s", fmtTokens(tok), fmtTokens(win))
+		ctx = contextBarText(tok, win, m.ctxHover)
 	}
 	goal := m.goalBadge()
-	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  Context: %s  ·  %s  ·  %s  ·  %s", sid, ctx, yolo, plan, goal))
+	meta := dimStyle.Render("  session "+sid+"  ") + dimStyle.Render(contextBarSep+"  ") +
+		ctx + dimStyle.Render("  "+contextBarSep+"  ") +
+		dimStyle.Render(joinSep(yolo, plan, goal))
 	top := lipgloss.JoinHorizontal(lipgloss.Top, left, dimStyle.Render(mid), lipgloss.NewStyle().Width(max(0, m.width-lipgloss.Width(left)-lipgloss.Width(mid)-lipgloss.Width(right))).Render(""), dimStyle.Render(right))
 	if m.width > 0 {
 		top = lipgloss.NewStyle().Width(m.width).MaxWidth(m.width).Render(top)

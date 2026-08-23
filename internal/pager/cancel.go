@@ -32,9 +32,13 @@ func (m *model) renderCancelTurn(w int) string {
 	b.WriteString(titleStyle.Render(title) + "\n")
 	b.WriteString(dimStyle.Render(count) + "\n\n")
 	for i, c := range cancelTurnChoices {
-		line := "  " + c
+		marker := "(○)"
 		if i == m.cancelCursor {
-			line = selStyle.Render("▸ " + c)
+			marker = "(●)"
+		}
+		line := fmt.Sprintf(" %d %s %s", i+1, marker, c)
+		if i == m.cancelCursor {
+			line = selStyle.Render(line)
 		}
 		b.WriteString(line + "\n")
 	}

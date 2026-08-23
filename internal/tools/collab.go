@@ -95,6 +95,11 @@ func (b *TeamBox) RunningCount() int {
 	return n
 }
 
+// Snapshot copies the current roster for UI panes such as /tasks.
+func (b *TeamBox) Snapshot() []AgentInfo {
+	return b.snapshot()
+}
+
 func (b *TeamBox) snapshot() []AgentInfo {
 	if b == nil {
 		return nil

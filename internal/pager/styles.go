@@ -17,26 +17,31 @@ var (
 )
 
 var (
-	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted))
-	userStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink)).Bold(true)
-	agentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
-	toolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
-	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
-	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
-	claimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colClaim)).Bold(true)
-	barStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colBar))
-	userLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink)).Bold(true).PaddingRight(1)
-	agentLabel = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true).PaddingRight(1)
-	sysLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Italic(true)
-	codeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237"))
-	headMd     = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
-	bulletMd   = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
-	goalTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
-	panelStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("63")).
-			Padding(0, 1)
+	titleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
+	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted))
+	userStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink)).Bold(true)
+	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
+	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
+	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
+	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
+	claimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colClaim)).Bold(true)
+	barStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colBar))
+	userLabel        = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink)).Bold(true).PaddingRight(1)
+	agentLabel       = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true).PaddingRight(1)
+	sysLabel         = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Italic(true)
+	codeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237"))
+	bashKwStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
+	bashStrStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
+	bashCommentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Italic(true)
+	bashOpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colPink))
+	bashHeredocStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted))
+	headMd           = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
+	bulletMd         = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
+	goalTitle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
+	panelStyle       = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("63")).
+				Padding(0, 1)
 	toolCard = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(colGold)).

@@ -10,6 +10,16 @@ import (
 // prompt vs scrollback vs dashboard rows. Matches Rust pane order enough for
 // click-to-focus and click-to-select-block.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if msg.Action == tea.MouseActionMotion {
+		hovered := m.screen == screenChat && msg.Y <= 1
+		if m.dashDetails {
+			hovered = m.screen == screenChat && msg.Y <= 2
+		}
+		if m.ctxHover != hovered {
+			m.ctxHover = hovered
+		}
+		return nil, true
+	}
 	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
 		return nil, true
 	}

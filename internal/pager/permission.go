@@ -35,7 +35,7 @@ func (m *model) permCommand() string {
 }
 
 func (m *model) permWords() []string {
-	return strings.Fields(m.permCommand())
+	return bashWords(m.permCommand())
 }
 
 func (m *model) permScopedCmd() string {
@@ -134,6 +134,7 @@ func (m *model) initPermCard() {
 	m.permPatternMode = false
 	m.permPattern = ""
 	m.permMCPServer = false
+	m.permExpanded = false
 	words := m.permWords()
 	m.permWordN = len(words)
 	if m.permWordN == 0 {
@@ -172,15 +173,21 @@ func (m *model) renderPermission(w int) string {
 	}
 	cmd := m.permCommand()
 	if cmd != "" {
-		lines := strings.Split(cmd, "\n")
-		max := 5
-		trunc := len(lines) > max
-		if trunc {
-			lines = lines[:max-1]
+		contentW := w - 8
+		if contentW < 8 {
+			contentW = 8
 		}
-		b.WriteString("\n" + codeStyle.Render(strings.Join(lines, "\n")) + "\n")
+		maxRows := 0
+		if !m.permExpanded {
+			maxRows = permissionCollapsedRows
+		}
+		rows, trunc := bashDisplayRows(cmd, contentW, maxRows)
+		b.WriteString("\n")
+		for _, row := range rows {
+			b.WriteString(highlightBashCommand(row) + "\n")
+		}
 		if trunc {
-			b.WriteString(dimStyle.Render("… expand with ctrl+e") + "\n")
+			b.WriteString(truncationIndicator() + "\n")
 		}
 	}
 	b.WriteByte('\n')
@@ -211,7 +218,7 @@ func (m *model) renderPermission(w int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ scope  ·  e edit glob  ·  x followup  ·  esc park") + park)
+	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ scope  ·  e edit glob  ·  x followup  ·  Ctrl-F expand  ·  esc park") + park)
 	return modalBox.Width(w).Render(b.String())
 }
 
@@ -326,9 +333,15 @@ func (m *model) handlePermissionKey(msg tea.KeyMsg) tea.Cmd {
 		m.ta.Blur()
 	case "tab":
 		// stay in card
+	case "ctrl+f":
+		m.permExpanded = !m.permExpanded
 	case "ctrl+e":
 		if m.perm != nil {
-			m.openBlockViewer("Permission args", m.perm.Args)
+			body := m.permCommand()
+			if body == "" {
+				body = m.perm.Args
+			}
+			m.openBlockViewer("Permission args", body)
 		}
 	}
 	return nil

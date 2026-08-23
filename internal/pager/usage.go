@@ -2,6 +2,7 @@ package pager
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -81,4 +82,91 @@ func (m *model) handleUsageKey(msg tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func (m *model) openCache() {
+	m.overlay = overlayCache
+	m.filter = ""
+	m.items = nil
+	m.cursor = 0
+}
+
+func (m *model) renderCache(w int) string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Prompt cache") + "\n\n")
+	b.WriteString(m.cacheReport())
+	b.WriteString("\n\n" + dimStyle.Render("esc close"))
+	return modalBox.Width(w).Render(b.String())
+}
+
+func (m *model) cacheReport() string {
+	if m.sess == nil || len(m.sess.Messages) == 0 {
+		return "Prompt cache telemetry: no turns recorded yet in this session."
+	}
+	bytes := 0
+	turns := 0
+	var prompts []string
+	for _, msg := range m.sess.Messages {
+		bytes += len(msg.Content)
+		if msg.Role == types.RoleUser {
+			turns++
+			prompts = append(prompts, msg.Content)
+		}
+	}
+	tokens := bytes / 4
+	var b strings.Builder
+	b.WriteString("Prompt Cache Telemetry & Diagnostics:\n")
+	b.WriteString("  All-provider hit rate: n/a (Entropy has no sampler cache telemetry yet)\n")
+	b.WriteString("  Supported hit rate:    n/a (no cache-reporting requests)\n")
+	fmt.Fprintf(&b, "  Turns tracked:  %d (local conversation turns)\n", turns)
+	fmt.Fprintf(&b, "  Prompt bytes:   %s\n", groupThousands(bytes))
+	fmt.Fprintf(&b, "  Estimated tokens: %s (bytes/4)\n", groupThousands(tokens))
+	if reuse := prefixReusePct(prompts); reuse >= 0 {
+		fmt.Fprintf(&b, "  Prefix reuse:   %.1f%% (shared prefix of consecutive user prompts)\n", reuse)
+	}
+	return b.String()
+}
+
+func groupThousands(n int) string {
+	sign := ""
+	if n < 0 {
+		sign = "-"
+		n = -n
+	}
+	s := strconv.Itoa(n)
+	var parts []string
+	for len(s) > 3 {
+		parts = append([]string{s[len(s)-3:]}, parts...)
+		s = s[:len(s)-3]
+	}
+	parts = append([]string{s}, parts...)
+	return sign + strings.Join(parts, ",")
+}
+
+func prefixReusePct(prompts []string) float64 {
+	if len(prompts) < 2 {
+		return -1
+	}
+	var sum float64
+	pairs := 0
+	for i := 1; i < len(prompts); i++ {
+		a, b := prompts[i-1], prompts[i]
+		n := 0
+		for n < len(a) && n < len(b) && a[n] == b[n] {
+			n++
+		}
+		den := len(a)
+		if len(b) > den {
+			den = len(b)
+		}
+		if den == 0 {
+			continue
+		}
+		sum += float64(n) / float64(den) * 100
+		pairs++
+	}
+	if pairs == 0 {
+		return -1
+	}
+	return sum / float64(pairs)
 }

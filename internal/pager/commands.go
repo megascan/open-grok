@@ -177,6 +177,10 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "expand":
 		m.toggleFold(-1)
 	case "context":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		m.openUsage(0)
 	case "minimal":
 		m.screenMd = modeMinimal
@@ -277,10 +281,16 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "mcps":
 		m.openMCP()
 	case "share":
-		if m.sess != nil {
-			return m.copyText("Entropy session "+m.sess.ID+" · "+m.opts.Model.Name+"\n"+m.sess.ExportMarkdown(), false)
+		if m.sess == nil {
+			m.appendSys("No active session to share")
+			break
 		}
+		return m.copyText("Entropy session "+m.sess.ID+" · "+m.opts.Model.Name+"\n"+m.sess.ExportMarkdown(), false)
 	case "session-info":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		m.openUsage(2)
 	case "rename":
 		if m.sess != nil && arg != "" {
@@ -471,15 +481,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "usage":
 		m.openUsage(1)
 	case "cache":
-		m.overlay = overlayCache
-		n := 0
-		if m.sess != nil {
-			for _, msg := range m.sess.Messages {
-				n += len(msg.Content)
-			}
-		}
-		m.items = []listItem{{Label: "prompt bytes in session", Detail: strconv.Itoa(n)}}
-		m.cursor = 0
+		m.openCache()
 	case "queue":
 		if strings.EqualFold(arg, "clear") {
 			m.queue = nil
@@ -489,19 +491,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		m.openQueue()
 	case "tasks":
-		m.overlay = overlayTasks
-		m.items = nil
-		for _, j := range m.loops {
-			st := j.Every.String()
-			if j.stopped {
-				st = "stopped"
-			}
-			m.items = append(m.items, listItem{Label: j.ID, Detail: st + "  " + truncate(j.Prompt, 40)})
-		}
-		if len(m.items) == 0 {
-			m.items = []listItem{{Label: "(no background loops)"}}
-		}
-		m.cursor = 0
+		m.openTasks()
 	case "release-notes":
 		m.openReleaseNotes()
 	case "tutorial":
@@ -559,12 +549,78 @@ func (m *model) sessionInfo() string {
 			turns++
 		}
 	}
-	return fmt.Sprintf(
-		"session %s\ntitle %s\nmodel %s (%s)\nprovider %s\nbackend %s\nyolo %v\nplan %v\nmode %s\n%d user turns · %d bytes\nworking dirs: %s\n%s\nEntropy %s",
-		m.sess.ID, m.sess.Title, m.opts.Model.ID, m.opts.Model.Name, m.opts.Model.Provider, m.opts.Model.APIBackend,
-		m.sess.YOLO, m.sess.Plan.Active, m.screenMd, turns, bytes, strings.Join(m.sess.ExtraDirs, ", "),
-		m.sess.Goal.StatusLine(), version.String(),
-	)
+	win := m.opts.Model.ContextWindow
+	if win == 0 {
+		win = 128_000
+	}
+	used := bytes / 4
+	pct := usagePct(used, win)
+	var b strings.Builder
+	if t := strings.TrimSpace(m.sess.Title); t != "" {
+		fmt.Fprintf(&b, "  Title: %s\n", t)
+	}
+	fmt.Fprintf(&b, "  Shell version: %s\n", version.String())
+	b.WriteString(sessionAuthLines(m.opts.Model.Provider))
+	fmt.Fprintf(&b, "  Session ID: %s\n", m.sess.ID)
+	cwd := m.sess.CWD
+	if cwd == "" {
+		cwd = m.opts.CWD
+	}
+	fmt.Fprintf(&b, "  Working directory: %s\n", cwd)
+	modelName := m.opts.Model.Name
+	if modelName == "" {
+		modelName = m.opts.Model.ID
+	}
+	fmt.Fprintf(&b, "  Model: %s\n", modelName)
+	backend := string(m.opts.Model.APIBackend)
+	if backend == "" {
+		backend = string(m.sess.Backend)
+	}
+	if backend != "" {
+		fmt.Fprintf(&b, "  API Backend: %s\n", backend)
+	}
+	if sandboxActive() {
+		net := ""
+		if config.FirstEnv("ENTROPY_SANDBOX_NET", "OPENGROK_SANDBOX_NET", "GROK_SANDBOX_RESTRICT_NETWORK") != "" {
+			net = " (network: restricted)"
+		}
+		fmt.Fprintf(&b, "  Sandbox: entropy%s\n", net)
+	}
+	fmt.Fprintf(&b, "  Turn: %d\n", turns)
+	fmt.Fprintf(&b, "  Context: %d / %d tokens (%.0f%%)", used, win, pct)
+	return b.String()
+}
+
+func sessionAuthLines(p types.Provider) string {
+	envSet := false
+	used := ""
+	for _, k := range auth.EnvKeys(p) {
+		if os.Getenv(k) != "" {
+			envSet = true
+			used = k
+			break
+		}
+	}
+	st := auth.Status()
+	_, signed := st[p]
+	if envSet {
+		method := "  Auth method: API key\n"
+		if used != "" {
+			method = fmt.Sprintf("  Auth method: API key (%s)\n", used)
+		}
+		hint := "  Run `entropy login` to use a stored credential instead.\n"
+		if p == types.ProviderXAI {
+			hint = "  Run `entropy login` to use your SuperGrok subscription instead.\n"
+		}
+		return method + hint
+	}
+	if signed && p == types.ProviderCodex {
+		return "  Auth method: OAuth\n"
+	}
+	if signed {
+		return "  Auth method: API key\n"
+	}
+	return "  Auth method: signed out\n"
 }
 
 func (m *model) contextReport() string {

@@ -174,6 +174,8 @@ type model struct {
 	permParked                                                            bool
 	permCursor                                                            int
 	permWordN                                                             int
+	permExpanded                                                          bool
+	ctxHover                                                              bool
 	permFollowup                                                          string
 	permFollowupMode                                                      bool
 	permPattern                                                           string
