@@ -88,6 +88,10 @@ func (m *model) renderOverlay() string {
 		return m.renderAgents(w)
 	case overlayLineView:
 		return m.renderLineViewer(w)
+	case overlayWorkflows:
+		return m.renderWorkflows(w)
+	case overlayVoice:
+		return ""
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -109,7 +113,7 @@ func (m *model) renderOverlay() string {
 		return m.renderListModal("Theme (live preview)", w)
 	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
 		overlayDoctor, overlayDocs, overlayTutorial, overlayExtensions,
-		overlayWorkflows, overlayPersonas, overlayFind,
+		overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
 		overlayQueue, overlayTasks, overlayCache,
 		overlayMCP, overlayTimeline:
@@ -291,6 +295,9 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayWorkflows {
+		return m.handleWorkflowsKey(msg), true
+	}
 	if m.overlay == overlayMemory {
 		return m.handleMemoryKey(msg), true
 	}
@@ -554,6 +561,12 @@ func (m *model) pickOverlay() tea.Cmd {
 		_ = config.Save(m.cfg)
 		m.overlay = overlayNone
 		m.appendSys("privacy: " + it.Key)
+	case overlayExtensions:
+		if strings.HasPrefix(it.Key, "hint") {
+			return nil
+		}
+		m.appendSys(it.Detail)
+		return nil
 	case overlayFind:
 		m.jumpFind(it.Key)
 		m.overlay = overlayNone
@@ -778,7 +791,7 @@ func (m *model) fillExtensions() {
 	case 1:
 		m.items = dirListing(append([]string{filepath.Join(config.Home(), "plugins")}, config.ProjectSubdir(cwd, "plugins")...)...)
 	case 2:
-		m.items = dirListing(filepath.Join(config.Home(), "marketplace"))
+		m.fillMarketplace()
 	case 3:
 		for _, s := range tools.DiscoverSkills(cwd) {
 			badge := "skill"
@@ -872,6 +885,39 @@ func sanitizeMCPName(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func (m *model) fillMarketplace() {
+	home := config.Home()
+	cwd := m.opts.CWD
+	m.items = []listItem{{
+		Key:    "hint",
+		Label:  "Local catalog (no grok.com store)",
+		Detail: "Entropy cannot reach xAI marketplace. Drop a plugin into " + filepath.Join(home, "plugins") + " or a skill into " + filepath.Join(home, "skills"),
+	}}
+	plugins := dirListing(append([]string{filepath.Join(home, "plugins")}, config.ProjectSubdir(cwd, "plugins")...)...)
+	for _, it := range plugins {
+		if it.Label == "(empty)" {
+			continue
+		}
+		m.items = append(m.items, listItem{Key: "plugin:" + it.Label, Label: "plugin · " + it.Label, Detail: it.Detail})
+	}
+	for _, s := range tools.DiscoverSkills(cwd) {
+		m.items = append(m.items, listItem{Key: "skill:" + s.Name, Label: "skill · " + s.Name, Detail: truncate(s.Description, 48)})
+	}
+	for _, it := range dirListing(filepath.Join(home, "marketplace")) {
+		if it.Label == "(empty)" {
+			continue
+		}
+		m.items = append(m.items, listItem{Key: "cache:" + it.Label, Label: "cache · " + it.Label, Detail: it.Detail})
+	}
+	if len(m.items) == 1 {
+		m.items = append(m.items, listItem{
+			Key:    "hint-install",
+			Label:  "Install from a path",
+			Detail: "Copy a plugin directory into ~/.entropy/plugins or a SKILL.md tree into ~/.entropy/skills, then reopen /marketplace",
+		})
+	}
 }
 
 func (m *model) openExtensions(tab int) {

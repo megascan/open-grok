@@ -104,3 +104,33 @@ func TestSubagentGetsFreshInactivePlanTracker(t *testing.T) {
 		t.Fatal("parent plan tracker must stay active")
 	}
 }
+
+func TestMCPServerAllowRuleMatchesQualifiedTools(t *testing.T) {
+	if workspace.MCPTitleizeSegment("list_issues") != "List Issues" {
+		t.Fatal(workspace.MCPTitleizeSegment("list_issues"))
+	}
+	if workspace.MCPToolDisplayName("linear__list_issues", "linear") != "(Linear) List Issues" {
+		t.Fatal(workspace.MCPToolDisplayName("linear__list_issues", "linear"))
+	}
+	d, reason := workspace.Check(workspace.Request{
+		Tool: "mcp_linear_list_issues", Access: types.AccessMCP,
+		AllowRules: []string{"mcp:linear"},
+	})
+	if d != workspace.Allow {
+		t.Fatalf("server allow got %s (%s)", d, reason)
+	}
+	d, _ = workspace.Check(workspace.Request{
+		Tool: "linear__list_issues", Access: types.AccessMCP,
+		AllowRules: []string{"mcp:linear"},
+	})
+	if d != workspace.Allow {
+		t.Fatal("rust-style __ names must match")
+	}
+	d, _ = workspace.Check(workspace.Request{
+		Tool: "mcp_other_fetch", Access: types.AccessMCP,
+		AllowRules: []string{"mcp:linear"},
+	})
+	if d != workspace.Ask {
+		t.Fatalf("other server still asks, got %s", d)
+	}
+}

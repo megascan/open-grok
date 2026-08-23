@@ -37,8 +37,8 @@ type (
 	turnDone    struct{ err error }
 	streamDelta struct{ ev agent.Event }
 	permAskMsg  struct {
-		Tool, Access, Path, Args, Command string
-		Reply                             chan bool
+		Tool, Access, Path, Args, Command, Server string
+		Reply                                     chan bool
 	}
 	btwDeltaMsg struct{ text string }
 	btwDoneMsg  struct{ err error }
@@ -110,6 +110,7 @@ const (
 	overlayShortcuts
 	overlayGoal
 	overlayLineView
+	overlayVoice
 )
 
 type permMode int
@@ -171,6 +172,12 @@ type model struct {
 	permFollowupMode                                                      bool
 	permPattern                                                           string
 	permPatternMode                                                       bool
+	permMCPServer                                                         bool
+	voice                                                                 *voiceState
+	workflows                                                             []workflowRun
+	wfDetail, wfPhase                                                     int
+	wfActiveID                                                            string
+	todos                                                                 []tools.TodoItem
 	rewindPhase                                                           rewindPhase
 	rewindPoints                                                          []rewindPoint
 	rewindCursor                                                          int
@@ -292,6 +299,7 @@ func newModel(opt Options) (*model, error) {
 		groupTools:        cfg.PrefBool("group_tool_verbs", cfg.UI.GroupToolVerbs, true),
 		simpleMode:        cfg.PrefBool("simple_mode", cfg.UI.SimpleMode, true),
 		expandedGroups:    map[string]bool{},
+		wfDetail:          -1,
 	}
 	if m.followUp == "" {
 		m.followUp = "queue"
@@ -380,6 +388,7 @@ func (m *model) attachSession(sess *agent.Session) {
 		m.appendBlock(block{kind: blockGoal, body: "restored goal (" + string(snap.Status) + "):\n" + snap.Objective + "\n\nActive goals pause across restart. /goal resume to continue."})
 	}
 	m.rebuildHistory()
+	m.todos = tools.LoadTodos(sess.Dir)
 	m.screen = screenChat
 	m.overlay = overlayNone
 }
@@ -418,6 +427,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.turnCancel = nil
 		m.status = "ready"
+		m.finishWorkflow(msg.err)
 		if msg.err != nil {
 			if msg.err == context.Canceled || strings.Contains(msg.err.Error(), "canceled") {
 				m.appendBlock(block{kind: blockSystem, body: "turn cancelled"})
@@ -514,6 +524,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayVoice {
+		return m.handleVoiceKey(msg), true
+	}
+	if isVoiceChord(msg) && m.voiceKeybindOn() {
+		return m.toggleVoice(), true
+	}
+	if m.overlay == overlayWorkflows {
+		return m.handleWorkflowsKey(msg), true
+	}
 	if m.overlay == overlayShortcuts {
 		return m.handleShortcutsKey(msg), true
 	}
@@ -848,6 +867,10 @@ func (m *model) applyStream(ev agent.Event) {
 		}
 		m.appendBlock(block{kind: blockThinking, body: ev.Text, at: time.Now()})
 	case "tool":
+		if strings.EqualFold(ev.Tool, "todo_write") {
+			m.reloadTodos()
+			return
+		}
 		kind := blockTool
 		title := strings.ToLower(ev.Tool)
 		if strings.Contains(title, "image") || strings.EqualFold(ev.Tool, "imagine") {
@@ -858,6 +881,10 @@ func (m *model) applyStream(ev agent.Event) {
 		}
 		m.appendBlock(block{kind: kind, title: "▸ " + ev.Tool, body: truncate(ev.Text, 400), at: time.Now()})
 	case "tool_result":
+		if strings.EqualFold(ev.Tool, "todo_write") {
+			m.reloadTodos()
+			return
+		}
 		kind := blockToolResult
 		if strings.EqualFold(ev.Tool, "update_goal") {
 			kind = blockGoal
@@ -866,11 +893,28 @@ func (m *model) applyStream(ev agent.Event) {
 	}
 }
 
+func (m *model) reloadTodos() {
+	if m.sess == nil {
+		m.todos = nil
+		return
+	}
+	m.todos = tools.LoadTodos(m.sess.Dir)
+}
+
 func (m *model) submit(text string) tea.Cmd {
-	m.history = append(m.history, text)
-	m.chips = chipPathsIn(text)
+	display, wire := expandSubmit(text)
+	return m.submitDisplay(display, wire)
+}
+
+func (m *model) submitDisplay(display, wire string) tea.Cmd {
+	if m.sess == nil {
+		m.appendSys("no active session")
+		return nil
+	}
+	m.history = append(m.history, display)
+	m.chips = chipPathsIn(display)
 	userIdx := len(m.blocks)
-	m.appendBlock(block{kind: blockUser, body: text, at: time.Now()})
+	m.appendBlock(block{kind: blockUser, body: display, at: time.Now()})
 	m.appendBlock(block{kind: blockAgent, body: "", at: time.Now()})
 	m.busy = true
 	m.status = "sampling"
@@ -911,10 +955,14 @@ func (m *model) submit(text string) tea.Cmd {
 					break
 				}
 			}
+			server := ""
+			if mcp, ok := t.(tools.MCPTool); ok {
+				server = mcp.ServerName
+			}
 			if prog != nil {
 				prog.Send(permAskMsg{
 					Tool: t.Name(), Access: string(t.Access()), Path: path,
-					Args: string(args), Command: cmd, Reply: ch,
+					Args: string(args), Command: cmd, Server: server, Reply: ch,
 				})
 			} else {
 				return false
@@ -943,7 +991,7 @@ func (m *model) submit(text string) tea.Cmd {
 			}
 			return <-ch
 		}
-		err = agent.RunTurn(ctx, sess, rt, text, func(ev agent.Event) {
+		err = agent.RunTurn(ctx, sess, rt, wire, func(ev agent.Event) {
 			if prog != nil {
 				prog.Send(streamDelta{ev: ev})
 			}

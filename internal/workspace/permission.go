@@ -122,6 +122,9 @@ func matchRule(rule string, req Request) bool {
 	if strings.HasPrefix(rule, "bash:") && req.Access == types.AccessBash {
 		return strings.Contains(req.Command, strings.TrimPrefix(rule, "bash:"))
 	}
+	if matchMCPAllow(rule, req) {
+		return true
+	}
 	name, pat, ok := splitToolPattern(rule)
 	if ok && strings.EqualFold(name, req.Tool) {
 		if pat == "" || pat == "*" {

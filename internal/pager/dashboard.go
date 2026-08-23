@@ -318,6 +318,9 @@ func (m *model) renderDashPeekPanel() string {
 				b.WriteString(line + "\n")
 			}
 			b.WriteString(dimStyle.Render("1-9 select  ·  enter answer  ·  esc back") + "\n")
+			if banner := m.renderVoiceBanner(); banner != "" {
+				b.WriteString(banner + "\n")
+			}
 			return b.String()
 		}
 		for _, it := range m.items {
@@ -325,7 +328,13 @@ func (m *model) renderDashPeekPanel() string {
 		}
 		b.WriteString("❯ reply " + m.peekReply + "█\n")
 		b.WriteString(dimStyle.Render("enter send  ·  ctrl+s send+open  ·  empty enter opens  ·  esc clears reply") + "\n")
+		if banner := m.renderVoiceBanner(); banner != "" {
+			b.WriteString(banner + "\n")
+		}
 		return b.String()
+	}
+	if banner := m.renderVoiceBanner(); banner != "" {
+		b.WriteString(banner + "\n")
 	}
 	b.WriteString("❯ Dispatch a new agent  " + m.dashDraft + "█\n")
 	b.WriteString(dimStyle.Render("enter spawn  ·  ctrl+s spawn+open  ·  ctrl+r rename  ·  ctrl+t pin  ·  ctrl+g group  ·  ctrl+x stop/delete  ·  ctrl+/ search  ·  ctrl+u clear  ·  esc never clears draft") + "\n")

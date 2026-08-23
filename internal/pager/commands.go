@@ -380,23 +380,21 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "doctor":
 		m.openDoctor()
 	case "voice":
-		m.appendSys("Voice capture is not bound to a microphone in this Go pager. Type instead — the prompt is focused.")
-		m.focusScroll = false
-		m.ta.Focus()
+		return m.toggleVoice()
 	case "loop":
 		return m.startLoop(arg)
 	case "imagine":
 		if arg == "" {
-			m.appendSys("usage: /imagine <description>")
+			m.appendSys(imagineUsageMessage())
 			break
 		}
-		return m.submit("Generate an image (tool: image generation if available, otherwise a detailed visual description the user can feed to an image model): " + arg)
+		return m.submitDisplay("/imagine "+arg, imagineInstruction(arg))
 	case "imagine-video":
 		if arg == "" {
-			m.appendSys("usage: /imagine-video <description>")
+			m.appendSys(imagineVideoUsageMessage())
 			break
 		}
-		return m.submit("Plan shots and describe a video (image_to_video if the provider supports it): " + arg)
+		return m.submitDisplay("/imagine-video "+arg, imagineVideoInstruction(arg))
 	case "timestamps":
 		m.timestamps = !m.timestamps
 		m.persistUI()
@@ -519,13 +517,15 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("usage: /deep-research <query>")
 			break
 		}
-		return m.submit("Deep-research workflow: plan bounded questions, gather sourced claims, cross-check, and report only surviving claims with locators. Query: " + arg)
+		return m.startWorkflow("deep-research", "Deep research", arg,
+			"Deep-research workflow: plan bounded questions, gather sourced claims, cross-check, and report only surviving claims with locators. Query: "+arg)
 	case "ultracode":
 		if arg == "" {
 			m.appendSys("usage: /ultracode <task>")
 			break
 		}
-		return m.submit("Ultracode workflow: scout, competing plans, implement, adversarial review. Task: " + arg)
+		return m.startWorkflow("ultracode", "Ultracode", arg,
+			"Ultracode workflow: scout, competing plans, implement, adversarial review. Task: "+arg)
 	case "workflow":
 		return m.handleWorkflow(arg)
 	default:
@@ -737,38 +737,6 @@ func (m *model) editPrompt() tea.Cmd {
 type editDone struct {
 	text string
 	err  error
-}
-
-func (m *model) openWorkflows() {
-	m.overlay = overlayWorkflows
-	m.cursor = 0
-	m.items = dirListing(append(config.ProjectSubdir(m.opts.CWD, "workflows"), filepath.Join(config.Home(), "workflows"))...)
-}
-
-func (m *model) handleWorkflow(arg string) tea.Cmd {
-	fields := strings.Fields(arg)
-	if len(fields) == 0 {
-		m.openWorkflows()
-		return nil
-	}
-	switch fields[0] {
-	case "pause", "resume", "stop", "save":
-		m.appendSys("workflow " + fields[0] + " " + strings.Join(fields[1:], " ") + " — runs are tracked in /workflows")
-		return nil
-	}
-	name := fields[0]
-	rest := strings.Join(fields[1:], " ")
-	for _, dir := range append(config.ProjectSubdir(m.opts.CWD, "workflows"), filepath.Join(config.Home(), "workflows")) {
-		p := filepath.Join(dir, name)
-		for _, ext := range []string{"", ".rhai", ".md"} {
-			data, err := os.ReadFile(p + ext)
-			if err != nil {
-				continue
-			}
-			return m.submit("Launch saved workflow " + name + " with args " + rest + ".\nScript:\n" + string(data))
-		}
-	}
-	return m.submit("Launch workflow " + name + " " + rest)
 }
 
 func (m *model) startLoop(arg string) tea.Cmd {

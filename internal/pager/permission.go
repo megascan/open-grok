@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/workspace"
 )
 
 type permChoice struct {
@@ -52,24 +53,73 @@ func (m *model) permScopedCmd() string {
 	return strings.Join(words[:n], " ")
 }
 
+func (m *model) permMCPServerName() string {
+	if m.perm == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(m.perm.Server); s != "" {
+		return s
+	}
+	tool := m.perm.Tool
+	if server, _, ok := strings.Cut(tool, workspace.MCPToolNameDelimiter); ok && server != "" && !strings.Contains(server, " ") {
+		return server
+	}
+	return ""
+}
+
+func (m *model) permMCPQualified() string {
+	server := m.permMCPServerName()
+	if server == "" || m.perm == nil {
+		return ""
+	}
+	if strings.Contains(m.perm.Tool, workspace.MCPToolNameDelimiter) {
+		return m.perm.Tool
+	}
+	action := m.perm.Tool
+	prefix := "mcp_" + server + "_"
+	if strings.HasPrefix(action, prefix) {
+		action = strings.TrimPrefix(action, prefix)
+	} else if strings.HasPrefix(action, "mcp_") {
+		action = strings.TrimPrefix(action, "mcp_")
+		action = strings.TrimPrefix(action, server+"_")
+	}
+	return server + workspace.MCPToolNameDelimiter + action
+}
+
+func (m *model) permAlwaysLabel() string {
+	server := m.permMCPServerName()
+	if m.perm != nil && m.perm.Access == "mcp" && server != "" {
+		if m.permMCPServer {
+			return "Always allow: all tools from " + workspace.MCPTitleizeSegment(server)
+		}
+		name := workspace.MCPToolDisplayName(m.permMCPQualified(), server)
+		return "Always allow: " + name
+	}
+	return "Always allow this tool"
+}
+
 func (m *model) permChoices() []permChoice {
 	if m.perm == nil {
 		return nil
 	}
 	cmd := m.permScopedCmd()
 	bash := m.perm.Access == "bash" && strings.TrimSpace(cmd) != ""
+	mcp := m.perm.Access == "mcp"
 	var out []permChoice
 	if bash {
 		out = append(out, permChoice{ID: "always-cmd", Label: "Always allow: " + cmd})
+	}
+	if mcp {
+		out = append(out, permChoice{ID: "always", Label: m.permAlwaysLabel()})
 	}
 	out = append(out, permChoice{ID: "allow", Label: "Yes, proceed"})
 	if bash {
 		out = append(out, permChoice{ID: "never-cmd", Label: "Never allow: " + cmd})
 	} else {
-		out = append(out,
-			permChoice{ID: "always", Label: "Always allow this tool"},
-			permChoice{ID: "never", Label: "Never allow this tool"},
-		)
+		if !mcp {
+			out = append(out, permChoice{ID: "always", Label: "Always allow this tool"})
+		}
+		out = append(out, permChoice{ID: "never", Label: "Never allow this tool"})
 	}
 	out = append(out, permChoice{ID: "followup", Label: "Tell Entropy what to do differently"})
 	return out
@@ -80,6 +130,7 @@ func (m *model) initPermCard() {
 	m.permFollowupMode = false
 	m.permPatternMode = false
 	m.permPattern = ""
+	m.permMCPServer = false
 	words := m.permWords()
 	m.permWordN = len(words)
 	if m.permWordN == 0 {
@@ -157,7 +208,7 @@ func (m *model) renderPermission(w int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ bash scope  ·  e edit glob  ·  x followup  ·  esc park") + park)
+	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ scope  ·  e edit glob  ·  x followup  ·  esc park") + park)
 	return modalBox.Width(w).Render(b.String())
 }
 
@@ -228,10 +279,20 @@ func (m *model) handlePermissionKey(msg tea.KeyMsg) tea.Cmd {
 			m.permCursor++
 		}
 	case "left", "h":
+		if m.perm != nil && m.perm.Access == "mcp" && m.permMCPServerName() != "" {
+			m.jumpPermAlways()
+			m.permMCPServer = false
+			break
+		}
 		if m.permWordN > 1 {
 			m.permWordN--
 		}
 	case "right", "l":
+		if m.perm != nil && m.perm.Access == "mcp" && m.permMCPServerName() != "" {
+			m.jumpPermAlways()
+			m.permMCPServer = true
+			break
+		}
 		if n := len(m.permWords()); m.permWordN < n {
 			m.permWordN++
 		}
@@ -275,8 +336,15 @@ func (m *model) applyPermChoice(c permChoice) tea.Cmd {
 	case "allow":
 		m.replyPerm(true, false, false)
 	case "always":
-		m.rememberPermRule(m.perm.Tool, false)
-		m.replyPerm(true, true, false)
+		rule := m.perm.Tool
+		if m.perm.Access == "mcp" && m.permMCPServer && m.permMCPServerName() != "" {
+			rule = workspace.MCPServerAllowRule(m.permMCPServerName())
+		}
+		m.rememberPermRule(rule, false)
+		if m.sess != nil {
+			m.sess.Allow = append(m.sess.Allow, rule)
+		}
+		m.replyPerm(true, false, false)
 	case "always-cmd":
 		rule := "bash:" + m.permScopedCmd()
 		if m.sess != nil {
@@ -347,6 +415,15 @@ func appendUniqRule(list []string, rule string) []string {
 		}
 	}
 	return append(list, rule)
+}
+
+func (m *model) jumpPermAlways() {
+	for i, c := range m.permChoices() {
+		if c.ID == "always" || c.ID == "always-cmd" {
+			m.permCursor = i
+			return
+		}
+	}
 }
 
 func (m *model) openBlockViewer(title, body string) {

@@ -237,7 +237,9 @@ func (m *model) settingValue(d settingDef) string {
 	case "auto_update":
 		return onOff(m.cfg.UI.AutoUpdate)
 	case "voice_keybind_enabled":
-		return onOff(m.cfg.UI.VoiceKeybind)
+		return onOff(m.voiceKeybindOn())
+	case "voice_capture_mode":
+		return m.voiceCaptureMode()
 	case "memory.enabled":
 		return onOff(m.cfg.MemoryEnabled())
 	}

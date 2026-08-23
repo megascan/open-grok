@@ -108,6 +108,7 @@ func DefaultPack() []Tool {
 		ExitPlanMode{},
 		TaskSpawn{},
 		UpdateGoal{},
+		TodoWrite{},
 	}
 	return append(pack, DirectCollabPack()...)
 }
@@ -140,6 +141,7 @@ func NestedPack() []Tool {
 		Skill{},
 		MemorySearch{},
 		MemorySave{},
+		TodoWrite{},
 	}
 }
 

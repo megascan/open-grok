@@ -21,6 +21,7 @@ var (
 	_ Tool = ExitPlanMode{}
 	_ Tool = TaskSpawn{}
 	_ Tool = UpdateGoal{}
+	_ Tool = TodoWrite{}
 	_ Tool = ListSessions{}
 	_ Tool = ReadSession{}
 	_ Tool = MessageSession{}

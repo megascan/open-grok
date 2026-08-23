@@ -75,7 +75,7 @@ var slashCatalog = []slashCmd{
 	{Name: "btw", Help: "aside to the agent without interrupting the turn", Category: "session"},
 	{Name: "recap", Aliases: []string{"summarize"}, Help: "summarize the conversation so far", Category: "session"},
 	{Name: "doctor", Aliases: []string{"terminal-setup", "terminal-check", "terminal-info"}, Help: "check terminal, clipboard, color, and home", Category: "help"},
-	{Name: "voice", Help: "voice input (falls back to the prompt when no mic)", Category: "input"},
+	{Name: "voice", Help: "toggle dictation (Ctrl+Space/F8; Esc/Enter to stop)", Category: "input"},
 	{Name: "loop", Help: "run a prompt on a recurring interval", Category: "scheduling"},
 	{Name: "imagine", Help: "generate an image from a description", Category: "media"},
 	{Name: "imagine-video", Help: "generate a video from a description", Category: "media"},

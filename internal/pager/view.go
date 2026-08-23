@@ -245,12 +245,17 @@ func (m *model) goalBadge() string {
 
 func (m *model) renderSidebar() string {
 	w := m.sidebarWidth() - 2
+	var b strings.Builder
+	if todo := m.renderTodoPane(w); todo != "" {
+		b.WriteString(todo)
+		b.WriteString("\n")
+	}
+	b.WriteString(goalTitle.Render("GOALS") + "\n")
 	if m.sess == nil || m.sess.Goal == nil {
-		return panelStyle.Width(m.sidebarWidth() - 2).Height(m.vp.Height).Render(goalTitle.Render("GOALS") + "\n" + dimStyle.Render("No session."))
+		b.WriteString(dimStyle.Render("No session."))
+		return panelStyle.Width(m.sidebarWidth() - 2).Height(m.vp.Height).Render(b.String())
 	}
 	snap := m.sess.Goal.Snapshot()
-	var b strings.Builder
-	b.WriteString(goalTitle.Render("GOALS") + "\n")
 	if snap == nil {
 		b.WriteString(dimStyle.Render("No goal running.") + "\n\n")
 		b.WriteString(dimStyle.Render("/goal <objective>") + "\n")
@@ -349,6 +354,9 @@ func (m *model) viewChat() string {
 	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
 	if panel := m.renderBtwPanel(); panel != "" {
 		input = panel + "\n" + input
+	}
+	if banner := m.renderVoiceBanner(); banner != "" {
+		input = banner + "\n" + input
 	}
 	hud := ""
 	if m.scrollHUD {

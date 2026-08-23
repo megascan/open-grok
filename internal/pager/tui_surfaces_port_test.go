@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/tools"
 )
 
 func TestFormatMemoryModified(t *testing.T) {
@@ -296,5 +297,199 @@ func TestDashboardDetailsChromeFlushChips(t *testing.T) {
 	}
 	if strings.Contains(got, "[‹] [›]") {
 		t.Fatalf("chips must be flush without a space: %q", got)
+	}
+}
+
+func TestImagineInstructionMatchesRust(t *testing.T) {
+	got := imagineInstruction("a sunset")
+	if !strings.Contains(got, "Call the image_gen tool immediately") {
+		t.Fatalf("%s", got)
+	}
+	if !strings.Contains(got, "verbatim") || !strings.Contains(got, "Prompt: a sunset") {
+		t.Fatalf("%s", got)
+	}
+	display, wire := expandSubmit("/imagine a sunset")
+	if display != "/imagine a sunset" {
+		t.Fatalf("display %q", display)
+	}
+	if wire != got {
+		t.Fatalf("wire mismatch")
+	}
+	if !strings.Contains(imagineUsageMessage(), "Usage: /imagine <description>") {
+		t.Fatal(imagineUsageMessage())
+	}
+	v := imagineVideoInstruction("orbit the city")
+	if !strings.Contains(v, "# Imagine Video") || !strings.Contains(v, "User prompt: orbit the city") {
+		t.Fatalf("%s", v)
+	}
+	if !strings.Contains(v, "`image_to_video`") {
+		t.Fatal("skill must name image_to_video")
+	}
+}
+
+func TestImagineSlashShowsUsageAndDisplay(t *testing.T) {
+	m := testModel(t)
+	m.runSlash("imagine", "")
+	if !strings.Contains(m.status, "Usage: /imagine") && (len(m.blocks) == 0 || !strings.Contains(m.blocks[len(m.blocks)-1].body, "Usage: /imagine")) {
+		t.Fatalf("status %q blocks %+v", m.status, m.blocks)
+	}
+}
+
+func TestVoiceOverlayToggleAndSend(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	m.screen = screenChat
+	m.runSlash("voice", "")
+	if m.overlay != overlayVoice || m.voice == nil || !m.voice.Active {
+		t.Fatalf("overlay %d voice %+v", m.overlay, m.voice)
+	}
+	body := stripANSI(m.renderVoiceBanner())
+	if !strings.Contains(body, "Recording") {
+		t.Fatalf("%s", body)
+	}
+	m.handleVoiceKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+	if m.voice.Transcript != "hello" {
+		t.Fatalf("%q", m.voice.Transcript)
+	}
+	m.handleVoiceKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.overlay == overlayVoice || (m.voice != nil && m.voice.Active) {
+		t.Fatal("esc must cancel without sending")
+	}
+	m.startVoice()
+	m.voice.Transcript = "typed dictation"
+	cmd := m.handleVoiceKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter must submit")
+	}
+	if m.overlay == overlayVoice {
+		t.Fatal("enter stops recording")
+	}
+}
+
+func TestVoiceChordIgnoredOnWelcome(t *testing.T) {
+	m := testModel(t)
+	m.screen = screenWelcome
+	m.toggleVoice()
+	if m.voice != nil {
+		t.Fatal("welcome has no dictation target")
+	}
+}
+
+func TestWorkflowsEmptyAndLiveRun(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	m.openWorkflows()
+	body := stripANSI(m.renderWorkflows(72))
+	if !strings.Contains(body, "No workflow runs in this session yet.") {
+		t.Fatalf("%s", body)
+	}
+	if !strings.Contains(body, "/ultracode") || !strings.Contains(body, "/deep-research") {
+		t.Fatalf("%s", body)
+	}
+	m.startWorkflow("ultracode", "Ultracode", "port the pager", "wire")
+	if len(m.workflows) != 1 || m.workflows[0].Status != "active" {
+		t.Fatalf("%+v", m.workflows)
+	}
+	m.openWorkflows()
+	list := stripANSI(m.renderWorkflows(72))
+	if !strings.Contains(list, "Ultracode") || !strings.Contains(list, "0/4 phases") {
+		t.Fatalf("%s", list)
+	}
+	m.handleWorkflowsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	detail := stripANSI(m.renderWorkflows(72))
+	if !strings.Contains(detail, "Scout") || !strings.Contains(detail, "p pause") {
+		t.Fatalf("%s", detail)
+	}
+	m.handleWorkflowsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if m.workflows[0].Status != "user_paused" {
+		t.Fatalf("status %s", m.workflows[0].Status)
+	}
+	m.handleWorkflowsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if m.workflows[0].Status != "cancelled" {
+		t.Fatalf("status %s", m.workflows[0].Status)
+	}
+}
+
+func TestMCPAlwaysAllowToolVsServer(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan bool, 1)
+	m.perm = &permAskMsg{
+		Tool: "mcp_linear_list_issues", Access: "mcp",
+		Server: "linear", Reply: ch,
+	}
+	m.initPermCard()
+	choices := m.permChoices()
+	if choices[0].ID != "always" || !strings.Contains(choices[0].Label, "Always allow: (Linear) List Issues") {
+		t.Fatalf("tool-scope %+v", choices)
+	}
+	m.handlePermissionKey(tea.KeyMsg{Type: tea.KeyRight})
+	choices = m.permChoices()
+	if !strings.Contains(choices[0].Label, "Always allow: all tools from Linear") {
+		t.Fatalf("server-scope %q", choices[0].Label)
+	}
+	if !m.permMCPServer {
+		t.Fatal("right selects server")
+	}
+	m.handlePermissionKey(tea.KeyMsg{Type: tea.KeyLeft})
+	if m.permMCPServer {
+		t.Fatal("left selects tool")
+	}
+	m.permMCPServer = true
+	m.applyPermChoice(permChoice{ID: "always"})
+	if !<-ch {
+		t.Fatal("allow")
+	}
+	found := false
+	for _, r := range m.sess.Allow {
+		if r == "mcp:linear" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected mcp:linear in %v", m.sess.Allow)
+	}
+}
+
+func TestTodoPaneIconsAndCounts(t *testing.T) {
+	m := testModel(t)
+	m.todos = []tools.TodoItem{
+		{ID: "1", Content: "Explore", Status: tools.TodoInProgress},
+		{ID: "2", Content: "Review", Status: tools.TodoPending},
+		{ID: "3", Content: "Done", Status: tools.TodoCompleted},
+		{ID: "4", Content: "Nope", Status: tools.TodoCancelled},
+	}
+	body := stripANSI(m.renderTodoPane(40))
+	if !strings.Contains(body, "TODOS") || !strings.Contains(body, "1/3") {
+		t.Fatalf("%s", body)
+	}
+	if !strings.Contains(body, "▶ Explore") || !strings.Contains(body, "□ Review") {
+		t.Fatalf("%s", body)
+	}
+	if !strings.Contains(body, "✓ Done") || !strings.Contains(body, "✗ Nope") {
+		t.Fatalf("%s", body)
+	}
+}
+
+func TestMarketplaceLocalCatalogHint(t *testing.T) {
+	m := testModel(t)
+	m.openExtensions(2)
+	if m.extTab != 2 {
+		t.Fatal("marketplace tab")
+	}
+	found := false
+	for _, it := range m.items {
+		if strings.Contains(it.Label, "Local catalog") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%+v", m.items)
 	}
 }
