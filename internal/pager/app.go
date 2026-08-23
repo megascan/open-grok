@@ -3,7 +3,6 @@ package pager
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"strconv"
 	"strings"
 	"time"
