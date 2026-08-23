@@ -2,6 +2,7 @@ package pager
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -160,6 +161,21 @@ func (m *model) mermaidOn() bool {
 	return m.cfg.PrefBool("render_mermaid", m.cfg.UI.RenderMermaid, true)
 }
 
+func fmtTokens(n int) string {
+	switch {
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 10_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dK", n/1000)
+	case n < 10_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	default:
+		return fmt.Sprintf("%dM", n/1_000_000)
+	}
+}
+
 func (m *model) renderHeader() string {
 	left := titleStyle.Render(" Entropy ") + dimStyle.Render(" "+version.String())
 	mid := fmt.Sprintf(" %s  ·  %s", m.opts.Model.Name, m.opts.Model.Provider.DisplayName())
@@ -182,14 +198,19 @@ func (m *model) renderHeader() string {
 		yolo = "plan"
 	}
 	sid := ""
-	ctx := "0 B"
+	ctx := "0 / 0"
 	if m.sess != nil {
 		sid = shortID(m.sess.ID)
 		n := 0
 		for _, msg := range m.sess.Messages {
 			n += len(msg.Content)
 		}
-		ctx = fmt.Sprintf("%d B", n)
+		tok := n / 4
+		win := m.opts.Model.ContextWindow
+		if win == 0 {
+			win = 128_000
+		}
+		ctx = fmt.Sprintf("%s / %s", fmtTokens(tok), fmtTokens(win))
 	}
 	goal := m.goalBadge()
 	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  Context: %s  ·  %s  ·  %s  ·  %s", sid, ctx, yolo, plan, goal))

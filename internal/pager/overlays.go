@@ -76,6 +76,12 @@ func (m *model) renderOverlay() string {
 		return m.renderBtwComposer(w)
 	case overlayBlock:
 		return m.renderBlockViewer(w)
+	case overlayShortcuts:
+		return m.renderShortcuts(w)
+	case overlayGoal:
+		return m.renderGoalDetail(w)
+	case overlayUsage:
+		return m.renderUsage(w)
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -99,7 +105,7 @@ func (m *model) renderOverlay() string {
 		overlayDoctor, overlayDocs, overlayTutorial, overlayExtensions,
 		overlayWorkflows, overlayPersonas, overlayAgents, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
-		overlayUsage, overlayQueue, overlayTasks, overlayCache,
+		overlayQueue, overlayTasks, overlayCache,
 		overlayMCP, overlayTimeline, overlayMemory:
 		return m.renderListModal(m.overlayTitle(), w)
 	default:
@@ -143,6 +149,10 @@ func (m *model) overlayTitle() string {
 		return "Announcements"
 	case overlayReleaseNotes:
 		return "Release notes"
+	case overlayShortcuts:
+		return "Shortcuts"
+	case overlayGoal:
+		return "Goal"
 	case overlayUsage:
 		return "Usage"
 	case overlayQueue:
@@ -290,6 +300,11 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayBlock {
 		return m.handleBlockViewerKey(msg), true
 	}
+	if m.overlay == overlayQueue {
+		if cmd, handled := m.handleQueueKey(msg); handled {
+			return cmd, true
+		}
+	}
 	if m.overlay == overlayResume && msg.String() == "d" {
 		if m.cursor < len(m.items) {
 			it := m.items[m.cursor]
@@ -397,10 +412,20 @@ func (m *model) previewOverlay() {
 }
 
 func (m *model) applyOverlayFilter() {
+	if m.overlay == overlayHistory {
+		saved := m.filter
+		m.items = fuzzyHistory(saved, m.history)
+		if m.cursor >= len(m.items) {
+			m.cursor = 0
+		}
+	}
 	if m.overlay == overlaySettings {
 		saved := m.cursor
 		m.fillSettings()
 		m.cursor = saved
+	}
+	if m.overlay == overlayHistory {
+		return
 	}
 	if m.filter == "" {
 		return
@@ -625,10 +650,45 @@ func repoName(cwd string) string {
 func (m *model) openHistory() {
 	m.overlay = overlayHistory
 	m.cursor = 0
-	m.items = nil
-	for i := len(m.history) - 1; i >= 0; i-- {
-		m.items = append(m.items, listItem{Key: m.history[i], Label: truncate(m.history[i], 60)})
+	m.filter = ""
+	m.items = fuzzyHistory("", m.history)
+}
+
+func fuzzyHistory(q string, hist []string) []listItem {
+	var items []listItem
+	for i := len(hist) - 1; i >= 0; i-- {
+		items = append(items, listItem{Key: hist[i], Label: truncate(hist[i], 70)})
 	}
+	q = strings.ToLower(strings.TrimSpace(q))
+	if q == "" {
+		return items
+	}
+	type scored struct {
+		it listItem
+		n  int
+	}
+	var hits []scored
+	for _, it := range items {
+		n := scoreName(q, it.Key)
+		if n == 0 && strings.Contains(strings.ToLower(it.Key), q) {
+			n = 1
+		}
+		if n > 0 {
+			hits = append(hits, scored{it, n})
+		}
+	}
+	for i := 0; i < len(hits); i++ {
+		for j := i + 1; j < len(hits); j++ {
+			if hits[j].n > hits[i].n {
+				hits[i], hits[j] = hits[j], hits[i]
+			}
+		}
+	}
+	out := make([]listItem, len(hits))
+	for i, h := range hits {
+		out[i] = h.it
+	}
+	return out
 }
 
 func (m *model) openModels() {

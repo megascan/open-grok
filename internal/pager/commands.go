@@ -175,7 +175,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "expand":
 		m.toggleFold(-1)
 	case "context":
-		m.appendSys(m.contextReport())
+		m.openUsage(0)
 	case "minimal":
 		m.screenMd = modeMinimal
 		m.persistUI()
@@ -279,7 +279,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			return m.copyText("Entropy session "+m.sess.ID+" · "+m.opts.Model.Name+"\n"+m.sess.ExportMarkdown(), false)
 		}
 	case "session-info":
-		m.appendSys(m.sessionInfo())
+		m.openUsage(2)
 	case "rename":
 		if m.sess != nil && arg != "" {
 			m.sess.Title = arg
@@ -459,9 +459,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "import-claude":
 		m.openImportClaude()
 	case "usage":
-		m.overlay = overlayUsage
-		m.items = m.usageItems()
-		m.cursor = 0
+		m.openUsage(1)
 	case "cache":
 		m.overlay = overlayCache
 		n := 0
@@ -473,20 +471,13 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.items = []listItem{{Label: "prompt bytes in session", Detail: strconv.Itoa(n)}}
 		m.cursor = 0
 	case "queue":
-		m.overlay = overlayQueue
-		m.items = nil
-		for i, q := range m.queue {
-			m.items = append(m.items, listItem{Label: strconv.Itoa(i + 1), Detail: q})
-		}
-		if len(m.items) == 0 {
-			m.items = []listItem{{Label: "(empty)"}}
-		}
 		if strings.EqualFold(arg, "clear") {
 			m.queue = nil
 			m.appendSys("queue cleared")
 			m.overlay = overlayNone
+			break
 		}
-		m.cursor = 0
+		m.openQueue()
 	case "tasks":
 		m.overlay = overlayTasks
 		m.items = nil
@@ -684,7 +675,7 @@ func (m *model) handleGoal(arg string) tea.Cmd {
 	gs := parseGoalSlash(arg)
 	switch gs.Verb {
 	case goalVerbStatus:
-		m.appendBlock(block{kind: blockGoal, title: "status", body: m.goalStatusText()})
+		m.openGoalDetail()
 	case goalVerbPause:
 		if m.sess.Goal.PauseUser() {
 			_ = m.sess.AppendUpdate(map[string]any{"type": "goal_mode_state", "status": "user_paused"})

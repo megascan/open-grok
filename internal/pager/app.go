@@ -107,6 +107,8 @@ const (
 	overlayRewind
 	overlayBtw
 	overlayBlock
+	overlayShortcuts
+	overlayGoal
 )
 
 type permMode int
@@ -178,6 +180,10 @@ type model struct {
 	blockTitle                                                            string
 	blockBody                                                             string
 	blockScroll                                                           int
+	usageTab                                                              int
+	shortcutExpand                                                        int
+	gitBranch                                                             string
+	gitWorktree                                                           bool
 	question                                                              *qAskMsg
 	qCursor                                                               int
 	qFree                                                                 string
@@ -504,6 +510,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayShortcuts {
+		return m.handleShortcutsKey(msg), true
+	}
+	if m.overlay == overlayGoal {
+		return m.handleGoalOverlayKey(msg), true
+	}
+	if m.overlay == overlayUsage {
+		return m.handleUsageKey(msg), true
+	}
 	if m.overlay == overlayRewind {
 		return m.handleRewindKey(msg), true
 	}
@@ -529,6 +544,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if m.overlay == overlayPlan && m.plan != nil {
 		return m.handlePlanKey(msg), true
+	}
+	if m.overlay == overlayShortcuts {
+		return m.handleShortcutsKey(msg), true
+	}
+	if m.overlay == overlayGoal {
+		return m.handleGoalOverlayKey(msg), true
+	}
+	if m.overlay == overlayUsage {
+		return m.handleUsageKey(msg), true
+	}
+	if m.overlay == overlayQueue {
+		if cmd, handled := m.handleQueueKey(msg); handled {
+			return cmd, true
+		}
 	}
 	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
 		return m.handleOverlayKey(msg)
@@ -606,6 +635,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.openDashboard()
 		return nil, true
+	case "ctrl+x", "ctrl+.":
+		m.openShortcuts()
+		return nil, true
+	case "g":
+		if m.focusScroll {
+			m.openGoalDetail()
+			return nil, true
+		}
+	case "?":
+		if m.focusScroll {
+			m.openShortcuts()
+			return nil, true
+		}
 	case "[", "]":
 		if m.dashDetails {
 			delta := 1

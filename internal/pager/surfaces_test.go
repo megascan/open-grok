@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/hooks"
 	"github.com/megascan/open-grok/internal/types"
@@ -244,5 +245,132 @@ func TestBlockViewerOpensFromPermission(t *testing.T) {
 	m.handleBlockViewerKey(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.overlay != overlayPermission {
 		t.Fatalf("esc returns to permission, got %d", m.overlay)
+	}
+}
+
+func TestWelcomeHeroBoxAndTips(t *testing.T) {
+	m := testModel(t)
+	if err := auth.SaveAPIKey(types.ProviderXAI, "xai-test-not-real", false); err != nil {
+		t.Fatal(err)
+	}
+	m.width, m.height = 100, 30
+	m.refreshWelcome()
+	got := m.viewWelcome()
+	if !strings.Contains(got, "Thanks for trying Entropy") {
+		t.Fatalf("hero subtitle missing:\n%s", got)
+	}
+	if !strings.Contains(got, "Type a message...") {
+		t.Fatal("welcome prompt box")
+	}
+	if !strings.Contains(got, quitChord()+" quit") {
+		t.Fatalf("quit chord %q not in view", quitChord())
+	}
+}
+
+func TestVSCodeFamilyQuitChord(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "vscode")
+	if quitChord() != "ctrl+d" {
+		t.Fatal(quitChord())
+	}
+	t.Setenv("TERM_PROGRAM", "xterm")
+	t.Setenv("VSCODE_INJECTION", "")
+	t.Setenv("VSCODE_GIT_IPC_HANDLE", "")
+	if vscodeFamily() {
+		t.Fatal("xterm is not vscode family")
+	}
+}
+
+func TestShortcutsCheatsheet(t *testing.T) {
+	m := testModel(t)
+	m.openShortcuts()
+	if m.overlay != overlayShortcuts {
+		t.Fatal("overlay")
+	}
+	body := m.renderShortcuts(60)
+	if !strings.Contains(body, "Essentials") || !strings.Contains(body, "Send") {
+		t.Fatalf("%s", body)
+	}
+	m.filter = "rewind"
+	m.items = m.shortcutItems(m.filter)
+	if len(m.items) == 0 {
+		t.Fatal("fuzzy filter")
+	}
+}
+
+func TestUsageTabs(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	m.runSlash("usage", "")
+	if m.overlay != overlayUsage || m.usageTab != 1 {
+		t.Fatalf("usage tab %d overlay %d", m.usageTab, m.overlay)
+	}
+	m.handleUsageKey(tea.KeyMsg{Type: tea.KeyLeft})
+	if m.usageTab != 0 {
+		t.Fatalf("h/l wrap got %d", m.usageTab)
+	}
+	body := m.renderUsage(72)
+	if !strings.Contains(body, "Context usage") || !strings.Contains(body, "Session info") {
+		t.Fatalf("%s", body)
+	}
+}
+
+func TestHistoryFuzzyRanksPrefix(t *testing.T) {
+	items := fuzzyHistory("comp", []string{"compare hashes", "unrelated", "compact the log"})
+	if len(items) < 2 {
+		t.Fatalf("%+v", items)
+	}
+	if !strings.Contains(items[0].Key, "comp") {
+		t.Fatalf("top %q", items[0].Key)
+	}
+}
+
+func TestQueueReorderAndDelete(t *testing.T) {
+	m := testModel(t)
+	m.queue = []string{"first", "second", "third"}
+	m.openQueue()
+	if !strings.Contains(m.items[0].Label, "#1") {
+		t.Fatalf("%v", m.items)
+	}
+	m.cursor = 1
+	m.handleQueueKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'K'}})
+	if m.queue[0] != "second" || m.queue[1] != "first" {
+		t.Fatalf("%v", m.queue)
+	}
+	m.cursor = 0
+	m.handleQueueKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if len(m.queue) != 2 || m.queue[0] != "first" {
+		t.Fatalf("after delete %v", m.queue)
+	}
+}
+
+func TestGoalOverlay(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	bud := int64(8000)
+	if err := m.sess.Goal.Create("ship the tui", &bud); err != nil {
+		t.Fatal(err)
+	}
+	m.openGoalDetail()
+	if m.overlay != overlayGoal {
+		t.Fatal("overlay")
+	}
+	body := m.renderGoalDetail(72)
+	if !strings.Contains(body, "ship the tui") || !strings.Contains(body, "budget") {
+		t.Fatalf("%s", body)
+	}
+}
+
+func TestFmtTokensAndOSC52Tmux(t *testing.T) {
+	if fmtTokens(1500) != "1.5K" {
+		t.Fatalf("%s", fmtTokens(1500))
+	}
+	t.Setenv("TMUX", "/tmp/tmux-1000/default")
+	got := copyToast(true, false, "/tmp/x", "hi", false)
+	if !strings.Contains(got, "allow-passthrough") {
+		t.Fatalf("%s", got)
 	}
 }

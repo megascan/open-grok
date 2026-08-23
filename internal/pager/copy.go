@@ -92,8 +92,12 @@ func copyToast(nativeOK, oscOff bool, backup, s string, withStats bool) string {
 		return "Clipboard unreachable — wrote " + disp
 	case oscOff:
 		return "Copied!" + stats
+	case os.Getenv("TMUX") != "":
+		return "Copied via OSC 52. If paste fails in tmux, set allow-passthrough on." + stats
+	case vscodeFamily():
+		return "Copied via OSC 52. VS Code SSH: enable the remote terminal clipboard." + stats
 	case runtime.GOOS == "linux":
-		return "Copied via OSC 52."
+		return "Copied via OSC 52." + stats
 	default:
 		return "Copied!" + stats
 	}
