@@ -39,8 +39,9 @@ type Runtime struct {
 
 // RunTurn samples until the model stops or maxTurns, dispatching tools.
 func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, emit func(Event)) error {
-	ensureRuntime(sess, rt.Model)
+	ensureRuntime(sess, rt)
 	sess.EnsureMCP(ctx)
+	sess.Approve = rt.Approve
 	if !rt.Model.ToolsEnabled() {
 		rt.Pack = nil
 	} else {
@@ -151,8 +152,8 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	return fmt.Errorf("max tool turns (%d) exceeded", maxTurns)
 }
 
-func ensureRuntime(sess *Session, model catalog.Model) {
-	mode := EffectiveToolMode(model)
+func ensureRuntime(sess *Session, rt Runtime) {
+	mode := EffectiveToolMode(rt.Model)
 	if mode != types.ToolModeCodeMode && mode != types.ToolModeCodeModeOnly {
 		return
 	}
@@ -189,6 +190,9 @@ func bindTask(sess *Session, rt Runtime) []tools.Tool {
 				child.YOLO = parent.YOLO
 				child.Allow = parent.Allow
 				child.Deny = parent.Deny
+				child.ExtraDirs = append([]string(nil), parent.ExtraDirs...)
+				child.Approve = parent.Approve
+				child.PermMode = parent.PermMode
 				child.Plan = workspace.NewInactive()
 				child.Plan.PlanFile = filepath.Join(child.Dir, "plan.md")
 				child.SubagentDepth = parent.SubagentDepth + 1
@@ -307,16 +311,23 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		Path:       path,
 		Command:    toolCommand(args),
 		AlwaysYOLO: sess.YOLO,
+		AutoMode:   sess.PermMode == "auto",
 		PlanActive: sess.Plan.Active,
 		PlanFile:   sess.Plan.PlanFile,
 		AllowRules: sess.Allow,
 		DenyRules:  sess.Deny,
+		ExtraRoots: sess.ExtraDirs,
 	})
 	if dec == workspace.Deny {
 		return tools.Result{Content: "permission denied: " + reason, IsError: true}
 	}
 	if dec == workspace.Ask {
-		return tools.Result{Content: "permission required for " + t.Name() + " (pass --always-approve to auto-approve)", IsError: true}
+		if sess.Approve == nil {
+			return tools.Result{Content: "permission required for " + t.Name() + " (pass --always-approve to auto-approve)", IsError: true}
+		}
+		if !sess.Approve(t, args) {
+			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}
+		}
 	}
 	tc := tools.Context{
 		CWD:           sess.CWD,
@@ -332,17 +343,33 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 }
 
 func compact(s *Session) {
+	compactSession(s, false, "")
+}
+
+func compactSession(s *Session, force bool, note string) {
 	var n int
 	for _, m := range s.Messages {
 		n += len(m.Content)
 	}
-	if n < 120_000 || len(s.Messages) < 8 {
+	if !force && (n < 120_000 || len(s.Messages) < 8) {
 		return
 	}
-	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_started", "bytes": n})
-	keep := s.Messages[len(s.Messages)-6:]
-	summary := types.Message{Role: types.RoleSystem, Content: "Earlier turns were compacted. Continue from the recent tail."}
-	s.Messages = append([]types.Message{s.Messages[0], summary}, keep...)
+	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_started", "bytes": n, "manual": force, "note": note})
+	keepN := 6
+	if len(s.Messages) < keepN+1 {
+		keepN = len(s.Messages)
+	}
+	keep := s.Messages[len(s.Messages)-keepN:]
+	summary := "Earlier turns were compacted. Continue from the recent tail."
+	if note != "" {
+		summary += " Keep: " + note
+	}
+	head := []types.Message{}
+	if len(s.Messages) > 0 {
+		head = append(head, s.Messages[0])
+	}
+	s.Messages = append(head, types.Message{Role: types.RoleSystem, Content: summary})
+	s.Messages = append(s.Messages, keep...)
 	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_completed", "kept": len(s.Messages)})
 	_ = s.Persist()
 }

@@ -3,6 +3,7 @@ package pager
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/megascan/open-grok/internal/goals"
@@ -22,10 +23,12 @@ const (
 )
 
 type block struct {
-	kind  blockKind
-	title string
-	body  string
-	err   bool
+	kind   blockKind
+	title  string
+	body   string
+	err    bool
+	at     time.Time
+	folded bool
 }
 
 func (m *model) transcriptWidth() int {
@@ -47,7 +50,7 @@ func (m *model) sidebarWidth() int {
 }
 
 func (m *model) showSidebar() bool {
-	return m.width >= 92
+	return m.screenMd != modeMinimal && m.width >= 92
 }
 
 func (m *model) renderTranscript() string {
@@ -63,11 +66,18 @@ func (m *model) renderTranscript() string {
 }
 
 func (m *model) renderBlock(bl block, w int) string {
+	if bl.folded {
+		return dimStyle.Render("▸ " + truncate(bl.body, 60))
+	}
+	stamp := ""
+	if m.timestamps && !bl.at.IsZero() {
+		stamp = dimStyle.Render(" " + bl.at.Format("15:04:05"))
+	}
 	switch bl.kind {
 	case blockUser:
-		return userLabel.Render("YOU") + "\n" + renderMarkdown(bl.body, w)
+		return userLabel.Render("YOU") + stamp + "\n" + renderMarkdown(bl.body, w)
 	case blockAgent:
-		return agentLabel.Render("OPEN GROK") + "\n" + renderMarkdown(bl.body, w)
+		return agentLabel.Render("OPEN GROK") + stamp + "\n" + renderMarkdown(bl.body, w)
 	case blockThinking:
 		return dimStyle.Render("thinking") + "\n" + dimStyle.Render(bl.body)
 	case blockTool:
@@ -103,15 +113,24 @@ func (m *model) renderHeader() string {
 	}
 	right := " " + status + " "
 	plan := "plan off"
-	if m.sess.Plan.Active {
+	if m.sess != nil && m.sess.Plan.Active {
 		plan = "plan ON"
 	}
 	yolo := "ask"
-	if m.sess.YOLO {
+	switch m.permMode {
+	case permAlways:
 		yolo = "yolo"
+	case permAuto:
+		yolo = "auto"
+	case permPlan:
+		yolo = "plan"
+	}
+	sid := ""
+	if m.sess != nil {
+		sid = shortID(m.sess.ID)
 	}
 	goal := m.goalBadge()
-	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  %s  ·  %s  ·  %s", shortID(m.sess.ID), yolo, plan, goal))
+	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  %s  ·  %s  ·  %s", sid, yolo, plan, goal))
 	top := lipgloss.JoinHorizontal(lipgloss.Top, left, dimStyle.Render(mid), lipgloss.NewStyle().Width(max(0, m.width-lipgloss.Width(left)-lipgloss.Width(mid)-lipgloss.Width(right))).Render(""), dimStyle.Render(right))
 	if m.width > 0 {
 		top = lipgloss.NewStyle().Width(m.width).MaxWidth(m.width).Render(top)
@@ -120,6 +139,9 @@ func (m *model) renderHeader() string {
 }
 
 func (m *model) goalBadge() string {
+	if m.sess == nil || m.sess.Goal == nil {
+		return dimStyle.Render("goal off")
+	}
 	snap := m.sess.Goal.Snapshot()
 	if snap == nil {
 		return dimStyle.Render("goal off")
@@ -140,6 +162,9 @@ func (m *model) goalBadge() string {
 
 func (m *model) renderSidebar() string {
 	w := m.sidebarWidth() - 2
+	if m.sess == nil || m.sess.Goal == nil {
+		return panelStyle.Width(m.sidebarWidth() - 2).Height(m.vp.Height).Render(goalTitle.Render("GOALS") + "\n" + dimStyle.Render("No session."))
+	}
 	snap := m.sess.Goal.Snapshot()
 	var b strings.Builder
 	b.WriteString(goalTitle.Render("GOALS") + "\n")
@@ -195,14 +220,20 @@ func (m *model) renderSidebar() string {
 }
 
 func (m *model) renderFooter() string {
-	hint := "enter send  ·  ctrl+c quit  ·  /goal  ·  /help"
+	hint := "enter send  ·  shift+tab mode  ·  ctrl+\\ dashboard  ·  / for commands"
+	if m.multiline {
+		hint = "alt+enter send  ·  enter newline  ·  " + hint
+	}
+	if m.focusScroll {
+		hint = "tab prompt  ·  j/k or arrows scroll  ·  y copy block"
+	}
 	val := strings.TrimSpace(m.ta.Value())
 	if strings.HasPrefix(val, "/") {
-		matches := matchingSlash(val)
+		matches := FuzzySlash(val, m.screenMd)
 		if len(matches) > 0 {
 			var parts []string
 			for i, c := range matches {
-				if i >= 6 {
+				if i >= 8 {
 					break
 				}
 				parts = append(parts, "/"+c.Name)
@@ -210,7 +241,25 @@ func (m *model) renderFooter() string {
 			hint = strings.Join(parts, "  ")
 		}
 	}
+	if m.copied != "" {
+		hint = okStyle.Render("Copied!  backup " + m.copied)
+	}
 	return dimStyle.Render(hint)
+}
+
+func (m *model) viewChat() string {
+	head := m.renderHeader()
+	body := m.vp.View()
+	if m.showSidebar() {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, m.vp.View(), m.renderSidebar())
+	}
+	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
+	hud := ""
+	if m.scrollHUD {
+		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
+	}
+	return head + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n" +
+		hud + body + "\n" + input + "\n" + m.renderFooter()
 }
 
 func (m *model) appendBlock(bl block) {

@@ -51,10 +51,11 @@ func (Skill) Execute(_ context.Context, tc Context, args json.RawMessage) Result
 
 // SkillInfo is a discovered SKILL.md.
 type SkillInfo struct {
-	Name        string
-	Description string
-	Path        string
-	Body        string
+	Name          string
+	Description   string
+	Path          string
+	Body          string
+	UserInvocable bool
 }
 
 // DiscoverSkills walks well-known skills directories. Vendor default Cursor/Claude
@@ -114,6 +115,8 @@ func parseSkill(path string) SkillInfo {
 						info.Name = v
 					case "description":
 						info.Description = v
+					case "user-invocable":
+						info.UserInvocable = v == "true" || v == "yes" || v == "1"
 					}
 				}
 			}

@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/sampler"
+	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/types"
 )
 
@@ -150,5 +152,87 @@ func TestUpdateGoalTurnRecordsProgressWithoutCompleting(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("active goals must inject a model-facing reminder")
+	}
+}
+
+func TestApproveCallbackAllowsAsk(t *testing.T) {
+	t.Setenv("OPENGROK_HOME", t.TempDir())
+	config.ResetHomeForTest()
+	cwd := t.TempDir()
+	model := catalog.Model{
+		ID: "mock", Model: "mock", Name: "mock",
+		Provider: types.ProviderFireworks, APIBackend: types.BackendChat,
+		BaseURL: "https://example.invalid/v1",
+	}
+	sess, err := agent.NewSession(cwd, model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := false
+	n := 0
+	sseTool := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"write_file","arguments":"{\"path\":\"ok.txt\",\"contents\":\"yes\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n"
+	sseDone := `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n"
+	httpDo := rt(func(r *http.Request) (*http.Response, error) {
+		n++
+		body := sseDone
+		if n == 1 {
+			body = sseTool
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	err = agent.RunTurn(context.Background(), sess, agent.Runtime{
+		Model: model, Bearer: "k", HTTP: sampler.HTTPDoer(httpDo),
+		Approve: func(t tools.Tool, args json.RawMessage) bool {
+			asked = true
+			return t.Name() == "write_file"
+		},
+	}, "write", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !asked {
+		t.Fatal("Ask must invoke Approve")
+	}
+	got, err := os.ReadFile(filepath.Join(cwd, "ok.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "yes" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestApproveRejectStopsTheTool(t *testing.T) {
+	t.Setenv("OPENGROK_HOME", t.TempDir())
+	config.ResetHomeForTest()
+	cwd := t.TempDir()
+	model := catalog.Model{
+		ID: "mock", Model: "mock", Name: "mock",
+		Provider: types.ProviderFireworks, APIBackend: types.BackendChat,
+		BaseURL: "https://example.invalid/v1",
+	}
+	sess, err := agent.NewSession(cwd, model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	sseTool := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"write_file","arguments":"{\"path\":\"nope.txt\",\"contents\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n"
+	sseDone := `data: {"choices":[{"delta":{"content":"denied"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n"
+	httpDo := rt(func(r *http.Request) (*http.Response, error) {
+		n++
+		body := sseDone
+		if n == 1 {
+			body = sseTool
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	if err := agent.RunTurn(context.Background(), sess, agent.Runtime{
+		Model: model, Bearer: "k", HTTP: sampler.HTTPDoer(httpDo),
+		Approve: func(tools.Tool, json.RawMessage) bool { return false },
+	}, "write", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "nope.txt")); err == nil {
+		t.Fatal("rejected write must not land")
 	}
 }

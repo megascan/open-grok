@@ -49,6 +49,27 @@ func hookDirs(cwd string) []string {
 	return dirs
 }
 
+// Dirs returns project then user hook directories.
+func Dirs(cwd string) []string { return hookDirs(cwd) }
+
+// List names executable hook scripts discovered on disk.
+func List(cwd string) []string {
+	var out []string
+	for _, dir := range hookDirs(cwd) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out
+}
+
 func runHook(ctx context.Context, path string, ev Event) (int, string, error) {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {

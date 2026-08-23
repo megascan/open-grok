@@ -2,7 +2,7 @@ package pager
 
 import "github.com/charmbracelet/lipgloss"
 
-const (
+var (
 	colCyan    = "51"
 	colPink    = "219"
 	colGold    = "214"
@@ -57,5 +57,14 @@ var (
 			Background(lipgloss.Color("17")).
 			Foreground(lipgloss.Color("231")).
 			Bold(true).
+			Padding(0, 1)
+	modalBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("51")).
+			Padding(1, 2).
+			Background(lipgloss.Color("236"))
+	selStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("231")).
+			Background(lipgloss.Color("63")).
 			Padding(0, 1)
 )

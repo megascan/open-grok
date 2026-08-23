@@ -54,10 +54,32 @@ func TestDenyRuleBeatsAllow(t *testing.T) {
 	}
 }
 
-func TestReadAutoAllows(t *testing.T) {
-	d, _ := workspace.Check(workspace.Request{Tool: "read_file", Access: types.AccessRead})
+func TestAskNeedsApproval(t *testing.T) {
+	d, _ := workspace.Check(workspace.Request{Tool: "write_file", Access: types.AccessEdit, Path: "/tmp/x"})
+	if d != workspace.Ask {
+		t.Fatalf("edits ask, got %s", d)
+	}
+}
+
+func TestAutoModeAllowsEditsButNotBash(t *testing.T) {
+	d, _ := workspace.Check(workspace.Request{Tool: "write_file", Access: types.AccessEdit, Path: "/tmp/x", AutoMode: true})
 	if d != workspace.Allow {
-		t.Fatalf("reads auto-allow, got %s", d)
+		t.Fatalf("auto allows edit, got %s", d)
+	}
+	d, _ = workspace.Check(workspace.Request{Tool: "bash", Access: types.AccessBash, Command: "ls", AutoMode: true})
+	if d != workspace.Ask {
+		t.Fatalf("auto still asks bash, got %s", d)
+	}
+}
+
+func TestExtraRootAllowsEdit(t *testing.T) {
+	root := t.TempDir()
+	d, _ := workspace.Check(workspace.Request{
+		Tool: "write_file", Access: types.AccessEdit,
+		Path: filepath.Join(root, "a.go"), ExtraRoots: []string{root},
+	})
+	if d != workspace.Allow {
+		t.Fatalf("extra root must allow, got %s", d)
 	}
 }
 

@@ -28,10 +28,12 @@ type Request struct {
 	Path       string
 	Command    string
 	AlwaysYOLO bool
+	AutoMode   bool
 	PlanActive bool
 	PlanFile   string
 	AllowRules []string
 	DenyRules  []string
+	ExtraRoots []string
 }
 
 // Check runs the permission pipeline. Deny wins over allow.
@@ -55,12 +57,41 @@ func Check(req Request) (Decision, string) {
 			return Allow, "allow rule: " + rule
 		}
 	}
+	if extraRootAllows(req) {
+		return Allow, "working-dir allow"
+	}
+	if req.AutoMode && req.Access != types.AccessBash {
+		return Allow, "auto permission mode"
+	}
 	switch req.Access {
 	case types.AccessRead, types.AccessNone:
 		return Allow, "read/none auto-allow"
 	default:
 		return Ask, "needs approval"
 	}
+}
+
+func extraRootAllows(req Request) bool {
+	if req.Path == "" || len(req.ExtraRoots) == 0 {
+		return false
+	}
+	if req.Access != types.AccessRead && req.Access != types.AccessEdit {
+		return false
+	}
+	abs, err := filepath.Abs(req.Path)
+	if err != nil {
+		return false
+	}
+	for _, root := range req.ExtraRoots {
+		r, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		if abs == r || strings.HasPrefix(abs, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // planModeEditGate is the hard reject that runs before hooks/permissions.

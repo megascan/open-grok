@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,31 +23,36 @@ import (
 
 // Session is one persisted conversation.
 type Session struct {
-	ID             string                 `json:"id"`
-	Title          string                 `json:"title,omitempty"`
-	CWD            string                 `json:"cwd"`
-	CreatedAt      time.Time              `json:"created_at"`
-	UpdatedAt      time.Time              `json:"updated_at"`
-	ModelID        string                 `json:"model_id"`
-	Provider       types.Provider         `json:"provider"`
-	Backend        types.ApiBackend       `json:"backend"`
-	Messages       []types.Message        `json:"messages"`
-	EverUsedNonXAI bool                   `json:"ever_used_codex"`
-	Dir            string                 `json:"-"`
-	Plan           workspace.PlanTracker  `json:"-"`
-	Goal           *goals.Tracker         `json:"-"`
-	YOLO           bool                   `json:"-"`
-	Allow          []string               `json:"-"`
-	Deny           []string               `json:"-"`
-	JS             *codemode.Runtime      `json:"-"`
-	SubagentDepth  int                    `json:"-"`
-	Team           *tools.TeamBox         `json:"-"`
-	MCPClients     []*mcp.Client          `json:"-"`
-	MCPTools       []tools.Tool           `json:"-"`
-	Inbox          []sessionbus.Delivered `json:"-"`
-	inboxMu        sync.Mutex             `json:"-"`
-	Children       map[string]*Session    `json:"-"`
-	mcpLoaded      bool                   `json:"-"`
+	ID             string                                 `json:"id"`
+	Title          string                                 `json:"title,omitempty"`
+	CWD            string                                 `json:"cwd"`
+	CreatedAt      time.Time                              `json:"created_at"`
+	UpdatedAt      time.Time                              `json:"updated_at"`
+	ModelID        string                                 `json:"model_id"`
+	Provider       types.Provider                         `json:"provider"`
+	Backend        types.ApiBackend                       `json:"backend"`
+	Messages       []types.Message                        `json:"messages"`
+	EverUsedNonXAI bool                                   `json:"ever_used_codex"`
+	Dir            string                                 `json:"-"`
+	Plan           workspace.PlanTracker                  `json:"-"`
+	Goal           *goals.Tracker                         `json:"-"`
+	YOLO           bool                                   `json:"-"`
+	Allow          []string                               `json:"-"`
+	Deny           []string                               `json:"-"`
+	JS             *codemode.Runtime                      `json:"-"`
+	SubagentDepth  int                                    `json:"-"`
+	Team           *tools.TeamBox                         `json:"-"`
+	MCPClients     []*mcp.Client                          `json:"-"`
+	MCPTools       []tools.Tool                           `json:"-"`
+	Inbox          []sessionbus.Delivered                 `json:"-"`
+	inboxMu        sync.Mutex                             `json:"-"`
+	Children       map[string]*Session                    `json:"-"`
+	mcpLoaded      bool                                   `json:"-"`
+	ExtraDirs      []string                               `json:"-"`
+	Effort         string                                 `json:"effort,omitempty"`
+	Swarm          bool                                   `json:"-"`
+	PermMode       string                                 `json:"-"`
+	Approve        func(tools.Tool, json.RawMessage) bool `json:"-"`
 }
 
 // NewSession creates a session directory under ~/.opengrok/sessions/<cwd>/<id>.
@@ -96,6 +102,7 @@ func LoadSession(cwd, id string) (*Session, error) {
 	s.Dir = dir
 	s.Plan.PlanFile = filepath.Join(dir, "plan.md")
 	s.Goal = goals.Load(dir)
+	s.ExtraDirs = loadWorkingDirs(dir)
 	s.attach()
 	return &s, nil
 }
@@ -255,7 +262,78 @@ func ForkSession(src *Session) (*Session, error) {
 	dst.YOLO = src.YOLO
 	dst.Allow = src.Allow
 	dst.Deny = src.Deny
+	dst.ExtraDirs = append([]string(nil), src.ExtraDirs...)
 	return dst, dst.Persist()
+}
+
+// DeleteSession removes the session directory from disk.
+func DeleteSession(s *Session) error {
+	if s == nil || s.Dir == "" {
+		return nil
+	}
+	liveSessions.Delete(s.ID)
+	return os.RemoveAll(s.Dir)
+}
+
+// CompactNow forces a compaction checkpoint, keeping a tail of recent turns.
+func CompactNow(s *Session, note string) {
+	compactSession(s, true, note)
+}
+
+// AddWorkingDir widens this session's read/edit roots without changing CWD.
+func (s *Session) AddWorkingDir(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("%s is not a directory", abs)
+	}
+	for _, d := range s.ExtraDirs {
+		if d == abs {
+			return nil
+		}
+	}
+	s.ExtraDirs = append(s.ExtraDirs, abs)
+	return saveWorkingDirs(s)
+}
+
+// RemoveWorkingDir drops an extra root.
+func (s *Session) RemoveWorkingDir(path string) error {
+	abs, _ := filepath.Abs(path)
+	var keep []string
+	for _, d := range s.ExtraDirs {
+		if d != abs && d != path {
+			keep = append(keep, d)
+		}
+	}
+	s.ExtraDirs = keep
+	return saveWorkingDirs(s)
+}
+
+func loadWorkingDirs(dir string) []string {
+	data, err := os.ReadFile(filepath.Join(dir, "working_dirs.json"))
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	_ = json.Unmarshal(data, &dirs)
+	return dirs
+}
+
+func saveWorkingDirs(s *Session) error {
+	if s.Dir == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(s.ExtraDirs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(s.Dir, "working_dirs.json"), data, 0o600)
 }
 
 func drainInbox(s *Session) []types.Message {

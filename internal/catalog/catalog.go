@@ -107,6 +107,11 @@ func LookupIn(id string, extra []Model) (Model, bool) {
 			return m, true
 		}
 	}
+	for _, m := range pool {
+		if strings.EqualFold(m.Name, id) {
+			return m, true
+		}
+	}
 	return Model{}, false
 }
 
