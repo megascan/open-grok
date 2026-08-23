@@ -547,7 +547,11 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		if strings.TrimSpace(arg) != "" {
 			return m.submit("/gboom " + arg)
 		}
-		m.appendSys("💥 gboom")
+		if !detectGraphicsProtocol() {
+			m.appendSys(gboomNoGraphicsToast)
+			break
+		}
+		m.openGboom()
 	case "scroll-debug":
 		m.scrollHUD = !m.scrollHUD
 	case "debug":

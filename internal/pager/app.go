@@ -116,6 +116,7 @@ const (
 	overlayLineView
 	overlayVoice
 	overlayLogin
+	overlayGboom
 )
 
 type permMode int
@@ -189,6 +190,7 @@ type model struct {
 	permPatternMode                                                       bool
 	permMCPServer                                                         bool
 	voice                                                                 *voiceState
+	gboom                                                                 *gboomHUD
 	workflows                                                             []workflowRun
 	wfDetail, wfPhase                                                     int
 	wfActiveID                                                            string

@@ -97,6 +97,8 @@ func (m *model) renderOverlay() string {
 		return ""
 	case overlayLogin:
 		return m.renderLoginOverlay(w)
+	case overlayGboom:
+		return m.renderGboom()
 	case overlayFiles, overlayPalette, overlayHistory:
 		return ""
 	case overlayPermission:
@@ -189,6 +191,8 @@ func (m *model) overlayTitle() string {
 		return "Jump to which turn?"
 	case overlayWorktree:
 		return worktreeDialogTitle
+	case overlayGboom:
+		return "GBOOM"
 	}
 	return "Entropy"
 }
@@ -490,6 +494,9 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayGboom {
+		return m.handleGboomKey(msg), true
+	}
 	if m.overlay == overlayLogin {
 		return m.handleLoginKey(msg), true
 	}
