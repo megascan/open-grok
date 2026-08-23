@@ -497,13 +497,9 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "tutorial":
 		m.openTutorial()
 	case "config-agents":
-		m.overlay = overlayAgents
-		m.items = dirListing(append([]string{filepath.Join(config.Home(), "agents")}, config.ProjectSubdir(m.opts.CWD, "agents")...)...)
-		m.cursor = 0
+		m.openAgents(agentsTabAgents)
 	case "personas":
-		m.overlay = overlayPersonas
-		m.items = dirListing(append([]string{filepath.Join(config.Home(), "personas")}, config.ProjectSubdir(m.opts.CWD, "personas")...)...)
-		m.cursor = 0
+		m.openAgents(agentsTabPersonas)
 	case "gboom":
 		m.appendSys("💥 gboom")
 	case "scroll-debug":
@@ -614,30 +610,7 @@ func (m *model) handleMemory(arg string) tea.Cmd {
 		_ = config.Save(m.cfg)
 		m.appendSys("memory off")
 	default:
-		if !m.cfg.MemoryEnabled() {
-			m.appendSys("memory is off — /memory on or ENTROPY_MEMORY=1")
-			break
-		}
-		m.overlay = overlayMemory
-		m.cursor = 0
-		m.items = nil
-		dir := filepath.Join(config.Home(), "memory")
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-			if arg != "" && !strings.Contains(strings.ToLower(e.Name()+string(data)), strings.ToLower(arg)) {
-				continue
-			}
-			m.items = append(m.items, listItem{Key: e.Name(), Label: e.Name(), Detail: truncate(string(data), 80)})
-		}
-		if len(m.items) == 0 {
-			body, _ := json.Marshal(map[string]string{"query": arg})
-			res := tools.MemorySearch{}.Execute(context.Background(), tools.Context{}, body)
-			m.items = []listItem{{Label: res.Content}}
-		}
+		m.openMemory(strings.TrimSpace(arg))
 	}
 	m.refreshVP()
 	return nil

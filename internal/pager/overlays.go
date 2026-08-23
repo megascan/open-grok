@@ -82,6 +82,12 @@ func (m *model) renderOverlay() string {
 		return m.renderGoalDetail(w)
 	case overlayUsage:
 		return m.renderUsage(w)
+	case overlayMemory:
+		return m.renderMemory(w)
+	case overlayAgents:
+		return m.renderAgents(w)
+	case overlayLineView:
+		return m.renderLineViewer(w)
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -103,10 +109,10 @@ func (m *model) renderOverlay() string {
 		return m.renderListModal("Theme (live preview)", w)
 	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
 		overlayDoctor, overlayDocs, overlayTutorial, overlayExtensions,
-		overlayWorkflows, overlayPersonas, overlayAgents, overlayFind,
+		overlayWorkflows, overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
 		overlayQueue, overlayTasks, overlayCache,
-		overlayMCP, overlayTimeline, overlayMemory:
+		overlayMCP, overlayTimeline:
 		return m.renderListModal(m.overlayTitle(), w)
 	default:
 		return ""
@@ -285,6 +291,15 @@ func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayMemory {
+		return m.handleMemoryKey(msg), true
+	}
+	if m.overlay == overlayAgents {
+		return m.handleAgentsKey(msg), true
+	}
+	if m.overlay == overlayLineView {
+		return m.handleLineViewerKey(msg), true
+	}
 	if m.overlay == overlayWorktree {
 		return m.handleWorktreeKey(msg), true
 	}

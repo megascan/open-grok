@@ -189,6 +189,18 @@ func (m *model) handleFileSearchKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "right":
 		m.acceptFileSearch(false)
 		return nil, true
+	case ":", "ctrl+l":
+		if m.cursor < len(m.items) && m.items[m.cursor].Detail != "dir" {
+			rel := m.items[m.cursor].Key
+			tok, ok := parseAtToken(m.ta.Value())
+			if ok {
+				m.ta.SetValue(strings.TrimRight(acceptAtPath(m.ta.Value(), tok, rel, false, false), " "))
+			}
+			cmd := m.openLineViewerFile(rel, true)
+			if m.overlay == overlayLineView {
+				return cmd, true
+			}
+		}
 	}
 	return nil, false
 }

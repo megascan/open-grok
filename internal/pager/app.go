@@ -109,6 +109,7 @@ const (
 	overlayBlock
 	overlayShortcuts
 	overlayGoal
+	overlayLineView
 )
 
 type permMode int
@@ -237,6 +238,9 @@ type model struct {
 	worktreeLabel                                                         string
 	importPlan                                                            claudeimport.Plan
 	importSel                                                             []bool
+	mem                                                                   *memoryModal
+	agents                                                                *agentsModal
+	lineView                                                              *lineViewer
 }
 
 // Run starts the interactive TUI.
@@ -519,6 +523,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayUsage {
 		return m.handleUsageKey(msg), true
 	}
+	if m.overlay == overlayMemory {
+		return m.handleMemoryKey(msg), true
+	}
+	if m.overlay == overlayAgents {
+		return m.handleAgentsKey(msg), true
+	}
+	if m.overlay == overlayLineView {
+		return m.handleLineViewerKey(msg), true
+	}
 	if m.overlay == overlayRewind {
 		return m.handleRewindKey(msg), true
 	}
@@ -635,6 +648,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.openDashboard()
 		return nil, true
+	case "ctrl+l":
+		if cmd, ok := m.tryOpenLineViewerFromDraft(); ok {
+			return cmd, true
+		}
+	case ":":
+		if cmd, ok := m.tryOpenLineViewerFromDraft(); ok {
+			return cmd, true
+		}
+		return nil, false
 	case "ctrl+x", "ctrl+.":
 		m.openShortcuts()
 		return nil, true

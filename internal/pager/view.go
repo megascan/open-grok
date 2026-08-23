@@ -363,17 +363,24 @@ func (m *model) renderDashDetailsHeader() string {
 	if m.sess != nil && m.sess.Title != "" {
 		title = m.sess.Title
 	}
+	right := "[Dashboard]"
 	ids := m.attachableDashIDs()
-	pos := ""
 	if n := len(ids); n > 1 && m.sess != nil {
 		for i, id := range ids {
 			if id == m.sess.ID {
-				pos = fmt.Sprintf("  %d/%d  [‹] [›]", i+1, n)
+				// Rust paints `{i}/{n} [‹][›] [Dashboard]` with flush cycle chips.
+				right = fmt.Sprintf("%d/%d [‹][›] [Dashboard]", i+1, n)
 				break
 			}
 		}
 	}
-	return headerBar.Width(max(20, m.width)).Render(" " + title + pos + "  [Dashboard]")
+	left := " " + title
+	inner := max(20, m.width)
+	gap := inner - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	if gap < 1 {
+		gap = 1
+	}
+	return headerBar.Width(inner).Render(left + strings.Repeat(" ", gap) + right)
 }
 
 func (m *model) scrollToBlock(idx int) {
