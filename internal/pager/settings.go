@@ -120,11 +120,24 @@ func rustSettingsCatalog() []settingDef {
 }
 
 func (m *model) openSettings() {
+	m.openSettingsFocus("")
+}
+
+func (m *model) openSettingsFocus(key string) {
 	m.overlay = overlaySettings
 	m.cursor = 0
 	m.filter = ""
 	m.fillSettings()
 	m.cursor = firstNonHeader(m.items)
+	if key == "" {
+		return
+	}
+	for i, it := range m.items {
+		if it.Key == key {
+			m.cursor = i
+			return
+		}
+	}
 }
 
 func settingHeaderLabel(cat string) string {

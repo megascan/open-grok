@@ -72,6 +72,15 @@ func resolveTheme(name string) Theme {
 		}
 		return resolveTheme("grokday")
 	}
+	if canon, ok := parseThemeKind(n); ok && canon != "auto" {
+		n = canon
+		if n == "rosepine-moon" {
+			n = "rosepine"
+		}
+		if n == "oscura-midnight" {
+			n = "oscura"
+		}
+	}
 	for _, t := range builtinThemes {
 		if t.Name == n {
 			return t
@@ -85,14 +94,69 @@ func resolveTheme(name string) Theme {
 	return builtinThemes[0]
 }
 
+// themeCanonicalNames matches ThemeKind::ALL display_name() order.
+func themeCanonicalNames() []string {
+	return []string{"groknight", "grokday", "tokyonight", "rosepine-moon", "oscura-midnight"}
+}
+
+func parseThemeKind(name string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "auto", "system":
+		return "auto", true
+	case "groknight", "grok-night", "dark":
+		return "groknight", true
+	case "grokday", "grok-day", "light", "day":
+		return "grokday", true
+	case "tokyonight", "tokyo-night", "tokyo":
+		return "tokyonight", true
+	case "rosepine", "rose-pine", "rosepine-moon", "rose-pine-moon":
+		return "rosepine-moon", true
+	case "oscura", "oscura-midnight":
+		return "oscura-midnight", true
+	default:
+		return "", false
+	}
+}
+
+func canonicalThemeName(name string) string {
+	if canon, ok := parseThemeKind(name); ok {
+		return canon
+	}
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func themePrettyName(canonical string) string {
+	switch canonicalThemeName(canonical) {
+	case "auto":
+		return "Auto"
+	case "groknight":
+		return "Grok Night"
+	case "grokday":
+		return "Grok Day"
+	case "tokyonight":
+		return "Tokyo Night"
+	case "rosepine-moon":
+		return "Rose Pine Moon"
+	case "oscura-midnight":
+		return "Oscura Midnight"
+	default:
+		return canonical
+	}
+}
+
+func unknownThemeError(name string) string {
+	return "Unknown theme: " + name + ". Available: auto, " + strings.Join(themeCanonicalNames(), ", ")
+}
+
 func nextThemeName(current string) string {
-	cur := resolveTheme(current).Name
-	for i, t := range builtinThemes {
-		if t.Name == cur {
-			return builtinThemes[(i+1)%len(builtinThemes)].Name
+	names := themeCanonicalNames()
+	cur := canonicalThemeName(resolveTheme(current).Name)
+	for i, n := range names {
+		if n == cur {
+			return names[(i+1)%len(names)]
 		}
 	}
-	return builtinThemes[0].Name
+	return names[0]
 }
 
 func applyTheme(t Theme) {

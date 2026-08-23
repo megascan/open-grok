@@ -32,6 +32,16 @@ func (m *model) handleSlash(text string) tea.Cmd {
 		arg = strings.Join(fields[1:], " ")
 	}
 	if cmd, ok := ResolveSlash(raw); ok {
+		if cmd.Name == "minimal" && m.screenMd == modeMinimal {
+			m.appendSys("You're already in minimal mode.")
+			m.refreshVP()
+			return nil
+		}
+		if cmd.Name == "fullscreen" && m.screenMd == modeFull {
+			m.appendSys("You're already in fullscreen mode.")
+			m.refreshVP()
+			return nil
+		}
 		if cmd.Mode != "" && cmd.Mode != m.screenMd {
 			other := "/fullscreen"
 			if m.screenMd == modeFull {
@@ -131,14 +141,26 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "find":
 		return m.openFind(arg)
 	case "history":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		m.openHistory()
 	case "export":
 		return m.exportConversation(arg)
 	case "transcript":
 		return m.openTranscriptPager()
 	case "edit-prompt":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		return m.editPrompt()
 	case "expand":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		m.toggleFold(-1)
 	case "context":
 		if m.sess == nil {
@@ -147,16 +169,24 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		m.openUsage(0)
 	case "minimal":
+		if m.sess == nil {
+			m.appendSys("No active session to reopen in minimal mode")
+			break
+		}
 		m.screenMd = modeMinimal
 		m.persistUI()
 		m.appendSys("minimal mode — terminal palette, no theme picker. /fullscreen to switch back.")
 	case "fullscreen":
+		if m.sess == nil {
+			m.appendSys("No active session to reopen in fullscreen mode")
+			break
+		}
 		m.screenMd = modeFull
 		m.persistUI()
 		m.appendSys("fullscreen mode. /minimal to switch back.")
 	case "model":
 		if arg == "" {
-			m.openModels()
+			m.appendSys("Usage: /model <name> [effort]")
 			break
 		}
 		fields := strings.Fields(arg)
@@ -187,22 +217,33 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("effort = " + m.sess.Effort)
 		}
 	case "fast":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if strings.TrimSpace(m.opts.Model.ID) == "" && strings.TrimSpace(m.opts.Model.Name) == "" {
+			m.appendSys("No active model")
+			break
+		}
+		if !m.opts.Model.SupportsFast() {
+			m.appendSys("current model does not support Fast mode")
+			break
+		}
 		m.fastTier = !m.fastTier
-		m.appendSys(fmt.Sprintf("codex fast tier = %v", m.fastTier))
+		m.appendSys(saveSuccessToast("Fast mode", m.fastTier))
 	case "always-approve":
 		if m.permMode == permAlways {
 			m.permMode = permAsk
 			if m.sess != nil {
 				m.sess.YOLO = false
 			}
-			m.appendSys("always-approve off")
+			m.appendSys(yoloToast(false, m.sess != nil && m.sess.Plan.Active))
 		} else {
 			m.permMode = permAlways
 			if m.sess != nil {
 				m.sess.YOLO = true
-				m.sess.Plan.Exit()
 			}
-			m.appendSys("always-approve on")
+			m.appendSys(yoloToast(true, m.sess != nil && m.sess.Plan.Active))
 		}
 	case "yolo-2":
 		if !sandboxActive() {
@@ -229,16 +270,16 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "multiline":
 		m.multiline = !m.multiline
 		m.persistUI()
-		m.appendSys("multiline = " + onOff(m.multiline))
+		m.appendSys(saveSuccessToast("Multiline", m.multiline))
 	case "compact-mode":
 		m.compactUI = !m.compactUI
 		m.persistUI()
 		m.layoutChat()
-		m.appendSys("compact-mode = " + onOff(m.compactUI))
+		m.appendSys(saveSuccessToast("Compact mode", m.compactUI))
 	case "vim-mode":
 		m.vimMode = !m.vimMode
 		m.persistUI()
-		m.appendSys("vim-mode = " + onOff(m.vimMode))
+		m.appendSys(saveSuccessToast("Vim scrollback", m.vimMode))
 	case "hooks":
 		m.openExtensions(0)
 	case "plugins":
@@ -322,17 +363,21 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		_ = m.sess.RemoveWorkingDir(arg)
 		m.appendSys("Removing working directory…")
 	case "theme":
-		if arg == "" {
-			m.openTheme()
+		trimmed := strings.TrimSpace(arg)
+		if trimmed == "" {
+			trimmed = nextThemeName(m.theme)
+		} else if strings.EqualFold(trimmed, "next") {
+			trimmed = nextThemeName(m.theme)
+		}
+		canon, ok := parseThemeKind(trimmed)
+		if !ok {
+			m.appendSys(unknownThemeError(trimmed))
 			break
 		}
-		if strings.EqualFold(arg, "next") {
-			arg = nextThemeName(m.theme)
-		}
-		m.theme = arg
-		applyTheme(resolveTheme(arg))
-		saveTheme(arg)
-		m.appendSys("theme: " + resolveTheme(arg).Name)
+		m.theme = canon
+		applyTheme(resolveTheme(canon))
+		saveTheme(canon)
+		m.appendSys(saveThemeToast(canon))
 	case "feedback":
 		if arg != "" {
 			m.appendSys("feedback recorded locally:\n" + arg)
@@ -341,13 +386,23 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.overlay = overlayFeedback
 		m.feedback = ""
 	case "announcements":
-		m.overlay = overlayAnnouncements
-		m.items = []listItem{{Label: "Entropy native Go", Detail: "The shipping binary is entropy. Rust crates remain the behavioral reference."}}
-		m.cursor = 0
+		tok := ""
+		if f := strings.Fields(arg); len(f) > 0 {
+			tok = strings.ToLower(f[0])
+		}
+		switch tok {
+		case "hide":
+			m.setAnnouncementsHidden(true)
+		case "show":
+			m.setAnnouncementsHidden(false)
+		default:
+			m.appendSys("Usage: /announcements hide | show")
+		}
 	case "remember":
 		return m.remember(arg)
 	case "plan":
 		if m.sess == nil {
+			m.appendSys("No active session")
 			break
 		}
 		if m.sess.Plan.Active && arg == "" {
@@ -367,6 +422,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		return m.handleSwarm(arg)
 	case "view-plan":
 		if m.sess == nil {
+			m.appendSys("No active session")
 			break
 		}
 		data, err := os.ReadFile(m.sess.Plan.PlanFile)
@@ -380,8 +436,12 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "workflows":
 		m.openWorkflows()
 	case "btw":
-		if arg == "" {
-			m.openBtwComposer("")
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if strings.TrimSpace(arg) == "" {
+			m.appendSys("Usage: /btw <question>")
 			break
 		}
 		return m.startBTW(arg)
@@ -412,7 +472,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "timestamps":
 		m.timestamps = !m.timestamps
 		m.persistUI()
-		m.appendSys("timestamps = " + onOff(m.timestamps))
+		m.appendSys(saveSuccessToast("Timestamps", m.timestamps))
 	case "timeline":
 		m.cfg.UI.ShowTimeline = !m.cfg.UI.ShowTimeline
 		m.persistUI()
@@ -425,21 +485,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "settings":
 		m.openSettings()
 	case "privacy":
-		switch strings.ToLower(strings.TrimSpace(arg)) {
-		case "opt-in":
-			m.ackPrivacyBanner(true)
-			m.appendSys("privacy: opted in")
-		case "opt-out":
-			m.ackPrivacyBanner(false)
-			m.appendSys("privacy: opted out")
-		default:
-			m.overlay = overlayPrivacy
-			m.cursor = 0
-			m.items = []listItem{
-				{Key: "opt-in", Label: "Opt in", Detail: "allow coding-data retention/training where the provider offers it"},
-				{Key: "opt-out", Label: "Opt out", Detail: "do not share coding data for training"},
-			}
-		}
+		m.openSettingsFocus("coding_data_sharing")
 	case "rewind":
 		m.openRewindPicker()
 	case "jump":
@@ -470,6 +516,10 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "cache":
 		m.openCache()
 	case "queue":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
 		if strings.EqualFold(arg, "clear") {
 			m.queue = nil
 			m.appendSys("queue cleared")
@@ -488,6 +538,13 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "personas":
 		m.openAgents(agentsTabPersonas)
 	case "gboom":
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if strings.TrimSpace(arg) != "" {
+			return m.submit("/gboom " + arg)
+		}
 		m.appendSys("💥 gboom")
 	case "scroll-debug":
 		m.scrollHUD = !m.scrollHUD
@@ -522,6 +579,24 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	}
 	m.refreshVP()
 	return nil
+}
+
+func saveSuccessToast(label string, on bool) string {
+	return "\u2713 " + label + ": " + onOff(on)
+}
+
+func saveThemeToast(canonical string) string {
+	return "\u2713 Theme: " + themePrettyName(canonical)
+}
+
+func yoloToast(on, planActive bool) string {
+	if !on {
+		return saveSuccessToast("Always-approve", false)
+	}
+	if planActive {
+		return "\u26A0 Always-approve ON: plan mode still blocks file edits until you exit plan mode"
+	}
+	return "\u26A0 Always-approve ON: all tool actions auto-run"
 }
 
 func (m *model) sessionInfo() string {

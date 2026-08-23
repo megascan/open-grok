@@ -355,7 +355,7 @@ func newModel(opt Options) (*model, error) {
 	ta := textarea.New()
 	ta.Placeholder = "Message Entropy…  (type / for commands)"
 	ta.Focus()
-	ta.Prompt = "▎ "
+	ta.Prompt = promptArrow
 	ta.CharLimit = 32 * 1024
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
@@ -555,20 +555,29 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	livePrompt := m.screen == screenChat && !m.focusScroll && m.perm == nil &&
-		(m.overlay == overlayNone || m.overlay == overlayPalette || m.overlay == overlayFiles)
+		(m.overlay == overlayNone || m.isPromptOverlay())
 	if livePrompt {
 		var cmd tea.Cmd
 		m.ta, cmd = m.ta.Update(msg)
 		cmds = append(cmds, cmd)
 		val := strings.TrimSpace(m.ta.Value())
-		if strings.HasPrefix(val, "/") {
+		if m.overlay == overlayHistory {
+			m.refreshHistorySearch()
+			m.syncPromptPrefix()
+		} else if strings.HasPrefix(val, "/") {
+			opening := m.overlay != overlayPalette
 			m.overlay = overlayPalette
 			m.filter = m.ta.Value()
-			m.cursor = 0
+			if opening {
+				m.cursor = 0
+			}
+			m.syncPromptPrefix()
 		} else if _, ok := parseAtToken(m.ta.Value()); ok {
 			m.refreshFileSearch()
-		} else if m.overlay == overlayPalette || m.overlay == overlayFiles {
+			m.syncPromptPrefix()
+		} else if m.isPromptOverlay() {
 			m.overlay = overlayNone
+			m.syncPromptPrefix()
 		}
 	}
 	if m.screen == screenChat && (m.focusScroll || m.overlay == overlayNone) {
@@ -650,7 +659,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if msg.String() == "ctrl+p" && m.screen == screenChat {
 		return m.toggleCommandPalette(), true
 	}
-	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
+	if m.overlay != overlayNone && !m.isPromptOverlay() {
 		return m.handleOverlayKey(msg)
 	}
 	if m.screen == screenWelcome {
@@ -667,6 +676,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if m.overlay == overlayFiles {
 		return m.handleFileSearchKey(msg)
+	}
+	if m.overlay == overlayHistory {
+		return m.handleHistoryKey(msg)
 	}
 	if m.screen != screenChat {
 		return nil, false
@@ -895,6 +907,9 @@ func (m *model) layoutChat() {
 	if m.showPrivacyBanner() {
 		header += strings.Count(privacyBanner(), "\n")
 	}
+	if m.showAnnouncementBanner() {
+		header += strings.Count(announcementBanner(), "\n")
+	}
 	if m.turnStatusVisible() {
 		footer++
 	}
@@ -912,6 +927,14 @@ func (m *model) layoutChat() {
 	}
 	m.ta.SetWidth(max(20, m.width-6))
 	m.refreshVP()
+}
+
+func (m *model) syncPromptPrefix() {
+	if m.overlay == overlayHistory {
+		m.ta.Prompt = historySearchPrefix
+	} else {
+		m.ta.Prompt = promptArrow
+	}
 }
 
 func (m *model) persistUI() {

@@ -168,10 +168,17 @@ func (m *model) renderPromptInput() string {
 	ghost := m.suggest.ghostFor(text)
 	if ghost != "" && !strings.Contains(text, "\n") && !m.focusScroll {
 		cursor := "█"
-		body := "▎ " + text + cursor + dimStyle.Render(ghost)
+		body := m.promptPrefix() + text + cursor + dimStyle.Render(ghost)
 		return inputBox.Width(w).Render(body)
 	}
 	return inputBox.Width(w).Render(m.ta.View())
+}
+
+func (m *model) promptPrefix() string {
+	if m.overlay == overlayHistory {
+		return historySearchPrefix
+	}
+	return promptArrow
 }
 
 func fmtTokens(n int) string {
@@ -375,6 +382,13 @@ func (m *model) viewChat() string {
 			privacy += "\n"
 		}
 	}
+	announce := ""
+	if m.showAnnouncementBanner() {
+		announce = announcementBanner()
+		if !strings.HasSuffix(announce, "\n") {
+			announce += "\n"
+		}
+	}
 	hud := ""
 	if m.scrollHUD {
 		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
@@ -385,6 +399,7 @@ func (m *model) viewChat() string {
 		m.privacyY = strings.Count(prefix, "\n")
 		prefix += privacy
 	}
+	prefix += announce
 	prefix += hud
 	m.transcriptTop = strings.Count(prefix, "\n")
 
@@ -406,6 +421,10 @@ func (m *model) viewChat() string {
 	chips := m.renderChips()
 	input := m.renderPromptInput()
 	if dd := m.renderSlashDropdown(); dd != "" {
+		input = dd + "\n" + input
+	} else if dd := m.renderFileDropdown(); dd != "" {
+		input = dd + "\n" + input
+	} else if dd := m.renderHistoryDropdown(); dd != "" {
 		input = dd + "\n" + input
 	}
 	if panel := m.renderBtwPanel(); panel != "" {

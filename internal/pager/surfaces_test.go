@@ -145,6 +145,13 @@ func TestBtwComposerOpensWithoutInterrupting(t *testing.T) {
 	}
 	m.busy = true
 	m.handleSlash("/btw")
+	if m.overlay != overlayNone {
+		t.Fatalf("empty /btw must not open a composer, overlay %d", m.overlay)
+	}
+	if lastSys(m) != "Usage: /btw <question>" {
+		t.Fatalf("usage %q", lastSys(m))
+	}
+	m.openBtwComposer("")
 	if m.overlay != overlayBtw {
 		t.Fatalf("overlay %d", m.overlay)
 	}
@@ -152,8 +159,8 @@ func TestBtwComposerOpensWithoutInterrupting(t *testing.T) {
 	if !strings.Contains(body, "without interrupting") {
 		t.Fatalf("composer copy:\n%s", body)
 	}
-	m.btwDraft = "what files did we touch?"
-	m.handleBtwComposerKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.overlay = overlayNone
+	m.handleSlash("/btw what files did we touch?")
 	if m.btw == nil || m.btw.Question != "what files did we touch?" {
 		t.Fatalf("btw %+v", m.btw)
 	}

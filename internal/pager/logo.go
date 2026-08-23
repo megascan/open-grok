@@ -70,3 +70,30 @@ func (m *model) ackPrivacyBanner(optIn bool) {
 	_ = config.Save(m.cfg)
 	m.layoutChat()
 }
+
+func announcementBanner() string {
+	return claimStyle.Render("  [Entropy]") + dimStyle.Render("        hide: /announcements hide  [hide]") + "\n"
+}
+
+func (m *model) showAnnouncementBanner() bool {
+	if m.sess == nil || m.screenMd == modeMinimal {
+		return false
+	}
+	if m.cfg.Prefs != nil && m.cfg.Prefs["announcements_hidden"] == "true" {
+		return false
+	}
+	return true
+}
+
+func (m *model) setAnnouncementsHidden(hidden bool) {
+	if m.cfg.Prefs == nil {
+		m.cfg.Prefs = config.Prefs{}
+	}
+	if hidden {
+		m.cfg.Prefs["announcements_hidden"] = "true"
+	} else {
+		delete(m.cfg.Prefs, "announcements_hidden")
+	}
+	_ = config.Save(m.cfg)
+	m.layoutChat()
+}

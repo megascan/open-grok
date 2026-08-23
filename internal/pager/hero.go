@@ -193,5 +193,5 @@ func authStatusLine(m *model) string {
 func (m *model) welcomePromptBox() string {
 	w := max(24, m.width-4)
 	ph := "Type a message..."
-	return inputBox.Width(w).Render(dimStyle.Render("▎ " + ph))
+	return inputBox.Width(w).Render(dimStyle.Render(promptArrow + ph))
 }

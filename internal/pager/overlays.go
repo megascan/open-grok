@@ -17,7 +17,7 @@ import (
 )
 
 func (m *model) viewWithOverlay(base string) string {
-	if m.overlay == overlayPalette {
+	if m.isPromptOverlay() {
 		return base
 	}
 	box := m.renderOverlay()
@@ -96,9 +96,7 @@ func (m *model) renderOverlay() string {
 		return ""
 	case overlayLogin:
 		return m.renderLoginOverlay(w)
-	case overlayFiles:
-		return m.renderListModal("@ files", w)
-	case overlayPalette:
+	case overlayFiles, overlayPalette, overlayHistory:
 		return ""
 	case overlayPermission:
 		return m.renderPermission(w)
@@ -121,7 +119,7 @@ func (m *model) renderOverlay() string {
 		return m.renderListModal("Theme (live preview)", w)
 	case overlayCache:
 		return m.renderCache(w)
-	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
+	case overlayDashboard, overlayResume, overlayModel,
 		overlayDocs, overlayTutorial, overlayExtensions,
 		overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
@@ -268,42 +266,70 @@ func (m *model) renderPalette(w int) string {
 }
 
 func (m *model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
-	hits := FuzzySlash(m.filter, m.screenMd)
+	rows := m.slashDropdownRows()
+	if m.cursor >= len(rows) {
+		m.cursor = 0
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	d := parseSlashDraft(m.ta.Value())
 	switch msg.String() {
 	case "esc":
 		m.overlay = overlayNone
+		m.syncPromptPrefix()
 		return nil, true
 	case "up":
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		if d.InArgs && d.Cmd.Name == "theme" && m.cursor < len(rows) {
+			applyTheme(resolveTheme(rows[m.cursor].Label))
+		}
 		return nil, true
 	case "down", "tab":
-		if msg.String() == "tab" && len(hits) > 0 {
-			pick := hits[m.cursor]
-			m.ta.SetValue("/" + pick.Name + " ")
+		if msg.String() == "tab" && len(rows) > 0 {
+			if m.cursor >= len(rows) {
+				m.cursor = 0
+			}
+			m.ta.SetValue(rows[m.cursor].Insert)
 			m.filter = m.ta.Value()
+			m.cursor = 0
 			return nil, true
 		}
-		if m.cursor+1 < len(hits) {
+		if m.cursor+1 < len(rows) {
 			m.cursor++
+		}
+		if d.InArgs && d.Cmd.Name == "theme" && m.cursor < len(rows) {
+			applyTheme(resolveTheme(rows[m.cursor].Label))
 		}
 		return nil, true
 	case "enter":
-		if len(hits) == 0 {
-			m.overlay = overlayNone
-			return nil, true
-		}
-		pick := hits[m.cursor]
-		arg := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(m.ta.Value()), "/"+strings.ToLower(pick.Name)))
-		// If the user typed a full command line, dispatch that; else run the highlight.
 		text := strings.TrimSpace(m.ta.Value())
 		m.ta.Reset()
 		m.overlay = overlayNone
-		if strings.HasPrefix(strings.ToLower(text), "/"+pick.Name) && arg != strings.TrimSpace(text) {
+		m.syncPromptPrefix()
+		if d.InArgs && d.OK {
+			if strings.TrimSpace(d.Args) != "" {
+				return m.handleSlash(text), true
+			}
+			if len(rows) == 0 {
+				return m.handleSlash(text), true
+			}
+			run := rows[m.cursor].Run
+			if run == "" {
+				run = strings.TrimSpace(rows[m.cursor].Insert)
+			}
+			return m.handleSlash(run), true
+		}
+		if len(rows) == 0 {
 			return m.handleSlash(text), true
 		}
-		return m.handleSlash("/" + pick.Name + " " + arg), true
+		pick := rows[m.cursor]
+		if strings.HasPrefix(strings.ToLower(text), strings.ToLower(pick.Run)) && text != pick.Run {
+			return m.handleSlash(text), true
+		}
+		return m.handleSlash(pick.Run), true
 	}
 	return nil, false
 }
@@ -541,7 +567,7 @@ func (m *model) pickOverlay() tea.Cmd {
 		applyTheme(resolveTheme(it.Key))
 		saveTheme(it.Key)
 		m.overlay = overlayNone
-		m.appendSys("theme: " + it.Key)
+		m.appendSys(saveThemeToast(canonicalThemeName(it.Key)))
 	case overlayResume, overlayDashboard:
 		if strings.HasPrefix(it.Key, "group:") {
 			return nil
@@ -747,8 +773,50 @@ func repoName(cwd string) string {
 func (m *model) openHistory() {
 	m.overlay = overlayHistory
 	m.cursor = 0
-	m.filter = ""
-	m.items = fuzzyHistory("", m.history)
+	m.ta.Reset()
+	m.syncPromptPrefix()
+	m.refreshHistorySearch()
+}
+
+func (m *model) refreshHistorySearch() {
+	if m.overlay != overlayHistory {
+		return
+	}
+	q := m.ta.Value()
+	m.filter = q
+	m.items = fuzzyHistory(q, m.history)
+	if m.cursor >= len(m.items) {
+		m.cursor = 0
+	}
+}
+
+func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "esc":
+		m.overlay = overlayNone
+		m.ta.Reset()
+		m.syncPromptPrefix()
+		return nil, true
+	case "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		return nil, true
+	case "down":
+		if m.cursor+1 < len(m.items) {
+			m.cursor++
+		}
+		return nil, true
+	case "enter", "tab":
+		if m.cursor < len(m.items) {
+			m.ta.SetValue(m.items[m.cursor].Key)
+		}
+		m.overlay = overlayNone
+		m.syncPromptPrefix()
+		m.ta.Focus()
+		return nil, true
+	}
+	return nil, false
 }
 
 func fuzzyHistory(q string, hist []string) []listItem {

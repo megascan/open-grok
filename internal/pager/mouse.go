@@ -34,7 +34,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	}
-	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
+	if m.overlay != overlayNone && !m.isPromptOverlay() {
 		return nil, true
 	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
@@ -134,7 +134,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 }
 
 func (m *model) handleMouseWheel(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if m.overlay != overlayNone && m.overlay != overlayPalette && m.overlay != overlayFiles {
+	if m.overlay != overlayNone && !m.isPromptOverlay() {
 		return nil, true
 	}
 	if m.screen != screenChat {

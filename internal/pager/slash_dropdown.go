@@ -9,11 +9,25 @@ import (
 // MAX_VISIBLE_SUGGESTIONS matches crates/.../slash/mod.rs.
 const maxVisibleSuggestions = 6
 
+// MAX_DROPDOWN_ROWS matches views/file_search/dropdown.rs.
+const maxFileDropdownRows = 8
+
 const (
-	slashLabelCap    = 40
-	slashLabelGap    = 2
-	slashPromptArrow = "\u276F " // ❯ plus space; always 2 columns
+	slashLabelCap = 40
+	slashLabelGap = 2
+	// promptArrow is glyphs::prompt_arrow(): U+276F plus space (2 columns).
+	promptArrow = "\u276F "
+	// historySearchPrefix is the in-prompt history-search indicator.
+	historySearchPrefix = "? "
 )
+
+// dropdownRow is one inline completion row (slash commands, args, @ files, history).
+type dropdownRow struct {
+	Label  string
+	Help   string
+	Insert string // composer replacement on Tab
+	Run    string // slash line on Enter; empty means Insert
+}
 
 // renderSlashDropdown paints the inline `/` completion list above the prompt,
 // matching views/slash_dropdown.rs chrome (❯ prefix, aligned labels, max 6 rows).
@@ -25,33 +39,69 @@ func (m *model) renderSlashDropdown() string {
 	if !strings.HasPrefix(val, "/") {
 		return ""
 	}
-	hits := FuzzySlash(m.filter, m.screenMd)
-	if len(hits) == 0 {
+	rows := m.slashDropdownRows()
+	if len(rows) == 0 {
+		d := parseSlashDraft(m.ta.Value())
+		if d.InArgs && d.OK {
+			return ""
+		}
 		return dimStyle.Render("  (no matches)")
 	}
-	if m.cursor >= len(hits) {
-		m.cursor = len(hits) - 1
+	return renderDropdownRows(rows, m.cursor, maxVisibleSuggestions, m.transcriptWidth())
+}
+
+func (m *model) renderFileDropdown() string {
+	if m.overlay != overlayFiles {
+		return ""
 	}
-	if m.cursor < 0 {
-		m.cursor = 0
+	rows := make([]dropdownRow, 0, len(m.items))
+	for _, it := range m.items {
+		rows = append(rows, dropdownRow{Label: it.Label, Help: it.Detail})
 	}
-	w := m.transcriptWidth()
+	return renderDropdownRows(rows, m.cursor, maxFileDropdownRows, m.transcriptWidth())
+}
+
+func (m *model) renderHistoryDropdown() string {
+	if m.overlay != overlayHistory {
+		return ""
+	}
+	rows := make([]dropdownRow, 0, len(m.items))
+	for _, it := range m.items {
+		rows = append(rows, dropdownRow{Label: it.Label, Help: it.Detail})
+	}
+	if len(rows) == 0 {
+		return dimStyle.Render("  (no matches)")
+	}
+	return renderDropdownRows(rows, m.cursor, maxFileDropdownRows, m.transcriptWidth())
+}
+
+func renderDropdownRows(rows []dropdownRow, selected, maxRows, width int) string {
+	if len(rows) == 0 {
+		return dimStyle.Render("  (no matches)")
+	}
+	if selected >= len(rows) {
+		selected = len(rows) - 1
+	}
+	if selected < 0 {
+		selected = 0
+	}
+	w := width
 	if w < 8 {
 		w = 8
 	}
-	labelW := slashLabelColumnWidth(hits, w)
+	labelW := dropdownLabelColumnWidth(rows, w)
 	start := 0
-	if m.cursor >= maxVisibleSuggestions {
-		start = m.cursor - maxVisibleSuggestions + 1
+	if selected >= maxRows {
+		start = selected - maxRows + 1
 	}
-	end := start + maxVisibleSuggestions
-	if end > len(hits) {
-		end = len(hits)
+	end := start + maxRows
+	if end > len(rows) {
+		end = len(rows)
 	}
 	var b strings.Builder
 	for i := start; i < end; i++ {
-		c := hits[i]
-		label := "/" + c.Name
+		r := rows[i]
+		label := r.Label
 		if lipgloss.Width(label) > labelW {
 			label = truncateWidth(label, labelW)
 		}
@@ -60,21 +110,21 @@ func (m *model) renderSlashDropdown() string {
 			pad = 0
 		}
 		descW := w - 2 - labelW - slashLabelGap
-		desc := c.Help
+		desc := r.Help
 		if descW > 0 {
 			desc = truncateWidth(desc, descW)
 		} else {
 			desc = ""
 		}
 		prefix := "  "
-		if i == m.cursor {
-			prefix = slashPromptArrow
+		if i == selected {
+			prefix = promptArrow
 		}
 		line := prefix + label + strings.Repeat(" ", pad)
 		if desc != "" {
 			line += strings.Repeat(" ", slashLabelGap) + desc
 		}
-		if i == m.cursor {
+		if i == selected {
 			line = selStyle.UnsetPadding().Render(line)
 		} else {
 			line = dimStyle.Render(line)
@@ -87,14 +137,14 @@ func (m *model) renderSlashDropdown() string {
 	return b.String()
 }
 
-func slashLabelColumnWidth(hits []slashCmd, contentW int) int {
+func dropdownLabelColumnWidth(rows []dropdownRow, contentW int) int {
 	budget := (contentW * 3 / 5)
 	if budget > slashLabelCap {
 		budget = slashLabelCap
 	}
 	maxW := 0
-	for _, c := range hits {
-		w := lipgloss.Width("/" + c.Name)
+	for _, r := range rows {
+		w := lipgloss.Width(r.Label)
 		if w <= slashLabelCap && w > maxW {
 			maxW = w
 		}
@@ -106,6 +156,14 @@ func slashLabelColumnWidth(hits []slashCmd, contentW int) int {
 		return 1
 	}
 	return maxW
+}
+
+func slashLabelColumnWidth(hits []slashCmd, contentW int) int {
+	rows := make([]dropdownRow, len(hits))
+	for i, c := range hits {
+		rows[i] = dropdownRow{Label: "/" + c.Name}
+	}
+	return dropdownLabelColumnWidth(rows, contentW)
 }
 
 func truncateWidth(s string, n int) string {
@@ -122,9 +180,6 @@ func truncateWidth(s string, n int) string {
 	w := 0
 	for _, r := range s {
 		rw := 1
-		if r == '\t' {
-			rw = 1
-		}
 		if w+rw >= n {
 			b.WriteRune('…')
 			break
@@ -133,4 +188,8 @@ func truncateWidth(s string, n int) string {
 		w += rw
 	}
 	return b.String()
+}
+
+func (m *model) isPromptOverlay() bool {
+	return m.overlay == overlayPalette || m.overlay == overlayFiles || m.overlay == overlayHistory
 }

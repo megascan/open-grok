@@ -115,6 +115,16 @@ func LookupIn(id string, extra []Model) (Model, bool) {
 	return Model{}, false
 }
 
+// SupportsFast reports whether the catalog advertises a Fast service tier.
+// Codex entries carry service_tiers in the Rust catalog; Go uses provider metadata.
+func (m Model) SupportsFast() bool {
+	if m.Provider == types.ProviderCodex {
+		return true
+	}
+	id := strings.ToLower(m.ID + " " + m.Model)
+	return strings.Contains(id, "-fast") || strings.HasSuffix(id, "fast")
+}
+
 // ToolsEnabled reports whether client tools should be advertised.
 // Identity still comes from model metadata; :free is a catalog property, not a guess from a URL.
 func (m Model) ToolsEnabled() bool {
