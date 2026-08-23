@@ -61,13 +61,77 @@ func (m *model) refreshWelcome() {
 	}
 }
 
+func centerPlain(width int, s string) string {
+	w := max(1, width)
+	vis := lipgloss.Width(s)
+	if vis >= w {
+		return s
+	}
+	pad := (w - vis) / 2
+	return strings.Repeat(" ", pad) + s
+}
+
+func (m *model) welcomeStackedLogo() string {
+	lines := m.welcomeLogoLines()
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString(centerPlain(m.width, line) + "\n")
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
+
+func (m *model) welcomeMenuLines() string {
+	var b strings.Builder
+	for i, it := range m.items {
+		line := fmt.Sprintf("%s  %s", it.Label, dimStyle.Render(it.Detail))
+		if i == m.cursor {
+			line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
+		}
+		b.WriteString(centerPlain(m.width, line) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderWelcomeTrust() string {
+	var b strings.Builder
+	b.WriteString(m.welcomeStackedLogo())
+	b.WriteString(centerPlain(m.width, claimStyle.Render(welcomeTrustQuestion)) + "\n")
+	b.WriteString(centerPlain(m.width, titleStyle.Render(m.opts.CWD)) + "\n\n")
+	b.WriteString(centerPlain(m.width, dimStyle.Render(welcomeTrustWarningLine1)) + "\n")
+	b.WriteString(centerPlain(m.width, dimStyle.Render(welcomeTrustWarningLine2)) + "\n\n")
+	b.WriteString(m.welcomeMenuLines())
+	b.WriteString("\n" + centerPlain(m.width, dimStyle.Render("y proceed  ·  n quit")))
+	return b.String()
+}
+
+func (m *model) renderWelcomeUnsigned() string {
+	var b strings.Builder
+	b.WriteString(m.welcomeStackedLogo())
+	b.WriteString(centerPlain(m.width, claimStyle.Render(welcomeUnsignedPrompt)) + "\n\n")
+	b.WriteString(m.welcomeMenuLines())
+	b.WriteString("\n" + centerPlain(m.width, dimStyle.Render("c Codex  ·  x xAI  ·  q quit  ·  ↑↓ enter")))
+	return b.String()
+}
+
 func (m *model) viewWelcome() string {
 	var b strings.Builder
 	loc := m.welcomeLocation()
 	ver := "Entropy " + version.String()
 	pad := max(1, m.width-lipgloss.Width(loc)-lipgloss.Width(ver))
 	b.WriteString(dimStyle.Render(loc+strings.Repeat(" ", pad)+ver) + "\n\n")
-	useHero := m.width >= heroBoxMinWidth && m.height >= 22 && !m.trustPending
+	if m.trustPending {
+		b.WriteString(m.renderWelcomeTrust())
+		return b.String()
+	}
+	if m.unsignedIn() {
+		b.WriteString(m.renderWelcomeUnsigned())
+		return b.String()
+	}
+	useHero := m.width >= heroBoxMinWidth && m.height >= 22
 	if useHero {
 		b.WriteString(m.renderHeroBox() + "\n")
 	} else {
@@ -77,26 +141,17 @@ func (m *model) viewWelcome() string {
 		b.WriteString(titleStyle.Render("  Welcome") + "\n")
 		b.WriteString(dimStyle.Render("  State: "+config.Home()+"   never ~/.grok") + "\n")
 		b.WriteString(dimStyle.Render("  Model: "+m.opts.Model.Name+" via "+m.opts.Model.Provider.DisplayName()) + "\n\n")
-		if m.trustPending {
-			b.WriteString(claimStyle.Render("  Do you trust the contents of this directory?") + "\n")
-			b.WriteString(titleStyle.Render("  "+m.opts.CWD) + "\n\n")
-			b.WriteString(dimStyle.Render("  Entropy may run or modify contents in this directory,") + "\n")
-			b.WriteString(dimStyle.Render("  posing security risks.") + "\n\n")
-		} else if m.unsignedIn() {
-			b.WriteString(claimStyle.Render("  Choose the account that will power this session.") + "\n\n")
+		st := auth.Status()
+		var signed []string
+		for _, p := range types.AllProviders {
+			if _, ok := st[p]; ok {
+				signed = append(signed, p.DisplayName())
+			}
+		}
+		if len(signed) == 0 {
+			b.WriteString(errStyle.Render("  Not signed in — pick Login or run entropy login") + "\n\n")
 		} else {
-			st := auth.Status()
-			var signed []string
-			for _, p := range types.AllProviders {
-				if _, ok := st[p]; ok {
-					signed = append(signed, p.DisplayName())
-				}
-			}
-			if len(signed) == 0 {
-				b.WriteString(errStyle.Render("  Not signed in — pick Login or run entropy login") + "\n\n")
-			} else {
-				b.WriteString(okStyle.Render("  Signed in: "+strings.Join(signed, ", ")) + "\n\n")
-			}
+			b.WriteString(okStyle.Render("  Signed in: "+strings.Join(signed, ", ")) + "\n\n")
 		}
 		for i, it := range m.items {
 			line := fmt.Sprintf("  %s  %s", it.Label, dimStyle.Render(it.Detail))
@@ -105,33 +160,19 @@ func (m *model) viewWelcome() string {
 			}
 			b.WriteString(line + "\n")
 		}
-		if !m.unsignedIn() && !m.trustPending {
-			b.WriteString("\n")
-			if m.showPrivacyBanner() {
-				b.WriteString(privacyBanner() + "\n")
-			}
-			for _, bullet := range changelogBullets() {
-				b.WriteString(dimStyle.Render("  • "+bullet) + "\n")
-			}
+		b.WriteString("\n")
+		if m.showPrivacyBanner() {
+			b.WriteString(privacyBanner() + "\n")
+		}
+		for _, bullet := range changelogBullets() {
+			b.WriteString(dimStyle.Render("  • "+bullet) + "\n")
 		}
 	}
-	if !m.unsignedIn() && !m.trustPending {
-		if tip := m.welcomeTip(); tip != "" {
-			b.WriteString("\n" + dimStyle.Render("  "+tip) + "\n")
-		}
-		b.WriteString("\n" + m.welcomePromptBox() + "\n")
-		b.WriteString(dimStyle.Render("  type to start  ·  enter  ·  shift+tab new session  ·  " + quitChord() + " quit"))
+	if tip := m.welcomeTip(); tip != "" {
+		b.WriteString("\n" + dimStyle.Render("  "+tip) + "\n")
 	}
-	hint := "  ↑↓ move  ·  enter  ·  q quit"
-	if m.unsignedIn() && !m.trustPending {
-		hint = "  c Codex  ·  x xAI  ·  q quit  ·  ↑↓ enter"
-	}
-	if m.trustPending {
-		hint = "  y proceed  ·  n quit"
-	}
-	if m.unsignedIn() || m.trustPending {
-		b.WriteString("\n" + dimStyle.Render(hint))
-	}
+	b.WriteString("\n" + m.welcomePromptBox() + "\n")
+	b.WriteString(dimStyle.Render("  type to start  ·  enter  ·  shift+tab new session  ·  " + quitChord() + " quit"))
 	return b.String()
 }
 

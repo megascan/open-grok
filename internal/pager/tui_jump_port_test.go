@@ -144,10 +144,10 @@ func TestForkNoSessionAndQuestion(t *testing.T) {
 		t.Fatalf("options %s", got)
 	}
 	view := stripANSI(m.renderQuestion(72))
-	if strings.Contains(view, "Other") {
-		t.Fatalf("local fork question must not show Other:\n%s", view)
+	if strings.Contains(view, "Other") || strings.Contains(view, questionFreeformPlaceholder) {
+		t.Fatalf("local fork question must not show freeform:\n%s", view)
 	}
-	if !strings.Contains(view, "(○)") || !strings.Contains(view, "(●)") {
+	if !strings.Contains(view, permAccentBar) || !strings.Contains(view, "(○)") {
 		t.Fatalf("radio chrome:\n%s", view)
 	}
 }

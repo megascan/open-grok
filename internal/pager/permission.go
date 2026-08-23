@@ -460,6 +460,24 @@ func (m *model) applyPermChoice(c permChoice) tea.Cmd {
 	return nil
 }
 
+func (m *model) showPerm(msg permAskMsg) {
+	p := msg
+	m.perm = &p
+	m.overlay = overlayPermission
+	m.permParked = false
+	m.initPermCard()
+}
+
+func (m *model) popNextPerm() bool {
+	if len(m.permQueue) == 0 {
+		return false
+	}
+	next := m.permQueue[0]
+	m.permQueue = m.permQueue[1:]
+	m.showPerm(next)
+	return true
+}
+
 func (m *model) replyPerm(allow, always, never bool) {
 	if m.perm == nil {
 		return
@@ -472,16 +490,19 @@ func (m *model) replyPerm(allow, always, never bool) {
 	}
 	_ = never
 	ch := m.perm.Reply
-	m.perm = nil
-	m.overlay = overlayNone
 	m.permParked = false
 	m.permFollowupMode = false
 	m.permPatternMode = false
-	if m.question != nil {
-		m.overlay = overlayQuestion
-	}
+	m.perm = nil
 	if ch != nil {
 		ch <- allow
+	}
+	if m.popNextPerm() {
+		return
+	}
+	m.overlay = overlayNone
+	if m.question != nil {
+		m.overlay = overlayQuestion
 	}
 }
 

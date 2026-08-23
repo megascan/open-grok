@@ -293,27 +293,114 @@ func (m *model) peekRow() (dashRow, bool) {
 	return r, true
 }
 
+func (m *model) peekLiveCurrent(row dashRow) bool {
+	return m.sess != nil && m.sess.ID == row.Sess.ID
+}
+
+func (m *model) peekQuestionLive() bool {
+	row, ok := m.peekRow()
+	return ok && m.question != nil && m.peekLiveCurrent(row)
+}
+
+func (m *model) peekPermissionLive() bool {
+	row, ok := m.peekRow()
+	return ok && m.perm != nil && m.peekLiveCurrent(row)
+}
+
+func (m *model) peekInputLive() bool {
+	return m.peekQuestionLive() || m.peekPermissionLive()
+}
+
+func (m *model) peekOptionLabels() []string {
+	if m.peekPermissionLive() {
+		var labels []string
+		for _, c := range m.permChoices() {
+			labels = append(labels, c.Label)
+		}
+		if len(labels) > 9 {
+			labels = labels[:9]
+		}
+		return labels
+	}
+	if !m.peekQuestionLive() {
+		return nil
+	}
+	opts := m.question.current().Options
+	if len(opts) == 0 {
+		opts = []string{"yes", "no"}
+	}
+	if !m.questionLocal() {
+		opts = append(append([]string{}, opts...), "Other")
+	}
+	if len(opts) > 9 {
+		opts = opts[:9]
+	}
+	return opts
+}
+
+func (m *model) peekRejectIndex() int {
+	if m.peekPermissionLive() {
+		for i, c := range m.permChoices() {
+			if i >= 9 {
+				break
+			}
+			if c.ID == "followup" {
+				return i
+			}
+		}
+		return -1
+	}
+	if m.peekQuestionLive() && !m.questionLocal() {
+		n := len(m.peekOptionLabels())
+		if n == 0 {
+			return -1
+		}
+		return n - 1
+	}
+	return -1
+}
+
+func (m *model) peekQuestionTitle() string {
+	if m.peekPermissionLive() {
+		return m.permTitle()
+	}
+	if !m.peekQuestionLive() {
+		return ""
+	}
+	cur := m.question.current()
+	n := len(m.question.items())
+	if n > 1 {
+		return fmt.Sprintf("(%d/%d) %s", m.question.Index+1, n, cur.Question)
+	}
+	return cur.Question
+}
+
 func (m *model) renderDashPeekPanel() string {
 	var b strings.Builder
 	if m.renaming {
 		return titleStyle.Render(" Rename: ") + m.dashRename + "█\n"
 	}
-	row, peek := m.peekRow()
+	_, peek := m.peekRow()
 	if peek {
 		b.WriteString(dimStyle.Render("╭ peek") + "\n")
-		if m.question != nil && m.sess != nil && m.sess.ID == row.Sess.ID {
-			b.WriteString(claimStyle.Render("▸ "+m.question.Question) + "\n")
-			opts := m.question.Options
-			if len(opts) == 0 {
-				opts = []string{"yes", "no"}
-			}
-			if len(opts) > 9 {
-				opts = opts[:9]
-			}
+		if m.peekInputLive() {
+			b.WriteString(claimStyle.Render("▸ "+m.peekQuestionTitle()) + "\n")
+			opts := m.peekOptionLabels()
+			reject := m.peekRejectIndex()
 			for i, o := range opts {
-				line := fmt.Sprintf("  %d. %s", i+1, o)
+				label := o
+				if i == reject {
+					if strings.TrimSpace(m.peekReply) != "" && m.peekQSel == i {
+						label = m.peekReply
+					} else if m.peekQuestionLive() {
+						label = peekOtherPlaceholder
+					} else {
+						label = permFollowupLabel
+					}
+				}
+				line := fmt.Sprintf("  %d. %s", i+1, label)
 				if m.peekQSel == i {
-					line = selStyle.Render("▸ " + strconv.Itoa(i+1) + ". " + o)
+					line = selStyle.Render("▸ " + strconv.Itoa(i+1) + ". " + label)
 				}
 				b.WriteString(line + "\n")
 			}
@@ -366,7 +453,7 @@ func (m *model) handleDashboardKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	s := msg.String()
 	_, peek := m.peekRow()
-	questionPeek := peek && m.question != nil && m.sess != nil && m.cursor < len(m.dashRows) && m.sess.ID == m.dashRows[m.cursor].Sess.ID
+	questionPeek := m.peekInputLive()
 
 	if s == "esc" {
 		if peek {
@@ -519,7 +606,7 @@ func (m *model) handleDashboardKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	if msg.Type == tea.KeyRunes {
-		if peek && (m.peekFocus || !m.dashListFocus) && !questionPeek {
+		if peek && (m.peekFocus || !m.dashListFocus) && (!questionPeek || m.peekQSel == m.peekRejectIndex()) {
 			m.peekFocus = true
 			m.dashListFocus = false
 			m.peekReply += string(msg.Runes)
@@ -534,17 +621,7 @@ func (m *model) handleDashboardKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func peekOptionCount(m *model) int {
-	if m.question == nil {
-		return 0
-	}
-	n := len(m.question.Options)
-	if n == 0 {
-		return 2
-	}
-	if n > 9 {
-		return 9
-	}
-	return n
+	return len(m.peekOptionLabels())
 }
 
 func (m *model) moveDashCursor(delta int) {
@@ -615,19 +692,47 @@ func (m *model) dashEnter(openChat bool) tea.Cmd {
 }
 
 func (m *model) answerPeekQuestion() tea.Cmd {
-	if m.question == nil || m.peekQSel < 0 {
+	if m.peekQSel < 0 {
 		return nil
 	}
-	opts := m.question.Options
+	if m.peekPermissionLive() {
+		choices := m.permChoices()
+		if m.peekQSel >= len(choices) {
+			return nil
+		}
+		c := choices[m.peekQSel]
+		if c.ID == "followup" {
+			m.permFollowup = strings.TrimSpace(m.peekReply)
+			m.permFollowupMode = true
+		}
+		m.peekQSel = -1
+		m.peekReply = ""
+		cmd := m.applyPermChoice(c)
+		m.refreshDashboard()
+		return cmd
+	}
+	if !m.peekQuestionLive() {
+		return nil
+	}
+	opts := m.question.current().Options
 	if len(opts) == 0 {
 		opts = []string{"yes", "no"}
 	}
-	if m.peekQSel >= len(opts) {
+	sel := m.peekQSel
+	m.peekQSel = -1
+	if sel == len(opts) {
+		ans := strings.TrimSpace(m.peekReply)
+		m.peekReply = ""
+		cmd := m.replyQuestion(ans)
+		m.refreshDashboard()
+		return cmd
+	}
+	if sel >= len(opts) {
 		return nil
 	}
-	ans := opts[m.peekQSel]
-	m.peekQSel = -1
-	cmd := m.replyQuestion(ans)
+	m.selectQuestionOption(sel)
+	cmd := m.advanceOrSubmitQuestion()
+	m.peekReply = ""
 	m.refreshDashboard()
 	return cmd
 }

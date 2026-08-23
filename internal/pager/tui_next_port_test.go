@@ -147,17 +147,29 @@ func TestRecapDoesNotAppendUserMessage(t *testing.T) {
 func TestQuestionCardRadioAndOther(t *testing.T) {
 	m := testModel(t)
 	m.question = &qAskMsg{Question: "Ship it?", Options: []string{"yes", "no"}, Reply: make(chan string, 1)}
-	view := m.renderQuestion(60)
-	if !strings.Contains(view, "(○)") || !strings.Contains(view, "(●)") {
+	view := stripANSI(m.renderQuestion(60))
+	if strings.Contains(view, "Question") && strings.Contains(view, "Question 1/") {
+		t.Fatalf("card must not use a Question N/M title:\n%s", view)
+	}
+	if !strings.Contains(view, "Ship it?") {
+		t.Fatalf("missing label:\n%s", view)
+	}
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("missing accent bar")
+	}
+	if !strings.Contains(view, "(○)") {
 		t.Fatalf("radio chrome missing: %s", view)
 	}
-	if !strings.Contains(view, "Other") || strings.Contains(view, "z  free text") {
-		t.Fatalf("Other row: %s", view)
+	if strings.Contains(view, "(●)") {
+		t.Fatalf("nothing selected yet, should be empty radios:\n%s", view)
+	}
+	if !strings.Contains(view, questionFreeformPlaceholder) || strings.Contains(view, "z  free text") {
+		t.Fatalf("freeform row: %s", view)
 	}
 	m.qCursor = 2
 	m.handleQuestionKey(tea.KeyMsg{Type: tea.KeyEnter})
 	if !m.qTyping {
-		t.Fatal("enter on Other starts typing")
+		t.Fatal("enter on freeform starts typing")
 	}
 }
 
@@ -170,16 +182,19 @@ func TestQuestionWrapsMultipleQuestions(t *testing.T) {
 		},
 		Reply: make(chan string, 1),
 	}
-	view := m.renderQuestion(60)
-	if !strings.Contains(view, "Question 1/2") {
+	view := stripANSI(m.renderQuestion(60))
+	if strings.Contains(view, "Question 1/2") {
+		t.Fatalf("question card has no N/M title:\n%s", view)
+	}
+	if !strings.Contains(view, "Color?") {
 		t.Fatalf("%s", view)
 	}
 	m.handleQuestionKey(tea.KeyMsg{Type: tea.KeyRight})
 	if m.question.Index != 1 {
 		t.Fatalf("index %d", m.question.Index)
 	}
-	view = m.renderQuestion(60)
-	if !strings.Contains(view, "Size?") || !strings.Contains(view, "Question 2/2") {
+	view = stripANSI(m.renderQuestion(60))
+	if !strings.Contains(view, "Size?") || strings.Contains(view, "Question 2/2") {
 		t.Fatalf("%s", view)
 	}
 }

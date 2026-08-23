@@ -249,8 +249,12 @@ func TestFolderTrustYesPersists(t *testing.T) {
 		t.Fatal("trust prompt required")
 	}
 	out := m.viewWelcome()
-	if !strings.Contains(stripANSI(out), "Do you trust the contents of this directory") {
-		t.Fatalf("trust copy missing: %s", stripANSI(out))
+	got := stripANSI(out)
+	if !strings.Contains(got, "Do you trust the contents of this directory") {
+		t.Fatalf("trust copy missing: %s", got)
+	}
+	if !strings.Contains(got, welcomeTrustWarningLine1) {
+		t.Fatalf("Open Grok trust warning missing: %s", got)
 	}
 	m.handleWelcomeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	if m.trustPending {

@@ -174,6 +174,7 @@ type model struct {
 	confirmKind                                                           string
 	feedback                                                              string
 	perm                                                                  *permAskMsg
+	permQueue                                                             []permAskMsg
 	permParked                                                            bool
 	permCursor                                                            int
 	permWordN                                                             int
@@ -207,6 +208,11 @@ type model struct {
 	qCursor                                                               int
 	qFree                                                                 string
 	qTyping                                                               bool
+	qSel                                                                  []int
+	qMulti                                                                []map[int]struct{}
+	qFrees                                                                []string
+	qFreeSel                                                              []bool
+	qCursors                                                              []int
 	doctorReport                                                          string
 	suggest                                                               promptSuggestion
 	plan                                                                  *planAskMsg
@@ -507,10 +513,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case suggestionLoadedMsg:
 		m.suggest.onLoaded(msg.text, msg.generation)
 	case permAskMsg:
-		m.perm = &msg
-		m.overlay = overlayPermission
-		m.permParked = false
-		m.initPermCard()
+		if m.perm != nil {
+			m.permQueue = append(m.permQueue, msg)
+			break
+		}
+		m.showPerm(msg)
 	case btwDeltaMsg:
 		if m.btw != nil && (m.btw.Phase == btwLoading || m.btw.Phase == btwDone) {
 			m.btw.Answer += msg.text
@@ -526,9 +533,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case qAskMsg:
 		m.question = &msg
-		m.qCursor = 0
-		m.qFree = ""
-		m.qTyping = false
+		m.qSel = nil
+		m.ensureQuestionState()
 		if m.overlay != overlayPermission && m.overlay != overlayCancelTurn {
 			m.overlay = overlayQuestion
 		}

@@ -51,6 +51,8 @@ func (m *model) openNewSessionQuestion() tea.Cmd {
 	m.qFree = ""
 	m.qTyping = false
 	m.overlay = overlayQuestion
+	m.qSel = nil
+	m.ensureQuestionState()
 	return nil
 }
 

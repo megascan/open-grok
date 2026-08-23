@@ -9,10 +9,16 @@ import (
 )
 
 const (
-	pickerDotFilled   = "\u25cf"
-	pickerDotEmpty    = "\u25cb"
-	permAccentBar     = "\u2503"
-	permFollowupLabel = "No, reject (type to add feedback)"
+	pickerDotFilled             = "\u25cf"
+	pickerDotEmpty              = "\u25cb"
+	permAccentBar               = "\u2503"
+	permFollowupLabel           = "No, reject (type to add feedback)"
+	questionFreeformPlaceholder = "Type your answer here"
+	peekOtherPlaceholder        = "Other (type your own answer)"
+	welcomeTrustWarningLine1    = "Open Grok may run or modify contents in this directory,"
+	welcomeTrustWarningLine2    = "posing security risks."
+	welcomeTrustQuestion        = "Do you trust the contents of this directory?"
+	welcomeUnsignedPrompt       = "Choose the account that will power this session."
 )
 
 func (m *model) enterSettingsEnum(def settingDef) {

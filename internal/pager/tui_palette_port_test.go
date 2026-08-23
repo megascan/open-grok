@@ -123,7 +123,7 @@ func TestNewSessionWorktreeAskNeverAndWelcomeSkip(t *testing.T) {
 		t.Fatalf("options %s", got)
 	}
 	view := stripANSI(m.renderQuestion(72))
-	if strings.Contains(view, "Other") {
+	if strings.Contains(view, "Other") || strings.Contains(view, questionFreeformPlaceholder) {
 		t.Fatalf("local new-session question must not show Other:\n%s", view)
 	}
 

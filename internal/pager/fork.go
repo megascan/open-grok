@@ -118,6 +118,8 @@ func (m *model) openForkQuestion(directive string) tea.Cmd {
 	m.qFree = ""
 	m.qTyping = false
 	m.overlay = overlayQuestion
+	m.qSel = nil
+	m.ensureQuestionState()
 	return nil
 }
 
