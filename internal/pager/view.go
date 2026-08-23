@@ -173,11 +173,17 @@ func (m *model) renderHeader() string {
 		yolo = "plan"
 	}
 	sid := ""
+	ctx := "0 B"
 	if m.sess != nil {
 		sid = shortID(m.sess.ID)
+		n := 0
+		for _, msg := range m.sess.Messages {
+			n += len(msg.Content)
+		}
+		ctx = fmt.Sprintf("%d B", n)
 	}
 	goal := m.goalBadge()
-	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  %s  ·  %s  ·  %s", sid, yolo, plan, goal))
+	meta := dimStyle.Render(fmt.Sprintf("  session %s  ·  Context: %s  ·  %s  ·  %s  ·  %s", sid, ctx, yolo, plan, goal))
 	top := lipgloss.JoinHorizontal(lipgloss.Top, left, dimStyle.Render(mid), lipgloss.NewStyle().Width(max(0, m.width-lipgloss.Width(left)-lipgloss.Width(mid)-lipgloss.Width(right))).Render(""), dimStyle.Render(right))
 	if m.width > 0 {
 		top = lipgloss.NewStyle().Width(m.width).MaxWidth(m.width).Render(top)
@@ -267,12 +273,12 @@ func (m *model) renderSidebar() string {
 }
 
 func (m *model) renderFooter() string {
-	hint := "enter send  ·  shift+tab mode  ·  ctrl+\\ dashboard  ·  / for commands"
+	hint := "enter send  ·  shift+tab mode  ·  ctrl+\\ dashboard  ·  / commands"
 	if m.multiline {
-		hint = "alt+enter send  ·  enter newline  ·  " + hint
+		hint = "alt+enter send  ·  enter newline  ·  shift+tab mode  ·  / commands"
 	}
 	if m.focusScroll {
-		hint = "tab prompt  ·  j/k or arrows scroll  ·  y copy block"
+		hint = "tab prompt  ·  j/k nav  ·  y copy  ·  e expand"
 	}
 	val := strings.TrimSpace(m.ta.Value())
 	if strings.HasPrefix(val, "/") {

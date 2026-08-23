@@ -275,7 +275,10 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 		return tea.Quit
 	case strings.HasPrefix(key, "resume:"):
 		id := strings.TrimPrefix(key, "resume:")
-		sess, err := agent.LoadSession(m.opts.CWD, id)
+		sess, err := agent.FindSession(id)
+		if err != nil {
+			sess, err = agent.LoadSession(m.opts.CWD, id)
+		}
 		if err != nil {
 			m.status = err.Error()
 			return nil
@@ -413,7 +416,10 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *model) confirmDelete(id string) {
-	sess, err := agent.LoadSession(m.opts.CWD, id)
+	sess, err := agent.FindSession(id)
+	if err != nil {
+		sess, err = agent.LoadSession(m.opts.CWD, id)
+	}
 	if err != nil {
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/foreign"
 	"github.com/megascan/open-grok/internal/hooks"
 	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/types"
@@ -189,6 +190,9 @@ func (m *model) renderListModal(title string, w int) string {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n" + dimStyle.Render("↑↓  enter  ·  esc close  ·  type to filter"))
+	if m.overlay == overlayResume {
+		b.WriteString(dimStyle.Render("  ·  d delete"))
+	}
 	return modalBox.Width(w).Render(b.String())
 }
 
@@ -264,6 +268,16 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if m.overlay == overlayImportClaude {
 		return m.handleImportClaudeKey(msg), true
+	}
+	if m.overlay == overlayResume && msg.String() == "d" {
+		if m.cursor < len(m.items) {
+			it := m.items[m.cursor]
+			if strings.HasPrefix(it.Key, "resume:") {
+				m.confirmKind = "delete-welcome:" + strings.TrimPrefix(it.Key, "resume:")
+				m.overlay = overlayConfirm
+			}
+		}
+		return nil, true
 	}
 	switch m.overlay {
 	case overlayFeedback:
@@ -399,8 +413,19 @@ func (m *model) pickOverlay() tea.Cmd {
 		m.overlay = overlayNone
 		m.appendSys("theme: " + it.Key)
 	case overlayResume, overlayDashboard:
+		if strings.HasPrefix(it.Key, "group:") {
+			return nil
+		}
+		if strings.HasPrefix(it.Key, "foreign:") {
+			m.appendSys("Foreign session " + it.Label + " — Entropy cannot replay another product's transcript. Start a new session and describe the work.")
+			m.overlay = overlayNone
+			return m.pickWelcome("new")
+		}
 		if strings.HasPrefix(it.Key, "resume:") {
-			sess, err := agent.LoadSession(m.opts.CWD, strings.TrimPrefix(it.Key, "resume:"))
+			sess, err := agent.FindSession(strings.TrimPrefix(it.Key, "resume:"))
+			if err != nil {
+				sess, err = agent.LoadSession(m.opts.CWD, strings.TrimPrefix(it.Key, "resume:"))
+			}
 			if err == nil {
 				m.attachSession(sess)
 				m.layoutChat()
@@ -522,18 +547,58 @@ func (m *model) openResume() {
 func (m *model) fillSessions(kind string) {
 	m.cursor = 0
 	m.items = []listItem{{Key: "new", Label: "New session", Detail: m.dashCWD}}
-	list, _ := agent.ListSessions(m.opts.CWD)
+	list, _ := agent.ListAllSessions()
+	currentRepo := repoName(m.opts.CWD)
+	groups := map[string][]agent.Session{}
+	var order []string
+	seen := map[string]bool{}
 	for _, s := range list {
-		title := s.Title
-		if title == "" {
-			title = "(untitled)"
+		repo := repoName(s.CWD)
+		if !seen[repo] {
+			seen[repo] = true
+			order = append(order, repo)
 		}
+		groups[repo] = append(groups[repo], s)
+	}
+	if currentRepo != "" {
+		for i, r := range order {
+			if r == currentRepo {
+				order = append([]string{r}, append(order[:i], order[i+1:]...)...)
+				break
+			}
+		}
+	}
+	for _, repo := range order {
+		m.items = append(m.items, listItem{Key: "group:" + repo, Label: repo, Detail: "—"})
+		for _, s := range groups[repo] {
+			title := s.Title
+			if title == "" {
+				title = "(untitled)"
+			}
+			m.items = append(m.items, listItem{
+				Key: "resume:" + s.ID, Label: "  " + shortID(s.ID) + "  " + title,
+				Detail: s.UpdatedAt.Format("15:04") + "  " + s.ModelID + "  " + s.CWD,
+			})
+		}
+	}
+	for _, f := range foreign.ScanRecent(m.opts.CWD) {
 		m.items = append(m.items, listItem{
-			Key: "resume:" + s.ID, Label: shortID(s.ID) + "  " + title,
-			Detail: s.UpdatedAt.Format("15:04") + "  " + s.ModelID,
+			Key:    "foreign:" + f.Tool + ":" + f.ID,
+			Label:  "[" + f.Tool + "] " + f.Title,
+			Detail: f.UpdatedAt.Format("15:04") + "  " + f.CWD,
 		})
 	}
 	_ = kind
+}
+
+func repoName(cwd string) string {
+	cwd = filepath.Clean(cwd)
+	base := filepath.Base(cwd)
+	parent := filepath.Base(filepath.Dir(cwd))
+	if parent == "." || parent == "/" || parent == string(filepath.Separator) {
+		return base
+	}
+	return parent + "-" + base
 }
 
 func (m *model) openHistory() {

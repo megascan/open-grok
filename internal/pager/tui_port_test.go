@@ -181,6 +181,44 @@ func TestSignedInWelcomeResumeWorktreeChangelog(t *testing.T) {
 	}
 }
 
+func TestResumePickerListsAllCWDAndArmsDelete(t *testing.T) {
+	m := testModel(t)
+	other := t.TempDir()
+	s1, err := agent.NewSession(m.opts.CWD, m.opts.Model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Title = "here"
+	_ = s1.Persist()
+	s2, err := agent.NewSession(other, m.opts.Model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Title = "there"
+	_ = s2.Persist()
+	m.openResume()
+	foundHere, foundThere, foundGroup := false, false, false
+	for i, it := range m.items {
+		if it.Key == "resume:"+s1.ID {
+			foundHere = true
+		}
+		if it.Key == "resume:"+s2.ID {
+			foundThere = true
+			m.cursor = i
+		}
+		if strings.HasPrefix(it.Key, "group:") {
+			foundGroup = true
+		}
+	}
+	if !foundHere || !foundThere || !foundGroup {
+		t.Fatalf("picker items %+v", m.items)
+	}
+	m.handleOverlayKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if m.overlay != overlayConfirm || m.confirmKind != "delete-welcome:"+s2.ID {
+		t.Fatalf("d must arm delete, overlay=%d kind=%s", m.overlay, m.confirmKind)
+	}
+}
+
 func TestWelcomePrintableStartsSession(t *testing.T) {
 	m := testModel(t)
 	if err := auth.SaveAPIKey(types.ProviderXAI, "xai-test-not-real", false); err != nil {

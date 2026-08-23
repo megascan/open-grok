@@ -141,6 +141,75 @@ func ListSessions(cwd string) ([]Session, error) {
 	return out, nil
 }
 
+// ListAllSessions walks every cwd bucket under ~/.entropy/sessions.
+func ListAllSessions() ([]Session, error) {
+	root := config.SessionsRoot()
+	cwdDirs, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []Session
+	for _, cwdEnt := range cwdDirs {
+		if !cwdEnt.IsDir() {
+			continue
+		}
+		cwdPath := filepath.Join(root, cwdEnt.Name())
+		decoded, _ := config.DecodeCWDFromDirname(cwdPath)
+		sessEnts, err := os.ReadDir(cwdPath)
+		if err != nil {
+			continue
+		}
+		for _, e := range sessEnts {
+			if !e.IsDir() || e.Name() == ".cwd" {
+				continue
+			}
+			dir := filepath.Join(cwdPath, e.Name())
+			data, err := os.ReadFile(filepath.Join(dir, "session.json"))
+			if err != nil {
+				continue
+			}
+			var s Session
+			if json.Unmarshal(data, &s) != nil {
+				continue
+			}
+			s.Dir = dir
+			if s.CWD == "" {
+				s.CWD = decoded
+			}
+			s.Plan.PlanFile = filepath.Join(dir, "plan.md")
+			s.Goal = goals.Load(dir)
+			s.attach()
+			out = append(out, s)
+		}
+	}
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].UpdatedAt.After(out[i].UpdatedAt) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
+// FindSession locates a session by id across all cwd buckets.
+func FindSession(id string) (*Session, error) {
+	list, err := ListAllSessions()
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		if list[i].ID == id {
+			s := list[i]
+			return &s, nil
+		}
+	}
+	return nil, fmt.Errorf("session not found: %s", id)
+}
+
 // Persist writes session.json, summary.json, and appends updates.jsonl.
 func (s *Session) Persist() error {
 	s.UpdatedAt = time.Now().UTC()
