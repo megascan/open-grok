@@ -71,6 +71,9 @@ func NewRoot() *cobra.Command {
 		newCompletionsCmd(),
 		newVersionCmd(),
 		newMCPCmd(),
+		newExportCmd(),
+		newMemoryCmd(),
+		newWrapCmd(),
 	)
 	return root
 }

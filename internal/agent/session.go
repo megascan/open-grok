@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/megascan/open-grok/internal/catalog"
+	"github.com/megascan/open-grok/internal/codemode"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/workspace"
@@ -30,6 +31,8 @@ type Session struct {
 	YOLO           bool                  `json:"-"`
 	Allow          []string              `json:"-"`
 	Deny           []string              `json:"-"`
+	JS             *codemode.Runtime     `json:"-"`
+	SubagentDepth  int                   `json:"-"`
 }
 
 // NewSession creates a session directory under ~/.opengrok/sessions/<cwd>/<id>.

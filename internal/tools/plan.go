@@ -99,8 +99,43 @@ func DefaultPack() []Tool {
 		ListDir{},
 		WebSearch{},
 		WebFetch{},
+		ApplyPatch{},
+		Skill{},
+		MemorySearch{},
+		MemorySave{},
+		AskUserQuestion{},
 		EnterPlanMode{},
 		ExitPlanMode{},
+		TaskSpawn{},
+	}
+}
+
+// DirectOnlyPack is the Code Mode Only top-level set (human + multi-agent).
+func DirectOnlyPack() []Tool {
+	return []Tool{
+		AskUserQuestion{},
+		EnterPlanMode{},
+		ExitPlanMode{},
+		TaskSpawn{},
+	}
+}
+
+// NestedPack is what JavaScript tools.* may call in Code Mode Only.
+func NestedPack() []Tool {
+	return []Tool{
+		Bash{},
+		ReadFile{},
+		WriteFile{},
+		SearchReplace{},
+		ApplyPatch{},
+		Grep{},
+		Glob{},
+		ListDir{},
+		WebSearch{},
+		WebFetch{},
+		Skill{},
+		MemorySearch{},
+		MemorySave{},
 	}
 }
 

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
 	"github.com/spf13/cobra"
@@ -116,4 +118,68 @@ func newMCPCmd() *cobra.Command {
 		},
 	})
 	return cmd
+}
+
+func newExportCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "export [session-id]",
+		Short: "Export a session transcript as Markdown",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, err := cwd()
+			if err != nil {
+				return err
+			}
+			id := ""
+			if len(args) > 0 {
+				id = args[0]
+			} else {
+				list, err := agent.ListSessions(dir)
+				if err != nil {
+					return err
+				}
+				if len(list) == 0 {
+					return fmt.Errorf("no sessions")
+				}
+				id = list[0].ID
+			}
+			sess, err := agent.LoadSession(dir, id)
+			if err != nil {
+				return err
+			}
+			fmt.Fprint(cmd.OutOrStdout(), sess.ExportMarkdown())
+			return nil
+		},
+	}
+}
+
+func newMemoryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "memory",
+		Short: "Manage cross-session memory notes",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List memory notes",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res := tools.MemorySearch{}.Execute(cmd.Context(), tools.Context{}, json.RawMessage(`{"query":""}`))
+			fmt.Fprintln(cmd.OutOrStdout(), res.Content)
+			return nil
+		},
+	})
+	return cmd
+}
+
+func newWrapCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "wrap [command] [args...]",
+		Short: "Run a command with this process's stdin/stdout",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := exec.Command(args[0], args[1:]...)
+			c.Stdin = os.Stdin
+			c.Stdout = os.Stdout
+			c.Stderr = os.Stderr
+			return c.Run()
+		},
+	}
 }

@@ -10,12 +10,14 @@ import (
 
 // Context is the per-session execution environment for a tool.
 type Context struct {
-	CWD           string
-	SessionDir    string
-	AlwaysApprove bool
-	PlanActive    bool
-	PlanFile      string
-	WorkspaceRoot string
+	CWD            string
+	SessionDir     string
+	AlwaysApprove  bool
+	PlanActive     bool
+	PlanFile       string
+	WorkspaceRoot  string
+	SubagentDepth  int
+	DispatchNested func(ctx context.Context, name string, args json.RawMessage) Result
 }
 
 // Result is a tool's model-facing output.

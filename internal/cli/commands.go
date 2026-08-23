@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/megascan/open-grok/internal/acp"
 	"github.com/megascan/open-grok/internal/catalog"
@@ -92,20 +93,49 @@ func newAgentCmd() *cobra.Command {
 			})
 		},
 	}
+	var bind, secret string
 	serve := &cobra.Command{
 		Use:   "serve",
 		Short: "WebSocket ACP server (127.0.0.1:2419)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("agent serve is not yet wired in the Go runtime; use `open-grok agent stdio`")
+			dir, err := cwd()
+			if err != nil {
+				return err
+			}
+			model, err := selectedModel()
+			if err != nil {
+				return err
+			}
+			return acp.ServeWS(cmd.Context(), bind, secret, acp.Options{
+				CWD:   dir,
+				Model: model.ID,
+				YOLO:  flagYOLO,
+			})
 		},
 	}
+	serve.Flags().StringVar(&bind, "bind", "127.0.0.1:2419", "Listen address")
+	serve.Flags().StringVar(&secret, "secret", os.Getenv("GROK_AGENT_SECRET"), "Bearer token")
+	var noExit bool
 	leader := &cobra.Command{
 		Use:   "leader",
 		Short: "Shared leader process for other clients",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("agent leader is not yet wired in the Go runtime; use in-process TUI or agent stdio")
+			dir, err := cwd()
+			if err != nil {
+				return err
+			}
+			model, err := selectedModel()
+			if err != nil {
+				return err
+			}
+			return acp.ServeLeader(cmd.Context(), acp.Options{
+				CWD:   dir,
+				Model: model.ID,
+				YOLO:  flagYOLO,
+			}, noExit)
 		},
 	}
+	leader.Flags().BoolVar(&noExit, "no-exit-on-disconnect", false, "Keep running after the last client disconnects")
 	cmd.AddCommand(stdio, serve, leader)
 	return cmd
 }
