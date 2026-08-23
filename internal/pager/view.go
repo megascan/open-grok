@@ -21,6 +21,10 @@ const (
 	blockToolResult
 	blockSystem
 	blockSession
+	blockSubagent
+	blockSwarm
+	blockBgTask
+	blockWorkflow
 	blockGoal
 	blockMermaid
 	blockImage
@@ -28,14 +32,18 @@ const (
 )
 
 type block struct {
-	kind   blockKind
-	title  string
-	body   string
-	err    bool
-	at     time.Time
-	folded bool
-	event  sessionEvent
-	hooks  toolHookData
+	kind     blockKind
+	title    string
+	body     string
+	err      bool
+	at       time.Time
+	folded   bool
+	event    sessionEvent
+	hooks    toolHookData
+	subagent *subagentCard
+	swarm    *swarmCard
+	bgTask   *bgTaskCard
+	workflow *workflowRun
 }
 
 func (m *model) transcriptWidth() int {
@@ -139,7 +147,7 @@ func (m *model) renderBlockAt(idx int, w int) string {
 		return ""
 	}
 	bl := m.blocks[idx]
-	if bl.folded && bl.kind != blockUser && bl.kind != blockThinking && bl.kind != blockTool && bl.kind != blockSession {
+	if bl.folded && !lifecycleChrome(bl.kind) && bl.kind != blockUser && bl.kind != blockThinking && bl.kind != blockTool && bl.kind != blockSession {
 		return dimStyle.Render("▸ " + truncate(bl.body, 60))
 	}
 	stamp := ""
@@ -162,6 +170,14 @@ func (m *model) renderBlockAt(idx int, w int) string {
 		return renderAccentBlock(strings.TrimLeft(bl.title, "▸ "), truncateResultBody(bl.body), bl.err)
 	case blockSession:
 		return m.renderSessionEvent(bl, w)
+	case blockSubagent:
+		return m.renderSubagentBlock(bl, w)
+	case blockSwarm:
+		return m.renderSwarmBlock(bl, w)
+	case blockBgTask:
+		return m.renderBgTaskBlock(bl, w)
+	case blockWorkflow:
+		return m.renderWorkflowCard(bl, w)
 	case blockGoal:
 		inner := goalTitle.Render("GOAL") + "\n" + bl.body
 		return goalCard.Width(w - 2).Render(inner)
@@ -587,6 +603,15 @@ func (m *model) blockLineOffset(idx int) int {
 		lines += strings.Count(m.renderBlockAt(i, w), "\n") + 2
 	}
 	return lines
+}
+
+func lifecycleChrome(k blockKind) bool {
+	switch k {
+	case blockSubagent, blockSwarm, blockBgTask, blockWorkflow:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *model) appendBlock(bl block) {

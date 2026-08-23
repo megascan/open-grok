@@ -130,6 +130,7 @@ const (
 type listItem struct {
 	Key, Label, Detail string
 	Header             bool
+	Marks              []int
 }
 
 type loopJob struct {
@@ -1036,7 +1037,19 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 			return nil
 		}
 		if isSchedulerTool(ev.Tool) {
+			if strings.EqualFold(ev.Tool, "scheduler_create") {
+				card := parseBgTaskCard(ev.Text)
+				m.appendBlock(block{kind: blockBgTask, title: ev.Tool, body: ev.Text, bgTask: card, at: time.Now()})
+			}
+			m.setTurnActivity("tool", ev.Tool)
 			return m.reloadLoops()
+		}
+		if strings.EqualFold(ev.Tool, "task") {
+			card := parseTaskCard(ev.Text)
+			m.setTurnActivity("tool", ev.Tool)
+			m.appendBlock(block{kind: blockSubagent, title: ev.Tool, body: ev.Text, subagent: card, at: time.Now()})
+			m.noteSwarmMember(card)
+			return nil
 		}
 		kind := blockTool
 		title := strings.ToLower(ev.Tool)
@@ -1054,7 +1067,16 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 			return nil
 		}
 		if isSchedulerTool(ev.Tool) {
+			if strings.EqualFold(ev.Tool, "scheduler_create") {
+				m.finishBgTask(ev.Text, ev.IsError)
+			}
+			m.setTurnActivity("thinking", "")
 			return m.reloadLoops()
+		}
+		if strings.EqualFold(ev.Tool, "task") {
+			m.finishSubagent(ev.Text, ev.IsError)
+			m.setTurnActivity("thinking", "")
+			return nil
 		}
 		kind := blockToolResult
 		if strings.EqualFold(ev.Tool, "update_goal") {

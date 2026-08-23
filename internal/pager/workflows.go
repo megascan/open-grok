@@ -192,6 +192,7 @@ func (m *model) startWorkflow(kind, displayName, objective, wire string) tea.Cmd
 	}
 	m.workflows = append(m.workflows, run)
 	m.wfActiveID = id
+	m.syncWorkflowBlock(run)
 	display := "/" + kind
 	if objective != "" {
 		display += " " + objective
@@ -239,6 +240,7 @@ func (m *model) finishWorkflow(err error) {
 				}
 			}
 		}
+		m.syncWorkflowBlock(*r)
 		return
 	}
 }
@@ -258,6 +260,7 @@ func (m *model) pauseWorkflow(run *workflowRun) {
 	if m.wfActiveID == run.ID && m.turnCancel != nil {
 		m.turnCancel()
 	}
+	m.syncWorkflowBlock(*run)
 }
 
 func (m *model) resumeWorkflow(run *workflowRun) tea.Cmd {
@@ -273,6 +276,7 @@ func (m *model) resumeWorkflow(run *workflowRun) tea.Cmd {
 		}
 	}
 	m.wfActiveID = run.ID
+	m.syncWorkflowBlock(*run)
 	prompt := "Resume the " + run.Name + " workflow from where it left off. Objective: " + run.Objective
 	return m.submitDisplay("/workflow resume "+run.ID, prompt)
 }
@@ -292,6 +296,7 @@ func (m *model) stopWorkflow(run *workflowRun) {
 		m.turnCancel()
 	}
 	m.wfActiveID = ""
+	m.syncWorkflowBlock(*run)
 }
 
 func (m *model) handleWorkflow(arg string) tea.Cmd {

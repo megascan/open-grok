@@ -29,6 +29,7 @@ type dropdownRow struct {
 	Help   string
 	Insert string // composer replacement on Tab
 	Run    string // slash line on Enter; empty means Insert
+	Marks  []int  // nucleo highlight indices into Label
 }
 
 // renderSlashDropdown paints the inline `/` completion list above the prompt,
@@ -69,12 +70,23 @@ func (m *model) renderHistoryDropdown() string {
 	}
 	rows := make([]dropdownRow, 0, len(m.items))
 	for _, it := range m.items {
-		rows = append(rows, dropdownRow{Label: it.Label, Help: it.Detail})
+		rows = append(rows, dropdownRow{Label: it.Label, Help: it.Detail, Marks: it.Marks})
 	}
 	if len(rows) == 0 {
 		return dimStyle.Render("  (no matches)")
 	}
 	return renderDropdownRows(rows, m.cursor, maxFileDropdownRows, m.transcriptWidth())
+}
+
+func clampMarks(marks []int, s string) []int {
+	n := len([]rune(s))
+	var out []int
+	for _, i := range marks {
+		if i >= 0 && i < n {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 func renderDropdownRows(rows []dropdownRow, selected, maxRows, width int) string {
@@ -104,6 +116,11 @@ func renderDropdownRows(rows []dropdownRow, selected, maxRows, width int) string
 	for i := start; i < end; i++ {
 		r := rows[i]
 		label := r.Label
+		if len(r.Marks) > 0 {
+			label = highlightMarks(label, clampMarks(r.Marks, label),
+				func(s string) string { return titleStyle.Bold(true).Render(s) },
+				nil)
+		}
 		if lipgloss.Width(label) > labelW {
 			label = truncateWidth(label, labelW)
 		}

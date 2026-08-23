@@ -45,12 +45,16 @@ func (m *model) slashDropdownRows() []dropdownRow {
 	}
 	hits := FuzzySlash(m.filter, m.screenMd)
 	rows := make([]dropdownRow, 0, len(hits))
+	q := strings.TrimSpace(m.filter)
 	for _, c := range hits {
+		label := "/" + c.Name
+		_, marks := nucleoMatch(q, label)
 		rows = append(rows, dropdownRow{
-			Label:  "/" + c.Name,
+			Label:  label,
 			Help:   c.Help,
 			Insert: "/" + c.Name + " ",
 			Run:    "/" + c.Name,
+			Marks:  marks,
 		})
 	}
 	return rows
@@ -115,8 +119,12 @@ func (m *model) slashArgRows(d slashDraft) []dropdownRow {
 	}
 	var hits []dropdownRow
 	for _, r := range rows {
+		n, marks := nucleoMatch(q, r.Label)
 		blob := strings.ToLower(r.Label + " " + r.Help + " " + r.Insert)
-		if scoreName(q, strings.ToLower(r.Label)) > 0 || strings.Contains(blob, q) {
+		if n > 0 || strings.Contains(blob, q) {
+			if n > 0 {
+				r.Marks = marks
+			}
 			hits = append(hits, r)
 		}
 	}

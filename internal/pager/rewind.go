@@ -254,6 +254,20 @@ func (m *model) replaySessionBlocks() {
 		case types.RoleAssistant:
 			m.appendBlock(block{kind: blockAgent, body: msg.Content})
 		case types.RoleTool:
+			if strings.EqualFold(msg.Name, "task") {
+				card := parseTaskCard("")
+				card.Desc = truncate(msg.Content, 80)
+				card.Status = "completed"
+				m.appendBlock(block{kind: blockSubagent, title: msg.Name, body: msg.Content, subagent: card})
+				continue
+			}
+			if strings.EqualFold(msg.Name, "scheduler_create") {
+				card := parseBgTaskCard("")
+				card.Desc = truncate(msg.Content, 80)
+				card.Status = "completed"
+				m.appendBlock(block{kind: blockBgTask, title: msg.Name, body: msg.Content, bgTask: card})
+				continue
+			}
 			m.appendBlock(block{kind: blockTool, title: msg.Name, body: ""})
 			m.appendBlock(block{kind: blockToolResult, title: msg.Name, body: msg.Content})
 		}

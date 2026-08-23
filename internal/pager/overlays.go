@@ -1157,7 +1157,7 @@ func fuzzyHistory(q string, hist []string) []listItem {
 	for i := len(hist) - 1; i >= 0; i-- {
 		items = append(items, listItem{Key: hist[i], Label: truncate(hist[i], 70)})
 	}
-	q = strings.ToLower(strings.TrimSpace(q))
+	q = strings.TrimSpace(q)
 	if q == "" {
 		return items
 	}
@@ -1167,13 +1167,13 @@ func fuzzyHistory(q string, hist []string) []listItem {
 	}
 	var hits []scored
 	for _, it := range items {
-		n := scoreName(q, it.Key)
-		if n == 0 && strings.Contains(strings.ToLower(it.Key), q) {
-			n = 1
+		n, _ := nucleoMatch(q, it.Key)
+		if n == 0 {
+			continue
 		}
-		if n > 0 {
-			hits = append(hits, scored{it, n})
-		}
+		_, marks := nucleoMatch(q, it.Label)
+		it.Marks = marks
+		hits = append(hits, scored{it, n})
 	}
 	for i := 0; i < len(hits); i++ {
 		for j := i + 1; j < len(hits); j++ {

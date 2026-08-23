@@ -811,6 +811,7 @@ func (m *model) handleSwarm(arg string) tea.Cmd {
 			m.sess.Swarm = true
 		}
 		m.persistUI()
+		m.appendBlock(block{kind: blockSwarm, swarm: &swarmCard{Desc: arg, Expected: 1}, folded: true, at: time.Now()})
 		m.appendSys("Swarm task started; manual approvals may slow the swarm.")
 		return m.submit("Swarm mode: partition this task across parallel subagents (depth 1), then merge. Task: " + arg)
 	}

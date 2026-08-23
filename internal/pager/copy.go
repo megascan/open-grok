@@ -32,8 +32,11 @@ func (m *model) copyBlock(idx int) tea.Cmd {
 	}
 	bl := m.blocks[idx]
 	text := bl.body
-	if bl.kind == blockSession {
+	switch bl.kind {
+	case blockSession:
 		text = bl.event.message()
+	case blockSubagent, blockSwarm, blockBgTask, blockWorkflow:
+		text = strings.TrimSpace(stripANSI(m.renderBlock(bl, 80)))
 	}
 	return m.copyText(text, true)
 }
