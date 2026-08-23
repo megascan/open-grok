@@ -18,6 +18,8 @@ func testModel(t *testing.T) *model {
 	t.Helper()
 	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
+	liveVoiceCapture = false
+	t.Cleanup(func() { liveVoiceCapture = true })
 	m, err := newModel(Options{
 		CWD:   t.TempDir(),
 		Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter},

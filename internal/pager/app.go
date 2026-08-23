@@ -539,6 +539,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case usageFetchedMsg:
 		m.usageLoading = false
 		m.usageLimitText = msg.text
+	case voiceEventMsg:
+		if cmd := m.handleVoiceEvent(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case voiceEndedMsg:
+		if m.voice != nil {
+			m.voice.events = nil
+		}
 	case suggestionLoadedMsg:
 		m.suggest.onLoaded(msg.text, msg.generation)
 	case permAskMsg:

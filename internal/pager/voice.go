@@ -1,18 +1,50 @@
 package pager
 
 import (
+	"context"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/megascan/open-grok/internal/auth"
+	"github.com/megascan/open-grok/internal/types"
+	"github.com/megascan/open-grok/internal/voice"
 )
 
-// voiceState is the dictation overlay. There is no microphone in this pager;
-// keys type into the transcript (the recording banner is the only feedback).
+// liveVoiceCapture starts Linux mic + streaming STT when a recorder is on PATH.
+// Pager tests turn this off so they never spawn pw-record/arecord.
+var liveVoiceCapture = true
+
+// startVoiceSession is voice.Start; tests replace it with a fake pipeline.
+var startVoiceSession = voice.Start
+
+var detectVoiceRecorder = voice.DetectRecorder
+
+func defaultResolveSTTBearer() (string, error) {
+	b, _, err := auth.ResolveBearer(types.ProviderXAI, auth.EnvKeys(types.ProviderXAI), false)
+	return b, err
+}
+
+var resolveSTTBearer = defaultResolveSTTBearer
+
+// voiceState is the dictation overlay. Live capture fills Interim/Transcript
+// from xAI streaming STT; keys can still edit the committed transcript.
 type voiceState struct {
 	Active     bool
 	Transcript string
 	Interim    string
+	Err        string
+	Hint       string
+	Recorder   string
+	TypedOnly  bool
+	stop       func()
+	events     <-chan voice.Event
 }
+
+type voiceEventMsg struct {
+	ev voice.Event
+}
+
+type voiceEndedMsg struct{}
 
 func (m *model) voiceKeybindOn() bool {
 	return m.cfg.PrefBool("voice_keybind_enabled", m.cfg.UI.VoiceKeybind, true)
@@ -50,19 +82,112 @@ func (m *model) toggleVoice() tea.Cmd {
 		m.stopVoice()
 		return nil
 	}
-	m.startVoice()
-	return nil
+	return m.startVoice()
 }
 
-func (m *model) startVoice() {
+func (m *model) startVoice() tea.Cmd {
 	m.voice = &voiceState{Active: true}
 	m.overlay = overlayVoice
 	m.focusScroll = false
 	m.ta.Blur()
+	if !liveVoiceCapture {
+		return nil
+	}
+	return m.beginLiveVoice()
+}
+
+func (m *model) beginLiveVoice() tea.Cmd {
+	if m.voice == nil {
+		return nil
+	}
+	if _, ok := detectVoiceRecorder(); !ok {
+		m.voice.TypedOnly = true
+		m.voice.Err = voice.ErrNoRecorder
+		return nil
+	}
+	if rec, ok := detectVoiceRecorder(); ok {
+		m.voice.Recorder = rec.Name()
+	}
+	bearer, err := resolveSTTBearer()
+	if err != nil {
+		m.voice.TypedOnly = true
+		m.voice.Err = voice.ErrAuth
+		return nil
+	}
+	cfg := voice.ConfigFromEnv()
+	if m.cfg.Prefs != nil {
+		if lang := strings.TrimSpace(m.cfg.Prefs["voice_stt_language"]); lang != "" {
+			cfg.Language = lang
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sess, err := startVoiceSession(ctx, cfg, bearer)
+	if err != nil {
+		cancel()
+		m.voice.TypedOnly = true
+		m.voice.Err = err.Error()
+		return nil
+	}
+	m.voice.stop = func() {
+		cancel()
+		sess.Stop()
+	}
+	m.voice.events = sess.Events
+	m.voice.TypedOnly = false
+	return listenVoice(sess.Events)
+}
+
+func listenVoice(ch <-chan voice.Event) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return voiceEndedMsg{}
+		}
+		return voiceEventMsg{ev: ev}
+	}
+}
+
+func (m *model) handleVoiceEvent(msg voiceEventMsg) tea.Cmd {
+	if m.voice == nil || !m.voice.Active {
+		return nil
+	}
+	switch msg.ev.Kind {
+	case voice.EventInterim:
+		m.voice.Interim = msg.ev.Text
+		m.voice.Err = ""
+	case voice.EventFinal:
+		text := strings.TrimSpace(msg.ev.Text)
+		if text != "" {
+			if strings.TrimSpace(m.voice.Transcript) == "" {
+				m.voice.Transcript = text
+			} else {
+				m.voice.Transcript = strings.TrimSpace(m.voice.Transcript) + " " + text
+			}
+		}
+		m.voice.Interim = ""
+	case voice.EventError:
+		m.voice.Err = msg.ev.Text
+		m.voice.Hint = msg.ev.Hint
+		m.voice.Interim = ""
+		if m.voice.stop != nil {
+			m.voice.stop()
+			m.voice.stop = nil
+		}
+		m.voice.events = nil
+		return nil
+	}
+	return listenVoice(m.voice.events)
 }
 
 func (m *model) stopVoice() {
 	if m.voice != nil {
+		if m.voice.stop != nil {
+			m.voice.stop()
+			m.voice.stop = nil
+		}
 		m.voice.Active = false
 	}
 	m.voice = nil
@@ -88,6 +213,13 @@ func (m *model) handleVoiceKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	case "enter":
 		text := strings.TrimSpace(m.voice.Transcript)
+		if extra := strings.TrimSpace(m.voice.Interim); extra != "" {
+			if text == "" {
+				text = extra
+			} else {
+				text += " " + extra
+			}
+		}
 		m.stopVoice()
 		if text == "" {
 			return nil
@@ -120,13 +252,27 @@ func (m *model) renderVoiceBanner() string {
 		return ""
 	}
 	body := strings.TrimSpace(m.voice.Transcript)
-	if body == "" {
-		body = m.voice.Interim
+	if m.voice.Interim != "" {
+		if body == "" {
+			body = m.voice.Interim
+		} else {
+			body += " " + m.voice.Interim
+		}
+	}
+	if body == "" && m.voice.Err != "" {
+		body = m.voice.Err
 	}
 	if body == "" {
-		body = "Listening… type to dictate (no microphone in this pager)"
+		if m.voice.TypedOnly || m.voice.Recorder == "" {
+			body = "Listening… type to dictate — " + voice.ErrNoRecorder
+		} else {
+			body = "Listening…"
+		}
 	}
 	hint := "enter send  ·  esc cancel  ·  Ctrl+Space/F8 stop  ·  " + m.voiceCaptureMode()
+	if m.voice.Hint != "" {
+		hint = m.voice.Hint + "  ·  " + hint
+	}
 	return panelStyle.Width(max(20, m.width-2)).Render(
 		okStyle.Render("● Recording") + "\n" + body + "█\n" + dimStyle.Render(hint),
 	)

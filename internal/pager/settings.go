@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/voice"
 )
 
 // settingDef is one Rust settings-registry row (xai-grok-pager settings/defs.rs).
@@ -111,7 +112,7 @@ func rustSettingsCatalog() []settingDef {
 		{"auto_update", "Advanced", "Auto update", "bool", nil, 0, 0, ""},
 		{"voice_keybind_enabled", "Input", "Voice keybind", "bool", nil, 0, 0, ""},
 		{"voice_capture_mode", "Input", "Voice capture", "enum", []string{"hold", "toggle"}, 0, 0, ""},
-		{"voice_stt_language", "Input", "Voice STT language", "enum", []string{"auto", "en", "zh"}, 0, 0, ""},
+		{"voice_stt_language", "Input", "Voice STT language", "enum", voice.SettingsLanguageCodes(), 0, 0, ""},
 		{"memory.enabled", "Memory", "Memory", "bool", nil, 0, 0, ""},
 		{"memory.dream.enabled", "Memory", "Memory dream", "bool", nil, 0, 0, ""},
 		{"features.telemetry", "Advanced", "Telemetry", "bool", nil, 0, 0, ""},

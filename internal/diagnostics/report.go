@@ -11,6 +11,7 @@ import (
 
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/version"
+	"github.com/megascan/open-grok/internal/voice"
 	"golang.org/x/term"
 )
 
@@ -187,7 +188,7 @@ func Collect() Report {
 		WrapSink:    wrapSinkOn(),
 		DataControl: dataControl(),
 		ClipStatus:  "unverified",
-		Microphone:  "none detected",
+		Microphone:  voice.DoctorMicrophone(),
 		Home:        config.Home(),
 		Version:     version.String(),
 	}
