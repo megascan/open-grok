@@ -551,7 +551,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys(gboomNoGraphicsToast)
 			break
 		}
-		m.openGboom()
+		return m.openGboom()
 	case "scroll-debug":
 		m.scrollHUD = !m.scrollHUD
 	case "debug":

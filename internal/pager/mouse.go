@@ -11,6 +11,12 @@ import (
 // prompt vs scrollback vs dashboard rows. Matches Rust pane order enough for
 // click-to-focus and click-to-select-block.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayGboom {
+		if tea.MouseEvent(msg).IsWheel() {
+			return nil, true
+		}
+		return m.handleGboomMouse(msg), true
+	}
 	if tea.MouseEvent(msg).IsWheel() {
 		return m.handleMouseWheel(msg)
 	}

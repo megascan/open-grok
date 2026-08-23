@@ -17,6 +17,7 @@ import (
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/claudeimport"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/gboom"
 	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
@@ -190,7 +191,7 @@ type model struct {
 	permPatternMode                                                       bool
 	permMCPServer                                                         bool
 	voice                                                                 *voiceState
-	gboom                                                                 *gboomHUD
+	gboom                                                                 *gboom.State
 	workflows                                                             []workflowRun
 	wfDetail, wfPhase                                                     int
 	wfActiveID                                                            string
@@ -554,6 +555,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.overlay != overlayPermission && m.overlay != overlayCancelTurn {
 			m.overlay = overlayPlan
 		}
+	case gboomTickMsg:
+		return m, m.handleGboomTick()
 	case loopTickMsg:
 		return m, m.onLoopTick(msg.id)
 	case editDone:
