@@ -171,6 +171,11 @@ type model struct {
 	loginP                                                                types.Provider
 	loginKimiCode                                                         bool
 	keyBuf                                                                string
+	loginOAuthWaiting                                                     bool
+	loginOAuthURL                                                         string
+	loginOAuthErr                                                         string
+	loginOAuthCancel                                                      context.CancelFunc
+	loginOAuthClose                                                       func()
 	echoOn                                                                bool
 	extTab                                                                int
 	docsIdx                                                               int
@@ -523,6 +528,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyRecapDone(msg)
 	case mermaidDoneMsg:
 		if cmd := m.handleMermaidDone(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case loginOAuthDoneMsg:
+		if cmd := m.handleLoginOAuthDone(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	case suggestionLoadedMsg:

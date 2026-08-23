@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -72,13 +73,27 @@ type deviceUserCodeJSON struct {
 	Interval     any    `json:"interval"`
 }
 
-// BrowserLogin runs the localhost PKCE callback flow.
-func BrowserLogin(ctx context.Context, ep Endpoints, announce bool) (TokenResponse, error) {
+// BrowserSession is an in-flight PKCE login waiting on the localhost callback.
+type BrowserSession struct {
+	AuthURL     string
+	RedirectURL string
+	ep          Endpoints
+	ln          net.Listener
+	srv         *http.Server
+	codeCh      chan string
+	errCh       chan error
+	verifier    string
+	closeOnce   sync.Once
+}
+
+// StartBrowserLogin binds the Codex PKCE callback and returns before waiting
+// so a TUI can show the authorize URL on the alternate screen.
+func StartBrowserLogin(ep Endpoints) (*BrowserSession, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", callbackPort))
 	if err != nil {
 		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", callbackBackup))
 		if err != nil {
-			return TokenResponse{}, fmt.Errorf("could not bind Codex OAuth callback on ports %d or %d: %w", callbackPort, callbackBackup, err)
+			return nil, fmt.Errorf("could not bind Codex OAuth callback on ports %d or %d: %w", callbackPort, callbackBackup, err)
 		}
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
@@ -125,33 +140,77 @@ func BrowserLogin(ctx context.Context, ep Endpoints, announce bool) (TokenRespon
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
-	defer func() {
+	return &BrowserSession{
+		AuthURL:     authURL,
+		RedirectURL: redirect,
+		ep:          ep,
+		ln:          ln,
+		srv:         srv,
+		codeCh:      codeCh,
+		errCh:       errCh,
+		verifier:    verifier,
+	}, nil
+}
+
+// OpenBrowser launches the system handler for the authorize URL.
+func (s *BrowserSession) OpenBrowser() error {
+	if s == nil {
+		return fmt.Errorf("codex oauth session is nil")
+	}
+	return openBrowser(s.AuthURL)
+}
+
+// Close shuts down the callback server. Safe to call more than once.
+func (s *BrowserSession) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(cctx)
-		_ = ln.Close()
-	}()
+		if s.srv != nil {
+			_ = s.srv.Shutdown(cctx)
+		}
+		if s.ln != nil {
+			_ = s.ln.Close()
+		}
+	})
+}
 
-	if announce {
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Signing in to OpenAI Codex with ChatGPT...")
-		fmt.Fprintln(os.Stderr, "Open this URL if your browser does not open automatically:")
-		fmt.Fprintln(os.Stderr, "  "+authURL)
+// Wait blocks until the ChatGPT callback arrives, then exchanges the code.
+func (s *BrowserSession) Wait(ctx context.Context) (TokenResponse, error) {
+	if s == nil {
+		return TokenResponse{}, fmt.Errorf("codex oauth session is nil")
 	}
-	_ = openBrowser(authURL)
-
+	defer s.Close()
 	timer := time.NewTimer(callbackWait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return TokenResponse{}, ctx.Err()
-	case err := <-errCh:
+	case err := <-s.errCh:
 		return TokenResponse{}, err
-	case code := <-codeCh:
-		return ExchangeCode(ctx, ep, code, redirect, verifier)
+	case code := <-s.codeCh:
+		return ExchangeCode(ctx, s.ep, code, s.RedirectURL, s.verifier)
 	case <-timer.C:
 		return TokenResponse{}, fmt.Errorf("timed out waiting for the Codex OAuth callback")
 	}
+}
+
+// BrowserLogin runs the localhost PKCE callback flow.
+func BrowserLogin(ctx context.Context, ep Endpoints, announce bool) (TokenResponse, error) {
+	sess, err := StartBrowserLogin(ep)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if announce {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Signing in to OpenAI Codex with ChatGPT...")
+		fmt.Fprintln(os.Stderr, "Open this URL if your browser does not open automatically:")
+		fmt.Fprintln(os.Stderr, "  "+sess.AuthURL)
+	}
+	_ = sess.OpenBrowser()
+	return sess.Wait(ctx)
 }
 
 // DeviceLogin runs the headless ChatGPT device-code flow.

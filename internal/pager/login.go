@@ -1,13 +1,42 @@
 package pager
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/auth"
+	"github.com/megascan/open-grok/internal/oauth"
 	"github.com/megascan/open-grok/internal/types"
 )
+
+const (
+	codexOpeningMsg = "Opening your browser to connect OpenAI Codex…"
+	codexConnected  = "OpenAI Codex connected."
+)
+
+type loginOAuthDoneMsg struct {
+	tok oauth.TokenResponse
+	err error
+}
+
+type startCodexOAuthFn func(ctx context.Context) (authURL string, wait func(context.Context) (oauth.TokenResponse, error), closer func(), err error)
+
+// startCodexOAuth is the production ChatGPT PKCE starter. Tests replace it so
+// the overlay never binds a port or opens a real browser.
+var startCodexOAuth startCodexOAuthFn = defaultStartCodexOAuth
+
+func defaultStartCodexOAuth(ctx context.Context) (string, func(context.Context) (oauth.TokenResponse, error), func(), error) {
+	_ = ctx
+	sess, err := oauth.StartBrowserLogin(oauth.DefaultEndpoints())
+	if err != nil {
+		return "", nil, nil, err
+	}
+	_ = sess.OpenBrowser()
+	return sess.AuthURL, sess.Wait, sess.Close, nil
+}
 
 // loginPickerLabel is the Rust /login modal display name.
 func loginPickerLabel(p types.Provider) string {
@@ -86,9 +115,20 @@ func (m *model) fillLoginPicker() {
 	m.cursor = 0
 }
 
+func (m *model) selectLoginProvider(p types.Provider) tea.Cmd {
+	m.loginP = p
+	m.keyBuf = ""
+	if p == types.ProviderCodex && !m.loginKimiCode {
+		return m.beginCodexOAuth()
+	}
+	return nil
+}
+
 // openLogin opens the in-session provider picker overlay when a chat is
-// already running, and the full-screen first-run login otherwise.
-func (m *model) openLogin(provider string) {
+// already running, and the full-screen first-run login otherwise. Selecting
+// Codex starts the same in-TUI ChatGPT PKCE flow as Rust Action::LoginCodex.
+func (m *model) openLogin(provider string) tea.Cmd {
+	m.stopCodexOAuth()
 	m.keyBuf = ""
 	m.loginKimiCode = false
 	stay := m.sess != nil && m.screen == screenChat
@@ -101,14 +141,93 @@ func (m *model) openLogin(provider string) {
 	if provider != "" {
 		p, ok := parseLoginProvider(provider)
 		if ok {
-			m.loginP = p
 			if provider == "kimi-code" || provider == "kimi_code" {
 				m.loginKimiCode = true
 			}
-			return
+			return m.selectLoginProvider(p)
 		}
 	}
 	m.fillLoginPicker()
+	return nil
+}
+
+func (m *model) beginCodexOAuth() tea.Cmd {
+	m.stopCodexOAuth()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.loginOAuthCancel = cancel
+	m.loginOAuthWaiting = true
+	m.loginOAuthURL = ""
+	m.loginOAuthErr = ""
+	authURL, wait, closer, err := startCodexOAuth(ctx)
+	if err != nil {
+		m.loginOAuthErr = err.Error()
+		m.status = "OpenAI Codex login failed: " + err.Error()
+		return nil
+	}
+	m.loginOAuthURL = authURL
+	m.loginOAuthClose = closer
+	if m.sess != nil {
+		m.appendSys(codexOpeningMsg)
+	}
+	return func() tea.Msg {
+		tok, err := wait(ctx)
+		return loginOAuthDoneMsg{tok: tok, err: err}
+	}
+}
+
+func (m *model) stopCodexOAuth() {
+	if m.loginOAuthCancel != nil {
+		m.loginOAuthCancel()
+		m.loginOAuthCancel = nil
+	}
+	if m.loginOAuthClose != nil {
+		m.loginOAuthClose()
+		m.loginOAuthClose = nil
+	}
+	m.loginOAuthWaiting = false
+	m.loginOAuthURL = ""
+	m.loginOAuthErr = ""
+}
+
+func (m *model) handleLoginOAuthDone(msg loginOAuthDoneMsg) tea.Cmd {
+	if errors.Is(msg.err, context.Canceled) {
+		return nil
+	}
+	if !m.loginOAuthWaiting {
+		return nil
+	}
+	if msg.err != nil {
+		m.loginOAuthErr = msg.err.Error()
+		m.status = "OpenAI Codex login failed: " + msg.err.Error()
+		if m.sess != nil {
+			m.appendSys("OpenAI Codex login failed: " + msg.err.Error())
+		}
+		return nil
+	}
+	if err := auth.SaveCodexOAuth(msg.tok); err != nil {
+		m.loginOAuthErr = err.Error()
+		m.status = err.Error()
+		return nil
+	}
+	m.stopCodexOAuth()
+	return m.finishLoginSuccess(codexConnected)
+}
+
+func (m *model) finishLoginSuccess(message string) tea.Cmd {
+	inOverlay := m.overlay == overlayLogin
+	m.keyBuf = ""
+	m.status = message
+	if inOverlay || m.sess != nil {
+		m.overlay = overlayNone
+		m.screen = screenChat
+		m.appendBlock(block{kind: blockSystem, body: message})
+		m.refreshVP()
+		return nil
+	}
+	m.loginP = ""
+	m.screen = screenWelcome
+	m.refreshWelcome()
+	return nil
 }
 
 func (m *model) renderLoginOverlay(w int) string {
@@ -133,8 +252,22 @@ func (m *model) loginBody() string {
 	}
 	writeAccent(&b, titleStyle.Render(loginPickerLabel(m.loginP)))
 	if m.loginP == types.ProviderCodex {
-		writeAccent(&b, dimStyle.Render("Codex OAuth needs a browser (entropy login --codex)."))
-		writeAccent(&b, dimStyle.Render("Paste an API key here to store OPENAI_API_KEY in codex-auth.json."))
+		if m.loginOAuthWaiting {
+			writeAccent(&b, dimStyle.Render(codexOpeningMsg))
+			if m.loginOAuthURL != "" {
+				writeAccent(&b, dimStyle.Render("Open this URL if your browser does not open automatically:"))
+				writeAccent(&b, m.loginOAuthURL)
+			}
+			if m.loginOAuthErr != "" {
+				writeAccent(&b, m.loginOAuthErr)
+			} else {
+				writeAccent(&b, dimStyle.Render("Waiting for the ChatGPT callback on localhost…"))
+			}
+			writeAccent(&b, dimStyle.Render("Paste an API key and press enter to skip OAuth."))
+		} else {
+			writeAccent(&b, dimStyle.Render("Sign in with ChatGPT in the browser, or paste an API key."))
+			writeAccent(&b, dimStyle.Render("Press enter with an empty field to open the browser."))
+		}
 	} else if m.loginP == types.ProviderXAI {
 		writeAccent(&b, dimStyle.Render("Sign in with xAI"))
 		writeAccent(&b, dimStyle.Render("Paste an API key. It is written owner-only under ~/.entropy."))
@@ -148,7 +281,11 @@ func (m *model) loginBody() string {
 	}
 	writeAccent(&b, "key: "+shown)
 	writeAccent(&b, "")
-	writeAccent(&b, dimStyle.Render("enter save  ·  esc back  ·  never commit this key"))
+	if m.loginP == types.ProviderCodex {
+		writeAccent(&b, dimStyle.Render("enter save/oauth  ·  esc cancel  ·  never commit this key"))
+	} else {
+		writeAccent(&b, dimStyle.Render("enter save  ·  esc back  ·  never commit this key"))
+	}
 	return b.String()
 }
 
@@ -176,8 +313,7 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 			if m.cursor < len(m.items) {
 				p, ok := parseLoginProvider(m.items[m.cursor].Key)
 				if ok {
-					m.loginP = p
-					m.keyBuf = ""
+					return m.selectLoginProvider(p)
 				}
 			}
 		default:
@@ -185,8 +321,7 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 				m.cursor = idx
 				p, ok := parseLoginProvider(m.items[idx].Key)
 				if ok {
-					m.loginP = p
-					m.keyBuf = ""
+					return m.selectLoginProvider(p)
 				}
 			}
 		}
@@ -194,6 +329,7 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	switch msg.Type {
 	case tea.KeyEsc:
+		m.stopCodexOAuth()
 		m.loginP = ""
 		m.keyBuf = ""
 		m.fillLoginPicker()
@@ -201,8 +337,12 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 	case tea.KeyEnter:
 		key := strings.TrimSpace(m.keyBuf)
 		if key == "" {
+			if m.loginP == types.ProviderCodex {
+				return m.beginCodexOAuth()
+			}
 			return nil
 		}
+		m.stopCodexOAuth()
 		if err := auth.SaveAPIKey(m.loginP, key, m.loginKimiCode); err != nil {
 			m.status = err.Error()
 			return nil

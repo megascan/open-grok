@@ -306,8 +306,7 @@ func (m *model) chooseStartup(p types.Provider) tea.Cmd {
 			break
 		}
 	}
-	m.openLogin(string(p))
-	return nil
+	return m.openLogin(string(p))
 }
 
 func (m *model) pickWelcome(key string) tea.Cmd {
@@ -351,7 +350,7 @@ func (m *model) pickWelcome(key string) tea.Cmd {
 		m.layoutChat()
 		return cmd
 	case key == "login":
-		m.openLogin("")
+		return m.openLogin("")
 	case key == "settings":
 		m.openSettings()
 	case key == "quit":

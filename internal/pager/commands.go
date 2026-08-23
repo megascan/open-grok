@@ -495,7 +495,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 				break
 			}
 		}
-		m.openLogin(arg)
+		return m.openLogin(arg)
 	case "logout":
 		p := m.opts.Model.Provider
 		if arg != "" {
