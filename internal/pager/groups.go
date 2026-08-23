@@ -6,6 +6,7 @@ import (
 )
 
 type verbRun struct {
+	Kind       verbKind
 	Verb, Noun string
 	Start, End int // inclusive Start, exclusive End in m.blocks
 	Failed     int
@@ -23,23 +24,8 @@ func toolName(title string) string {
 }
 
 func toolVerb(title string) (verb, noun string) {
-	name := toolName(title)
-	switch {
-	case strings.Contains(name, "read"):
-		return "Read", "file"
-	case strings.Contains(name, "write") || strings.Contains(name, "search_replace") || strings.Contains(name, "apply_patch"):
-		return "Edited", "file"
-	case strings.Contains(name, "grep") || strings.Contains(name, "search") || strings.Contains(name, "glob"):
-		return "Searched", "pattern"
-	case strings.Contains(name, "list") || name == "ls":
-		return "Listed", "dir"
-	case name == "bash" || strings.Contains(name, "shell") || name == "exec":
-		return "Ran", "command"
-	case strings.Contains(name, "web"):
-		return "Fetched", "url"
-	default:
-		return "Used", "tool"
-	}
+	k := classifyTool(title)
+	return k.verb(false), k.noun(1)
 }
 
 func (m *model) verbRuns() []verbRun {
@@ -51,8 +37,12 @@ func (m *model) verbRuns() []verbRun {
 			i++
 			continue
 		}
-		verb, noun := toolVerb(b.title)
-		run := verbRun{Verb: verb, Noun: noun, Start: i, End: i + 1}
+		kind := classifyTool(b.title)
+		if !kind.groupable() {
+			i++
+			continue
+		}
+		run := verbRun{Kind: kind, Verb: kind.verb(false), Noun: kind.noun(1), Start: i, End: i + 1}
 		if strings.TrimSpace(b.body) == "" {
 			run.Running = true
 		}
@@ -70,8 +60,8 @@ func (m *model) verbRuns() []verbRun {
 			if nb.kind != blockTool {
 				break
 			}
-			v2, _ := toolVerb(nb.title)
-			if v2 != verb {
+			k2 := classifyTool(nb.title)
+			if k2 != kind || !k2.groupable() {
 				break
 			}
 			if strings.TrimSpace(nb.body) == "" {
@@ -80,7 +70,17 @@ func (m *model) verbRuns() []verbRun {
 			run.End = j + 1
 			j++
 		}
-		runs = append(runs, run)
+		n := 0
+		for k := run.Start; k < run.End; k++ {
+			if m.blocks[k].kind == blockTool {
+				n++
+			}
+		}
+		if n >= 2 {
+			run.Verb = kind.verb(run.Running)
+			run.Noun = kind.noun(n)
+			runs = append(runs, run)
+		}
 		i = run.End
 		if i == run.Start {
 			i++
@@ -117,55 +117,32 @@ func (m *model) runForBlock(idx int) (verbRun, bool) {
 	return verbRun{}, false
 }
 
-func nounPlural(noun string, n int) string {
-	if n == 1 {
-		return noun
-	}
-	switch noun {
-	case "dir":
-		return "dirs"
-	default:
-		return noun + "s"
-	}
-}
-
-func (m *model) renderVerbHeader(run verbRun, w int) string {
+func (m *model) toolCount(run verbRun) int {
 	n := 0
 	for i := run.Start; i < run.End; i++ {
 		if m.blocks[i].kind == blockTool {
 			n++
 		}
 	}
+	return n
+}
+
+func (m *model) renderVerbHeader(run verbRun, w int) string {
+	n := m.toolCount(run)
 	if n == 0 {
 		n = 1
 	}
-	verb := run.Verb
-	if run.Running {
-		switch run.Verb {
-		case "Read":
-			verb = "Reading"
-		case "Edited":
-			verb = "Editing"
-		case "Searched":
-			verb = "Searching"
-		case "Listed":
-			verb = "Listing"
-		case "Ran":
-			verb = "Running"
-		case "Fetched":
-			verb = "Fetching"
-		case "Used":
-			verb = "Using"
-		}
-	}
+	verb := run.Kind.verb(run.Running)
 	mark := "▸ "
 	if m.groupExpanded(run) {
 		mark = "▾ "
 	}
-	label := fmt.Sprintf("%s%s %d %s", mark, verb, n, nounPlural(run.Noun, n))
+	label := fmt.Sprintf("%s%s %d %s", mark, verb, n, run.Kind.noun(n))
 	if run.Failed > 0 {
 		label += fmt.Sprintf(" · %d failed", run.Failed)
 	}
-	inner := toolStyle.Render(label)
-	return toolCard.Width(w - 2).Render(inner)
+	var b strings.Builder
+	writeAccent(&b, toolStyle.Render(label))
+	_ = w
+	return strings.TrimRight(b.String(), "\n")
 }

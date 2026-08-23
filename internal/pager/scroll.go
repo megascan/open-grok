@@ -58,6 +58,13 @@ func (m *model) toggleFold(idx int) {
 			return
 		}
 	}
+	if m.groupTools {
+		if run, ok := m.runForBlock(idx); ok && m.toolCount(run) >= 2 {
+			m.toggleGroup(run)
+			m.refreshVP()
+			return
+		}
+	}
 	m.blocks[idx].folded = !m.blocks[idx].folded
 	m.refreshVP()
 }

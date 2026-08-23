@@ -66,11 +66,17 @@ func (m *model) renderTranscript() string {
 		if i < skipUntil {
 			continue
 		}
+		if i > 0 && bl.kind == blockToolResult && m.blocks[i-1].kind == blockTool {
+			continue
+		}
+		if bl.kind == blockAgent && strings.TrimSpace(bl.body) == "" {
+			continue
+		}
 		if i > 0 && b.Len() > 0 {
 			b.WriteByte('\n')
 		}
 		if m.groupTools {
-			if run, ok := m.runStartingAt(i); ok {
+			if run, ok := m.runStartingAt(i); ok && m.toolCount(run) >= 2 {
 				header := m.renderVerbHeader(run, w)
 				if m.focusScroll && i == m.selectedBlock {
 					header = selStyle.Render("▌") + " " + header
@@ -83,7 +89,10 @@ func (m *model) renderTranscript() string {
 				b.WriteByte('\n')
 			}
 		}
-		body := m.renderBlock(bl, w)
+		body := m.renderBlockAt(i, w)
+		if body == "" {
+			continue
+		}
 		if m.focusScroll && i == m.selectedBlock {
 			body = selStyle.Render("▌") + " " + body
 		}
@@ -101,7 +110,7 @@ func (m *model) runStartingAt(i int) (verbRun, bool) {
 					n++
 				}
 			}
-			if n >= 1 {
+			if n >= 2 {
 				return r, true
 			}
 		}
@@ -110,7 +119,24 @@ func (m *model) runStartingAt(i int) (verbRun, bool) {
 }
 
 func (m *model) renderBlock(bl block, w int) string {
-	if bl.folded {
+	for i, existing := range m.blocks {
+		if existing.kind == bl.kind && existing.title == bl.title && existing.body == bl.body && existing.at.Equal(bl.at) {
+			return m.renderBlockAt(i, w)
+		}
+	}
+	saved := m.blocks
+	m.blocks = []block{bl}
+	out := m.renderBlockAt(0, w)
+	m.blocks = saved
+	return out
+}
+
+func (m *model) renderBlockAt(idx int, w int) string {
+	if idx < 0 || idx >= len(m.blocks) {
+		return ""
+	}
+	bl := m.blocks[idx]
+	if bl.folded && bl.kind != blockUser && bl.kind != blockThinking && bl.kind != blockTool {
 		return dimStyle.Render("▸ " + truncate(bl.body, 60))
 	}
 	stamp := ""
@@ -119,27 +145,18 @@ func (m *model) renderBlock(bl block, w int) string {
 	}
 	switch bl.kind {
 	case blockUser:
-		return userLabel.Render("YOU") + stamp + "\n" + renderMarkdownEx(bl.body, w, m.mermaidOn())
+		return m.renderUserBlock(bl, w) + stamp
 	case blockAgent:
-		return agentLabel.Render("ENTROPY") + stamp + "\n" + renderMarkdownEx(bl.body, w, m.mermaidOn())
+		if strings.TrimSpace(bl.body) == "" {
+			return ""
+		}
+		return renderMarkdownEx(bl.body, w, m.mermaidOn())
 	case blockThinking:
-		return dimStyle.Render("thinking") + "\n" + dimStyle.Render(bl.body)
+		return m.renderThinkingBlock(bl, idx, w)
 	case blockTool:
-		inner := toolStyle.Render(bl.title) + "\n" + dimStyle.Render(truncate(bl.body, 600))
-		return toolCard.Width(w - 2).Render(inner)
+		return m.renderToolBlock(idx, w)
 	case blockToolResult:
-		body := truncate(bl.body, 800)
-		st := dimStyle
-		card := toolCard
-		if bl.err {
-			st = errStyle
-			card = errCard
-		}
-		if strings.EqualFold(bl.title, "update_goal") {
-			card = goalCard
-		}
-		inner := dimStyle.Render(bl.title) + "\n" + st.Render(body)
-		return card.Width(w - 2).Render(inner)
+		return renderAccentBlock(strings.TrimLeft(bl.title, "▸ "), truncateResultBody(bl.body), bl.err)
 	case blockGoal:
 		inner := goalTitle.Render("GOAL") + "\n" + bl.body
 		return goalCard.Width(w - 2).Render(inner)
@@ -151,11 +168,105 @@ func (m *model) renderBlock(bl block, w int) string {
 	case blockBtw:
 		return m.renderBtwBlock(bl, w)
 	case blockImage:
-		inner := toolStyle.Render("image") + "\n" + dimStyle.Render(truncate(bl.body, 400))
-		return toolCard.Width(w - 2).Render(inner)
+		return renderAccentBlock("image", truncate(bl.body, 400), false)
 	default:
 		return sysLabel.Render(bl.body)
 	}
+}
+
+func (m *model) renderUserBlock(bl block, w int) string {
+	text := bl.body
+	if bl.folded {
+		text, _ = collapseUserLines(text)
+	}
+	prefix := userStyle.Render(userPromptPrefix(bl.body))
+	body := renderMarkdownEx(text, max(8, w-3), m.mermaidOn())
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	hang := strings.Repeat(" ", 2)
+	for i, line := range lines {
+		if i == 0 {
+			b.WriteString(prefix + line)
+		} else {
+			b.WriteString("\n" + hang + line)
+		}
+	}
+	return b.String()
+}
+
+func (m *model) renderThinkingBlock(bl block, idx, w int) string {
+	running := m.busy && m.lastThinkingIndex() == idx
+	header := "Thought"
+	if running {
+		header = "Thinking…"
+	}
+	var b strings.Builder
+	writeAccent(&b, dimStyle.Bold(true).Render(header))
+	if bl.folded && !running {
+		return strings.TrimRight(b.String(), "\n")
+	}
+	body := strings.TrimSpace(bl.body)
+	if body == "" {
+		return strings.TrimRight(b.String(), "\n")
+	}
+	shown := body
+	if !running {
+		lines := strings.Split(body, "\n")
+		if len(lines) > 8 {
+			shown = "…\n" + strings.Join(lines[len(lines)-6:], "\n")
+		}
+	}
+	for _, line := range strings.Split(shown, "\n") {
+		writeAccent(&b, dimStyle.Italic(true).Render(line))
+	}
+	_ = w
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *model) lastThinkingIndex() int {
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		if m.blocks[i].kind == blockThinking {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *model) renderToolBlock(idx, w int) string {
+	if idx < 0 || idx >= len(m.blocks) {
+		return ""
+	}
+	bl := m.blocks[idx]
+	header := toolCallHeader(bl.title, bl.body)
+	result := ""
+	failed := bl.err
+	if idx+1 < len(m.blocks) && m.blocks[idx+1].kind == blockToolResult {
+		rb := m.blocks[idx+1]
+		result = truncateResultBody(rb.body)
+		failed = failed || rb.err
+	} else if strings.TrimSpace(bl.body) != "" && parseToolArgs(bl.body) == nil {
+		result = truncateResultBody(bl.body)
+	}
+	if classifyTool(bl.title) == verbCommand {
+		cmd := strings.TrimPrefix(header, "Run ")
+		if cmd != "" && cmd != header {
+			var b strings.Builder
+			writeAccent(&b, toolStyle.Render("Run ")+highlightBashCommand(cmd))
+			if result != "" {
+				st := dimStyle
+				if failed {
+					st = errStyle
+				}
+				for _, line := range strings.Split(result, "\n") {
+					writeAccent(&b, st.Render(line))
+				}
+			}
+			_ = w
+			return strings.TrimRight(b.String(), "\n")
+		}
+	}
+	_ = w
+	return renderAccentBlock(header, result, failed)
 }
 
 func (m *model) mermaidOn() bool {
@@ -487,12 +598,18 @@ func (m *model) blockLineOffset(idx int) int {
 	lines := 0
 	w := m.transcriptWidth()
 	for i := 0; i < idx && i < len(m.blocks); i++ {
-		lines += strings.Count(m.renderBlock(m.blocks[i], w), "\n") + 2
+		lines += strings.Count(m.renderBlockAt(i, w), "\n") + 2
 	}
 	return lines
 }
 
 func (m *model) appendBlock(bl block) {
+	if bl.kind == blockUser {
+		nlines := strings.Count(bl.body, "\n") + 1
+		if nlines > userCollapsedMaxLines || len(bl.body) > userCollapsedMaxLines*60 {
+			bl.folded = true
+		}
+	}
 	m.blocks = append(m.blocks, bl)
 }
 

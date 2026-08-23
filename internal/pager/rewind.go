@@ -254,6 +254,7 @@ func (m *model) replaySessionBlocks() {
 		case types.RoleAssistant:
 			m.appendBlock(block{kind: blockAgent, body: msg.Content})
 		case types.RoleTool:
+			m.appendBlock(block{kind: blockTool, title: msg.Name, body: ""})
 			m.appendBlock(block{kind: blockToolResult, title: msg.Name, body: msg.Content})
 		}
 	}
