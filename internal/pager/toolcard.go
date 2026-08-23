@@ -98,6 +98,8 @@ func (k verbKind) noun(count int) string {
 func classifyTool(title string) verbKind {
 	name := toolName(title)
 	switch {
+	case strings.HasPrefix(name, "mcp_") || strings.Contains(name, "__") || name == "use_tool":
+		return verbMCP
 	case strings.Contains(name, "skill"):
 		return verbSkill
 	case name == "read" || name == "read_file" || strings.HasPrefix(name, "read_"):
@@ -106,7 +108,7 @@ func classifyTool(title string) verbKind {
 		return verbEdit
 	case name == "grep" || name == "glob" || name == "rg" || name == "search":
 		return verbSearch
-	case name == "web_search" || name == "x_search" || strings.Contains(name, "web_search"):
+	case name == "web_search" || name == "x_search" || strings.Contains(name, "web_search") || strings.Contains(name, "x_search"):
 		return verbWebSearch
 	case name == "web_fetch" || name == "webfetch" || strings.Contains(name, "web_fetch"):
 		return verbWebFetch
@@ -123,8 +125,6 @@ func classifyTool(title string) verbKind {
 		return verbDir
 	case name == "bash" || name == "shell" || name == "exec":
 		return verbCommand
-	case strings.HasPrefix(name, "mcp_") || strings.Contains(name, "__") || name == "use_tool":
-		return verbMCP
 	default:
 		if strings.Contains(name, "grep") || strings.Contains(name, "glob") {
 			return verbSearch

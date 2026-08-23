@@ -332,3 +332,73 @@ func TestLcsDiffKeepsEqualLines(t *testing.T) {
 		t.Fatalf("last %#v", hunk[3])
 	}
 }
+
+func TestWebSearchCardHeaderAndSources(t *testing.T) {
+	if got := toolCallHeader("web_search", `{"query":"rust tui"}`); got != "Web Search rust tui" {
+		t.Fatalf("header %q", got)
+	}
+	if got := toolCallHeader("x_search", `{"query":"grok"}`); got != "X Search grok" {
+		t.Fatalf("x %q", got)
+	}
+	m := testModel(t)
+	m.blocks = []block{
+		{kind: blockTool, title: "web_search", body: `{"query":"rust tui"}`, folded: true},
+		{kind: blockToolResult, title: "web_search", body: "see https://example.com/a and https://docs.rs/ratatui"},
+	}
+	collapsed := stripANSI(m.renderTranscript())
+	if !strings.Contains(collapsed, "Web Search rust tui (2 sites)") {
+		t.Fatalf("sites:\n%s", collapsed)
+	}
+	m.blocks[0].folded = false
+	expanded := stripANSI(m.renderTranscript())
+	if strings.Contains(expanded, "(2 sites)") {
+		t.Fatalf("expanded drops site suffix:\n%s", expanded)
+	}
+	if !strings.Contains(expanded, "Sources:") || !strings.Contains(expanded, "example.com") {
+		t.Fatalf("sources:\n%s", expanded)
+	}
+}
+
+func TestMemorySearchCardHeaderAndHits(t *testing.T) {
+	m := testModel(t)
+	m.blocks = []block{
+		{kind: blockTool, title: "memory_search", body: `{"query":"pager"}`, folded: true},
+		{kind: blockToolResult, title: "memory_search", body: "## notes.md\nalpha line\n## other.md\nbravo line\n"},
+	}
+	view := stripANSI(m.renderTranscript())
+	if !strings.Contains(view, "Memory Search pager (2 results)") {
+		t.Fatalf("header:\n%s", view)
+	}
+	m.blocks[0].folded = false
+	expanded := stripANSI(m.renderTranscript())
+	if !strings.Contains(expanded, "1. notes.md") || !strings.Contains(expanded, "alpha line") {
+		t.Fatalf("hits:\n%s", expanded)
+	}
+}
+
+func TestMCPToolCardTitleizesQualifiedName(t *testing.T) {
+	if got := toolCallHeader("linear__list_issues", `{"id":"ABC"}`); got != "Linear List Issues" {
+		t.Fatalf("mcp %q", got)
+	}
+	m := testModel(t)
+	m.blocks = []block{
+		{kind: blockTool, title: "linear__list_issues", body: `{"id":"ABC"}`},
+		{kind: blockToolResult, title: "linear__list_issues", body: "ok"},
+	}
+	expanded := stripANSI(m.renderTranscript())
+	if !strings.Contains(expanded, "Linear List Issues") {
+		t.Fatalf("header:\n%s", expanded)
+	}
+	if !strings.Contains(expanded, "id:") || !strings.Contains(expanded, "ABC") {
+		t.Fatalf("args:\n%s", expanded)
+	}
+}
+
+func TestSearchToolsHeader(t *testing.T) {
+	if got := toolCallHeaderFull("search_tool", `{"query":"linear"}`, "a\nb\n", true); !strings.Contains(got, "Search Tools linear") {
+		t.Fatalf("header %q", got)
+	}
+	if got := toolCallHeaderFull("search_tool", `{"query":"linear"}`, "a\nb\n", true); !strings.Contains(got, "(2 results)") {
+		t.Fatalf("count %q", got)
+	}
+}

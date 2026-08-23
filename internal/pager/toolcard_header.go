@@ -41,25 +41,15 @@ func toolCallHeaderFull(title, body, result string, collapsed bool) string {
 		}
 		return "Fetch " + url
 	case verbWebSearch:
-		return searchHeader(args, body, result, true)
+		return webSearchHeader(title, args, body, result, collapsed)
 	case verbMemory:
-		q := toolArgValue(args, "query", "q")
-		if q == "" {
-			return "Search"
-		}
-		return "Search " + strconv.Quote(q)
-	case verbMCP, verbMCPSearch:
-		name := strings.TrimLeft(strings.TrimSpace(title), "▸ ")
-		if name == "" {
-			name = toolName(title)
-		}
-		return name
+		return memorySearchHeader(args, body, result)
+	case verbMCP:
+		return mcpToolHeader(title, args)
+	case verbMCPSearch:
+		return searchToolsHeader(args, body, result)
 	default:
-		name := strings.TrimLeft(strings.TrimSpace(title), "▸ ")
-		if name == "" {
-			name = "tool"
-		}
-		return name
+		return otherToolHeader(title, args, body)
 	}
 }
 

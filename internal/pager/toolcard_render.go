@@ -15,8 +15,16 @@ func renderToolCard(title, argsBody, result string, failed, folded bool) string 
 		return renderEditCard(title, args, argsBody, result, failed, folded)
 	case verbFile:
 		return renderReadCard(header, args, result, failed, folded)
-	case verbSearch, verbWebSearch, verbMemory, verbMCPSearch:
+	case verbSearch:
 		return renderSearchCard(header, result, failed, folded)
+	case verbWebSearch:
+		return renderWebSearchCard(title, args, argsBody, result, failed, folded)
+	case verbMemory:
+		return renderMemorySearchCard(header, result, failed, folded)
+	case verbMCPSearch:
+		return renderSearchToolsCard(header, result, failed, folded)
+	case verbMCP:
+		return renderMCPCard(title, args, argsBody, result, failed, folded)
 	case verbDir:
 		return renderListCard(header, result, failed, folded)
 	case verbWebFetch:
@@ -24,10 +32,7 @@ func renderToolCard(title, argsBody, result string, failed, folded bool) string 
 	case verbCommand:
 		return renderRunCard(args, argsBody, result, failed, folded)
 	default:
-		if folded {
-			return renderAccentBlock(header, "", failed)
-		}
-		return renderAccentBlock(header, truncateResultBody(result), failed)
+		return renderOtherCard(header, args, argsBody, result, failed, folded)
 	}
 }
 
