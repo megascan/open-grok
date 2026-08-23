@@ -107,6 +107,7 @@ func DefaultPack() []Tool {
 		EnterPlanMode{},
 		ExitPlanMode{},
 		TaskSpawn{},
+		UpdateGoal{},
 	}
 	return append(pack, DirectCollabPack()...)
 }
@@ -118,6 +119,7 @@ func DirectOnlyPack() []Tool {
 		EnterPlanMode{},
 		ExitPlanMode{},
 		TaskSpawn{},
+		UpdateGoal{},
 	}
 	return append(pack, DirectCollabPack()...)
 }

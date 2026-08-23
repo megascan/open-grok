@@ -24,7 +24,7 @@ func TestCodexCodeModeOnlyWinsOnResponses(t *testing.T) {
 	if names["bash"] {
 		t.Fatal("Code Mode Only must not expose bash top-level")
 	}
-	if !names["ask_user_question"] || !names["task"] {
+	if !names["ask_user_question"] || !names["task"] || !names["update_goal"] {
 		t.Fatal("direct-only human/multi-agent tools stay top-level")
 	}
 }

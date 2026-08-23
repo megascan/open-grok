@@ -60,6 +60,9 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	for _, extra := range drainInbox(sess) {
 		sess.Messages = append(sess.Messages, extra)
 	}
+	if reminder := sess.Goal.Reminder(); reminder != "" {
+		userText = reminder + "\n" + userText
+	}
 	sess.Messages = append(sess.Messages, types.Message{Role: types.RoleUser, Content: userText})
 	_ = sess.AppendUpdate(map[string]any{"type": "user", "text": userText})
 	sess.CloseExportBoundary(rt.Model.Provider)
@@ -156,7 +159,7 @@ func ensureRuntime(sess *Session, model catalog.Model) {
 	if sess.JS != nil {
 		return
 	}
-	host := tools.Context{CWD: sess.CWD, SessionDir: sess.Dir, AlwaysApprove: sess.YOLO, PlanActive: sess.Plan.Active, PlanFile: sess.Plan.PlanFile, WorkspaceRoot: sess.CWD, SubagentDepth: sess.SubagentDepth}
+	host := tools.Context{CWD: sess.CWD, SessionDir: sess.Dir, AlwaysApprove: sess.YOLO, PlanActive: sess.Plan.Active, PlanFile: sess.Plan.PlanFile, WorkspaceRoot: sess.CWD, SubagentDepth: sess.SubagentDepth, Goal: sess.Goal}
 	host.DispatchNested = func(ctx context.Context, name string, args json.RawMessage) tools.Result {
 		t := tools.Lookup(tools.NestedPack(), name)
 		if t == nil {
@@ -323,6 +326,7 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		PlanFile:      sess.Plan.PlanFile,
 		WorkspaceRoot: sess.CWD,
 		SubagentDepth: sess.SubagentDepth,
+		Goal:          sess.Goal,
 	}
 	return t.Execute(ctx, tc, args)
 }

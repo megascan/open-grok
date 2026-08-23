@@ -102,3 +102,53 @@ func TestPlanModeBlocksNonPlanEditsEvenWithYOLO(t *testing.T) {
 		t.Fatal("plan mode must refuse the edit")
 	}
 }
+
+func TestUpdateGoalTurnRecordsProgressWithoutCompleting(t *testing.T) {
+	t.Setenv("OPENGROK_HOME", t.TempDir())
+	config.ResetHomeForTest()
+	cwd := t.TempDir()
+	model := catalog.Model{
+		ID: "mock", Model: "mock", Name: "mock",
+		Provider: types.ProviderFireworks, APIBackend: types.BackendChat,
+		BaseURL: "https://example.invalid/v1",
+	}
+	sess, err := agent.NewSession(cwd, model, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Goal.Create("land the TUI", nil); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	sseTool := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"update_goal","arguments":"{\"message\":\"drew the rail\",\"completed\":true}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n"
+	sseDone := `data: {"choices":[{"delta":{"content":"claimed"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n"
+	httpDo := rt(func(r *http.Request) (*http.Response, error) {
+		n++
+		body := sseDone
+		if n == 1 {
+			body = sseTool
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	if err := agent.RunTurn(context.Background(), sess, agent.Runtime{
+		Model: model, Bearer: "k", HTTP: sampler.HTTPDoer(httpDo),
+	}, "go", nil); err != nil {
+		t.Fatal(err)
+	}
+	snap := sess.Goal.Snapshot()
+	if snap == nil || string(snap.Status) != "active" {
+		t.Fatalf("model completed:true must stay active, got %+v", snap)
+	}
+	if !snap.CompletionClaimed {
+		t.Fatal("expected completion claim")
+	}
+	found := false
+	for _, m := range sess.Messages {
+		if m.Role == types.RoleUser && strings.Contains(m.Content, "<goal_reminder>") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("active goals must inject a model-facing reminder")
+	}
+}

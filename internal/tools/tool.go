@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/megascan/open-grok/internal/goals"
 	"github.com/megascan/open-grok/internal/types"
 )
 
@@ -18,6 +19,7 @@ type Context struct {
 	WorkspaceRoot  string
 	SubagentDepth  int
 	DispatchNested func(ctx context.Context, name string, args json.RawMessage) Result
+	Goal           *goals.Tracker
 }
 
 // Result is a tool's model-facing output.

@@ -12,6 +12,7 @@ import (
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/codemode"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/goals"
 	"github.com/megascan/open-grok/internal/mcp"
 	"github.com/megascan/open-grok/internal/sessionbus"
 	"github.com/megascan/open-grok/internal/tools"
@@ -33,6 +34,7 @@ type Session struct {
 	EverUsedNonXAI bool                   `json:"ever_used_codex"`
 	Dir            string                 `json:"-"`
 	Plan           workspace.PlanTracker  `json:"-"`
+	Goal           *goals.Tracker         `json:"-"`
 	YOLO           bool                   `json:"-"`
 	Allow          []string               `json:"-"`
 	Deny           []string               `json:"-"`
@@ -69,6 +71,7 @@ func NewSession(cwd string, model catalog.Model, yolo bool) (*Session, error) {
 		Dir:       dir,
 		YOLO:      yolo,
 		Plan:      workspace.NewInactive(),
+		Goal:      goals.New(dir),
 	}
 	s.Plan.PlanFile = filepath.Join(dir, "plan.md")
 	if !model.Provider.AllowsXAIServices() {
@@ -92,6 +95,7 @@ func LoadSession(cwd, id string) (*Session, error) {
 	}
 	s.Dir = dir
 	s.Plan.PlanFile = filepath.Join(dir, "plan.md")
+	s.Goal = goals.Load(dir)
 	s.attach()
 	return &s, nil
 }
@@ -140,6 +144,9 @@ func (s *Session) Persist() error {
 	}
 	if err := os.WriteFile(filepath.Join(s.Dir, "session.json"), data, 0o600); err != nil {
 		return err
+	}
+	if s.Goal != nil {
+		_ = s.Goal.Save()
 	}
 	summary := map[string]any{
 		"id":         s.ID,

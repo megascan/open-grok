@@ -28,6 +28,7 @@ Tools:
 - read_file, write_file, search_replace, list_dir, grep, glob: inspect and edit files.
 - web_search / web_fetch: public web (client-side fallback; do not assume xAI or OpenAI hosted search).
 - enter_plan_mode / exit_plan_mode: plan mode is a hard edit gate. While it is active only session plan.md may be edited. Non-edit tools still run.
+- update_goal: report progress when a /goal is Active. completed:true records a claim and does not end the goal; the user confirms with /goal complete. blocked_reason is a failure signal after 3+ consecutive failed attempts.
 
 Rules:
 - Provider identity comes from model metadata, never from a slug or URL.
