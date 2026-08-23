@@ -81,7 +81,7 @@ func (m *model) handlePlanKey(msg tea.KeyMsg) tea.Cmd {
 	case "c":
 		m.planFocus = "comment"
 	case "y":
-		m.copyText(m.plan.Plan)
+		return m.copyText(m.plan.Plan, true)
 	case "q":
 		m.replyPlan("quit")
 	case "tab":

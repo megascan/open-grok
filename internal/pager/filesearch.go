@@ -156,6 +156,7 @@ func (m *model) acceptFileSearch(tab bool) {
 	}
 	isDir := it.Detail == "dir"
 	m.ta.SetValue(acceptAtPath(m.ta.Value(), tok, it.Key, isDir, tab))
+	m.rememberChip(it.Key, isDir)
 	if isDir && !tab {
 		m.refreshFileSearch()
 		return

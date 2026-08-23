@@ -134,8 +134,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 				body = m.sess.ExportMarkdown()
 			}
 			if n > 1 {
-				m.copyNthAgent(n)
-				body = ""
+				return m.copyNthAgent(n)
 			}
 			if body != "" {
 				_ = os.WriteFile(path, []byte(body), 0o600)
@@ -143,7 +142,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 				break
 			}
 		}
-		m.copyNthAgent(n)
+		return m.copyNthAgent(n)
 	case "find":
 		m.overlay = overlayFind
 		m.cursor = 0
@@ -277,7 +276,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.openExtensions(4)
 	case "share":
 		if m.sess != nil {
-			m.copyText("Entropy session " + m.sess.ID + " · " + m.opts.Model.Name + "\n" + m.sess.ExportMarkdown())
+			return m.copyText("Entropy session "+m.sess.ID+" · "+m.opts.Model.Name+"\n"+m.sess.ExportMarkdown(), false)
 		}
 	case "session-info":
 		m.appendSys(m.sessionInfo())

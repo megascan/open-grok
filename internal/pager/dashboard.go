@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/sessionbus"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
 )
@@ -56,8 +58,12 @@ func (m *model) openDashboard() {
 	m.overlay = overlayNone
 	m.dashSearch = false
 	m.dashFilter = ""
-	m.dashDraft = ""
 	m.dashRename = ""
+	m.peekReply = ""
+	m.peekFocus = true
+	m.peekQSel = -1
+	m.dashDetails = false
+	m.dashListFocus = false
 	if m.dashGroup == "" {
 		m.dashGroup = "state"
 	}
@@ -77,6 +83,26 @@ func (m *model) refreshDashboard() {
 			st = "needs-input"
 		}
 		raw = append(raw, dashRow{Sess: s, State: st, Pinned: pins[s.ID]})
+	}
+	local := map[string]bool{}
+	for _, r := range raw {
+		local[r.Sess.ID] = true
+	}
+	for _, live := range sessionbus.LiveSessions() {
+		if local[live.SessionID] {
+			continue
+		}
+		if m.sess != nil && m.sess.ID == live.SessionID {
+			continue
+		}
+		title := ""
+		if live.Title != nil {
+			title = *live.Title
+		}
+		raw = append(raw, dashRow{
+			Sess:  agent.Session{ID: live.SessionID, Title: title, CWD: live.CWD, ModelID: live.ModelID},
+			State: "inactive",
+		})
 	}
 	if m.dashFilter != "" {
 		f := strings.ToLower(m.dashFilter)
@@ -115,10 +141,11 @@ func (m *model) groupDashRows(raw []dashRow) []dashRow {
 			out = append(out, dashRow{Header: k, State: "header"})
 			out = append(out, buckets[k]...)
 		}
+		out = append(out, dashRow{State: "new", Header: "[+ New Agent]"})
 		return out
 	}
-	order := []string{"needs-input", "working", "idle"}
-	labels := map[string]string{"needs-input": "Needs input", "working": "Working", "idle": "Idle"}
+	order := []string{"needs-input", "working", "idle", "inactive"}
+	labels := map[string]string{"needs-input": "Needs input", "working": "Working", "idle": "Idle", "inactive": "Inactive"}
 	buckets := map[string][]dashRow{}
 	for _, r := range raw {
 		if r.Pinned {
@@ -137,7 +164,14 @@ func (m *model) groupDashRows(raw []dashRow) []dashRow {
 		if len(rows) == 0 {
 			continue
 		}
-		out = append(out, dashRow{Header: labels[st], State: "header"})
+		hdr := labels[st]
+		if st == "inactive" && m.inactiveCollapsed && m.dashFilter == "" {
+			hdr = fmt.Sprintf("Inactive %d", len(rows))
+		}
+		out = append(out, dashRow{Header: hdr, State: "header"})
+		if st == "inactive" && m.inactiveCollapsed && m.dashFilter == "" {
+			continue
+		}
 		if st == "idle" && !m.dashIdleExpand && m.dashFilter == "" && len(rows) > 8 {
 			out = append(out, rows[:8]...)
 			out = append(out, dashRow{State: "more", More: len(rows) - 8, Header: fmt.Sprintf("%d more idle", len(rows)-8)})
@@ -145,6 +179,7 @@ func (m *model) groupDashRows(raw []dashRow) []dashRow {
 			out = append(out, rows...)
 		}
 	}
+	out = append(out, dashRow{State: "new", Header: "[+ New Agent]"})
 	return out
 }
 
@@ -154,7 +189,7 @@ func (m *model) fillDashPeek() {
 		return
 	}
 	row := m.dashRows[m.cursor]
-	if row.Sess.ID == "" {
+	if row.Sess.ID == "" || row.State == "inactive" || row.State == "new" {
 		return
 	}
 	s := row.Sess
@@ -194,10 +229,13 @@ func (m *model) viewDashboard() string {
 		b.WriteString(dimStyle.Render("  (no sessions — type below to dispatch)") + "\n")
 	}
 	for i, r := range m.dashRows {
-		if r.Header != "" && (r.State == "header" || r.State == "more") {
+		if r.Header != "" && (r.State == "header" || r.State == "more" || r.State == "new") {
 			mark := "▾ "
-			if r.State == "more" {
+			if r.State == "more" || (r.State == "header" && m.inactiveCollapsed && strings.HasPrefix(r.Header, "Inactive")) {
 				mark = "▸ "
+			}
+			if r.State == "new" {
+				mark = ""
 			}
 			line := dimStyle.Render(mark + r.Header)
 			if i == m.cursor {
@@ -215,6 +253,9 @@ func (m *model) viewDashboard() string {
 		case "needs-input":
 			dot = "●"
 			st = claimStyle.Render("awaiting")
+		case "inactive":
+			dot = "○"
+			st = dimStyle.Render("inactive")
 		}
 		pin := " "
 		if r.Pinned {
@@ -224,7 +265,11 @@ func (m *model) viewDashboard() string {
 		if title == "" {
 			title = "(untitled)"
 		}
-		line := fmt.Sprintf("%s%s %s · %s   %s   %s", pin, dot, title, shortID(r.Sess.ID), st, r.Sess.UpdatedAt.Format("15:04"))
+		stamp := ""
+		if !r.Sess.UpdatedAt.IsZero() {
+			stamp = r.Sess.UpdatedAt.Format("15:04")
+		}
+		line := fmt.Sprintf("%s%s %s · %s   %s   %s", pin, dot, title, shortID(r.Sess.ID), st, stamp)
 		if i == m.cursor {
 			line = selStyle.Render(line)
 		} else {
@@ -233,16 +278,57 @@ func (m *model) viewDashboard() string {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString(barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n")
-	b.WriteString(dimStyle.Render(" peek") + "\n")
-	for _, it := range m.items {
-		b.WriteString("  " + it.Label + "  " + dimStyle.Render(it.Detail) + "\n")
+	b.WriteString(m.renderDashPeekPanel())
+	return b.String()
+}
+
+func (m *model) peekRow() (dashRow, bool) {
+	if m.cursor < 0 || m.cursor >= len(m.dashRows) {
+		return dashRow{}, false
 	}
+	r := m.dashRows[m.cursor]
+	if r.Sess.ID == "" || r.State == "inactive" || r.State == "new" || r.State == "header" || r.State == "more" {
+		return dashRow{}, false
+	}
+	return r, true
+}
+
+func (m *model) renderDashPeekPanel() string {
+	var b strings.Builder
 	if m.renaming {
-		b.WriteString("\n" + titleStyle.Render(" Rename: ") + m.dashRename + "█\n")
-	} else {
-		b.WriteString("\n❯ " + m.dashDraft + "█\n")
-		b.WriteString(dimStyle.Render("enter open  ·  ctrl+s send+open  ·  ctrl+r rename  ·  ctrl+t pin  ·  ctrl+g group  ·  ctrl+x stop/delete  ·  ctrl+/ search  ·  ctrl+u clear  ·  ? help  ·  esc back"))
+		return titleStyle.Render(" Rename: ") + m.dashRename + "█\n"
 	}
+	row, peek := m.peekRow()
+	if peek {
+		b.WriteString(dimStyle.Render("╭ peek") + "\n")
+		if m.question != nil && m.sess != nil && m.sess.ID == row.Sess.ID {
+			b.WriteString(claimStyle.Render("▸ "+m.question.Question) + "\n")
+			opts := m.question.Options
+			if len(opts) == 0 {
+				opts = []string{"yes", "no"}
+			}
+			if len(opts) > 9 {
+				opts = opts[:9]
+			}
+			for i, o := range opts {
+				line := fmt.Sprintf("  %d. %s", i+1, o)
+				if m.peekQSel == i {
+					line = selStyle.Render("▸ " + strconv.Itoa(i+1) + ". " + o)
+				}
+				b.WriteString(line + "\n")
+			}
+			b.WriteString(dimStyle.Render("1-9 select  ·  enter answer  ·  esc back") + "\n")
+			return b.String()
+		}
+		for _, it := range m.items {
+			b.WriteString("  " + it.Label + "  " + dimStyle.Render(it.Detail) + "\n")
+		}
+		b.WriteString("❯ reply " + m.peekReply + "█\n")
+		b.WriteString(dimStyle.Render("enter send  ·  ctrl+s send+open  ·  empty enter opens  ·  esc clears reply") + "\n")
+		return b.String()
+	}
+	b.WriteString("❯ Dispatch a new agent  " + m.dashDraft + "█\n")
+	b.WriteString(dimStyle.Render("enter spawn  ·  ctrl+s spawn+open  ·  ctrl+r rename  ·  ctrl+t pin  ·  ctrl+g group  ·  ctrl+x stop/delete  ·  ctrl+/ search  ·  ctrl+u clear  ·  esc never clears draft") + "\n")
 	return b.String()
 }
 
@@ -269,54 +355,122 @@ func (m *model) handleDashboardKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 	}
-	switch msg.String() {
-	case "ctrl+\\", "esc":
-		if m.dashDraft != "" && msg.String() == "esc" {
+	s := msg.String()
+	_, peek := m.peekRow()
+	questionPeek := peek && m.question != nil && m.sess != nil && m.cursor < len(m.dashRows) && m.sess.ID == m.dashRows[m.cursor].Sess.ID
+
+	if s == "esc" {
+		if peek {
+			if m.peekReply != "" {
+				m.peekReply = ""
+				return nil
+			}
+			m.focusNewAgent()
+			return nil
+		}
+		if !m.dashListFocus {
+			m.dashListFocus = true
 			return nil
 		}
 		m.leaveDashboard()
 		return nil
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
-			m.fillDashPeek()
+	}
+	if s == "ctrl+\\" {
+		m.leaveDashboard()
+		return nil
+	}
+
+	if questionPeek {
+		if idx := optionIndexFromKey(s, peekOptionCount(m)); idx >= 0 {
+			if m.peekQSel == idx {
+				m.peekQSel = -1
+			} else {
+				m.peekQSel = idx
+			}
+			return nil
 		}
-	case "down", "j":
-		if m.cursor+1 < len(m.dashRows) {
-			m.cursor++
-			m.fillDashPeek()
+		switch s {
+		case "up":
+			if m.peekQSel > 0 {
+				m.peekQSel--
+				return nil
+			}
+			m.moveDashCursor(-1)
+			return nil
+		case "down":
+			n := peekOptionCount(m)
+			if m.peekQSel >= 0 && m.peekQSel+1 < n {
+				m.peekQSel++
+				return nil
+			}
+			m.moveDashCursor(1)
+			return nil
+		case "enter", "right":
+			if m.peekQSel >= 0 {
+				return m.answerPeekQuestion()
+			}
+			return m.attachDashRow()
 		}
+	}
+
+	nav := m.dashListFocus || s == "up" || s == "down"
+	if peek && m.peekFocus && (s == "j" || s == "k") {
+		nav = false
+	}
+	if nav {
+		switch s {
+		case "up", "k":
+			m.moveDashCursor(-1)
+			return nil
+		case "down", "j":
+			m.moveDashCursor(1)
+			return nil
+		}
+	}
+
+	switch s {
 	case "enter":
+		return m.dashEnter(false)
+	case "ctrl+s":
+		return m.dashEnter(true)
+	case "right", "l":
+		if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "header" && m.inactiveCollapsed && strings.HasPrefix(m.dashRows[m.cursor].Header, "Inactive") {
+			m.inactiveCollapsed = false
+			m.refreshDashboard()
+			return nil
+		}
 		if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "more" {
 			m.dashIdleExpand = true
 			m.refreshDashboard()
 			return nil
 		}
-		if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "header" {
+		if peek && strings.TrimSpace(m.peekReply) == "" {
+			return m.attachDashRow()
+		}
+	case "left", "h":
+		if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "header" && strings.HasPrefix(m.dashRows[m.cursor].Header, "Inactive") && !m.inactiveCollapsed {
+			m.inactiveCollapsed = true
+			m.refreshDashboard()
 			return nil
 		}
-		if strings.TrimSpace(m.dashDraft) != "" {
-			return m.dispatchAgent(m.dashDraft, false)
-		}
-		return m.attachDashRow()
-	case "ctrl+s":
-		if strings.TrimSpace(m.dashDraft) != "" {
-			return m.dispatchAgent(m.dashDraft, true)
-		}
-		return m.attachDashRow()
+	case "ctrl+n":
+		return m.newDashSession()
 	case "ctrl+r":
 		if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].Sess.ID != "" {
 			m.renaming = true
 			m.dashRename = m.dashRows[m.cursor].Sess.Title
 		}
+		return nil
 	case "ctrl+t":
 		m.togglePin()
+		return nil
 	case "ctrl+x":
 		return m.dashStopOrDelete()
 	case "ctrl+/":
 		m.dashSearch = !m.dashSearch
 		m.dashFilter = ""
 		m.refreshDashboard()
+		return nil
 	case "ctrl+g":
 		if m.dashGroup == "dir" {
 			m.dashGroup = "state"
@@ -324,19 +478,233 @@ func (m *model) handleDashboardKey(msg tea.KeyMsg) tea.Cmd {
 			m.dashGroup = "dir"
 		}
 		m.refreshDashboard()
-	case "ctrl+u", "ctrl+c":
-		m.dashDraft = ""
+		return nil
+	case "ctrl+u":
+		if peek {
+			m.peekReply = ""
+		} else {
+			m.dashDraft = ""
+		}
+		return nil
 	case "?":
 		m.status = "Enter open · Ctrl+S send+open · Ctrl+R rename · Ctrl+T pin · Ctrl+G group · Ctrl+X twice delete · Esc never clears draft (Ctrl+U)"
+		return nil
+	case "tab":
+		if peek {
+			m.peekFocus = !m.peekFocus
+			m.dashListFocus = !m.peekFocus
+		} else {
+			m.dashListFocus = !m.dashListFocus
+		}
+		return nil
 	case "backspace":
-		if len(m.dashDraft) > 0 {
+		if peek && m.peekFocus {
+			if len(m.peekReply) > 0 {
+				m.peekReply = m.peekReply[:len(m.peekReply)-1]
+			}
+			return nil
+		}
+		if !m.dashListFocus && len(m.dashDraft) > 0 {
 			m.dashDraft = m.dashDraft[:len(m.dashDraft)-1]
 		}
-	default:
-		if msg.Type == tea.KeyRunes {
+		return nil
+	}
+	if msg.Type == tea.KeyRunes {
+		if peek && (m.peekFocus || !m.dashListFocus) && !questionPeek {
+			m.peekFocus = true
+			m.dashListFocus = false
+			m.peekReply += string(msg.Runes)
+			return nil
+		}
+		if !peek {
+			m.dashListFocus = false
 			m.dashDraft += string(msg.Runes)
 		}
 	}
+	return nil
+}
+
+func peekOptionCount(m *model) int {
+	if m.question == nil {
+		return 0
+	}
+	n := len(m.question.Options)
+	if n == 0 {
+		return 2
+	}
+	if n > 9 {
+		return 9
+	}
+	return n
+}
+
+func (m *model) moveDashCursor(delta int) {
+	if len(m.dashRows) == 0 {
+		return
+	}
+	m.cursor += delta
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(m.dashRows) {
+		m.cursor = len(m.dashRows) - 1
+	}
+	m.peekReply = ""
+	m.peekQSel = -1
+	m.peekFocus = true
+	m.fillDashPeek()
+}
+
+func (m *model) focusNewAgent() {
+	m.peekReply = ""
+	m.peekQSel = -1
+	m.peekFocus = false
+	for i, r := range m.dashRows {
+		if r.State == "new" {
+			m.cursor = i
+			m.fillDashPeek()
+			return
+		}
+	}
+}
+
+func (m *model) dashEnter(openChat bool) tea.Cmd {
+	if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "more" {
+		m.dashIdleExpand = true
+		m.refreshDashboard()
+		return nil
+	}
+	if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "header" {
+		if strings.HasPrefix(m.dashRows[m.cursor].Header, "Inactive") {
+			m.inactiveCollapsed = !m.inactiveCollapsed
+			m.refreshDashboard()
+		}
+		return nil
+	}
+	if m.cursor < len(m.dashRows) && m.dashRows[m.cursor].State == "new" && strings.TrimSpace(m.dashDraft) == "" && strings.TrimSpace(m.peekReply) == "" {
+		return m.newDashSession()
+	}
+	if _, peek := m.peekRow(); peek {
+		text := strings.TrimSpace(m.peekReply)
+		if text == "" {
+			return m.attachDashRow()
+		}
+		if openChat {
+			m.peekReply = ""
+			m.peekQSel = -1
+			if cmd := m.attachDashRow(); cmd != nil {
+				return tea.Batch(cmd, m.submit(text))
+			}
+			return m.submit(text)
+		}
+		return m.sendPeekReply()
+	}
+	if strings.TrimSpace(m.dashDraft) != "" {
+		return m.dispatchAgent(m.dashDraft, openChat)
+	}
+	return m.attachDashRow()
+}
+
+func (m *model) answerPeekQuestion() tea.Cmd {
+	if m.question == nil || m.peekQSel < 0 {
+		return nil
+	}
+	opts := m.question.Options
+	if len(opts) == 0 {
+		opts = []string{"yes", "no"}
+	}
+	if m.peekQSel >= len(opts) {
+		return nil
+	}
+	ans := opts[m.peekQSel]
+	m.peekQSel = -1
+	m.replyQuestion(ans)
+	m.refreshDashboard()
+	return nil
+}
+
+func (m *model) sendPeekReply() tea.Cmd {
+	text := strings.TrimSpace(m.peekReply)
+	row, ok := m.peekRow()
+	if !ok || text == "" {
+		return nil
+	}
+	sess, err := agent.LoadSession(m.opts.CWD, row.Sess.ID)
+	if err != nil {
+		m.status = err.Error()
+		return nil
+	}
+	m.peekReply = ""
+	m.peekQSel = -1
+	if m.sess != nil && m.sess.ID == sess.ID && m.busy {
+		m.queue = append(m.queue, text)
+		m.status = "queued follow-up"
+		return nil
+	}
+	m.bindSession(sess, false)
+	return m.submit(text)
+}
+
+func (m *model) bindSession(sess *agent.Session, openChat bool) {
+	prev := m.screen
+	m.attachSession(sess)
+	if openChat {
+		m.layoutChat()
+		return
+	}
+	m.screen = prev
+}
+
+func (m *model) newDashSession() tea.Cmd {
+	sess, err := agent.NewSession(m.dashCWD, m.opts.Model, m.permMode == permAlways)
+	if err != nil {
+		m.status = err.Error()
+		return nil
+	}
+	m.dashDetails = true
+	m.attachSession(sess)
+	m.layoutChat()
+	return nil
+}
+
+func (m *model) attachableDashIDs() []string {
+	ids := make([]string, 0, len(m.dashRows))
+	seen := map[string]bool{}
+	for _, r := range m.dashRows {
+		if r.Sess.ID == "" || r.State == "inactive" || r.State == "new" || r.State == "header" || r.State == "more" {
+			continue
+		}
+		if seen[r.Sess.ID] {
+			continue
+		}
+		seen[r.Sess.ID] = true
+		ids = append(ids, r.Sess.ID)
+	}
+	return ids
+}
+
+func (m *model) cycleDashDetails(delta int) tea.Cmd {
+	ids := m.attachableDashIDs()
+	if len(ids) == 0 || m.sess == nil {
+		return nil
+	}
+	idx := 0
+	for i, id := range ids {
+		if id == m.sess.ID {
+			idx = i
+			break
+		}
+	}
+	n := len(ids)
+	idx = (idx + delta%n + n) % n
+	sess, err := agent.LoadSession(m.opts.CWD, ids[idx])
+	if err != nil {
+		m.status = err.Error()
+		return nil
+	}
+	m.dashDetails = true
+	m.attachSession(sess)
+	m.layoutChat()
 	return nil
 }
 
@@ -421,6 +789,7 @@ func (m *model) attachDashRow() tea.Cmd {
 		m.status = err.Error()
 		return nil
 	}
+	m.dashDetails = true
 	m.attachSession(sess)
 	m.layoutChat()
 	return nil
@@ -435,13 +804,11 @@ func (m *model) dispatchAgent(prompt string, attach bool) tea.Cmd {
 	sess.Title = truncate(prompt, 40)
 	_ = sess.Persist()
 	m.dashDraft = ""
+	m.bindSession(sess, attach)
 	if attach {
-		m.attachSession(sess)
-		m.layoutChat()
-		return m.submit(prompt)
+		m.dashDetails = true
 	}
-	m.refreshDashboard()
-	return nil
+	return m.submit(prompt)
 }
 
 func (m *model) leaveDashboard() {

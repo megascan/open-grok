@@ -58,9 +58,27 @@ func (m *model) showSidebar() bool {
 func (m *model) renderTranscript() string {
 	w := m.transcriptWidth()
 	var b strings.Builder
+	skipUntil := -1
 	for i, bl := range m.blocks {
-		if i > 0 {
+		if i < skipUntil {
+			continue
+		}
+		if i > 0 && b.Len() > 0 {
 			b.WriteByte('\n')
+		}
+		if m.groupTools {
+			if run, ok := m.runStartingAt(i); ok {
+				header := m.renderVerbHeader(run, w)
+				if m.focusScroll && i == m.selectedBlock {
+					header = selStyle.Render("▌") + " " + header
+				}
+				b.WriteString(header)
+				if !m.groupExpanded(run) {
+					skipUntil = run.End
+					continue
+				}
+				b.WriteByte('\n')
+			}
 		}
 		body := m.renderBlock(bl, w)
 		if m.focusScroll && i == m.selectedBlock {
@@ -69,6 +87,23 @@ func (m *model) renderTranscript() string {
 		b.WriteString(body)
 	}
 	return b.String()
+}
+
+func (m *model) runStartingAt(i int) (verbRun, bool) {
+	for _, r := range m.verbRuns() {
+		if r.Start == i {
+			n := 0
+			for k := r.Start; k < r.End; k++ {
+				if m.blocks[k].kind == blockTool {
+					n++
+				}
+			}
+			if n >= 1 {
+				return r, true
+			}
+		}
+	}
+	return verbRun{}, false
 }
 
 func (m *model) renderBlock(bl block, w int) string {
@@ -254,24 +289,69 @@ func (m *model) renderFooter() string {
 		}
 	}
 	if m.copied != "" {
-		hint = okStyle.Render("Copied!  backup " + m.copied)
+		hint = okStyle.Render(m.status)
+		if !strings.HasPrefix(m.status, "Cop") && m.copyToast != "" {
+			hint = okStyle.Render(m.copyToast)
+		}
+	}
+	if m.vimMode && m.focusScroll {
+		hint = "i/Tab/Space prompt  ·  j/k blocks  ·  y copy  ·  e expand group"
 	}
 	return dimStyle.Render(hint)
 }
 
 func (m *model) viewChat() string {
 	head := m.renderHeader()
+	if m.dashDetails {
+		head = m.renderDashDetailsHeader() + "\n" + head
+	}
 	body := m.vp.View()
 	if m.showSidebar() {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, m.vp.View(), m.renderSidebar())
 	}
+	chips := m.renderChips()
 	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
 	hud := ""
 	if m.scrollHUD {
 		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
 	}
 	return head + "\n" + barStyle.Render(strings.Repeat("─", max(8, m.width))) + "\n" +
-		hud + body + "\n" + input + "\n" + m.renderFooter()
+		hud + body + "\n" + chips + input + "\n" + m.renderFooter()
+}
+
+func (m *model) renderDashDetailsHeader() string {
+	title := "(untitled)"
+	if m.sess != nil && m.sess.Title != "" {
+		title = m.sess.Title
+	}
+	ids := m.attachableDashIDs()
+	pos := ""
+	if n := len(ids); n > 1 && m.sess != nil {
+		for i, id := range ids {
+			if id == m.sess.ID {
+				pos = fmt.Sprintf("  %d/%d  [‹] [›]", i+1, n)
+				break
+			}
+		}
+	}
+	return headerBar.Width(max(20, m.width)).Render(" " + title + pos + "  [Dashboard]")
+}
+
+func (m *model) scrollToBlock(idx int) {
+	m.vp.SetContent(m.renderTranscript())
+	if idx <= 0 || !m.pageFlip {
+		if m.pageFlip {
+			m.vp.GotoTop()
+		} else {
+			m.vp.GotoBottom()
+		}
+		return
+	}
+	lines := 0
+	for i := 0; i < idx && i < len(m.blocks); i++ {
+		lines += strings.Count(m.renderBlock(m.blocks[i], m.transcriptWidth()), "\n") + 2
+	}
+	m.vp.SetYOffset(lines)
 }
 
 func (m *model) appendBlock(bl block) {

@@ -115,7 +115,7 @@ func (m *model) handleScrollKey(msg tea.KeyMsg) tea.Cmd {
 		case "ctrl+u":
 			m.vp.HalfViewUp()
 		case "y":
-			m.copyBlock(idx)
+			return m.copyBlock(idx)
 		case "e", "h", "l":
 			m.toggleFold(idx)
 		case "E":
@@ -137,7 +137,7 @@ func (m *model) handleScrollKey(msg tea.KeyMsg) tea.Cmd {
 		m.focusScroll = false
 		m.ta.Focus()
 	case "y":
-		m.copyBlock(idx)
+		return m.copyBlock(idx)
 	}
 	return nil
 }
@@ -151,6 +151,13 @@ func (m *model) toggleFold(idx int) {
 	}
 	if idx >= len(m.blocks) {
 		return
+	}
+	if m.groupTools {
+		if run, ok := m.runForBlock(idx); ok {
+			m.toggleGroup(run)
+			m.refreshVP()
+			return
+		}
 	}
 	m.blocks[idx].folded = !m.blocks[idx].folded
 	m.refreshVP()

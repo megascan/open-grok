@@ -148,9 +148,9 @@ func (m *model) settingValue(d settingDef) string {
 	case "show_timeline":
 		return onOff(m.cfg.UI.ShowTimeline)
 	case "page_flip_on_send":
-		return onOff(m.cfg.UI.PageFlipOnSend)
+		return onOff(m.pageFlip)
 	case "simple_mode":
-		return onOff(m.cfg.UI.SimpleMode)
+		return onOff(m.simpleMode)
 	case "vim_mode":
 		return onOff(m.vimMode)
 	case "theme":
@@ -166,7 +166,7 @@ func (m *model) settingValue(d settingDef) string {
 	case "respect_manual_folds":
 		return onOff(m.cfg.UI.RespectFolds)
 	case "group_tool_verbs":
-		return onOff(m.cfg.UI.GroupToolVerbs)
+		return onOff(m.groupTools)
 	case "collapsed_edit_blocks":
 		return onOff(m.cfg.UI.CollapsedEdits)
 	case "invert_scroll":
@@ -340,15 +340,19 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 	case "show_timeline":
 		m.cfg.UI.ShowTimeline = !m.cfg.UI.ShowTimeline
 	case "page_flip_on_send":
-		m.cfg.UI.PageFlipOnSend = !m.cfg.UI.PageFlipOnSend
+		m.pageFlip = !m.pageFlip
+		m.cfg.UI.PageFlipOnSend = m.pageFlip
 	case "simple_mode":
-		m.cfg.UI.SimpleMode = !m.cfg.UI.SimpleMode
+		m.simpleMode = !m.simpleMode
+		m.cfg.UI.SimpleMode = m.simpleMode
 	case "render_mermaid":
 		m.cfg.UI.RenderMermaid = !m.cfg.UI.RenderMermaid
 	case "respect_manual_folds":
 		m.cfg.UI.RespectFolds = !m.cfg.UI.RespectFolds
 	case "group_tool_verbs":
-		m.cfg.UI.GroupToolVerbs = !m.cfg.UI.GroupToolVerbs
+		m.groupTools = !m.groupTools
+		m.cfg.UI.GroupToolVerbs = m.groupTools
+		m.expandedGroups = map[string]bool{}
 	case "collapsed_edit_blocks":
 		m.cfg.UI.CollapsedEdits = !m.cfg.UI.CollapsedEdits
 	case "invert_scroll":

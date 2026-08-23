@@ -175,6 +175,39 @@ func (f File) MemoryEnabled() bool {
 	return f.Features.Memory
 }
 
+// PrefBool returns a setting that stays at defaultOn until Prefs records an
+// explicit true/false. Missing TOML bools are false in Go, which would invert
+// Rust defaults such as page_flip_on_send and group_tool_verbs.
+func (f File) PrefBool(key string, field bool, defaultOn bool) bool {
+	if f.Prefs != nil {
+		if v, ok := f.Prefs[key]; ok {
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "true", "1", "on", "yes":
+				return true
+			case "false", "0", "off", "no":
+				return false
+			}
+		}
+	}
+	if field {
+		return true
+	}
+	return defaultOn
+}
+
+// SetPrefBool records an explicit boolean so later loads do not fall back to
+// the Rust-matching default.
+func (f *File) SetPrefBool(key string, on bool) {
+	if f.Prefs == nil {
+		f.Prefs = Prefs{}
+	}
+	if on {
+		f.Prefs[key] = "true"
+	} else {
+		f.Prefs[key] = "false"
+	}
+}
+
 // ScreenModeName is fullscreen unless the user picked minimal.
 func (f File) ScreenModeName() string {
 	if strings.EqualFold(f.UI.ScreenMode, "minimal") {

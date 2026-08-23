@@ -108,6 +108,21 @@ func TestWelcomeListsSessionsAndLogin(t *testing.T) {
 	if m.screen != screenWelcome {
 		t.Fatalf("screen %d", m.screen)
 	}
+	if m.unsignedIn() {
+		foundCodex, foundXAI := false, false
+		for _, it := range m.items {
+			if it.Key == "codex" {
+				foundCodex = true
+			}
+			if it.Key == "xai" {
+				foundXAI = true
+			}
+		}
+		if !foundCodex || !foundXAI {
+			t.Fatalf("unsigned welcome must offer Codex/xAI chooser, got %+v", m.items)
+		}
+		return
+	}
 	foundLogin := false
 	for _, it := range m.items {
 		if it.Key == "login" {

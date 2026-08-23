@@ -188,6 +188,19 @@ type model struct {
 	followUp, codeMode, imageGen                                          string
 	dashGroup                                                             string
 	dashIdleExpand                                                        bool
+	dashDetails                                                           bool
+	dashListFocus                                                         bool
+	dashNewAgent                                                          bool
+	peekReply                                                             string
+	peekFocus                                                             bool
+	peekQSel                                                              int
+	inactiveCollapsed                                                     bool
+	pageFlip, groupTools, simpleMode                                      bool
+	chips                                                                 []string
+	expandedGroups                                                        map[string]bool
+	escArmed                                                              time.Time
+	copyToast                                                             string
+	headerH, promptY                                                      int
 }
 
 // Run starts the interactive TUI.
@@ -214,25 +227,31 @@ func newModel(opt Options) (*model, error) {
 	}
 	applyTheme(resolveTheme(themeName))
 	m := &model{
-		opts:          opt,
-		cfg:           cfg,
-		status:        "ready",
-		theme:         themeName,
-		screenMd:      cfg.ScreenModeName(),
-		vimMode:       cfg.UI.VimMode,
-		timestamps:    cfg.UI.Timestamps,
-		compactUI:     cfg.UI.CompactMode,
-		multiline:     cfg.UI.Multiline,
-		mouseOn:       cfg.MouseReportingOn(),
-		thinkingOn:    cfg.ShowThinkingOn(),
-		swarm:         cfg.UI.SwarmMode,
-		dashCWD:       opt.CWD,
-		skillCWD:      opt.CWD,
-		echoOn:        false,
-		followUp:      cfg.UI.FollowUp,
-		codeMode:      cfg.UI.CodeMode,
-		imageGen:      cfg.UI.ImageGen,
-		selectedBlock: -1,
+		opts:              opt,
+		cfg:               cfg,
+		status:            "ready",
+		theme:             themeName,
+		screenMd:          cfg.ScreenModeName(),
+		vimMode:           cfg.UI.VimMode,
+		timestamps:        cfg.UI.Timestamps,
+		compactUI:         cfg.UI.CompactMode,
+		multiline:         cfg.UI.Multiline,
+		mouseOn:           cfg.MouseReportingOn(),
+		thinkingOn:        cfg.ShowThinkingOn(),
+		swarm:             cfg.UI.SwarmMode,
+		dashCWD:           opt.CWD,
+		skillCWD:          opt.CWD,
+		echoOn:            false,
+		followUp:          cfg.UI.FollowUp,
+		codeMode:          cfg.UI.CodeMode,
+		imageGen:          cfg.UI.ImageGen,
+		selectedBlock:     -1,
+		peekQSel:          -1,
+		inactiveCollapsed: true,
+		pageFlip:          cfg.PrefBool("page_flip_on_send", cfg.UI.PageFlipOnSend, true),
+		groupTools:        cfg.PrefBool("group_tool_verbs", cfg.UI.GroupToolVerbs, true),
+		simpleMode:        cfg.PrefBool("simple_mode", cfg.UI.SimpleMode, true),
+		expandedGroups:    map[string]bool{},
 	}
 	if m.followUp == "" {
 		m.followUp = "queue"
@@ -268,6 +287,10 @@ func newModel(opt Options) (*model, error) {
 			return nil, err
 		}
 		m.screen = screenChat
+		if !m.simpleMode && strings.TrimSpace(m.ta.Value()) == "" {
+			m.focusScroll = true
+			m.ta.Blur()
+		}
 	} else {
 		m.screen = screenWelcome
 		m.refreshWelcome()
@@ -358,6 +381,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshVP()
 		}
+		if m.screen == screenDashboard {
+			m.refreshDashboard()
+		}
 		if len(m.queue) > 0 && !m.busy {
 			next := m.queue[0]
 			m.queue = m.queue[1:]
@@ -394,6 +420,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ta.SetValue(strings.TrimSpace(msg.text))
 		m.ta.Focus()
+	case tea.MouseMsg:
+		if cmd, handled := m.handleMouse(msg); handled {
+			return m, cmd
+		}
 	case tea.KeyMsg:
 		if cmd, handled := m.handleKey(msg); handled {
 			return m, cmd
@@ -481,19 +511,54 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			m.overlay = overlayPermission
 			return nil, true
 		}
-		if m.ta.Value() != "" {
-			m.ta.Reset()
+		if m.dashDetails && strings.TrimSpace(m.ta.Value()) == "" && !m.focusScroll {
+			m.dashDetails = false
+			m.openDashboard()
 			return nil, true
 		}
 		if m.busy {
+			if m.vimMode && m.screenMd != modeMinimal {
+				return nil, true
+			}
 			return m.requestCancelTurn(), true
 		}
-		return tea.Quit, true
+		if m.ta.Value() != "" {
+			if !m.escArmed.IsZero() && time.Since(m.escArmed) < 800*time.Millisecond {
+				m.ta.Reset()
+				m.escArmed = time.Time{}
+				return nil, true
+			}
+			m.escArmed = time.Now()
+			m.status = "Esc again to clear"
+			return nil, true
+		}
+		return nil, true
 	case "ctrl+d":
 		return tea.Quit, true
 	case "ctrl+\\":
+		if m.dashDetails {
+			m.dashDetails = false
+			m.openDashboard()
+			return nil, true
+		}
 		m.openDashboard()
 		return nil, true
+	case "[", "]":
+		if m.dashDetails {
+			delta := 1
+			if msg.String() == "[" {
+				delta = -1
+			}
+			return m.cycleDashDetails(delta), true
+		}
+	case "left", "right":
+		if m.dashDetails && m.focusScroll {
+			delta := 1
+			if msg.String() == "left" {
+				delta = -1
+			}
+			return m.cycleDashDetails(delta), true
+		}
 	case "shift+tab":
 		m.cyclePermMode()
 		return nil, true
@@ -616,6 +681,12 @@ func (m *model) persistUI() {
 	m.cfg.UI.Multiline = m.multiline
 	m.cfg.UI.ScreenMode = m.screenMd
 	m.cfg.UI.SwarmMode = m.swarm
+	m.cfg.UI.PageFlipOnSend = m.pageFlip
+	m.cfg.UI.GroupToolVerbs = m.groupTools
+	m.cfg.UI.SimpleMode = m.simpleMode
+	m.cfg.SetPrefBool("page_flip_on_send", m.pageFlip)
+	m.cfg.SetPrefBool("group_tool_verbs", m.groupTools)
+	m.cfg.SetPrefBool("simple_mode", m.simpleMode)
 	on := m.mouseOn
 	m.cfg.UI.MouseReporting = &on
 	th := m.thinkingOn
@@ -670,11 +741,16 @@ func (m *model) applyStream(ev agent.Event) {
 
 func (m *model) submit(text string) tea.Cmd {
 	m.history = append(m.history, text)
+	m.chips = chipPathsIn(text)
+	userIdx := len(m.blocks)
 	m.appendBlock(block{kind: blockUser, body: text, at: time.Now()})
 	m.appendBlock(block{kind: blockAgent, body: "", at: time.Now()})
 	m.busy = true
 	m.status = "sampling"
 	m.refreshVP()
+	if m.pageFlip {
+		m.scrollToBlock(userIdx)
+	}
 	sess := m.sess
 	model := m.opts.Model
 	if sess.Effort != "" {

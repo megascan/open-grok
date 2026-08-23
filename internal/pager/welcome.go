@@ -9,13 +9,32 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/auth"
+	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
 )
 
+func (m *model) unsignedIn() bool {
+	st := auth.Status()
+	_, xai := st[types.ProviderXAI]
+	_, codex := st[types.ProviderCodex]
+	return !xai && !codex
+}
+
 func (m *model) refreshWelcome() {
 	m.items = nil
+	if m.unsignedIn() {
+		m.items = []listItem{
+			{Key: "codex", Label: "c  Continue with ChatGPT Codex", Detail: "Codex OAuth or API key"},
+			{Key: "xai", Label: "x  Continue with xAI Grok", Detail: "xAI API key"},
+			{Key: "quit", Label: "q  Quit", Detail: "leave Entropy"},
+		}
+		if m.cursor >= len(m.items) {
+			m.cursor = 0
+		}
+		return
+	}
 	m.items = append(m.items, listItem{Key: "new", Label: "New session", Detail: "start chatting in " + m.opts.CWD})
 	list, _ := agent.ListSessions(m.opts.CWD)
 	for i, s := range list {
@@ -55,7 +74,9 @@ func (m *model) viewWelcome() string {
 			signed = append(signed, p.DisplayName())
 		}
 	}
-	if len(signed) == 0 {
+	if m.unsignedIn() {
+		b.WriteString(claimStyle.Render("  Choose the account that will power this session.") + "\n\n")
+	} else if len(signed) == 0 {
 		b.WriteString(errStyle.Render("  Not signed in — pick Login or run entropy login") + "\n\n")
 	} else {
 		b.WriteString(okStyle.Render("  Signed in: "+strings.Join(signed, ", ")) + "\n\n")
@@ -67,11 +88,41 @@ func (m *model) viewWelcome() string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("  ↑↓ move  ·  enter  ·  d delete session  ·  q quit"))
+	hint := "  ↑↓ move  ·  enter  ·  d delete session  ·  q quit"
+	if m.unsignedIn() {
+		hint = "  c Codex  ·  x xAI  ·  q quit  ·  ↑↓ enter"
+	}
+	b.WriteString("\n" + dimStyle.Render(hint))
 	return b.String()
 }
 
 func (m *model) handleWelcomeKey(msg tea.KeyMsg) tea.Cmd {
+	if m.unsignedIn() {
+		switch msg.String() {
+		case "c":
+			return m.chooseStartup(types.ProviderCodex)
+		case "x":
+			return m.chooseStartup(types.ProviderXAI)
+		case "q", "ctrl+c", "ctrl+d":
+			return tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			return nil
+		case "down", "j":
+			if m.cursor+1 < len(m.items) {
+				m.cursor++
+			}
+			return nil
+		case "enter":
+			if m.cursor >= len(m.items) {
+				return nil
+			}
+			return m.pickWelcome(m.items[m.cursor].Key)
+		}
+		return nil
+	}
 	switch msg.String() {
 	case "up", "k":
 		if m.cursor > 0 {
@@ -97,8 +148,23 @@ func (m *model) handleWelcomeKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+func (m *model) chooseStartup(p types.Provider) tea.Cmd {
+	for _, mod := range catalog.All() {
+		if mod.Provider == p {
+			m.opts.Model = mod
+			break
+		}
+	}
+	m.openLogin(string(p))
+	return nil
+}
+
 func (m *model) pickWelcome(key string) tea.Cmd {
 	switch {
+	case key == "codex":
+		return m.chooseStartup(types.ProviderCodex)
+	case key == "xai":
+		return m.chooseStartup(types.ProviderXAI)
 	case key == "new":
 		sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, m.permMode == permAlways)
 		if err != nil {

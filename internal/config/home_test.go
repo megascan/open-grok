@@ -109,6 +109,23 @@ func TestNeverGrokHome(t *testing.T) {
 	}
 }
 
+func TestPrefBoolDefaultsOnWhenUnset(t *testing.T) {
+	var f config.File
+	if !f.PrefBool("page_flip_on_send", f.UI.PageFlipOnSend, true) {
+		t.Fatal("missing pref must default on (Rust page_flip_on_send)")
+	}
+	if !f.PrefBool("group_tool_verbs", f.UI.GroupToolVerbs, true) {
+		t.Fatal("missing pref must default on (Rust group_tool_verbs)")
+	}
+	if !f.PrefBool("simple_mode", f.UI.SimpleMode, true) {
+		t.Fatal("missing pref must default on (Rust simple_mode)")
+	}
+	f.SetPrefBool("page_flip_on_send", false)
+	if f.PrefBool("page_flip_on_send", false, true) {
+		t.Fatal("explicit false must win")
+	}
+}
+
 func TestHomeFallsBackToOPENGROK_HOME(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("ENTROPY_HOME", "")
