@@ -19,7 +19,28 @@ const (
 	welcomeTrustWarningLine2    = "posing security risks."
 	welcomeTrustQuestion        = "Do you trust the contents of this directory?"
 	welcomeUnsignedPrompt       = "Choose the account that will power this session."
+	feedbackPlaceholder         = "Please provide as much detail as possible."
+	feedbackBlockedQuestion     = "Finish answering the current question first"
+	feedbackBlockedOverlay      = "Close or answer what's open before sending feedback"
+	planWaitingLabel            = "Waiting on plan approval"
+	planEmptyTitle              = "No plan written — approve or request changes"
 )
+
+func writeAccent(b *strings.Builder, s string) {
+	b.WriteString(titleStyle.Render(permAccentBar) + "  " + s + "\n")
+}
+
+func radioRow(hotkey, label string, cursor bool) string {
+	marker := "(" + pickerDotEmpty + ")"
+	if cursor {
+		marker = "(" + pickerDotFilled + ")"
+	}
+	line := hotkey + " " + marker + " " + label
+	if cursor {
+		return selStyle.Render(line)
+	}
+	return line
+}
 
 func (m *model) enterSettingsEnum(def settingDef) {
 	m.settingsEnumKey = def.Key

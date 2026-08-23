@@ -1,7 +1,6 @@
 package pager
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -119,37 +118,45 @@ func (m *model) renderLoginOverlay(w int) string {
 func (m *model) loginBody() string {
 	var b strings.Builder
 	if m.loginP == "" {
-		b.WriteString(titleStyle.Render("Choose a provider") + "\n\n")
+		writeAccent(&b, titleStyle.Render("Choose a provider"))
+		writeAccent(&b, "")
 		for i, it := range m.items {
-			line := fmt.Sprintf("  %s  %s", it.Label, dimStyle.Render(it.Detail))
-			if i == m.cursor {
-				line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
+			label := it.Label
+			if it.Detail != "" {
+				label += "  " + it.Detail
 			}
-			b.WriteString(line + "\n")
+			writeAccent(&b, radioRow(optionHotkey(i), label, i == m.cursor))
 		}
-		b.WriteString("\n" + dimStyle.Render("enter select  ·  esc back"))
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("enter select  ·  esc back"))
 		return b.String()
 	}
-	b.WriteString(titleStyle.Render(loginPickerLabel(m.loginP)) + "\n")
+	writeAccent(&b, titleStyle.Render(loginPickerLabel(m.loginP)))
 	if m.loginP == types.ProviderCodex {
-		b.WriteString(dimStyle.Render("Codex OAuth needs a browser (entropy login --codex).") + "\n")
-		b.WriteString(dimStyle.Render("Paste an API key here to store OPENAI_API_KEY in codex-auth.json.") + "\n\n")
+		writeAccent(&b, dimStyle.Render("Codex OAuth needs a browser (entropy login --codex)."))
+		writeAccent(&b, dimStyle.Render("Paste an API key here to store OPENAI_API_KEY in codex-auth.json."))
+	} else if m.loginP == types.ProviderXAI {
+		writeAccent(&b, dimStyle.Render("Sign in with xAI"))
+		writeAccent(&b, dimStyle.Render("Paste an API key. It is written owner-only under ~/.entropy."))
 	} else {
-		b.WriteString(dimStyle.Render("Paste an API key. It is written owner-only under ~/.entropy.") + "\n\n")
+		writeAccent(&b, dimStyle.Render("Paste an API key. It is written owner-only under ~/.entropy."))
 	}
+	writeAccent(&b, "")
 	shown := strings.Repeat("•", len(m.keyBuf))
 	if shown == "" {
 		shown = dimStyle.Render("(hidden)")
 	}
-	b.WriteString("key: " + shown + "\n\n")
-	b.WriteString(dimStyle.Render("enter save  ·  esc back  ·  never commit this key"))
+	writeAccent(&b, "key: "+shown)
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("enter save  ·  esc back  ·  never commit this key"))
 	return b.String()
 }
 
 func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 	inOverlay := m.overlay == overlayLogin
 	if m.loginP == "" {
-		switch msg.String() {
+		s := msg.String()
+		switch s {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -168,6 +175,15 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 		case "enter":
 			if m.cursor < len(m.items) {
 				p, ok := parseLoginProvider(m.items[m.cursor].Key)
+				if ok {
+					m.loginP = p
+					m.keyBuf = ""
+				}
+			}
+		default:
+			if idx := optionIndexFromKey(s, len(m.items)); idx >= 0 {
+				m.cursor = idx
+				p, ok := parseLoginProvider(m.items[idx].Key)
 				if ok {
 					m.loginP = p
 					m.keyBuf = ""

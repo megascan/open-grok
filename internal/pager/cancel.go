@@ -29,20 +29,14 @@ func (m *model) renderCancelTurn(w int) string {
 		count = "1 subagent running"
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(title) + "\n")
-	b.WriteString(dimStyle.Render(count) + "\n\n")
+	writeAccent(&b, titleStyle.Render(title))
+	writeAccent(&b, dimStyle.Render(count))
+	writeAccent(&b, "")
 	for i, c := range cancelTurnChoices {
-		marker := "(○)"
-		if i == m.cancelCursor {
-			marker = "(●)"
-		}
-		line := fmt.Sprintf(" %d %s %s", i+1, marker, c)
-		if i == m.cancelCursor {
-			line = selStyle.Render(line)
-		}
-		b.WriteString(line + "\n")
+		writeAccent(&b, radioRow(fmt.Sprintf("%d", i+1), c, i == m.cancelCursor))
 	}
-	b.WriteString("\n" + dimStyle.Render("enter  ·  tab walk  ·  esc keep running"))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("enter  ·  tab walk  ·  esc keep running"))
 	return modalBox.Width(w).Render(b.String())
 }
 

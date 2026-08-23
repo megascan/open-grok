@@ -20,13 +20,14 @@ func (m *model) renderPlanApproval(w int) string {
 		return ""
 	}
 	var b strings.Builder
-	title := "Plan approval"
+	title := planWaitingLabel
 	body := m.plan.Plan
 	if !m.plan.HasPlan || strings.TrimSpace(body) == "" {
-		title = "No plan written — approve or request changes"
+		title = planEmptyTitle
 		body = emptyPlanPlaceholder
 	}
-	b.WriteString(titleStyle.Render(title) + "\n\n")
+	writeAccent(&b, titleStyle.Render(title))
+	writeAccent(&b, "")
 	lines := strings.Split(body, "\n")
 	start := m.planScroll
 	if start < 0 {
@@ -41,16 +42,18 @@ func (m *model) renderPlanApproval(w int) string {
 		if m.planFocus == "preview" && i == start {
 			mark = "▸ "
 		}
-		b.WriteString(mark + lines[i] + "\n")
+		writeAccent(&b, mark+lines[i])
 	}
 	if m.planFocus == "prompt" || m.planFocus == "comment" {
 		label := "revision notes: "
 		if m.planFocus == "comment" {
 			label = "comment: "
 		}
-		b.WriteString("\n" + claimStyle.Render(label) + m.planDraft + "█\n")
+		writeAccent(&b, "")
+		writeAccent(&b, claimStyle.Render(label)+m.planDraft+"█")
 	}
-	b.WriteString("\n" + dimStyle.Render("a approve  ·  s request changes  ·  c comment  ·  y copy  ·  q quit  ·  tab prompt"))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("a approve  ·  s request changes  ·  c comment  ·  y copy  ·  q quit  ·  tab prompt"))
 	return modalBox.Width(w).Render(b.String())
 }
 

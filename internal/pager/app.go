@@ -231,6 +231,7 @@ type model struct {
 	settingsEnumKey, settingsEnumOrig                                     string
 	settingsEnumIdx                                                       int
 	settingsSecretKey, settingsSecret                                     string
+	themePreviewOrig                                                      string
 	permMode                                                              permMode
 	queue                                                                 []string
 	loops                                                                 []loopJob

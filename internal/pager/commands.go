@@ -372,6 +372,18 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.sendFeedback(arg)
 			break
 		}
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		if m.question != nil {
+			m.appendSys(feedbackBlockedQuestion)
+			break
+		}
+		if m.perm != nil || m.plan != nil {
+			m.appendSys(feedbackBlockedOverlay)
+			break
+		}
 		m.overlay = overlayFeedback
 		m.feedback = ""
 	case "announcements":

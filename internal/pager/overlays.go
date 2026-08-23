@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -112,14 +113,16 @@ func (m *model) renderOverlay() string {
 		}
 		return modalBox.Width(w).Render(titleStyle.Render(title) + "\n\n" + body)
 	case overlayFeedback:
-		return modalBox.Width(w).Render(titleStyle.Render(feedbackQuestionLabel) + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
+		return m.renderFeedback(w)
 	case overlaySettings:
 		return m.renderSettings(w)
 	case overlayTheme:
-		return m.renderListModal("Theme (live preview)", w)
+		return m.renderThemePicker(w)
 	case overlayCache:
 		return m.renderCache(w)
-	case overlayDashboard, overlayResume, overlayModel,
+	case overlayModel:
+		return m.renderModelPicker(w)
+	case overlayDashboard, overlayResume,
 		overlayDocs, overlayTutorial, overlayExtensions,
 		overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
@@ -197,6 +200,103 @@ func (m *model) overlayTitle() string {
 		return "New worktree"
 	}
 	return "Entropy"
+}
+
+func (m *model) renderFeedback(w int) string {
+	var b strings.Builder
+	writeAccent(&b, titleStyle.Render(feedbackQuestionLabel))
+	writeAccent(&b, "")
+	body := m.feedback
+	showPH := strings.TrimSpace(body) == ""
+	if showPH {
+		body = feedbackPlaceholder
+	}
+	innerW := max(24, w-10)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colMuted)).
+		Width(innerW).
+		Padding(0, 1)
+	text := body + "█"
+	if showPH {
+		text = dimStyle.Render(feedbackPlaceholder) + "█"
+	}
+	writeAccent(&b, box.Render(text))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("enter send  ·  esc discard  ·  ctrl+c clear"))
+	return modalBox.Width(w).Render(b.String())
+}
+
+func (m *model) renderThemePicker(w int) string {
+	return m.renderRadioPicker("Theme", "↑/↓ try  ·  Enter select  ·  Esc revert", w)
+}
+
+func (m *model) renderModelPicker(w int) string {
+	return m.renderRadioPicker("Models", "↑↓  enter  ·  esc close  ·  type to filter", w)
+}
+
+func (m *model) renderRadioPicker(title, hint string, w int) string {
+	var b strings.Builder
+	writeAccent(&b, titleStyle.Render(title))
+	if m.filter != "" {
+		writeAccent(&b, dimStyle.Render("filter: "+m.filter))
+	}
+	writeAccent(&b, "")
+	if len(m.items) == 0 {
+		writeAccent(&b, dimStyle.Render("(empty)"))
+	}
+	start := 0
+	limit := 16
+	if m.cursor >= limit {
+		start = m.cursor - limit + 1
+	}
+	for i, it := range m.items {
+		if i < start || i >= start+limit {
+			continue
+		}
+		label := it.Label
+		if it.Detail != "" {
+			label += "  " + it.Detail
+		}
+		writeAccent(&b, radioRow(optionHotkey(i), label, i == m.cursor))
+	}
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render(hint))
+	return modalBox.Width(w).Render(b.String())
+}
+
+func modelPickerDetail(mod catalog.Model) string {
+	var parts []string
+	if slug := strings.TrimSpace(mod.Model); slug != "" {
+		parts = append(parts, slug)
+	} else if mod.ID != "" {
+		parts = append(parts, mod.ID)
+	}
+	if mod.ContextWindow > 0 {
+		parts = append(parts, formatContextWindow(mod.ContextWindow))
+	}
+	if d := strings.TrimSpace(mod.Description); d != "" {
+		parts = append(parts, d)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func formatContextWindow(tokens int) string {
+	if tokens >= 1_000_000 {
+		tenths := (tokens*10 + 500_000) / 1_000_000
+		if tenths%10 == 0 {
+			return fmt.Sprintf("%dM context", tenths/10)
+		}
+		return fmt.Sprintf("%d.%dM context", tenths/10, tenths%10)
+	}
+	if tokens >= 1_000 {
+		tenths := (tokens*10 + 500) / 1_000
+		if tenths%10 == 0 {
+			return fmt.Sprintf("%dK context", tenths/10)
+		}
+		return fmt.Sprintf("%d.%dK context", tenths/10, tenths%10)
+	}
+	return fmt.Sprintf("%d context", tokens)
 }
 
 func (m *model) renderListModal(title string, w int) string {
@@ -411,6 +511,12 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		case tea.KeyEsc:
 			m.overlay = overlayNone
 			m.feedback = ""
+		case tea.KeyCtrlC:
+			if strings.TrimSpace(m.feedback) != "" {
+				m.feedback = ""
+				return nil, true
+			}
+			m.overlay = overlayNone
 		case tea.KeyEnter:
 			text := m.feedback
 			m.feedback = ""
@@ -453,6 +559,11 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "esc":
 		if m.overlay == overlayTimeline || m.overlay == overlayFind {
 			m.restoreJumpViewport()
+		}
+		if m.overlay == overlayTheme && m.themePreviewOrig != "" {
+			m.theme = m.themePreviewOrig
+			applyTheme(resolveTheme(m.themePreviewOrig))
+			m.themePreviewOrig = ""
 		}
 		m.overlay = overlayNone
 		m.filter = ""
@@ -569,6 +680,7 @@ func (m *model) pickOverlay() tea.Cmd {
 		m.theme = it.Key
 		applyTheme(resolveTheme(it.Key))
 		saveTheme(it.Key)
+		m.themePreviewOrig = ""
 		m.overlay = overlayNone
 		m.appendSys(saveThemeToast(canonicalThemeName(it.Key)))
 	case overlayResume, overlayDashboard:
@@ -704,11 +816,36 @@ func (m *model) openAuxModel(which string) {
 func (m *model) openTheme() {
 	m.overlay = overlayTheme
 	m.cursor = 0
+	m.themePreviewOrig = m.theme
 	m.items = nil
-	for _, t := range builtinThemes {
-		m.items = append(m.items, listItem{Key: t.Name, Label: t.Name, Detail: strings.Join(t.Aliases, ", ")})
+	autoActive := ""
+	if canonicalThemeName(m.theme) == "auto" {
+		autoActive = " (active)"
 	}
-	m.items = append(m.items, listItem{Key: "auto", Label: "auto", Detail: "follow system appearance"})
+	m.items = append(m.items, listItem{
+		Key:    "auto",
+		Label:  "auto",
+		Detail: "auto (follow system)" + autoActive,
+	})
+	current := canonicalThemeName(m.theme)
+	for _, name := range themeCanonicalNames() {
+		active := ""
+		if name == current && current != "auto" {
+			active = " (active)"
+		}
+		m.items = append(m.items, listItem{
+			Key:    name,
+			Label:  name,
+			Detail: themePrettyName(name) + active,
+		})
+	}
+	for i, it := range m.items {
+		if it.Key == current || (current == "auto" && it.Key == "auto") {
+			m.cursor = i
+			break
+		}
+	}
+	m.previewOverlay()
 }
 
 func (m *model) openResume() {
@@ -863,10 +1000,28 @@ func (m *model) openModels() {
 	m.overlay = overlayModel
 	m.cursor = 0
 	m.items = nil
-	for _, mod := range catalog.All() {
+	mods := catalog.All()
+	sort.SliceStable(mods, func(i, j int) bool {
+		pi := mods[i].Provider.DisplayName()
+		pj := mods[j].Provider.DisplayName()
+		if !strings.EqualFold(pi, pj) {
+			return strings.ToLower(pi) < strings.ToLower(pj)
+		}
+		return strings.ToLower(mods[i].Name) < strings.ToLower(mods[j].Name)
+	})
+	for _, mod := range mods {
+		label := mod.Provider.DisplayName() + " · " + mod.Name
+		if m.opts.Model.ID == mod.ID {
+			label += " (current)"
+		}
 		m.items = append(m.items, listItem{
-			Key: mod.ID, Label: mod.Name, Detail: string(mod.Provider) + "  " + string(mod.APIBackend),
+			Key:    mod.ID,
+			Label:  label,
+			Detail: modelPickerDetail(mod),
 		})
+		if m.opts.Model.ID == mod.ID {
+			m.cursor = len(m.items) - 1
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/agent"
 	"github.com/megascan/open-grok/internal/auth"
+	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/types"
 )
 
@@ -276,5 +277,132 @@ func TestDashboardPeekPermissionAndQuestionChrome(t *testing.T) {
 	}
 	if !strings.Contains(view, peekOtherPlaceholder) {
 		t.Fatalf("other:\n%s", view)
+	}
+}
+
+func TestFeedbackPaneQuestionChromeAndPlaceholder(t *testing.T) {
+	m := testModel(t)
+	sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.sess = sess
+	m.width = 80
+	m.handleSlash("/feedback")
+	view := stripANSI(m.renderOverlay())
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+	if !strings.Contains(view, feedbackQuestionLabel) {
+		t.Fatalf("label:\n%s", view)
+	}
+	if !strings.Contains(view, "Please provide as much") || !strings.Contains(view, "detail as possible") {
+		t.Fatalf("placeholder:\n%s", view)
+	}
+	m.question = &qAskMsg{Question: "busy?", Options: []string{"yes"}}
+	m.overlay = overlayNone
+	m.handleSlash("/feedback")
+	if lastSys(m) != feedbackBlockedQuestion {
+		t.Fatalf("blocked %q", lastSys(m))
+	}
+}
+
+func TestPlanApprovalWaitingChrome(t *testing.T) {
+	m := testModel(t)
+	m.plan = &planAskMsg{HasPlan: true, Plan: "# Ship it\n\nDo the thing."}
+	view := stripANSI(m.renderPlanApproval(72))
+	if !strings.Contains(view, planWaitingLabel) {
+		t.Fatalf("waiting:\n%s", view)
+	}
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+	m.plan.HasPlan = false
+	m.plan.Plan = ""
+	view = stripANSI(m.renderPlanApproval(72))
+	if !strings.Contains(view, planEmptyTitle) {
+		t.Fatalf("empty:\n%s", view)
+	}
+}
+
+func TestThemePickerAutoFirstAndEscReverts(t *testing.T) {
+	m := testModel(t)
+	m.theme = "groknight"
+	applyTheme(resolveTheme(m.theme))
+	m.openTheme()
+	if m.items[0].Key != "auto" {
+		t.Fatalf("auto first %+v", m.items[0])
+	}
+	if m.items[1].Key != "groknight" || !strings.Contains(m.items[1].Detail, "(active)") {
+		t.Fatalf("active %+v", m.items[1])
+	}
+	view := stripANSI(m.renderThemePicker(72))
+	if !strings.Contains(view, permAccentBar) || !strings.Contains(view, "("+pickerDotFilled+")") {
+		t.Fatalf("radio:\n%s", view)
+	}
+	m.cursor = 2
+	m.previewOverlay()
+	m.handleOverlayKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if canonicalThemeName(m.theme) != "groknight" {
+		t.Fatalf("esc revert %q", m.theme)
+	}
+	if m.overlay != overlayNone {
+		t.Fatal("esc closes")
+	}
+}
+
+func TestLoginPickerRadioChrome(t *testing.T) {
+	m := testModel(t)
+	m.openLogin("")
+	view := stripANSI(m.loginBody())
+	if !strings.Contains(view, "Choose a provider") {
+		t.Fatal("title")
+	}
+	if !strings.Contains(view, permAccentBar) || !strings.Contains(view, "("+pickerDotFilled+")") {
+		t.Fatalf("radio:\n%s", view)
+	}
+	if !strings.Contains(view, "xAI Grok") || !strings.Contains(view, "ChatGPT Codex") {
+		t.Fatalf("providers:\n%s", view)
+	}
+}
+
+func TestModelPickerProviderCurrentAndContext(t *testing.T) {
+	m := testModel(t)
+	mods := catalog.All()
+	if len(mods) == 0 {
+		t.Fatal("catalog empty")
+	}
+	m.opts.Model = mods[0]
+	m.openModels()
+	if len(m.items) == 0 {
+		t.Fatal("picker empty")
+	}
+	foundCurrent := false
+	for _, it := range m.items {
+		if strings.Contains(it.Label, "(current)") {
+			foundCurrent = true
+		}
+		if it.Key == m.opts.Model.ID && !strings.Contains(it.Label, " · ") {
+			t.Fatalf("provider · name missing: %q", it.Label)
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("current missing %+v", m.items[0])
+	}
+	view := stripANSI(m.renderModelPicker(72))
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+}
+
+func TestCancelTurnAccentBar(t *testing.T) {
+	m := testModel(t)
+	m.cancel = &cancelTurnState{Running: 1}
+	view := stripANSI(m.renderCancelTurn(60))
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+	if !strings.Contains(view, "1 subagent running") {
+		t.Fatalf("%s", view)
 	}
 }
