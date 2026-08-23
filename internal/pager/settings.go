@@ -12,111 +12,120 @@ import (
 type settingDef struct {
 	Key, Category, Label, Kind string
 	Choices                    []string
+	Min, Max                   int64  // int kind (Rust SettingKind::Int)
+	Default                    string // string/int seed when Prefs has no row
 }
 
 // rustSettingsCatalog is the user-visible settings modal, keyed like the Rust pager.
 func rustSettingsCatalog() []settingDef {
 	return []settingDef{
-		{"compact_mode", "Appearance", "Compact mode", "bool", nil},
-		{"screen_mode", "Appearance", "Default screen mode", "enum", []string{"fullscreen", "minimal"}},
-		{"show_timestamps", "Appearance", "Timestamps", "bool", nil},
-		{"show_timeline", "Appearance", "Show timeline", "bool", nil},
-		{"page_flip_on_send", "Appearance", "Page flip on send", "bool", nil},
-		{"simple_mode", "Appearance", "Simple mode", "bool", nil},
-		{"vim_mode", "Appearance", "Vim-mode scrollback", "bool", nil},
-		{"theme", "Appearance", "Theme", "action", nil},
-		{"auto_dark_theme", "Appearance", "Auto dark theme", "enum", []string{"groknight", "tokyonight", "rosepine-moon", "oscura-midnight"}},
-		{"auto_light_theme", "Appearance", "Auto light theme", "enum", []string{"grokday"}},
-		{"render_mermaid", "Appearance", "Render mermaid", "bool", nil},
-		{"show_thinking_blocks", "Appearance", "Show thinking blocks", "bool", nil},
-		{"prompt_suggestions", "Appearance", "Prompt suggestions", "bool", nil},
-		{"respect_manual_folds", "Appearance", "Respect manual folds", "bool", nil},
-		{"group_tool_verbs", "Appearance", "Group tool verbs", "bool", nil},
-		{"collapsed_edit_blocks", "Appearance", "Collapsed edit blocks", "bool", nil},
-		{"display_refresh_auto_cadence", "Appearance", "Auto display-refresh cadence", "bool", nil},
-		{"scroll_speed", "Appearance", "Scroll speed", "enum", []string{"slow", "normal", "fast"}},
-		{"scroll_mode", "Appearance", "Scroll mode", "enum", []string{"line", "block", "page"}},
-		{"scroll_lines", "Appearance", "Scroll lines", "enum", []string{"1", "3", "5"}},
-		{"invert_scroll", "Appearance", "Invert scroll", "bool", nil},
-		{"keep_text_selection", "Appearance", "Keep text selection", "bool", nil},
-		{"show_tips", "Appearance", "Show tips", "bool", nil},
-		{"ui.mouse_reporting_toggle", "Appearance", "Mouse reporting", "bool", nil},
-		{"combine_queued_prompts", "Editor", "Combine queued prompts", "bool", nil},
-		{"follow_up_behavior", "Editor", "Follow-up behavior", "enum", []string{"queue", "steer"}},
-		{"confirm_before_rewind", "Editor", "Confirm before rewind", "bool", nil},
-		{"enter_steers", "Editor", "Enter steers", "bool", nil},
-		{"multiline_mode", "Editor", "Multiline input", "bool", nil},
-		{"swarm_mode", "Agent", "Swarm mode", "bool", nil},
-		{"antigravity_subagents", "Agent", "Antigravity subagents", "bool", nil},
-		{"antigravity_skip_permissions", "Agent", "Antigravity skip permissions", "bool", nil},
-		{"permission_mode", "Agent", "Permission mode", "enum", []string{"default", "ask", "auto", "always-approve"}},
-		{"remember_tool_approvals", "Agent", "Remember tool approvals", "bool", nil},
-		{"code_mode", "Agent", "Code mode", "enum", []string{"direct", "code_mode", "code_mode_only"}},
-		{"plan_mode", "Agent", "Plan mode", "bool", nil},
-		{"default_selected_permission", "Agent", "Default permission selection", "enum", []string{"allow", "always", "deny"}},
-		{"stream_tool_calls", "Agent", "Stream tool calls", "bool", nil},
-		{"hunk_tracker_mode", "Agent", "Hunk tracker", "enum", []string{"off", "agent", "all"}},
-		{"sandbox.auto_allow_bash", "Agent", "Sandbox auto-allow bash", "bool", nil},
-		{"tools.respect_gitignore", "Agent", "Respect gitignore", "bool", nil},
-		{"image_generation_provider", "Models", "Image generation", "enum", []string{"grok", "openai"}},
-		{"default_model", "Models", "Default model", "action", nil},
-		{"kimi_api_endpoint", "Models", "Kimi API endpoint", "enum", []string{"platform", "code"}},
-		{"kimi_api_key", "Models", "Kimi Platform API key", "secret", nil},
-		{"kimi_code_api_key", "Models", "Kimi Code API key", "secret", nil},
-		{"fireworks_api_key", "Models", "Fireworks API key", "secret", nil},
-		{"deepseek_api_key", "Models", "DeepSeek API key", "secret", nil},
-		{"meta_api_key", "Models", "Meta API key", "secret", nil},
-		{"opencode_go_api_key", "Models", "OpenCode Go API key", "secret", nil},
-		{"wafer_api_key", "Models", "Wafer AI API key", "secret", nil},
-		{"zai_api_key", "Models", "Z AI API key", "secret", nil},
-		{"runinfra_api_key", "Models", "RunInfra API key", "secret", nil},
-		{"gemini_api_key", "Models", "Google Gemini API key", "secret", nil},
-		{"openrouter_api_key", "Models", "OpenRouter API key", "secret", nil},
-		{"opencode_go_models", "Models", "OpenCode Go live catalog", "bool", nil},
-		{"openrouter_models", "Models", "OpenRouter live catalog", "bool", nil},
-		{"custom_models", "Models", "Custom models", "action", nil},
-		{"recap_model", "Models", "Recap model", "action", nil},
-		{"memory_model", "Models", "Memory model", "action", nil},
-		{"fork_secondary_model", "Models", "Fork secondary model", "action", nil},
-		{"toolset.perplexity_web_search.enabled", "Models", "Perplexity web search", "bool", nil},
-		{"perplexity_api_key", "Models", "Perplexity API key", "secret", nil},
-		{"toolset.web_search_source.xai", "Models", "xAI web search source", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.codex", "Models", "Codex web search source", "enum", []string{"native", "xai", "perplexity"}},
-		{"toolset.web_search_source.kimi_platform", "Models", "Kimi Platform web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.kimi_code", "Models", "Kimi Code web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.fireworks", "Models", "Fireworks web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.deepseek", "Models", "DeepSeek web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.opencode_go", "Models", "OpenCode Go web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.web_search_source.openrouter", "Models", "OpenRouter web search", "enum", []string{"native", "perplexity"}},
-		{"toolset.x_search.enabled", "Models", "X search", "bool", nil},
-		{"coding_data_sharing", "Privacy", "Coding data sharing", "enum", []string{"opt-in", "opt-out"}},
-		{"toolset.ask_user_question.timeout_enabled", "Agent", "Question-card timeout", "bool", nil},
-		{"contextual_hints", "Appearance", "Contextual hints", "bool", nil},
-		{"contextual_hints.undo", "Appearance", "Hint: undo", "bool", nil},
-		{"contextual_hints.plan_mode", "Appearance", "Hint: plan mode", "bool", nil},
-		{"contextual_hints.image_input", "Appearance", "Hint: image input", "bool", nil},
-		{"contextual_hints.send_now", "Appearance", "Hint: send now", "bool", nil},
-		{"contextual_hints.small_screen", "Appearance", "Hint: small screen", "bool", nil},
-		{"contextual_hints.word_select", "Appearance", "Hint: word select", "bool", nil},
-		{"contextual_hints.ssh_wrap", "Appearance", "Hint: SSH wrap", "bool", nil},
-		{"auto_update", "Advanced", "Auto update", "bool", nil},
-		{"voice_keybind_enabled", "Input", "Voice keybind", "bool", nil},
-		{"voice_capture_mode", "Input", "Voice capture", "enum", []string{"hold", "toggle"}},
-		{"voice_stt_language", "Input", "Voice STT language", "enum", []string{"auto", "en", "zh"}},
-		{"memory.enabled", "Memory", "Memory", "bool", nil},
-		{"memory.dream.enabled", "Memory", "Memory dream", "bool", nil},
-		{"features.telemetry", "Advanced", "Telemetry", "bool", nil},
-		{"features.lsp_tools", "Advanced", "LSP tools", "bool", nil},
-		{"features.web_fetch", "Advanced", "Web fetch", "bool", nil},
-		{"toolset.web_fetch.allow_local", "Advanced", "Web fetch allow local", "bool", nil},
-		{"features.two_pass_compaction", "Advanced", "Two-pass compaction", "bool", nil},
-		{"features.non_git_warning", "Advanced", "Non-git warning", "bool", nil},
-		{"features.remember_mode", "Advanced", "Remember mode", "bool", nil},
-		{"doom_loop_recovery.enabled", "Advanced", "Doom-loop recovery", "bool", nil},
-		{"features.subagent_worktree_snapshot", "Advanced", "Subagent worktree snapshot", "bool", nil},
-		{"diagnostics.crash_handler", "Advanced", "Crash handler", "bool", nil},
-		{"suggestions.enabled", "Appearance", "Suggestions", "bool", nil},
-		{"suggestions.ai_enabled", "Appearance", "AI suggestions", "bool", nil},
+		{"compact_mode", "Appearance", "Compact mode", "bool", nil, 0, 0, ""},
+		{"screen_mode", "Appearance", "Default screen mode", "enum", []string{"fullscreen", "minimal"}, 0, 0, ""},
+		{"show_timestamps", "Appearance", "Timestamps", "bool", nil, 0, 0, ""},
+		{"show_timeline", "Appearance", "Show timeline", "bool", nil, 0, 0, ""},
+		{"page_flip_on_send", "Appearance", "Page flip on send", "bool", nil, 0, 0, ""},
+		{"simple_mode", "Appearance", "Simple mode", "bool", nil, 0, 0, ""},
+		{"vim_mode", "Appearance", "Vim-mode scrollback", "bool", nil, 0, 0, ""},
+		{"theme", "Appearance", "Theme", "action", nil, 0, 0, ""},
+		{"auto_dark_theme", "Appearance", "Auto dark theme", "enum", []string{"groknight", "tokyonight", "rosepine-moon", "oscura-midnight"}, 0, 0, ""},
+		{"auto_light_theme", "Appearance", "Auto light theme", "enum", []string{"grokday"}, 0, 0, ""},
+		{"render_mermaid", "Appearance", "Render mermaid", "bool", nil, 0, 0, ""},
+		{"show_thinking_blocks", "Appearance", "Show thinking blocks", "bool", nil, 0, 0, ""},
+		{"prompt_suggestions", "Appearance", "Prompt suggestions", "bool", nil, 0, 0, ""},
+		{"respect_manual_folds", "Appearance", "Respect manual folds", "bool", nil, 0, 0, ""},
+		{"group_tool_verbs", "Appearance", "Group tool verbs", "bool", nil, 0, 0, ""},
+		{"collapsed_edit_blocks", "Appearance", "Collapsed edit blocks", "bool", nil, 0, 0, ""},
+		{"display_refresh_auto_cadence", "Appearance", "Auto display-refresh cadence", "bool", nil, 0, 0, ""},
+		{"scroll_speed", "Appearance", "Scroll speed", "int", nil, 1, 100, "50"},
+		{"scroll_mode", "Appearance", "Scroll mode", "enum", []string{"line", "block", "page"}, 0, 0, ""},
+		{"scroll_lines", "Appearance", "Scroll lines", "int", nil, 1, 10, "3"},
+		{"max_thoughts_width", "Appearance", "Max thoughts width", "int", nil, 40, 500, "120"},
+		{"invert_scroll", "Appearance", "Invert scroll", "bool", nil, 0, 0, ""},
+		{"keep_text_selection", "Appearance", "Keep text selection", "bool", nil, 0, 0, ""},
+		{"show_tips", "Appearance", "Show tips", "bool", nil, 0, 0, ""},
+		{"ui.mouse_reporting_toggle", "Appearance", "Mouse reporting", "bool", nil, 0, 0, ""},
+		{"combine_queued_prompts", "Editor", "Combine queued prompts", "bool", nil, 0, 0, ""},
+		{"follow_up_behavior", "Editor", "Follow-up behavior", "enum", []string{"queue", "steer"}, 0, 0, ""},
+		{"confirm_before_rewind", "Editor", "Confirm before rewind", "bool", nil, 0, 0, ""},
+		{"enter_steers", "Editor", "Enter steers", "bool", nil, 0, 0, ""},
+		{"multiline_mode", "Editor", "Multiline input", "bool", nil, 0, 0, ""},
+		{"swarm_mode", "Agent", "Swarm mode", "bool", nil, 0, 0, ""},
+		{"antigravity_subagents", "Agent", "Antigravity subagents", "bool", nil, 0, 0, ""},
+		{"antigravity_skip_permissions", "Agent", "Antigravity skip permissions", "bool", nil, 0, 0, ""},
+		{"permission_mode", "Agent", "Permission mode", "enum", []string{"default", "ask", "auto", "always-approve"}, 0, 0, ""},
+		{"remember_tool_approvals", "Agent", "Remember tool approvals", "bool", nil, 0, 0, ""},
+		{"code_mode", "Agent", "Code mode", "enum", []string{"direct", "code_mode", "code_mode_only"}, 0, 0, ""},
+		{"plan_mode", "Agent", "Plan mode", "bool", nil, 0, 0, ""},
+		{"default_selected_permission", "Agent", "Default permission selection", "enum", []string{"allow", "always", "deny"}, 0, 0, ""},
+		{"stream_tool_calls", "Agent", "Stream tool calls", "bool", nil, 0, 0, ""},
+		{"hunk_tracker_mode", "Agent", "Hunk tracker", "enum", []string{"off", "agent", "all"}, 0, 0, ""},
+		{"sandbox.auto_allow_bash", "Agent", "Sandbox auto-allow bash", "bool", nil, 0, 0, ""},
+		{"tools.respect_gitignore", "Agent", "Respect gitignore", "bool", nil, 0, 0, ""},
+		{"image_generation_provider", "Models", "Image generation", "enum", []string{"grok", "openai"}, 0, 0, ""},
+		{"default_model", "Models", "Default model", "action", nil, 0, 0, ""},
+		{"kimi_api_endpoint", "Models", "Kimi API endpoint", "enum", []string{"platform", "code"}, 0, 0, ""},
+		{"kimi_api_key", "Models", "Kimi Platform API key", "secret", nil, 0, 0, ""},
+		{"kimi_code_api_key", "Models", "Kimi Code API key", "secret", nil, 0, 0, ""},
+		{"fireworks_api_key", "Models", "Fireworks API key", "secret", nil, 0, 0, ""},
+		{"deepseek_api_key", "Models", "DeepSeek API key", "secret", nil, 0, 0, ""},
+		{"meta_api_key", "Models", "Meta API key", "secret", nil, 0, 0, ""},
+		{"opencode_go_api_key", "Models", "OpenCode Go API key", "secret", nil, 0, 0, ""},
+		{"wafer_api_key", "Models", "Wafer AI API key", "secret", nil, 0, 0, ""},
+		{"zai_api_key", "Models", "Z AI API key", "secret", nil, 0, 0, ""},
+		{"runinfra_api_key", "Models", "RunInfra API key", "secret", nil, 0, 0, ""},
+		{"gemini_api_key", "Models", "Google Gemini API key", "secret", nil, 0, 0, ""},
+		{"openrouter_api_key", "Models", "OpenRouter API key", "secret", nil, 0, 0, ""},
+		{"opencode_go_models", "Models", "OpenCode Go live catalog", "bool", nil, 0, 0, ""},
+		{"openrouter_models", "Models", "OpenRouter live catalog", "bool", nil, 0, 0, ""},
+		{"custom_models", "Models", "Custom models", "action", nil, 0, 0, ""},
+		{"custom_model_id", "Models", "Catalog key", "string", nil, 0, 0, ""},
+		{"custom_model_slug", "Models", "Model id", "string", nil, 0, 0, ""},
+		{"custom_model_name", "Models", "Display name", "string", nil, 0, 0, ""},
+		{"custom_model_base_url", "Models", "Base URL", "string", nil, 0, 0, ""},
+		{"custom_model_env_key", "Models", "Env key name", "string", nil, 0, 0, ""},
+		{"custom_model_context_window", "Models", "Context window", "int", nil, 1000, 4000000, "128000"},
+		{"recap_model", "Models", "Recap model", "action", nil, 0, 0, ""},
+		{"memory_model", "Models", "Memory model", "action", nil, 0, 0, ""},
+		{"fork_secondary_model", "Models", "Fork secondary model", "action", nil, 0, 0, ""},
+		{"toolset.perplexity_web_search.enabled", "Models", "Perplexity web search", "bool", nil, 0, 0, ""},
+		{"perplexity_api_key", "Models", "Perplexity API key", "secret", nil, 0, 0, ""},
+		{"toolset.web_search_source.xai", "Models", "xAI web search source", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.codex", "Models", "Codex web search source", "enum", []string{"native", "xai", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.kimi_platform", "Models", "Kimi Platform web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.kimi_code", "Models", "Kimi Code web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.fireworks", "Models", "Fireworks web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.deepseek", "Models", "DeepSeek web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.opencode_go", "Models", "OpenCode Go web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.web_search_source.openrouter", "Models", "OpenRouter web search", "enum", []string{"native", "perplexity"}, 0, 0, ""},
+		{"toolset.x_search.enabled", "Models", "X search", "bool", nil, 0, 0, ""},
+		{"coding_data_sharing", "Privacy", "Coding data sharing", "enum", []string{"opt-in", "opt-out"}, 0, 0, ""},
+		{"toolset.ask_user_question.timeout_enabled", "Agent", "Question-card timeout", "bool", nil, 0, 0, ""},
+		{"contextual_hints", "Appearance", "Contextual hints", "bool", nil, 0, 0, ""},
+		{"contextual_hints.undo", "Appearance", "Hint: undo", "bool", nil, 0, 0, ""},
+		{"contextual_hints.plan_mode", "Appearance", "Hint: plan mode", "bool", nil, 0, 0, ""},
+		{"contextual_hints.image_input", "Appearance", "Hint: image input", "bool", nil, 0, 0, ""},
+		{"contextual_hints.send_now", "Appearance", "Hint: send now", "bool", nil, 0, 0, ""},
+		{"contextual_hints.small_screen", "Appearance", "Hint: small screen", "bool", nil, 0, 0, ""},
+		{"contextual_hints.word_select", "Appearance", "Hint: word select", "bool", nil, 0, 0, ""},
+		{"contextual_hints.ssh_wrap", "Appearance", "Hint: SSH wrap", "bool", nil, 0, 0, ""},
+		{"auto_update", "Advanced", "Auto update", "bool", nil, 0, 0, ""},
+		{"voice_keybind_enabled", "Input", "Voice keybind", "bool", nil, 0, 0, ""},
+		{"voice_capture_mode", "Input", "Voice capture", "enum", []string{"hold", "toggle"}, 0, 0, ""},
+		{"voice_stt_language", "Input", "Voice STT language", "enum", []string{"auto", "en", "zh"}, 0, 0, ""},
+		{"memory.enabled", "Memory", "Memory", "bool", nil, 0, 0, ""},
+		{"memory.dream.enabled", "Memory", "Memory dream", "bool", nil, 0, 0, ""},
+		{"features.telemetry", "Advanced", "Telemetry", "bool", nil, 0, 0, ""},
+		{"features.lsp_tools", "Advanced", "LSP tools", "bool", nil, 0, 0, ""},
+		{"features.web_fetch", "Advanced", "Web fetch", "bool", nil, 0, 0, ""},
+		{"toolset.web_fetch.allow_local", "Advanced", "Web fetch allow local", "bool", nil, 0, 0, ""},
+		{"features.two_pass_compaction", "Advanced", "Two-pass compaction", "bool", nil, 0, 0, ""},
+		{"features.non_git_warning", "Advanced", "Non-git warning", "bool", nil, 0, 0, ""},
+		{"features.remember_mode", "Advanced", "Remember mode", "bool", nil, 0, 0, ""},
+		{"doom_loop_recovery.enabled", "Advanced", "Doom-loop recovery", "bool", nil, 0, 0, ""},
+		{"features.subagent_worktree_snapshot", "Advanced", "Subagent worktree snapshot", "bool", nil, 0, 0, ""},
+		{"diagnostics.crash_handler", "Advanced", "Crash handler", "bool", nil, 0, 0, ""},
+		{"suggestions.enabled", "Appearance", "Suggestions", "bool", nil, 0, 0, ""},
+		{"suggestions.ai_enabled", "Appearance", "AI suggestions", "bool", nil, 0, 0, ""},
 	}
 }
 
@@ -134,6 +143,7 @@ func (m *model) openSettingsFocus(key string) {
 	m.settingsEnumIdx = 0
 	m.settingsSecretKey = ""
 	m.settingsSecret = ""
+	m.clearSettingsEditor()
 	m.fillSettings()
 	m.cursor = firstNonHeader(m.items)
 	if key == "" {
@@ -249,6 +259,9 @@ func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 	if m.settingsSecretKey != "" {
 		return m.handleSettingsSecretKey(msg)
 	}
+	if m.settingsEditKey != "" {
+		return m.handleSettingsEditKey(msg)
+	}
 	if m.settingsFilter {
 		return m.handleSettingsFilterKey(msg)
 	}
@@ -291,6 +304,7 @@ func (m *model) closeSettings() {
 	m.settingsEnumKey = ""
 	m.settingsSecretKey = ""
 	m.settingsSecret = ""
+	m.clearSettingsEditor()
 }
 
 func lookupSetting(key string) (settingDef, bool) {
@@ -313,6 +327,9 @@ func (m *model) activateSetting(key string) tea.Cmd {
 		return nil
 	case "secret":
 		m.enterSettingsSecret(def)
+		return nil
+	case "string", "int":
+		m.enterSettingsEditor(def)
 		return nil
 	default:
 		return m.toggleSetting(key)
@@ -368,6 +385,9 @@ func (m *model) renderSettings(w int) string {
 	}
 	if m.settingsSecretKey != "" {
 		return m.renderSettingsSecret(w)
+	}
+	if m.settingsEditKey != "" {
+		return m.renderSettingsEditor(w)
 	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Settings") + "\n")
@@ -535,6 +555,9 @@ func (m *model) settingValue(d settingDef) string {
 		if v, ok := m.cfg.Prefs[d.Key]; ok && v != "" {
 			return v
 		}
+	}
+	if d.Kind == "int" || d.Kind == "string" {
+		return d.Default
 	}
 	if d.Kind == "bool" {
 		return "off"

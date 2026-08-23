@@ -237,6 +237,8 @@ type model struct {
 	settingsEnumKey, settingsEnumOrig                                     string
 	settingsEnumIdx                                                       int
 	settingsSecretKey, settingsSecret                                     string
+	settingsEditKey, settingsEditBuf, settingsEditErr, settingsEditKind   string
+	settingsEditMin, settingsEditMax                                      int64
 	themePreviewOrig                                                      string
 	permMode                                                              permMode
 	queue                                                                 []string
