@@ -30,7 +30,12 @@ func (m *model) copyBlock(idx int) tea.Cmd {
 	if idx < 0 || idx >= len(m.blocks) {
 		return nil
 	}
-	return m.copyText(m.blocks[idx].body, true)
+	bl := m.blocks[idx]
+	text := bl.body
+	if bl.kind == blockSession {
+		text = bl.event.message()
+	}
+	return m.copyText(text, true)
 }
 
 func (m *model) copyNthAgent(n int) tea.Cmd {

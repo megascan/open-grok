@@ -20,6 +20,7 @@ const (
 	blockTool
 	blockToolResult
 	blockSystem
+	blockSession
 	blockGoal
 	blockMermaid
 	blockImage
@@ -33,6 +34,7 @@ type block struct {
 	err    bool
 	at     time.Time
 	folded bool
+	event  sessionEvent
 }
 
 func (m *model) transcriptWidth() int {
@@ -136,7 +138,7 @@ func (m *model) renderBlockAt(idx int, w int) string {
 		return ""
 	}
 	bl := m.blocks[idx]
-	if bl.folded && bl.kind != blockUser && bl.kind != blockThinking && bl.kind != blockTool {
+	if bl.folded && bl.kind != blockUser && bl.kind != blockThinking && bl.kind != blockTool && bl.kind != blockSession {
 		return dimStyle.Render("▸ " + truncate(bl.body, 60))
 	}
 	stamp := ""
@@ -157,6 +159,8 @@ func (m *model) renderBlockAt(idx int, w int) string {
 		return m.renderToolBlock(idx, w)
 	case blockToolResult:
 		return renderAccentBlock(strings.TrimLeft(bl.title, "▸ "), truncateResultBody(bl.body), bl.err)
+	case blockSession:
+		return m.renderSessionEvent(bl, w)
 	case blockGoal:
 		inner := goalTitle.Render("GOAL") + "\n" + bl.body
 		return goalCard.Width(w - 2).Render(inner)

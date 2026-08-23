@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/megascan/open-grok/internal/catalog"
@@ -22,11 +23,15 @@ const maxTurns = 32
 
 // Event is a user-visible turn increment.
 type Event struct {
-	Kind    string
-	Text    string
-	Tool    string
-	ToolID  string
-	IsError bool
+	Kind         string
+	Text         string
+	Tool         string
+	ToolID       string
+	IsError      bool
+	Percent      uint8
+	TokensBefore uint64
+	TokensAfter  uint64
+	ElapsedMS    int64
 }
 
 // Runtime is the injectable sampler/tool environment for a turn.
@@ -72,7 +77,23 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 	sess.Messages = append(sess.Messages, types.Message{Role: types.RoleUser, Content: userText})
 	_ = sess.AppendUpdate(map[string]any{"type": "user", "text": userText})
 	sess.CloseExportBoundary(rt.Model.Provider)
-	compact(sess)
+	if st := compact(sess); st.Ran && emit != nil {
+		win := rt.Model.ContextWindow
+		if win <= 0 {
+			win = 128_000
+		}
+		beforeTok := uint64(st.BytesBefore / 4)
+		afterTok := uint64(st.BytesAfter / 4)
+		pct := 0
+		if win > 0 {
+			pct = int(beforeTok) * 100 / win
+			if pct > 99 {
+				pct = 99
+			}
+		}
+		emit(Event{Kind: "compact_started", Percent: uint8(pct)})
+		emit(Event{Kind: "compact_completed", TokensBefore: beforeTok, TokensAfter: afterTok, ElapsedMS: st.Elapsed.Milliseconds()})
+	}
 
 	ad := sampler.Adapter{
 		Provider: rt.Model.Provider,
@@ -405,17 +426,25 @@ func finishPlanMode(sess *Session) tools.Result {
 	}
 }
 
-func compact(s *Session) {
-	compactSession(s, false, "")
+type compactStats struct {
+	Ran         bool
+	BytesBefore int
+	BytesAfter  int
+	Elapsed     time.Duration
 }
 
-func compactSession(s *Session, force bool, note string) {
+func compact(s *Session) compactStats {
+	return compactSession(s, false, "")
+}
+
+func compactSession(s *Session, force bool, note string) compactStats {
+	start := time.Now()
 	var n int
 	for _, m := range s.Messages {
 		n += len(m.Content)
 	}
 	if !force && (n < 120_000 || len(s.Messages) < 8) {
-		return
+		return compactStats{}
 	}
 	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_started", "bytes": n, "manual": force, "note": note})
 	keepN := 6
@@ -433,8 +462,13 @@ func compactSession(s *Session, force bool, note string) {
 	}
 	s.Messages = append(head, types.Message{Role: types.RoleSystem, Content: summary})
 	s.Messages = append(s.Messages, keep...)
+	after := 0
+	for _, m := range s.Messages {
+		after += len(m.Content)
+	}
 	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_completed", "kept": len(s.Messages)})
 	_ = s.Persist()
+	return compactStats{Ran: true, BytesBefore: n, BytesAfter: after, Elapsed: time.Since(start)}
 }
 
 func toolPath(cwd string, args json.RawMessage) string {

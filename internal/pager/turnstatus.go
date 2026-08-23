@@ -123,19 +123,7 @@ func (m *model) turnStatusLabel() string {
 }
 
 func formatTurnElapsed(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	sec := d.Seconds()
-	if sec < 60 {
-		if sec < 10 {
-			return fmt.Sprintf("%.1fs", sec)
-		}
-		return fmt.Sprintf("%.0fs", sec)
-	}
-	min := int(sec) / 60
-	s := int(sec) % 60
-	return fmt.Sprintf("%dm%ds", min, s)
+	return formatDuration(d)
 }
 
 // renderTurnStatus paints the single-row activity line between scrollback

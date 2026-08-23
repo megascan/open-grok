@@ -135,12 +135,17 @@ func TestRecapDoesNotAppendUserMessage(t *testing.T) {
 	if len(m.sess.Messages) != before {
 		t.Fatal("recap must not persist a user turn")
 	}
-	if len(m.blocks) == 0 || m.blocks[len(m.blocks)-1].kind != blockSystem || m.blocks[len(m.blocks)-1].body != "Recap — generating…" {
+	last := m.blocks[len(m.blocks)-1]
+	if last.kind != blockSession || last.event.kind != sessRecap || !last.event.running {
 		t.Fatalf("%+v", m.blocks)
 	}
 	m.applyRecapDone(recapDoneMsg{body: "Recap: We fixed the parser in foo.rs."})
-	if m.blocks[len(m.blocks)-1].body != "Recap — We fixed the parser in foo.rs." {
-		t.Fatalf("%q", m.blocks[len(m.blocks)-1].body)
+	last = m.blocks[len(m.blocks)-1]
+	if last.kind != blockSession || last.event.summary != "We fixed the parser in foo.rs." {
+		t.Fatalf("%q %+v", last.body, last.event)
+	}
+	if last.body != "Recap "+emDash+" We fixed the parser in foo.rs." {
+		t.Fatalf("body %q", last.body)
 	}
 }
 

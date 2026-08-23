@@ -3,6 +3,7 @@ package pager
 import (
 	"context"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/megascan/open-grok/internal/agent"
@@ -43,7 +44,7 @@ func (m *model) sendRecap() tea.Cmd {
 	}
 	m.ta.Reset()
 	m.status = "recap"
-	m.appendBlock(block{kind: blockSystem, body: "Recap — generating…"})
+	m.appendSessionEvent(sessionEvent{kind: sessRecap, running: true})
 	m.refreshVP()
 	sess := m.sess
 	model := m.opts.Model
@@ -90,26 +91,41 @@ func (m *model) sendRecap() tea.Cmd {
 }
 
 func (m *model) applyRecapDone(msg recapDoneMsg) {
-	line := ""
-	if msg.err != nil || strings.TrimSpace(msg.body) == "" {
+	summary := agent.CleanRecapText(msg.body)
+	ok := msg.err == nil && summary != ""
+	if !ok {
 		m.status = agent.RecapUnavailableToast(true)
-		line = m.status
 	} else {
-		line = agent.FormatRecapLine(msg.body)
-		if line == "" {
-			m.status = agent.RecapUnavailableToast(true)
-			line = m.status
-		} else {
-			m.status = "ready"
-		}
+		m.status = "ready"
 	}
 	for i := len(m.blocks) - 1; i >= 0; i-- {
-		if m.blocks[i].kind == blockSystem && strings.HasPrefix(m.blocks[i].body, "Recap —") {
-			m.blocks[i].body = line
+		if m.blocks[i].kind == blockSession && m.blocks[i].event.kind == sessRecap {
+			if !ok {
+				m.blocks[i] = block{kind: blockSystem, body: m.status, at: time.Now()}
+			} else {
+				ev := sessionEvent{kind: sessRecap, summary: summary}
+				m.blocks[i].event = ev
+				m.blocks[i].body = ev.message()
+				m.blocks[i].folded = false
+			}
+			m.refreshVP()
+			return
+		}
+		if m.blocks[i].kind == blockSystem && strings.HasPrefix(m.blocks[i].body, "Recap") {
+			if !ok {
+				m.blocks[i].body = m.status
+			} else {
+				ev := sessionEvent{kind: sessRecap, summary: summary}
+				m.blocks[i] = block{kind: blockSession, event: ev, body: ev.message(), at: time.Now()}
+			}
 			m.refreshVP()
 			return
 		}
 	}
-	m.appendSys(line)
+	if !ok {
+		m.appendSys(m.status)
+	} else {
+		m.appendSessionEvent(sessionEvent{kind: sessRecap, summary: summary})
+	}
 	m.refreshVP()
 }

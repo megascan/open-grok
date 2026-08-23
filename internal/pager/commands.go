@@ -120,16 +120,17 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		return m.handleFork(arg)
 	case "compact":
 		if m.sess == nil {
+			m.status = "No active session"
 			m.appendSys("No active session")
 			break
 		}
+		start := time.Now()
 		agent.CompactNow(m.sess, arg)
-		m.appendSys("compacted" + func() string {
-			if arg != "" {
-				return " (keep: " + arg + ")"
-			}
-			return ""
-		}())
+		m.appendSessionEvent(sessionEvent{
+			kind:      sessCompactCompleted,
+			elapsed:   time.Since(start),
+			elapsedOK: true,
+		})
 	case "copy":
 		if m.sess == nil {
 			m.appendSys("No active session")
@@ -769,7 +770,12 @@ func (m *model) remember(arg string) tea.Cmd {
 	}
 	body, _ := json.Marshal(map[string]string{"name": "note-" + strconv.FormatInt(time.Now().Unix(), 10), "content": arg})
 	res := tools.MemorySave{}.Execute(context.Background(), tools.Context{}, body)
-	m.appendSys(res.Content)
+	if res.IsError {
+		m.appendSys(res.Content)
+	} else {
+		path := strings.TrimPrefix(res.Content, "saved ")
+		m.appendSessionEvent(sessionEvent{kind: sessMemorySaved, path: path, trigger: "flush"})
+	}
 	m.refreshVP()
 	return nil
 }
@@ -843,7 +849,11 @@ func (m *model) handleGoal(arg string) tea.Cmd {
 	case goalVerbComplete:
 		if m.sess.Goal.UserComplete() {
 			_ = m.sess.AppendUpdate(map[string]any{"type": "goal_mode_state", "status": "complete"})
-			m.appendBlock(block{kind: blockGoal, body: "goal marked complete (user-verified)"})
+			d := time.Duration(0)
+			if snap := m.sess.Goal.Snapshot(); snap != nil {
+				d = time.Duration(snap.ElapsedMS) * time.Millisecond
+			}
+			m.appendSessionEvent(sessionEvent{kind: sessGoalCompleted, elapsed: d, elapsedOK: true})
 		} else {
 			m.appendBlock(block{kind: blockGoal, body: "no goal to complete", err: true})
 		}

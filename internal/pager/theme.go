@@ -172,6 +172,7 @@ func rebuildStyles(t Theme) {
 	agentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Cyan)).Bold(true)
 	toolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Gold))
 	errStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Red))
+	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Gold))
 	okStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Green)).Bold(true)
 	insertStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Green))
 	deleteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Red))

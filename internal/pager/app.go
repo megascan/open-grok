@@ -482,6 +482,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case turnDone:
+		var elapsed *time.Duration
+		if !m.turnStarted.IsZero() {
+			d := time.Since(m.turnStarted)
+			elapsed = &d
+		}
 		m.busy = false
 		m.turnCancel = nil
 		m.turnActivity = ""
@@ -491,13 +496,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "ready"
 		m.layoutChat()
 		m.finishWorkflow(msg.err)
+		m.appendSessionEvent(sessionEventFromTurn(msg.err, elapsed))
+		m.refreshVP()
 		if msg.err != nil {
-			if msg.err == context.Canceled || strings.Contains(msg.err.Error(), "canceled") {
-				m.appendBlock(block{kind: blockSystem, body: "turn cancelled"})
-			} else {
-				m.appendBlock(block{kind: blockSystem, body: "error: " + msg.err.Error(), err: true})
-			}
-			m.refreshVP()
 			m.suggest.clear()
 		}
 		if m.screen == screenDashboard {
@@ -1061,6 +1062,22 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 		}
 		m.setTurnActivity("thinking", "")
 		m.appendBlock(block{kind: kind, title: ev.Tool, body: ev.Text, err: ev.IsError, at: time.Now()})
+	case "compact_started":
+		m.setTurnActivity("compacting", "")
+		m.appendSessionEvent(sessionEvent{kind: sessCompactionStarted, percentage: ev.Percent})
+	case "compact_completed":
+		before := ev.TokensBefore
+		ms := ev.ElapsedMS
+		m.appendSessionEvent(sessionEvent{
+			kind:         sessCompactionCompleted,
+			tokensBefore: &before,
+			tokensAfter:  ev.TokensAfter,
+			elapsedMS:    &ms,
+		})
+		m.setTurnActivity("thinking", "")
+	case "compact_failed":
+		m.appendSessionEvent(sessionEvent{kind: sessCompactionFailed, error: ev.Text})
+		m.setTurnActivity("thinking", "")
 	}
 	return nil
 }

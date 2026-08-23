@@ -23,6 +23,7 @@ var (
 	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colCyan)).Bold(true)
 	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
 	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
+	warnStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colGold))
 	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen)).Bold(true)
 	insertStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen))
 	deleteStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))

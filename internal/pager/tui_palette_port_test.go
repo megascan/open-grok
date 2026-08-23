@@ -292,8 +292,11 @@ func TestFindLivePreviewRestoresOnEsc(t *testing.T) {
 
 func lastSys(m *model) string {
 	for i := len(m.blocks) - 1; i >= 0; i-- {
-		if m.blocks[i].kind == blockSystem {
+		switch m.blocks[i].kind {
+		case blockSystem:
 			return m.blocks[i].body
+		case blockSession:
+			return m.blocks[i].event.message()
 		}
 	}
 	return m.status
