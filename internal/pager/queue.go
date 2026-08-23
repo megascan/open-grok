@@ -25,7 +25,7 @@ func (m *model) fillQueue() {
 		}
 		extra := ""
 		if lines > 1 {
-			extra = fmt.Sprintf("  (+%d lines)", lines-1)
+			extra = fmt.Sprintf("  (+%d more line%s)", lines-1, pluralS(lines-1))
 		}
 		m.items = append(m.items, listItem{
 			Key:    strconv.Itoa(i),
@@ -40,6 +40,54 @@ func (m *model) fillQueue() {
 	if m.cursor >= len(m.items) {
 		m.cursor = max(0, len(m.items)-1)
 	}
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+func firstNonemptyLine(text string) string {
+	for _, l := range strings.Split(text, "\n") {
+		if s := strings.TrimSpace(l); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func formatQueueRow(pos int, text string) string {
+	first := firstNonemptyLine(text)
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	extra := len(lines) - 1
+	if extra < 0 {
+		extra = 0
+	}
+	if extra > 0 {
+		return fmt.Sprintf("  #%d  %s  (+%d more line%s)", pos, first, extra, pluralS(extra))
+	}
+	return fmt.Sprintf("  #%d  %s", pos, first)
+}
+
+func (m *model) queueBlockText() string {
+	if len(m.queue) == 0 {
+		return "Queue is empty."
+	}
+	noun := "s"
+	if len(m.queue) == 1 {
+		noun = ""
+	}
+	rows := make([]string, 0, len(m.queue)+1)
+	rows = append(rows, fmt.Sprintf("Queued prompt%s (%d):", noun, len(m.queue)))
+	for i, q := range m.queue {
+		rows = append(rows, formatQueueRow(i+1, q))
+	}
+	return strings.Join(rows, "\n")
 }
 
 func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Cmd, bool) {

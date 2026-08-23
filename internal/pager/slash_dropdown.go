@@ -19,6 +19,8 @@ const (
 	promptArrow = "\u276F "
 	// historySearchPrefix is the in-prompt history-search indicator.
 	historySearchPrefix = "? "
+	// rememberPrefix is PromptInputMode::Remember (agent_view/mod.rs).
+	rememberPrefix = "# "
 )
 
 // dropdownRow is one inline completion row (slash commands, args, @ files, history).

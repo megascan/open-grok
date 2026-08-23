@@ -112,7 +112,7 @@ func (m *model) renderOverlay() string {
 		}
 		return modalBox.Width(w).Render(titleStyle.Render(title) + "\n\n" + body)
 	case overlayFeedback:
-		return modalBox.Width(w).Render(titleStyle.Render("Feedback") + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
+		return modalBox.Width(w).Render(titleStyle.Render(feedbackQuestionLabel) + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
 	case overlaySettings:
 		return m.renderSettings(w)
 	case overlayTheme:
@@ -338,6 +338,9 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayLogin {
 		return m.handleLoginKey(msg), true
 	}
+	if m.overlay == overlaySettings {
+		return m.handleSettingsKey(msg), true
+	}
 	if m.overlay == overlayDoctor && len(m.items) == 0 {
 		switch msg.String() {
 		case "esc":
@@ -409,10 +412,10 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			m.overlay = overlayNone
 			m.feedback = ""
 		case tea.KeyEnter:
-			m.appendBlock(block{kind: blockSystem, body: "feedback recorded locally (not uploaded):\n" + m.feedback})
+			text := m.feedback
 			m.feedback = ""
 			m.overlay = overlayNone
-			m.refreshVP()
+			m.sendFeedback(text)
 		case tea.KeyBackspace:
 			if len(m.feedback) > 0 {
 				m.feedback = m.feedback[:len(m.feedback)-1]

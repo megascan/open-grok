@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -100,4 +101,37 @@ func joinSep(parts ...string) string {
 		}
 	}
 	return strings.Join(keep, "  "+contextBarSep+"  ")
+}
+
+func (m *model) tasksBlockText() string {
+	items := m.taskItems()
+	if len(items) == 0 || (len(items) == 1 && items[0].Key == "" && strings.HasPrefix(items[0].Label, "(no ")) {
+		return "No background tasks, workflows, or subagents."
+	}
+	noun := "s"
+	if len(items) == 1 {
+		noun = ""
+	}
+	rows := make([]string, 0, len(items)+1)
+	rows = append(rows, fmt.Sprintf("Task%s (%d):", noun, len(items)))
+	for _, it := range items {
+		status := "done"
+		if strings.Contains(it.Detail, "running") {
+			status = "running"
+		} else if strings.Contains(it.Detail, "stopped") {
+			status = "stopped"
+		}
+		kind := "Task"
+		if strings.HasPrefix(it.Key, "agent:") {
+			kind = "Agent"
+		}
+		one := it.Label
+		if it.Detail != "" && !strings.HasPrefix(it.Key, "agent:") {
+			one = it.Label + " · " + it.Detail
+		} else if strings.HasPrefix(it.Key, "agent:") && it.Detail != "" {
+			one = it.Label + " · " + it.Detail
+		}
+		rows = append(rows, fmt.Sprintf("  %-9s%s", status, kind+" · "+one))
+	}
+	return strings.Join(rows, "\n")
 }

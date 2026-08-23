@@ -178,6 +178,9 @@ func (m *model) promptPrefix() string {
 	if m.overlay == overlayHistory {
 		return historySearchPrefix
 	}
+	if m.rememberMode {
+		return rememberPrefix
+	}
 	return promptArrow
 }
 
@@ -432,6 +435,9 @@ func (m *model) viewChat() string {
 	}
 	if banner := m.renderVoiceBanner(); banner != "" {
 		input = banner + "\n" + input
+	}
+	if m.modeBanner != "" {
+		input = titleStyle.Render(m.modeBanner) + "\n" + input
 	}
 	return prefix + body + "\n" + turn + chips + input + "\n" + m.renderFooter()
 }

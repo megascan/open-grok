@@ -127,6 +127,7 @@ func (m *model) openSettingsFocus(key string) {
 	m.overlay = overlaySettings
 	m.cursor = 0
 	m.filter = ""
+	m.settingsFilter = false
 	m.fillSettings()
 	m.cursor = firstNonHeader(m.items)
 	if key == "" {
@@ -232,10 +233,20 @@ func (m *model) moveSettings(delta int) {
 }
 
 func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
+	if isSettingsCloseKey(msg) {
+		m.overlay = overlayNone
+		m.filter = ""
+		m.settingsFilter = false
+		return nil
+	}
+	if m.settingsFilter {
+		return m.handleSettingsFilterKey(msg)
+	}
 	switch msg.String() {
 	case "esc":
 		m.overlay = overlayNone
 		m.filter = ""
+		m.settingsFilter = false
 		return nil
 	case "up", "k":
 		m.moveSettings(-1)
@@ -248,10 +259,37 @@ func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 			return m.toggleSetting(m.items[m.cursor].Key)
 		}
 		return nil
+	case "/", "i":
+		m.settingsFilter = true
+		return nil
 	}
-	if msg.Type == tea.KeyBackspace && m.filter != "" {
-		m.filter = m.filter[:len(m.filter)-1]
+	return nil
+}
+
+func (m *model) handleSettingsFilterKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.filter = ""
+		m.settingsFilter = false
 		m.fillSettings()
+		m.cursor = firstNonHeader(m.items)
+		return nil
+	case "enter":
+		m.settingsFilter = false
+		return nil
+	case "up":
+		m.moveSettings(-1)
+		return nil
+	case "down":
+		m.moveSettings(1)
+		return nil
+	}
+	if msg.Type == tea.KeyBackspace {
+		if m.filter != "" {
+			m.filter = m.filter[:len(m.filter)-1]
+			m.fillSettings()
+			m.cursor = firstNonHeader(m.items)
+		}
 		return nil
 	}
 	if msg.Type == tea.KeyRunes {
@@ -263,11 +301,23 @@ func (m *model) handleSettingsKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+func isSettingsCloseKey(msg tea.KeyMsg) bool {
+	switch msg.String() {
+	case "f2", "ctrl+,", "cmd+,", "super+,":
+		return true
+	}
+	return msg.Type == tea.KeyF2
+}
+
 func (m *model) renderSettings(w int) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Settings") + "\n")
-	if m.filter != "" {
-		b.WriteString(dimStyle.Render("filter: "+m.filter) + "\n")
+	if m.filter != "" || m.settingsFilter {
+		cursor := ""
+		if m.settingsFilter {
+			cursor = "█"
+		}
+		b.WriteString(dimStyle.Render("filter: "+m.filter+cursor) + "\n")
 	}
 	b.WriteByte('\n')
 	if len(m.items) == 0 {
@@ -298,7 +348,11 @@ func (m *model) renderSettings(w int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("j/k  ·  space/enter  ·  type to filter  ·  esc"))
+	hint := "j/k  ·  space/enter  ·  / search  ·  i search  ·  F2/Esc close"
+	if m.settingsFilter {
+		hint = "type to filter  ·  ↑/↓ nav  ·  Backspace edit  ·  enter commit  ·  esc clear"
+	}
+	b.WriteString("\n" + dimStyle.Render(hint))
 	return modalBox.Width(w).Render(b.String())
 }
 

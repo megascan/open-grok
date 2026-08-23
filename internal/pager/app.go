@@ -220,6 +220,8 @@ type model struct {
 	alwaysStopKids, alwaysKeepKids                                        bool
 	focusScroll                                                           bool
 	vimMode, timestamps, compactUI, multiline, mouseOn, thinkingOn, swarm bool
+	rememberMode, settingsFilter, autoModeGate                            bool
+	modeBanner                                                            string
 	permMode                                                              permMode
 	queue                                                                 []string
 	loops                                                                 []loopJob
@@ -336,6 +338,7 @@ func newModel(opt Options) (*model, error) {
 		fpsOn:             envFlagOn("ENTROPY_FPS", "GROK_FPS"),
 		scrollHUD:         envFlagOn("ENTROPY_SCROLL_DEBUG", "GROK_SCROLL_DEBUG"),
 		railHover:         timelineHitNone,
+		autoModeGate:      true,
 	}
 	if path, ok := envScrollLogStart(); ok {
 		m.scrollLogPath = path
@@ -691,12 +694,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		if m.busy {
 			return m.requestCancelTurn(), true
 		}
+		if m.rememberMode && m.ta.Value() == "" {
+			m.exitRememberMode()
+			return nil, true
+		}
 		if m.ta.Value() == "" {
 			return tea.Quit, true
 		}
 		m.ta.Reset()
 		return nil, true
 	case "esc":
+		if m.rememberMode && strings.TrimSpace(m.ta.Value()) == "" {
+			m.exitRememberMode()
+			return nil, true
+		}
 		if m.question != nil && m.overlay == overlayNone {
 			m.overlay = overlayQuestion
 			return nil, true
@@ -793,6 +804,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "shift+tab":
 		m.cyclePermMode()
 		return nil, true
+	case "f2", "ctrl+,":
+		m.openSettings()
+		return nil, true
+	case "#":
+		if m.canEnterRememberFromHash() {
+			m.enterRememberMode()
+			return nil, true
+		}
+		return nil, false
+	case "backspace", "ctrl+w", "ctrl+u":
+		if m.rememberMode && strings.TrimSpace(m.ta.Value()) == "" {
+			m.exitRememberMode()
+			return nil, true
+		}
 	case "tab":
 		if m.tryAcceptSuggestion(false) {
 			return nil, true
@@ -837,6 +862,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			return nil, false
 		}
 		text := strings.TrimSpace(m.ta.Value())
+		if m.rememberMode {
+			m.ta.Reset()
+			m.exitRememberMode()
+			if text == "" {
+				m.appendSys("Please provide a memory note.")
+				m.refreshVP()
+				return nil, true
+			}
+			return m.remember(text), true
+		}
 		if text == "" {
 			return nil, true
 		}
@@ -930,11 +965,7 @@ func (m *model) layoutChat() {
 }
 
 func (m *model) syncPromptPrefix() {
-	if m.overlay == overlayHistory {
-		m.ta.Prompt = historySearchPrefix
-	} else {
-		m.ta.Prompt = promptArrow
-	}
+	m.ta.Prompt = m.promptPrefix()
 }
 
 func (m *model) persistUI() {
@@ -1167,33 +1198,92 @@ func (m *model) rebuildHistory() {
 }
 
 func (m *model) cyclePermMode() {
-	switch m.permMode {
-	case permAsk:
-		m.permMode = permPlan
-		if m.sess != nil {
-			m.sess.Plan.Enter(m.sess.Plan.PlanFile)
-			m.sess.YOLO = false
+	// Shift+Tab ring: Ask → Plan → Auto → Always-approve → Ask.
+	// Auto is skipped when autoModeGate is off (Rust auto_mode_gate).
+	inPlan := m.permMode == permPlan || (m.sess != nil && m.sess.Plan.Active)
+	inAuto := m.permMode == permAuto
+	inYolo := m.permMode == permAlways || (m.sess != nil && m.sess.YOLO)
+	switch {
+	case !inPlan && !inAuto && !inYolo:
+		m.armPlanMode()
+		m.showModeBanner("Plan")
+	case inPlan && !inAuto && !inYolo:
+		m.disarmPlanMode()
+		if m.autoModeGate {
+			m.permMode = permAuto
+			if m.sess != nil {
+				m.sess.YOLO = false
+			}
+			m.showModeBanner("Auto")
+		} else {
+			m.permMode = permAlways
+			if m.sess != nil {
+				m.sess.YOLO = true
+			}
+			m.showModeBanner("Always-Approve")
 		}
-		m.status = "plan mode"
-	case permPlan:
+	case !inPlan && inAuto && !inYolo:
 		m.permMode = permAlways
 		if m.sess != nil {
-			m.sess.Plan.Exit()
 			m.sess.YOLO = true
 		}
-		m.status = "always-approve"
+		m.showModeBanner("Always-Approve")
 	default:
+		m.disarmPlanMode()
 		m.permMode = permAsk
 		if m.sess != nil {
-			m.sess.Plan.Exit()
 			m.sess.YOLO = false
-			m.sess.PermMode = "ask"
 		}
-		m.status = "ask"
+		m.showModeBanner("Normal")
 	}
 	if m.sess != nil {
 		m.sess.PermMode = m.permModeName()
 	}
+}
+
+func (m *model) armPlanMode() {
+	m.permMode = permPlan
+	if m.sess != nil {
+		m.sess.Plan.Enter(m.sess.Plan.PlanFile)
+		m.sess.YOLO = false
+		m.sess.PermMode = m.permModeName()
+	}
+}
+
+func (m *model) disarmPlanMode() {
+	if m.sess != nil {
+		m.sess.Plan.Exit()
+	}
+}
+
+func (m *model) showModeBanner(name string) {
+	m.modeBanner = "Switched to mode: " + name
+	m.status = name
+}
+
+func (m *model) rememberModeEnabled() bool {
+	if m.cfg.Prefs == nil {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(m.cfg.Prefs["features.remember_mode"]))
+	return v == "true" || v == "on" || v == "1"
+}
+
+func (m *model) enterRememberMode() {
+	m.rememberMode = true
+	m.ta.Reset()
+	m.syncPromptPrefix()
+}
+
+func (m *model) exitRememberMode() {
+	m.rememberMode = false
+	m.syncPromptPrefix()
+}
+
+func (m *model) canEnterRememberFromHash() bool {
+	return m.rememberModeEnabled() && !m.rememberMode &&
+		strings.TrimSpace(m.ta.Value()) == "" &&
+		m.overlay == overlayNone && !m.focusScroll
 }
 
 func sandboxActive() bool {

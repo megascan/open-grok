@@ -232,40 +232,29 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.fastTier = !m.fastTier
 		m.appendSys(saveSuccessToast("Fast mode", m.fastTier))
 	case "always-approve":
-		if m.permMode == permAlways {
+		m.toggleAlwaysApprove()
+	case "yolo-2":
+		if !sandboxActive() {
+			m.appendSys(yolo2SandboxError)
+			break
+		}
+		m.toggleAlwaysApprove()
+	case "auto":
+		currentlyAuto := m.permMode == permAuto
+		if currentlyAuto {
 			m.permMode = permAsk
 			if m.sess != nil {
 				m.sess.YOLO = false
+				m.sess.PermMode = "ask"
 			}
-			m.appendSys(yoloToast(false, m.sess != nil && m.sess.Plan.Active))
-		} else {
-			m.permMode = permAlways
-			if m.sess != nil {
-				m.sess.YOLO = true
-			}
-			m.appendSys(yoloToast(true, m.sess != nil && m.sess.Plan.Active))
-		}
-	case "yolo-2":
-		if !sandboxActive() {
-			m.appendSys("/yolo-2 refuses to run without an applied OS sandbox. Start with ENTROPY_SANDBOX=1.")
-			break
-		}
-		m.permMode = permAlways
-		if m.sess != nil {
-			m.sess.YOLO = true
-		}
-		m.appendSys("yolo-2 on (sandbox active)")
-	case "auto":
-		if m.permMode == permAuto {
-			m.permMode = permAsk
-			m.appendSys("auto permission mode off")
+			m.appendSys(permissionModeToast(permAsk))
 		} else {
 			m.permMode = permAuto
 			if m.sess != nil {
 				m.sess.YOLO = false
 				m.sess.PermMode = "auto"
 			}
-			m.appendSys("auto permission mode on — bash still asks")
+			m.appendSys(permissionModeToast(permAuto))
 		}
 	case "multiline":
 		m.multiline = !m.multiline
@@ -380,7 +369,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.appendSys(saveThemeToast(canon))
 	case "feedback":
 		if arg != "" {
-			m.appendSys("feedback recorded locally:\n" + arg)
+			m.sendFeedback(arg)
 			break
 		}
 		m.overlay = overlayFeedback
@@ -405,15 +394,8 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("No active session")
 			break
 		}
-		if m.sess.Plan.Active && arg == "" {
-			m.sess.Plan.Exit()
-			m.permMode = permAsk
-			m.appendSys("plan mode off")
-			break
-		}
-		m.sess.Plan.Enter(m.sess.Plan.PlanFile)
-		m.permMode = permPlan
-		m.appendSys("plan mode on — only " + m.sess.Plan.PlanFile + " may be edited")
+		m.armPlanMode()
+		m.appendSys(saveSuccessToast("Plan mode", true))
 		if arg != "" {
 			_ = os.WriteFile(m.sess.Plan.PlanFile, []byte("# Plan\n\n"+arg+"\n"), 0o600)
 			return m.submit("Enter plan mode. Draft the plan in the session plan file. Description: " + arg)
@@ -526,9 +508,13 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.overlay = overlayNone
 			break
 		}
-		m.openQueue()
+		m.appendSys(m.queueBlockText())
 	case "tasks":
-		m.openTasks()
+		if m.sess == nil {
+			m.appendSys("No active session")
+			break
+		}
+		m.appendSys(m.tasksBlockText())
 	case "release-notes":
 		m.openReleaseNotes()
 	case "tutorial":
@@ -597,6 +583,50 @@ func yoloToast(on, planActive bool) string {
 		return "\u26A0 Always-approve ON: plan mode still blocks file edits until you exit plan mode"
 	}
 	return "\u26A0 Always-approve ON: all tool actions auto-run"
+}
+
+func permissionModeToast(kind permMode) string {
+	switch kind {
+	case permAuto:
+		return "\u2713 Permission mode: Auto (classifier)"
+	case permAlways:
+		return yoloToast(true, false)
+	default:
+		return "\u2713 Permission mode: Ask"
+	}
+}
+
+const yolo2SandboxError = "YOLO-2 requires an active OS sandbox. Restart Open Grok with `--sandbox workspace` before enabling it."
+
+const feedbackQuestionLabel = "How can we improve Grok Build?"
+
+const feedbackThanks = "Thanks for the feedback! The Open Grok team is on it."
+
+func (m *model) toggleAlwaysApprove() {
+	if m.permMode == permAlways {
+		m.permMode = permAsk
+		if m.sess != nil {
+			m.sess.YOLO = false
+		}
+		m.appendSys(yoloToast(false, m.sess != nil && m.sess.Plan.Active))
+		return
+	}
+	m.permMode = permAlways
+	if m.sess != nil {
+		m.sess.YOLO = true
+	}
+	m.appendSys(yoloToast(true, m.sess != nil && m.sess.Plan.Active))
+}
+
+func (m *model) sendFeedback(text string) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		m.appendSys("Please provide feedback text.")
+		m.refreshVP()
+		return
+	}
+	m.appendSys(feedbackThanks)
+	m.refreshVP()
 }
 
 func (m *model) sessionInfo() string {
@@ -718,7 +748,7 @@ func (m *model) contextReport() string {
 
 func (m *model) remember(arg string) tea.Cmd {
 	if arg == "" {
-		m.appendSys("usage: /remember <note>")
+		m.enterRememberMode()
 		m.refreshVP()
 		return nil
 	}
@@ -760,13 +790,14 @@ func (m *model) handleSwarm(arg string) tea.Cmd {
 			m.sess.Swarm = true
 		}
 		m.persistUI()
+		m.appendSys("Swarm task started; manual approvals may slow the swarm.")
 		return m.submit("Swarm mode: partition this task across parallel subagents (depth 1), then merge. Task: " + arg)
 	}
 	if m.sess != nil {
 		m.sess.Swarm = m.swarm
 	}
 	m.persistUI()
-	m.appendSys("swarm = " + onOff(m.swarm))
+	m.appendSys(saveSuccessToast("Swarm mode", m.swarm))
 	m.refreshVP()
 	return nil
 }
