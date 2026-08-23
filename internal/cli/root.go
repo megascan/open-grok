@@ -139,10 +139,29 @@ func runHeadless(ctx context.Context, dir string, model catalog.Model, prompt st
 	if err != nil {
 		return err
 	}
-	sess, err := agent.NewSession(dir, model, flagYOLO)
+	var sess *agent.Session
+	switch {
+	case flagResume != "":
+		sess, err = agent.LoadSession(dir, flagResume)
+	case flagContinue:
+		list, lerr := agent.ListSessions(dir)
+		if lerr != nil {
+			return lerr
+		}
+		if len(list) == 0 {
+			sess, err = agent.NewSession(dir, model, flagYOLO)
+		} else {
+			s := list[0]
+			sess = &s
+			sess.YOLO = flagYOLO
+		}
+	default:
+		sess, err = agent.NewSession(dir, model, flagYOLO)
+	}
 	if err != nil {
 		return err
 	}
+	sess.YOLO = flagYOLO
 	var out strings.Builder
 	err = agent.RunTurn(ctx, sess, agent.Runtime{Model: model, Bearer: bearer}, prompt, func(ev agent.Event) {
 		if ev.Kind == "text" {

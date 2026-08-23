@@ -6,19 +6,22 @@ import (
 
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/oauth"
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/spf13/cobra"
 )
 
 func newLoginCmd() *cobra.Command {
 	var (
-		codex    bool
-		apiKey   string
-		kimiCode bool
+		codex      bool
+		apiKey     string
+		kimiCode   bool
+		deviceAuth bool
+		useOAuth   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "login [provider]",
-		Short: "Sign in to a provider (API key; OAuth stores separately for Codex/xAI)",
+		Short: "Sign in to a provider (API key; Codex defaults to ChatGPT OAuth)",
 		ValidArgs: func() []string {
 			out := make([]string, 0, len(types.AllProviders))
 			for _, p := range types.AllProviders {
@@ -41,6 +44,25 @@ func newLoginCmd() *cobra.Command {
 			if name == "kimi-code" || name == "kimi_code" {
 				kimiCode = true
 			}
+			if p == types.ProviderCodex && apiKey == "" {
+				ep := oauth.DefaultEndpoints()
+				var tok oauth.TokenResponse
+				var err error
+				if deviceAuth {
+					tok, err = oauth.DeviceLogin(cmd.Context(), ep)
+				} else {
+					tok, err = oauth.BrowserLogin(cmd.Context(), ep, true)
+				}
+				if err != nil {
+					return err
+				}
+				if err := auth.SaveCodexOAuth(tok); err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "saved OpenAI Codex OAuth tokens to %s\n", config.CodexAuthJSON())
+				return nil
+			}
+			_ = useOAuth
 			key, err := readAPIKey(p, apiKey)
 			if err != nil {
 				return err
@@ -60,8 +82,11 @@ func newLoginCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&codex, "codex", false, "Sign in to ChatGPT Codex (isolated store)")
-	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key (otherwise prompt or env)")
+	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key (otherwise prompt or env; skips OAuth)")
 	cmd.Flags().BoolVar(&kimiCode, "kimi-code", false, "Store the key on the Kimi Code scope")
+	cmd.Flags().BoolVar(&deviceAuth, "device-auth", false, "Codex device-code login (headless/remote)")
+	cmd.Flags().BoolVar(&deviceAuth, "device-code", false, "Alias for --device-auth")
+	cmd.Flags().BoolVar(&useOAuth, "oauth", false, "Use browser OAuth (Codex default when no --api-key)")
 	return cmd
 }
 

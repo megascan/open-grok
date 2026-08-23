@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -72,4 +73,20 @@ func (f File) SessionBusEnabled() bool {
 		return true
 	}
 	return *f.SessionBus.Enabled
+}
+
+// Save writes config.toml with owner-only permissions.
+func Save(f File) error {
+	if err := os.MkdirAll(filepath.Dir(ConfigTOML()), 0o700); err != nil {
+		return err
+	}
+	data, err := toml.Marshal(f)
+	if err != nil {
+		return err
+	}
+	tmp := ConfigTOML() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, ConfigTOML())
 }

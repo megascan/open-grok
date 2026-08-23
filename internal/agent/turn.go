@@ -40,13 +40,21 @@ type Runtime struct {
 // RunTurn samples until the model stops or maxTurns, dispatching tools.
 func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, emit func(Event)) error {
 	ensureRuntime(sess, rt.Model)
+	sess.EnsureMCP(ctx)
 	if rt.Pack == nil {
 		rt.Pack = PackFor(rt.Model, sess.JS)
 	}
+	if len(sess.MCPTools) > 0 {
+		rt.Pack = append(rt.Pack, sess.MCPTools...)
+	}
 	rt.Pack = bindTask(sess, rt)
+	rt.Pack = bindCollab(sess, rt)
 	if len(sess.Messages) == 0 {
 		prompt := SystemPrompt(rt.Model, sess.CWD, LoadProjectInstructions(sess.CWD))
 		sess.Messages = append(sess.Messages, types.Message{Role: types.RoleSystem, Content: prompt})
+	}
+	for _, extra := range drainInbox(sess) {
+		sess.Messages = append(sess.Messages, extra)
 	}
 	sess.Messages = append(sess.Messages, types.Message{Role: types.RoleUser, Content: userText})
 	_ = sess.AppendUpdate(map[string]any{"type": "user", "text": userText})
@@ -170,15 +178,19 @@ func bindTask(sess *Session, rt Runtime) []tools.Tool {
 				child.Plan = workspace.NewInactive()
 				child.Plan.PlanFile = filepath.Join(child.Dir, "plan.md")
 				child.SubagentDepth = parent.SubagentDepth + 1
+				if parent.Team != nil {
+					parent.Team.Register(child.ID, label)
+					if parent.Children == nil {
+						parent.Children = map[string]*Session{}
+					}
+					parent.Children[child.ID] = child
+				}
 				var b strings.Builder
 				err = RunTurn(ctx, child, Runtime{Model: model, Bearer: bearer, HTTP: httpDo}, prompt, func(ev Event) {
 					if ev.Kind == "text" {
 						b.WriteString(ev.Text)
 					}
 				})
-				if err != nil {
-					return tools.Result{Content: err.Error(), IsError: true}
-				}
 				sum := b.String()
 				if sum == "" {
 					sum = "subagent " + child.ID + " finished"
@@ -186,12 +198,68 @@ func bindTask(sess *Session, rt Runtime) []tools.Tool {
 				if label != "" {
 					sum = label + ": " + sum
 				}
+				if parent.Team != nil {
+					parent.Team.Finish(child.ID, sum, err != nil)
+				}
+				if err != nil {
+					return tools.Result{Content: err.Error(), IsError: true}
+				}
 				return tools.Result{Content: sum}
 			}
 			out = append(out, ts)
 			continue
 		}
 		out = append(out, t)
+	}
+	return out
+}
+
+func bindCollab(sess *Session, rt Runtime) []tools.Tool {
+	out := make([]tools.Tool, 0, len(rt.Pack))
+	for _, t := range rt.Pack {
+		switch v := t.(type) {
+		case tools.ListAgents:
+			v.Box = sess.Team
+			out = append(out, v)
+		case tools.SendMessage:
+			v.Box = sess.Team
+			out = append(out, v)
+		case tools.FollowupTask:
+			v.Box = sess.Team
+			if sess.Team != nil {
+				parent := sess
+				sess.Team.SetFollowup(func(ctx context.Context, id, prompt string) tools.Result {
+					child := parent.Children[id]
+					if child == nil {
+						return tools.Result{Content: "unknown agent id", IsError: true}
+					}
+					var b strings.Builder
+					model, ok := catalog.Lookup(child.ModelID)
+					if !ok {
+						model = catalog.Model{ID: child.ModelID, Model: child.ModelID, Provider: child.Provider, APIBackend: child.Backend}
+					}
+					err := RunTurn(ctx, child, Runtime{Model: model, Bearer: rt.Bearer, HTTP: rt.HTTP}, prompt, func(ev Event) {
+						if ev.Kind == "text" {
+							b.WriteString(ev.Text)
+						}
+					})
+					if err != nil {
+						return tools.Result{Content: err.Error(), IsError: true}
+					}
+					return tools.Result{Content: b.String()}
+				})
+			}
+			out = append(out, v)
+		case tools.WaitAgent:
+			v.Box = sess.Team
+			out = append(out, v)
+		case tools.MessageSession:
+			v.SourceID = sess.ID
+			v.SourceProject = filepath.Base(sess.CWD)
+			out = append(out, v)
+		default:
+			out = append(out, t)
+		}
 	}
 	return out
 }
@@ -256,9 +324,12 @@ func compact(s *Session) {
 	if n < 120_000 || len(s.Messages) < 8 {
 		return
 	}
+	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_started", "bytes": n})
 	keep := s.Messages[len(s.Messages)-6:]
 	summary := types.Message{Role: types.RoleSystem, Content: "Earlier turns were compacted. Continue from the recent tail."}
 	s.Messages = append([]types.Message{s.Messages[0], summary}, keep...)
+	_ = s.AppendUpdate(map[string]any{"type": "auto_compact_completed", "kept": len(s.Messages)})
+	_ = s.Persist()
 }
 
 func toolPath(cwd string, args json.RawMessage) string {

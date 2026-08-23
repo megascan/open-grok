@@ -126,6 +126,10 @@ func (s *server) handle(ctx context.Context, req rpcReq, write func(any)) (any, 
 		return s.sessionPrompt(ctx, req.Params, write)
 	case "session/cancel":
 		return map[string]any{}, nil
+	case "session/list":
+		return s.sessionList()
+	case "session/set_model":
+		return s.sessionSetModel(req.Params)
 	default:
 		return nil, fmt.Errorf("unknown method %s", req.Method)
 	}
@@ -254,4 +258,47 @@ func (s *server) sessionPrompt(ctx context.Context, params json.RawMessage, writ
 	_ = uuid.Nil
 	_ = types.RoleUser
 	return map[string]any{"stopReason": "end_turn"}, nil
+}
+
+func (s *server) sessionList() (any, error) {
+	list, err := agent.ListSessions(s.opt.CWD)
+	if err != nil {
+		return nil, err
+	}
+	var rows []map[string]any
+	for _, sess := range list {
+		rows = append(rows, map[string]any{
+			"sessionId": sess.ID,
+			"title":     sess.Title,
+			"updatedAt": sess.UpdatedAt,
+		})
+	}
+	return map[string]any{"sessions": rows}, nil
+}
+
+func (s *server) sessionSetModel(params json.RawMessage) (any, error) {
+	var p struct {
+		SessionID string `json:"sessionId"`
+		ModelID   string `json:"modelId"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	sess := s.sessions[p.SessionID]
+	s.mu.Unlock()
+	if sess == nil {
+		return nil, fmt.Errorf("unknown session")
+	}
+	model, ok := catalog.Lookup(p.ModelID)
+	if !ok {
+		return nil, fmt.Errorf("unknown model %s", p.ModelID)
+	}
+	sess.ModelID = model.ID
+	sess.Provider = model.Provider
+	sess.Backend = model.APIBackend
+	sess.CloseExportBoundary(model.Provider)
+	_ = sess.Persist()
+	s.opt.Model = model.ID
+	return map[string]any{"modelId": model.ID}, nil
 }

@@ -124,11 +124,18 @@ func writeStore(path string, s Store) error {
 	return os.Rename(tmp, path)
 }
 
-// SaveAPIKey writes a provider-local API key. Codex uses codex-auth.json.
+// SaveAPIKey writes a provider-local API key. Codex uses the Codex-rs
+// OPENAI_API_KEY shape inside codex-auth.json so OAuth and API keys coexist
+// with the Rust reference store.
 func SaveAPIKey(p types.Provider, key string, kimiCode bool) error {
 	key = trimKey(key)
 	if key == "" {
 		return errors.New("empty API key")
+	}
+	if p == types.ProviderCodex {
+		mu.Lock()
+		defer mu.Unlock()
+		return SaveCodexAPIKey(key)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -138,9 +145,6 @@ func SaveAPIKey(p types.Provider, key string, kimiCode bool) error {
 		return err
 	}
 	scope := ScopeFor(p, kimiCode)
-	if p == types.ProviderCodex {
-		scope = "codex::api_key"
-	}
 	store[scope] = Credential{
 		Key:        key,
 		AuthMode:   "api_key",
@@ -153,26 +157,24 @@ func SaveAPIKey(p types.Provider, key string, kimiCode bool) error {
 func Lookup(p types.Provider, kimiCode bool) (Credential, bool) {
 	mu.Lock()
 	defer mu.Unlock()
+	if p == types.ProviderCodex {
+		return lookupCodex()
+	}
 	path := pathFor(p)
 	store, err := readStore(path)
 	if err != nil {
 		return Credential{}, false
 	}
 	scope := ScopeFor(p, kimiCode)
-	if p == types.ProviderCodex {
-		if c, ok := store["codex::api_key"]; ok {
-			return c, c.Key != ""
-		}
-		if c, ok := store["codex::oauth"]; ok {
-			return c, c.Key != ""
-		}
-	}
 	c, ok := store[scope]
 	return c, ok && c.Key != ""
 }
 
 // ResolveBearer prefers an explicit environment key, then the stored credential.
 func ResolveBearer(p types.Provider, envKeys []string, kimiCode bool) (string, string, error) {
+	if p == types.ProviderCodex {
+		return resolveCodexBearer()
+	}
 	for _, name := range envKeys {
 		if v := trimKey(os.Getenv(name)); v != "" {
 			return v, "env:" + name, nil
@@ -199,8 +201,7 @@ func Logout(p types.Provider, all bool) error {
 		return err
 	}
 	if p == types.ProviderCodex {
-		delete(store, "codex::api_key")
-		delete(store, "codex::oauth")
+		return logoutCodex()
 	} else if p == types.ProviderKimi {
 		delete(store, scopeKimiAPIKey)
 		delete(store, scopeKimiCodeAPIKey)

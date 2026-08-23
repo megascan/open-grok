@@ -18,12 +18,14 @@ internal/codemode      persistent goja JS session (exec/wait + tools.*)
 internal/sampler       Chat Completions / Responses / Messages adapters
 internal/catalog       curated models + live /models
 internal/auth          provider-isolated auth.json / codex-auth.json
-internal/tools         bash, files, apply_patch, grep, glob, web, plan, skills, memory, task
+internal/tools         bash, files, apply_patch, grep, glob, web, plan, skills, memory, task, session bus, flat-team mailbox
 internal/workspace     plan-mode edit gate + permission manager
 internal/hooks         PreToolUse fail-open
 internal/config        OPENGROK_HOME / ~/.opengrok (never ~/.grok)
-internal/mcp           MCP stdio server list from config.toml
-internal/update        GitHub release check
+internal/mcp           MCP JSON-RPC client (stdio + HTTP) + tool wrapping
+internal/sessionbus    machine-local presence + IPC (list/read/message)
+internal/oauth         ChatGPT Codex browser PKCE + device-code
+internal/update        GitHub release check and install into OPENGROK_HOME/bin
 ```
 
 ## Invariants preserved
@@ -38,6 +40,8 @@ internal/update        GitHub release check
 8. Codex `code_mode_only` on Responses wins over Settings; non-Responses fails closed to Direct.
 9. Code Mode `exec`/`wait` are transport. Nested `tools.*` calls are what users should see.
 10. Hooks fail open.
+11. Session bus is root-session only; peer bodies are untrusted model input.
+12. Codex OAuth tokens live in `codex-auth.json` in the Codex-rs shape (`tokens` / `OPENAI_API_KEY`).
 
 ## Packages used (not reimplemented)
 

@@ -26,9 +26,18 @@ func newUpdateCmd() *cobra.Command {
 				return json.NewEncoder(os.Stdout).Encode(res)
 			}
 			fmt.Printf("current: %s\nlatest:  %s\nnewer:   %v\nasset:   %s\n", res.Current, res.Latest, res.Newer, res.Asset)
-			if !check && res.Newer {
-				fmt.Println("automatic install is not enabled in this Go build; download the asset and replace $OPENGROK_HOME/bin/open-grok")
+			if check {
+				return nil
 			}
+			if !res.Newer {
+				fmt.Println("already up to date")
+				return nil
+			}
+			path, err := update.Install(res)
+			if err != nil {
+				return err
+			}
+			fmt.Println("installed", path)
 			return nil
 		},
 	}

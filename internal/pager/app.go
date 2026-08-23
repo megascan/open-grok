@@ -3,6 +3,7 @@ package pager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/tools"
 	"github.com/megascan/open-grok/internal/version"
 )
 
@@ -269,7 +271,7 @@ func (m *model) handleSlash(text string) tea.Cmd {
 	}
 	switch cmd {
 	case "help":
-		m.append(dimStyle.Render("/help  /login [provider]  /model [id]  /quit  /clear  /yolo"))
+		m.append(dimStyle.Render("/help  /login  /model [id]  /quit  /clear  /yolo  /compact  /plan  /sessions  /export  /memory  /mcp  /status  /fork  /rewind"))
 	case "quit", "exit":
 		return tea.Quit
 	case "clear":
@@ -278,6 +280,52 @@ func (m *model) handleSlash(text string) tea.Cmd {
 	case "yolo":
 		m.sess.YOLO = !m.sess.YOLO
 		m.append(fmt.Sprintf("always-approve = %v", m.sess.YOLO))
+	case "compact":
+		_ = m.sess.AppendUpdate(map[string]any{"type": "auto_compact_started", "manual": true})
+		m.append("compaction runs automatically when the transcript is large; a checkpoint was recorded")
+	case "plan":
+		if m.sess.Plan.Active {
+			m.sess.Plan.Exit()
+			m.append("plan mode off")
+		} else {
+			m.sess.Plan.Enter(m.sess.Plan.PlanFile)
+			m.append("plan mode on — only " + m.sess.Plan.PlanFile + " may be edited")
+		}
+	case "sessions":
+		list, _ := agent.ListSessions(m.opts.CWD)
+		for _, s := range list {
+			m.append(fmt.Sprintf("%s  %s  %s", s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Title))
+		}
+	case "export":
+		m.append(m.sess.ExportMarkdown())
+	case "memory":
+		res := memorySearch(arg)
+		m.append(res)
+	case "mcp":
+		cfg, _ := config.Load()
+		if len(cfg.MCP) == 0 {
+			m.append("(no mcp_servers)")
+			break
+		}
+		for name, s := range cfg.MCP {
+			m.append(name + "  " + s.Command)
+		}
+	case "status":
+		m.append(fmt.Sprintf("session %s  model %s  provider %s  yolo %v  plan %v", m.sess.ID, m.opts.Model.ID, m.opts.Model.Provider, m.sess.YOLO, m.sess.Plan.Active))
+	case "fork":
+		dst, err := agent.ForkSession(m.sess)
+		if err != nil {
+			m.append(errStyle.Render(err.Error()))
+			break
+		}
+		m.sess = dst
+		m.append("forked to " + dst.ID)
+	case "rewind":
+		if len(m.sess.Messages) > 2 {
+			m.sess.Messages = m.sess.Messages[:len(m.sess.Messages)-2]
+			_ = m.sess.Persist()
+			m.append("rewound last exchange")
+		}
 	case "model":
 		if arg == "" {
 			m.append("current model: " + m.opts.Model.ID + " (" + m.opts.Model.Provider.DisplayName() + ")")
@@ -302,6 +350,11 @@ func (m *model) handleSlash(text string) tea.Cmd {
 	m.vp.SetContent(m.log.String())
 	m.vp.GotoBottom()
 	return nil
+}
+
+func memorySearch(q string) string {
+	body, _ := json.Marshal(map[string]string{"query": q})
+	return tools.MemorySearch{}.Execute(context.Background(), tools.Context{}, body).Content
 }
 
 func max(a, b int) int {

@@ -54,6 +54,9 @@ func newInspectCmd() *cobra.Command {
 				"config_toml":   config.ConfigTOML(),
 				"model":         cfg.Model,
 				"system_config": config.SystemConfigDir(),
+				"mcp_servers":   cfg.MCP,
+				"session_bus":   cfg.SessionBusEnabled(),
+				"dashboard":     cfg.DashboardEnabled(),
 			}
 			if asJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(info)

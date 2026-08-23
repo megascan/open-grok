@@ -89,7 +89,7 @@ func (ExitPlanMode) Execute(_ context.Context, _ Context, args json.RawMessage) 
 
 // DefaultPack is the Grok Build toolset used for Direct tool mode.
 func DefaultPack() []Tool {
-	return []Tool{
+	pack := []Tool{
 		Bash{},
 		ReadFile{},
 		WriteFile{},
@@ -108,16 +108,18 @@ func DefaultPack() []Tool {
 		ExitPlanMode{},
 		TaskSpawn{},
 	}
+	return append(pack, DirectCollabPack()...)
 }
 
 // DirectOnlyPack is the Code Mode Only top-level set (human + multi-agent).
 func DirectOnlyPack() []Tool {
-	return []Tool{
+	pack := []Tool{
 		AskUserQuestion{},
 		EnterPlanMode{},
 		ExitPlanMode{},
 		TaskSpawn{},
 	}
+	return append(pack, DirectCollabPack()...)
 }
 
 // NestedPack is what JavaScript tools.* may call in Code Mode Only.
