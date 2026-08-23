@@ -183,7 +183,7 @@ func (m *model) renderBlockAt(idx int, w int) string {
 		return goalCard.Width(w - 2).Render(inner)
 	case blockMermaid:
 		if m.mermaidOn() {
-			return renderMermaidASCII(bl.body, w)
+			return renderMermaidASCIIEx(bl.body, w, m.mermaidPendingFor(bl.body))
 		}
 		return mermaidFallbackCard(bl.body, w)
 	case blockBtw:

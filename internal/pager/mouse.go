@@ -134,6 +134,14 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 				m.toggleGroup(run)
 			}
 		}
+		if m.mermaidOn() {
+			if src := mermaidSourceFromBlock(m.blocks[idx]); src != "" {
+				_, btns := layoutMermaidAffordance(m.mermaidPendingFor(src))
+				if kind, ok := hitMermaidButton(msg.X, btns); ok {
+					return m.clickMermaid(src, kind), true
+				}
+			}
+		}
 		m.refreshVP()
 	}
 	return nil, true

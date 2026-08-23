@@ -18,29 +18,33 @@ type mermaidEdge struct {
 var edgeRe = regexp.MustCompile(`^([A-Za-z0-9_]+)(?:\[[^\]]*\]|\([^\)]*\)|\{[^}]*\}|\(\([^)]*\)\))?\s*(-->|---|-.->|==>)\s*(?:\|([^|]+)\|)?\s*([A-Za-z0-9_]+)(?:\[[^\]]*\]|\(([^\)]*)\)|\{([^}]*)\}|\(\(([^)]*)\)\))?`)
 
 func renderMermaidASCII(src string, width int) string {
+	return renderMermaidASCIIEx(src, width, false)
+}
+
+func renderMermaidASCIIEx(src string, width int, rendering bool) string {
 	src = strings.TrimSpace(src)
 	if src == "" {
-		return mermaidCard("(empty diagram)", width)
+		return mermaidCard("(empty diagram)", width, rendering)
 	}
 	kind, dir, nodes, edges, extras := parseMermaid(src)
 	switch kind {
 	case "sequencediagram":
-		return mermaidCard(renderSequenceASCII(extras, width), width)
+		return mermaidCard(renderSequenceASCII(extras, width), width, rendering)
 	case "pie":
-		return mermaidCard(renderPieASCII(extras, width), width)
+		return mermaidCard(renderPieASCII(extras, width), width, rendering)
 	case "flowchart", "graph":
-		return mermaidCard(renderFlowchartASCII(dir, nodes, edges, width), width)
+		return mermaidCard(renderFlowchartASCII(dir, nodes, edges, width), width, rendering)
 	default:
 		body := src
 		if len(body) > 800 {
 			body = body[:800] + "…"
 		}
-		return mermaidCard(body, width)
+		return mermaidCard(body, width, rendering)
 	}
 }
 
-func mermaidCard(body string, width int) string {
-	inner := toolStyle.Render("mermaid") + "\n" + codeStyle.Render(body)
+func mermaidCard(body string, width int, rendering bool) string {
+	inner := codeStyle.Render(body) + "\n" + mermaidAffordanceLine(rendering)
 	return toolCard.Width(max(20, width-2)).Render(inner)
 }
 

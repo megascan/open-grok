@@ -10,9 +10,13 @@ import (
 	"os"
 
 	"github.com/megascan/open-grok/internal/cli"
+	"github.com/megascan/open-grok/internal/pager"
 )
 
 func main() {
+	if pager.TryMermaidRender(os.Args) {
+		return
+	}
 	if err := cli.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -239,6 +239,7 @@ type model struct {
 	settingsSecretKey, settingsSecret                                     string
 	settingsEditKey, settingsEditBuf, settingsEditErr, settingsEditKind   string
 	settingsEditMin, settingsEditMax                                      int64
+	mermaidBusy                                                           map[string]bool
 	themePreviewOrig                                                      string
 	permMode                                                              permMode
 	queue                                                                 []string
@@ -520,6 +521,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case recapDoneMsg:
 		m.applyRecapDone(msg)
+	case mermaidDoneMsg:
+		if cmd := m.handleMermaidDone(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case suggestionLoadedMsg:
 		m.suggest.onLoaded(msg.text, msg.generation)
 	case permAskMsg:
