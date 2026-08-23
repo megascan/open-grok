@@ -192,7 +192,7 @@ func TestPermissionReplyAlwaysAllow(t *testing.T) {
 	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
 		t.Fatal(err)
 	}
-	m.replyPerm(true, true)
+	m.replyPerm(true, true, false)
 	if !<-ch {
 		t.Fatal("expected allow")
 	}

@@ -273,7 +273,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "skills":
 		m.openExtensions(3)
 	case "mcps":
-		m.openExtensions(4)
+		m.openMCP()
 	case "share":
 		if m.sess != nil {
 			return m.copyText("Entropy session "+m.sess.ID+" · "+m.opts.Model.Name+"\n"+m.sess.ExportMarkdown(), false)
@@ -371,10 +371,10 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.openWorkflows()
 	case "btw":
 		if arg == "" {
-			m.appendSys("usage: /btw <aside>")
+			m.openBtwComposer("")
 			break
 		}
-		return m.submit("BTW (do not interrupt the main task; answer this aside separately): " + arg)
+		return m.startBTW(arg)
 	case "recap":
 		return m.submit("Recap this conversation: decisions, open questions, and next steps. Be concise.")
 	case "doctor":
@@ -433,15 +433,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			}
 		}
 	case "rewind":
-		if m.sess == nil || len(m.sess.Messages) <= 2 {
-			break
-		}
-		if m.cfg.UI.ConfirmRewind {
-			m.overlay = overlayConfirm
-			m.confirmKind = "rewind"
-			break
-		}
-		m.doRewind()
+		m.openRewindPicker()
 	case "jump":
 		m.overlay = overlayTimeline
 		m.cursor = 0
@@ -554,15 +546,6 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	}
 	m.refreshVP()
 	return nil
-}
-
-func (m *model) doRewind() {
-	if m.sess == nil || len(m.sess.Messages) <= 2 {
-		return
-	}
-	m.sess.Messages = m.sess.Messages[:len(m.sess.Messages)-2]
-	_ = m.sess.Persist()
-	m.appendSys("rewound last exchange")
 }
 
 func (m *model) sessionInfo() string {

@@ -37,10 +37,12 @@ type (
 	turnDone    struct{ err error }
 	streamDelta struct{ ev agent.Event }
 	permAskMsg  struct {
-		Tool, Access, Path, Args string
-		Reply                    chan bool
+		Tool, Access, Path, Args, Command string
+		Reply                             chan bool
 	}
-	qAskMsg struct {
+	btwDeltaMsg struct{ text string }
+	btwDoneMsg  struct{ err error }
+	qAskMsg     struct {
 		Question string
 		Options  []string
 		Reply    chan string
@@ -102,6 +104,9 @@ const (
 	overlayCancelTurn
 	overlayWorktree
 	overlayMemory
+	overlayRewind
+	overlayBtw
+	overlayBlock
 )
 
 type permMode int
@@ -157,6 +162,22 @@ type model struct {
 	feedback                                                              string
 	perm                                                                  *permAskMsg
 	permParked                                                            bool
+	permCursor                                                            int
+	permWordN                                                             int
+	permFollowup                                                          string
+	permFollowupMode                                                      bool
+	permPattern                                                           string
+	permPatternMode                                                       bool
+	rewindPhase                                                           rewindPhase
+	rewindPoints                                                          []rewindPoint
+	rewindCursor                                                          int
+	rewindTarget                                                          int
+	rewindPreview                                                         string
+	btw                                                                   *btwState
+	btwDraft                                                              string
+	blockTitle                                                            string
+	blockBody                                                             string
+	blockScroll                                                           int
 	question                                                              *qAskMsg
 	qCursor                                                               int
 	qFree                                                                 string
@@ -407,6 +428,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.perm = &msg
 		m.overlay = overlayPermission
 		m.permParked = false
+		m.initPermCard()
+	case btwDeltaMsg:
+		if m.btw != nil && (m.btw.Phase == btwLoading || m.btw.Phase == btwDone) {
+			m.btw.Answer += msg.text
+		}
+	case btwDoneMsg:
+		if m.btw != nil {
+			if msg.err != nil {
+				m.btw.Phase = btwError
+				m.btw.Err = msg.err.Error()
+			} else {
+				m.btw.Phase = btwDone
+			}
+		}
 	case qAskMsg:
 		m.question = &msg
 		m.qCursor = 0
@@ -469,6 +504,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.overlay == overlayRewind {
+		return m.handleRewindKey(msg), true
+	}
+	if m.overlay == overlayBtw {
+		return m.handleBtwComposerKey(msg), true
+	}
+	if m.overlay == overlayBlock {
+		return m.handleBlockViewerKey(msg), true
+	}
+	if m.btw != nil && m.overlay == overlayNone {
+		if cmd, handled := m.handleBtwPanelKey(msg); handled {
+			return cmd, true
+		}
+	}
 	if m.overlay == overlayPermission && m.perm != nil && !m.permParked {
 		return m.handlePermissionKey(msg), true
 	}
@@ -791,10 +840,17 @@ func (m *model) submit(text string) tea.Cmd {
 			if p, ok := parsed["path"].(string); ok {
 				path = p
 			}
+			cmd := ""
+			for _, k := range []string{"command", "cmd", "script"} {
+				if s, ok := parsed[k].(string); ok && s != "" {
+					cmd = s
+					break
+				}
+			}
 			if prog != nil {
 				prog.Send(permAskMsg{
 					Tool: t.Name(), Access: string(t.Access()), Path: path,
-					Args: string(args), Reply: ch,
+					Args: string(args), Command: cmd, Reply: ch,
 				})
 			} else {
 				return false

@@ -70,6 +70,12 @@ func (m *model) renderOverlay() string {
 		return m.renderWorktreeDialog(w)
 	case overlayImportClaude:
 		return m.renderImportClaude(w)
+	case overlayRewind:
+		return m.renderRewind(w)
+	case overlayBtw:
+		return m.renderBtwComposer(w)
+	case overlayBlock:
+		return m.renderBlockViewer(w)
 	case overlayFiles:
 		return m.renderListModal("@ files", w)
 	case overlayPalette:
@@ -147,6 +153,12 @@ func (m *model) overlayTitle() string {
 		return "Prompt cache"
 	case overlayImportClaude:
 		return "Import Claude settings"
+	case overlayRewind:
+		return "Rewind"
+	case overlayBtw:
+		return "/btw"
+	case overlayBlock:
+		return m.blockTitle
 	case overlayMemory:
 		return "Memory"
 	case overlayMCP:
@@ -268,6 +280,15 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if m.overlay == overlayImportClaude {
 		return m.handleImportClaudeKey(msg), true
+	}
+	if m.overlay == overlayRewind {
+		return m.handleRewindKey(msg), true
+	}
+	if m.overlay == overlayBtw {
+		return m.handleBtwComposerKey(msg), true
+	}
+	if m.overlay == overlayBlock {
+		return m.handleBlockViewerKey(msg), true
 	}
 	if m.overlay == overlayResume && msg.String() == "d" {
 		if m.cursor < len(m.items) {
@@ -670,6 +691,12 @@ func (m *model) fillExtensions() {
 		for _, h := range hooks.List(cwd) {
 			m.items = append(m.items, listItem{Label: filepath.Base(h), Detail: h})
 		}
+		for _, h := range hooks.ListImported(cwd) {
+			m.items = append(m.items, listItem{
+				Label:  h.Event + " · " + h.Matcher,
+				Detail: "imported  " + truncate(h.Command, 48),
+			})
+		}
 		if len(m.items) == 0 {
 			m.items = append(m.items, listItem{Label: "(no hooks)", Detail: filepath.Join(cwd, ".entropy", "hooks")})
 		}
@@ -697,6 +724,79 @@ func (m *model) fillExtensions() {
 			m.items = append(m.items, listItem{Label: "(no mcp_servers in config.toml)"})
 		}
 	}
+}
+
+func (m *model) openMCP() {
+	m.overlay = overlayMCP
+	m.fillMCP()
+}
+
+func (m *model) fillMCP() {
+	m.cursor = 0
+	m.items = nil
+	cfg, _ := config.Load()
+	n := len(cfg.MCP)
+	m.items = append(m.items, listItem{
+		Key:    "section:managed",
+		Label:  "Managed by grok.com (0)",
+		Detail: "xAI-hosted connectors — not used by Entropy; local [mcp_servers] below",
+	})
+	m.items = append(m.items, listItem{
+		Key:    "section:local",
+		Label:  fmt.Sprintf("Local (%d)", n),
+		Detail: "config.toml [mcp_servers]",
+	})
+	for name, s := range cfg.MCP {
+		detail := s.Command + " " + strings.Join(s.Args, " ")
+		if s.URL != "" {
+			detail = s.URL
+		}
+		status := "configured"
+		if m.sess != nil {
+			found := false
+			for _, t := range m.sess.MCPTools {
+				if strings.Contains(t.Name(), sanitizeMCPName(name)) {
+					found = true
+					break
+				}
+			}
+			if found {
+				status = "connected"
+			} else if m.sess.MCPClients != nil {
+				status = "offline"
+			}
+		}
+		m.items = append(m.items, listItem{
+			Key:    "mcp:" + name,
+			Label:  name + "  ·  " + status,
+			Detail: strings.TrimSpace(detail),
+		})
+	}
+	if n == 0 {
+		m.items = append(m.items, listItem{Label: "(no mcp_servers in config.toml)", Detail: "add [mcp_servers.<name>] command / url"})
+	}
+	if m.sess != nil {
+		for _, t := range m.sess.MCPTools {
+			m.items = append(m.items, listItem{
+				Key:    "tool:" + t.Name(),
+				Label:  t.Name(),
+				Detail: "live tool  " + string(t.Access()),
+			})
+		}
+	}
+}
+
+func sanitizeMCPName(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func (m *model) openExtensions(tab int) {

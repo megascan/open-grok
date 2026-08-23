@@ -172,3 +172,54 @@ func runHook(ctx context.Context, path string, ev Event) (int, string, error) {
 	}
 	return code, buf.String(), err
 }
+
+// ImportedHook is one Claude-imported command hook from imported-from-claude.json.
+type ImportedHook struct {
+	Event   string
+	Matcher string
+	Command string
+	Path    string
+}
+
+// ListImported walks hook dirs for imported-from-claude.json entries.
+func ListImported(cwd string) []ImportedHook {
+	var out []ImportedHook
+	for _, dir := range hookDirs(cwd) {
+		path := filepath.Join(dir, "imported-from-claude.json")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var root map[string]any
+		if json.Unmarshal(raw, &root) != nil {
+			continue
+		}
+		hooks, _ := root["hooks"].(map[string]any)
+		for event, groupsAny := range hooks {
+			groups, _ := groupsAny.([]any)
+			for _, g := range groups {
+				gm, _ := g.(map[string]any)
+				if gm == nil {
+					continue
+				}
+				matcher, _ := gm["matcher"].(string)
+				if matcher == "" {
+					matcher = "*"
+				}
+				handlers, _ := gm["hooks"].([]any)
+				for _, h := range handlers {
+					hm, _ := h.(map[string]any)
+					if hm == nil {
+						continue
+					}
+					cmd, _ := hm["command"].(string)
+					if cmd == "" {
+						continue
+					}
+					out = append(out, ImportedHook{Event: event, Matcher: matcher, Command: cmd, Path: path})
+				}
+			}
+		}
+	}
+	return out
+}

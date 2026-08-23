@@ -7,6 +7,10 @@ import (
 
 // renderMarkdown applies a small, dependency-free transcript highlighter.
 func renderMarkdown(src string, width int) string {
+	return renderMarkdownEx(src, width, true)
+}
+
+func renderMarkdownEx(src string, width int, mermaid bool) string {
 	if src == "" {
 		return ""
 	}
@@ -16,19 +20,43 @@ func renderMarkdown(src string, width int) string {
 	lines := strings.Split(src, "\n")
 	var out []string
 	inFence := false
+	fenceKind := ""
+	var fence []string
 	for _, line := range lines {
 		trim := strings.TrimSpace(line)
 		if strings.HasPrefix(trim, "```") {
-			inFence = !inFence
-			if inFence && strings.HasPrefix(strings.ToLower(trim), "```mermaid") {
-				out = append(out, toolCard.Width(width-2).Render(toolStyle.Render("mermaid")+"\n"+dimStyle.Render("diagram source in scrollback — native mermaid worker is not in this Go pager")))
-			} else {
+			if inFence {
+				inFence = false
+				body := strings.Join(fence, "\n")
+				if fenceKind == "mermaid" {
+					if mermaid {
+						out = append(out, renderMermaidASCII(body, width))
+					} else {
+						out = append(out, mermaidFallbackCard(body, width))
+					}
+				} else {
+					for _, fl := range fence {
+						out = append(out, wrap(codeStyle.Render(fl), width)...)
+					}
+					out = append(out, dimStyle.Render(trim))
+				}
+				fence = nil
+				fenceKind = ""
+				continue
+			}
+			inFence = true
+			info := strings.TrimSpace(strings.TrimPrefix(trim, "```"))
+			fenceKind = strings.ToLower(info)
+			if i := strings.IndexByte(fenceKind, ' '); i >= 0 {
+				fenceKind = fenceKind[:i]
+			}
+			if fenceKind != "mermaid" {
 				out = append(out, dimStyle.Render(trim))
 			}
 			continue
 		}
 		if inFence {
-			out = append(out, wrap(codeStyle.Render(line), width)...)
+			fence = append(fence, line)
 			continue
 		}
 		switch {
@@ -42,6 +70,14 @@ func renderMarkdown(src string, width int) string {
 			out = append(out, wrap(bulletMd.Render("• ")+inlineMD(trim[2:]), width)...)
 		default:
 			out = append(out, wrap(inlineMD(line), width)...)
+		}
+	}
+	if inFence && fenceKind == "mermaid" {
+		body := strings.Join(fence, "\n")
+		if mermaid {
+			out = append(out, renderMermaidASCII(body, width))
+		} else {
+			out = append(out, mermaidFallbackCard(body, width))
 		}
 	}
 	return strings.Join(out, "\n")

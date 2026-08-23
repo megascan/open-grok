@@ -1,10 +1,106 @@
 package pager
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/megascan/open-grok/internal/config"
 )
+
+type permChoice struct {
+	ID    string // allow, always, always-cmd, never, followup
+	Label string
+}
+
+func (m *model) permCommand() string {
+	if m.perm == nil {
+		return ""
+	}
+	if m.perm.Command != "" {
+		return m.perm.Command
+	}
+	var parsed map[string]any
+	if json.Unmarshal([]byte(m.perm.Args), &parsed) != nil {
+		return ""
+	}
+	for _, k := range []string{"command", "cmd", "script"} {
+		if s, ok := parsed[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func (m *model) permWords() []string {
+	return strings.Fields(m.permCommand())
+}
+
+func (m *model) permScopedCmd() string {
+	words := m.permWords()
+	if len(words) == 0 {
+		return m.permCommand()
+	}
+	n := m.permWordN
+	if n < 1 {
+		n = 1
+	}
+	if n > len(words) {
+		n = len(words)
+	}
+	return strings.Join(words[:n], " ")
+}
+
+func (m *model) permChoices() []permChoice {
+	if m.perm == nil {
+		return nil
+	}
+	cmd := m.permScopedCmd()
+	bash := m.perm.Access == "bash" && strings.TrimSpace(cmd) != ""
+	var out []permChoice
+	if bash {
+		out = append(out, permChoice{ID: "always-cmd", Label: "Always allow: " + cmd})
+	}
+	out = append(out, permChoice{ID: "allow", Label: "Yes, proceed"})
+	if bash {
+		out = append(out, permChoice{ID: "never-cmd", Label: "Never allow: " + cmd})
+	} else {
+		out = append(out,
+			permChoice{ID: "always", Label: "Always allow this tool"},
+			permChoice{ID: "never", Label: "Never allow this tool"},
+		)
+	}
+	out = append(out, permChoice{ID: "followup", Label: "Tell Entropy what to do differently"})
+	return out
+}
+
+func (m *model) initPermCard() {
+	m.permFollowup = ""
+	m.permFollowupMode = false
+	m.permPatternMode = false
+	m.permPattern = ""
+	words := m.permWords()
+	m.permWordN = len(words)
+	if m.permWordN == 0 {
+		m.permWordN = 1
+	}
+	want := strings.ToLower(m.cfg.UI.DefaultPermChoice)
+	choices := m.permChoices()
+	m.permCursor = 0
+	for i, c := range choices {
+		switch want {
+		case "always":
+			if c.ID == "always" || c.ID == "always-cmd" {
+				m.permCursor = i
+			}
+		case "deny":
+			if c.ID == "never" {
+				m.permCursor = i
+			}
+		}
+	}
+}
 
 func (m *model) renderPermission(w int) string {
 	if m.perm == nil {
@@ -14,30 +110,151 @@ func (m *model) renderPermission(w int) string {
 	if m.permParked {
 		park = "\n" + dimStyle.Render("keyboard parked in scrollback — Tab returns")
 	}
-	body := titleStyle.Render("Permission") + "\n\n" +
-		"Allow " + toolStyle.Render(m.perm.Tool) + " (" + m.perm.Access + ")?\n"
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Permission") + "\n\n")
+	b.WriteString("Allow " + toolStyle.Render(m.perm.Tool) + " (" + m.perm.Access + ")?\n")
 	if m.perm.Path != "" {
-		body += dimStyle.Render("path: "+m.perm.Path) + "\n"
+		b.WriteString(dimStyle.Render("path: "+m.perm.Path) + "\n")
 	}
-	body += "\n" +
-		selStyle.Render(" y ") + " allow once   " +
-		selStyle.Render(" a ") + " always this tool   " +
-		selStyle.Render(" n ") + " deny\n" +
-		dimStyle.Render("esc parks in scrollback") + park
-	return modalBox.Width(w).Render(body)
+	cmd := m.permCommand()
+	if cmd != "" {
+		lines := strings.Split(cmd, "\n")
+		max := 5
+		trunc := len(lines) > max
+		if trunc {
+			lines = lines[:max-1]
+		}
+		b.WriteString("\n" + codeStyle.Render(strings.Join(lines, "\n")) + "\n")
+		if trunc {
+			b.WriteString(dimStyle.Render("… expand with ctrl+e") + "\n")
+		}
+	}
+	b.WriteByte('\n')
+	choices := m.permChoices()
+	if m.permCursor >= len(choices) {
+		m.permCursor = 0
+	}
+	for i, c := range choices {
+		marker := "(○)"
+		label := c.Label
+		if i == m.permCursor {
+			marker = "(●)"
+		}
+		if c.ID == "followup" && m.permFollowupMode {
+			label = "Tell Entropy what to do differently"
+			if m.permFollowup != "" {
+				label += "  ❯ " + m.permFollowup
+			} else {
+				label += "  ❯ "
+			}
+		}
+		if c.ID == "always-cmd" && m.permPatternMode {
+			label = "Always allow: " + m.permPattern + "█"
+		}
+		line := fmt.Sprintf(" %d %s %s", i+1, marker, label)
+		if i == m.permCursor {
+			line = selStyle.Render(line)
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n" + dimStyle.Render("1–9  ·  j/k  ·  enter  ·  ←/→ bash scope  ·  e edit glob  ·  x followup  ·  esc park") + park)
+	return modalBox.Width(w).Render(b.String())
 }
 
 func (m *model) handlePermissionKey(msg tea.KeyMsg) tea.Cmd {
 	if m.perm == nil {
 		return nil
 	}
-	switch msg.String() {
-	case "y", "enter":
-		m.replyPerm(true, false)
+	if m.permFollowupMode {
+		switch msg.Type {
+		case tea.KeyEsc:
+			m.permFollowupMode = false
+			return nil
+		case tea.KeyEnter:
+			text := strings.TrimSpace(m.permFollowup)
+			m.permFollowupMode = false
+			m.replyPerm(false, false, false)
+			if text != "" {
+				m.queue = append(m.queue, text)
+			}
+			return nil
+		case tea.KeyBackspace:
+			if len(m.permFollowup) > 0 {
+				m.permFollowup = m.permFollowup[:len(m.permFollowup)-1]
+			}
+			return nil
+		}
+		if msg.Type == tea.KeyRunes {
+			m.permFollowup += string(msg.Runes)
+		}
+		return nil
+	}
+	if m.permPatternMode {
+		switch msg.Type {
+		case tea.KeyEsc:
+			m.permPatternMode = false
+			return nil
+		case tea.KeyEnter:
+			m.permPatternMode = false
+			if m.sess != nil && strings.TrimSpace(m.permPattern) != "" {
+				m.sess.Allow = append(m.sess.Allow, "bash:"+m.permPattern)
+			}
+			m.replyPerm(true, true, false)
+			return nil
+		case tea.KeyBackspace:
+			if len(m.permPattern) > 0 {
+				m.permPattern = m.permPattern[:len(m.permPattern)-1]
+			}
+			return nil
+		}
+		if msg.Type == tea.KeyRunes {
+			m.permPattern += string(msg.Runes)
+		}
+		return nil
+	}
+	choices := m.permChoices()
+	s := msg.String()
+	if idx := optionIndexFromKey(s, len(choices)); idx >= 0 {
+		m.permCursor = idx
+		return m.applyPermChoice(choices[idx])
+	}
+	switch s {
+	case "up", "k":
+		if m.permCursor > 0 {
+			m.permCursor--
+		}
+	case "down", "j":
+		if m.permCursor+1 < len(choices) {
+			m.permCursor++
+		}
+	case "left", "h":
+		if m.permWordN > 1 {
+			m.permWordN--
+		}
+	case "right", "l":
+		if n := len(m.permWords()); m.permWordN < n {
+			m.permWordN++
+		}
+	case "e":
+		m.permPatternMode = true
+		m.permPattern = m.permScopedCmd()
+	case "x":
+		m.permFollowupMode = true
+		for i, c := range choices {
+			if c.ID == "followup" {
+				m.permCursor = i
+			}
+		}
+	case "y":
+		return m.applyPermChoice(permChoice{ID: "allow"})
 	case "a":
-		m.replyPerm(true, true)
+		return m.applyPermChoice(permChoice{ID: "always"})
 	case "n":
-		m.replyPerm(false, false)
+		return m.applyPermChoice(permChoice{ID: "never"})
+	case "enter":
+		if m.permCursor < len(choices) {
+			return m.applyPermChoice(choices[m.permCursor])
+		}
 	case "esc":
 		m.permParked = true
 		m.overlay = overlayNone
@@ -45,24 +262,64 @@ func (m *model) handlePermissionKey(msg tea.KeyMsg) tea.Cmd {
 		m.ta.Blur()
 	case "tab":
 		// stay in card
+	case "ctrl+e":
+		if m.perm != nil {
+			m.openBlockViewer("Permission args", m.perm.Args)
+		}
 	}
 	return nil
 }
 
-func (m *model) replyPerm(allow, always bool) {
+func (m *model) applyPermChoice(c permChoice) tea.Cmd {
+	switch c.ID {
+	case "allow":
+		m.replyPerm(true, false, false)
+	case "always":
+		m.rememberPermRule(m.perm.Tool, false)
+		m.replyPerm(true, true, false)
+	case "always-cmd":
+		rule := "bash:" + m.permScopedCmd()
+		if m.sess != nil {
+			m.sess.Allow = append(m.sess.Allow, rule)
+		}
+		m.rememberPermRule(rule, false)
+		m.replyPerm(true, false, false)
+	case "never":
+		if m.sess != nil {
+			m.sess.Deny = append(m.sess.Deny, m.perm.Tool)
+		}
+		m.rememberPermRule(m.perm.Tool, true)
+		m.replyPerm(false, false, true)
+	case "never-cmd":
+		rule := "bash:" + m.permScopedCmd()
+		if m.sess != nil {
+			m.sess.Deny = append(m.sess.Deny, rule)
+		}
+		m.rememberPermRule(rule, true)
+		m.replyPerm(false, false, true)
+	case "followup":
+		m.permFollowupMode = true
+	}
+	return nil
+}
+
+func (m *model) replyPerm(allow, always, never bool) {
 	if m.perm == nil {
 		return
 	}
 	if always && m.sess != nil {
 		m.sess.Allow = append(m.sess.Allow, m.perm.Tool)
 		if m.cfg.UI.RememberApprovals {
-			m.appendSys("always allow " + m.perm.Tool + " (this session + remembered for the project)")
+			m.appendSys("always allow " + m.perm.Tool + " (this session + remembered)")
 		}
 	}
+	_ = never
 	ch := m.perm.Reply
 	m.perm = nil
 	m.overlay = overlayNone
 	m.permParked = false
+	m.permFollowupMode = false
+	m.permPatternMode = false
 	if m.question != nil {
 		m.overlay = overlayQuestion
 	}
@@ -71,121 +328,30 @@ func (m *model) replyPerm(allow, always bool) {
 	}
 }
 
-func (m *model) handleScrollKey(msg tea.KeyMsg) tea.Cmd {
-	s := msg.String()
-	move := func(d int) {
-		if len(m.blocks) == 0 {
-			return
-		}
-		if m.selectedBlock < 0 {
-			m.selectedBlock = len(m.blocks) - 1
-		}
-		m.selectedBlock += d
-		if m.selectedBlock < 0 {
-			m.selectedBlock = 0
-		}
-		if m.selectedBlock >= len(m.blocks) {
-			m.selectedBlock = len(m.blocks) - 1
-		}
-		if s == "j" || s == "down" {
-			m.vp.LineDown(1)
-		}
-		if s == "k" || s == "up" {
-			m.vp.LineUp(1)
-		}
-		m.refreshVP()
-	}
-	idx := m.selectedBlock
-	if m.vimMode {
-		switch s {
-		case "j":
-			move(1)
-		case "k":
-			move(-1)
-		case "g":
-			m.selectedBlock = 0
-			m.vp.GotoTop()
-			m.refreshVP()
-		case "G":
-			m.selectedBlock = len(m.blocks) - 1
-			m.vp.GotoBottom()
-			m.refreshVP()
-		case "ctrl+d":
-			m.vp.HalfViewDown()
-		case "ctrl+u":
-			m.vp.HalfViewUp()
-		case "y":
-			return m.copyBlock(idx)
-		case "e", "h", "l":
-			m.toggleFold(idx)
-		case "E":
-			m.foldAll()
-		case "i", "tab", " ":
-			m.focusScroll = false
-			m.ta.Focus()
-		}
-		return nil
-	}
-	switch s {
-	case "up":
-		move(-1)
-	case "down":
-		move(1)
-	case "left", "right":
-		m.toggleFold(idx)
-	case " ":
-		m.focusScroll = false
-		m.ta.Focus()
-	case "y":
-		return m.copyBlock(idx)
-	}
-	return nil
-}
-
-func (m *model) toggleFold(idx int) {
-	if len(m.blocks) == 0 {
+func (m *model) rememberPermRule(rule string, deny bool) {
+	if m.perm == nil || !m.cfg.UI.RememberApprovals || strings.TrimSpace(rule) == "" {
 		return
 	}
-	if idx < 0 {
-		idx = len(m.blocks) - 1
+	if deny {
+		m.cfg.Permission.Deny = appendUniqRule(m.cfg.Permission.Deny, rule)
+	} else {
+		m.cfg.Permission.Allow = appendUniqRule(m.cfg.Permission.Allow, rule)
 	}
-	if idx >= len(m.blocks) {
-		return
-	}
-	if m.groupTools {
-		if run, ok := m.runForBlock(idx); ok {
-			m.toggleGroup(run)
-			m.refreshVP()
-			return
-		}
-	}
-	m.blocks[idx].folded = !m.blocks[idx].folded
-	m.refreshVP()
+	_ = config.Save(m.cfg)
 }
 
-func (m *model) foldAll() {
-	all := true
-	for _, b := range m.blocks {
-		if !b.folded {
-			all = false
-			break
+func appendUniqRule(list []string, rule string) []string {
+	for _, r := range list {
+		if r == rule {
+			return list
 		}
 	}
-	for i := range m.blocks {
-		m.blocks[i].folded = !all
-	}
-	m.refreshVP()
+	return append(list, rule)
 }
 
-func (m *model) jumpFind(q string) {
-	for i := len(m.blocks) - 1; i >= 0; i-- {
-		if stringsContainsFold(m.blocks[i].body, q) || stringsContainsFold(m.blocks[i].title, q) {
-			m.vp.SetContent(m.renderTranscript())
-			return
-		}
-	}
-}
-
-func stringsContainsFold(s, q string) bool {
-	return q == "" || strings.Contains(strings.ToLower(s), strings.ToLower(q))
+func (m *model) openBlockViewer(title, body string) {
+	m.blockTitle = title
+	m.blockBody = body
+	m.blockScroll = 0
+	m.overlay = overlayBlock
 }

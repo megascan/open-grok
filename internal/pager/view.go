@@ -22,6 +22,7 @@ const (
 	blockGoal
 	blockMermaid
 	blockImage
+	blockBtw
 )
 
 type block struct {
@@ -116,9 +117,9 @@ func (m *model) renderBlock(bl block, w int) string {
 	}
 	switch bl.kind {
 	case blockUser:
-		return userLabel.Render("YOU") + stamp + "\n" + renderMarkdown(bl.body, w)
+		return userLabel.Render("YOU") + stamp + "\n" + renderMarkdownEx(bl.body, w, m.mermaidOn())
 	case blockAgent:
-		return agentLabel.Render("ENTROPY") + stamp + "\n" + renderMarkdown(bl.body, w)
+		return agentLabel.Render("ENTROPY") + stamp + "\n" + renderMarkdownEx(bl.body, w, m.mermaidOn())
 	case blockThinking:
 		return dimStyle.Render("thinking") + "\n" + dimStyle.Render(bl.body)
 	case blockTool:
@@ -141,14 +142,22 @@ func (m *model) renderBlock(bl block, w int) string {
 		inner := goalTitle.Render("GOAL") + "\n" + bl.body
 		return goalCard.Width(w - 2).Render(inner)
 	case blockMermaid:
-		inner := toolStyle.Render("mermaid") + "\n" + dimStyle.Render(truncate(bl.body, 400))
-		return toolCard.Width(w - 2).Render(inner)
+		if m.mermaidOn() {
+			return renderMermaidASCII(bl.body, w)
+		}
+		return mermaidFallbackCard(bl.body, w)
+	case blockBtw:
+		return m.renderBtwBlock(bl, w)
 	case blockImage:
 		inner := toolStyle.Render("image") + "\n" + dimStyle.Render(truncate(bl.body, 400))
 		return toolCard.Width(w - 2).Render(inner)
 	default:
 		return sysLabel.Render(bl.body)
 	}
+}
+
+func (m *model) mermaidOn() bool {
+	return m.cfg.PrefBool("render_mermaid", m.cfg.UI.RenderMermaid, true)
 }
 
 func (m *model) renderHeader() string {
@@ -317,6 +326,9 @@ func (m *model) viewChat() string {
 	}
 	chips := m.renderChips()
 	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
+	if panel := m.renderBtwPanel(); panel != "" {
+		input = panel + "\n" + input
+	}
 	hud := ""
 	if m.scrollHUD {
 		hud = dimStyle.Render(fmt.Sprintf("scroll y=%d/%d blocks=%d", m.vp.YOffset, m.vp.TotalLineCount(), len(m.blocks))) + "\n"
