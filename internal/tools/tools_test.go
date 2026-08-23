@@ -67,6 +67,7 @@ func TestDefaultPackAccessKinds(t *testing.T) {
 		"write_file":     types.AccessEdit,
 		"search_replace": types.AccessEdit,
 		"read_file":      types.AccessRead,
+		"image_gen":      types.AccessEdit,
 	}
 	for _, ttool := range tools.DefaultPack() {
 		if k, ok := want[ttool.Name()]; ok && ttool.Access() != k {

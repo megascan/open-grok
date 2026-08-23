@@ -48,6 +48,15 @@ func toolCallHeaderFull(title, body, result string, collapsed bool) string {
 		return mcpToolHeader(title, args)
 	case verbMCPSearch:
 		return searchToolsHeader(args, body, result)
+	case verbImage:
+		prompt := toolArgValue(args, "prompt")
+		if prompt == "" {
+			prompt = firstLine(body)
+		}
+		if prompt == "" || strings.HasPrefix(prompt, "{") {
+			return "Generate image"
+		}
+		return "Generate " + prompt
 	default:
 		return otherToolHeader(title, args, body)
 	}

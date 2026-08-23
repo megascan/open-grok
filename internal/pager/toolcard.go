@@ -33,6 +33,7 @@ const (
 	verbCommand
 	verbEdit
 	verbMCP
+	verbImage
 	verbOther
 )
 
@@ -58,6 +59,8 @@ func (k verbKind) verb(running bool) string {
 		past, present = "Fetched", "Fetching"
 	case verbCommand, verbOther:
 		past, present = "Ran", "Running"
+	case verbImage:
+		past, present = "Generated", "Generating"
 	case verbEdit:
 		past, present = "Edited", "Editing"
 	case verbMCP:
@@ -88,6 +91,8 @@ func (k verbKind) noun(count int) string {
 		one, many = "MCP tool", "MCP tools"
 	case verbCommand:
 		one, many = "command", "commands"
+	case verbImage:
+		one, many = "image", "images"
 	}
 	if count == 1 {
 		return one
@@ -125,6 +130,8 @@ func classifyTool(title string) verbKind {
 		return verbDir
 	case name == "bash" || name == "shell" || name == "exec":
 		return verbCommand
+	case name == "image_gen" || name == "image_edit":
+		return verbImage
 	default:
 		if strings.Contains(name, "grep") || strings.Contains(name, "glob") {
 			return verbSearch

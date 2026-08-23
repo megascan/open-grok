@@ -12,6 +12,7 @@ var (
 	_ Tool = ListDir{}
 	_ Tool = WebSearch{}
 	_ Tool = WebFetch{}
+	_ Tool = ImageGen{}
 	_ Tool = ApplyPatch{}
 	_ Tool = Skill{}
 	_ Tool = MemorySearch{}

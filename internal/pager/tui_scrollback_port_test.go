@@ -402,3 +402,21 @@ func TestSearchToolsHeader(t *testing.T) {
 		t.Fatalf("count %q", got)
 	}
 }
+
+func TestImageGenCardHeader(t *testing.T) {
+	if got := toolCallHeader("image_gen", `{"prompt":"a red fox"}`); got != "Generate a red fox" {
+		t.Fatalf("header %q", got)
+	}
+	m := testModel(t)
+	m.blocks = []block{
+		{kind: blockTool, title: "image_gen", body: `{"prompt":"a red fox"}`},
+		{kind: blockToolResult, title: "image_gen", body: "Image generated and saved to /tmp/images/1.jpg. Do not read or re-display it, and do not describe how it appears to the user."},
+	}
+	view := stripANSI(m.renderTranscript())
+	if !strings.Contains(view, "Generate a red fox") {
+		t.Fatalf("card:\n%s", view)
+	}
+	if !strings.Contains(view, "images/1.jpg") {
+		t.Fatalf("saved path:\n%s", view)
+	}
+}

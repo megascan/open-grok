@@ -261,7 +261,7 @@ func TestToolsModulePacksAndExecute(t *testing.T) {
 
 	wantDefault := []string{
 		"bash", "read_file", "write_file", "search_replace", "grep", "glob", "list_dir",
-		"web_search", "web_fetch", "apply_patch", "skill", "memory_search", "memory_save",
+		"web_search", "web_fetch", "image_gen", "apply_patch", "skill", "memory_search", "memory_save",
 		"ask_user_question", "enter_plan_mode", "exit_plan_mode", "task", "update_goal", "todo_write",
 		"scheduler_create", "scheduler_delete", "scheduler_list",
 		"list_sessions", "read_session", "message_session", "list_agents", "send_message",
@@ -276,7 +276,7 @@ func TestToolsModulePacksAndExecute(t *testing.T) {
 	nested := tools.NestedPack()
 	assertPack(t, "NestedPack", nested, []string{
 		"bash", "read_file", "write_file", "search_replace", "apply_patch",
-		"grep", "glob", "list_dir", "web_search", "web_fetch", "skill",
+		"grep", "glob", "list_dir", "web_search", "web_fetch", "image_gen", "skill",
 		"memory_search", "memory_save", "todo_write",
 		"scheduler_create", "scheduler_delete", "scheduler_list",
 	})
