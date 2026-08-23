@@ -35,8 +35,13 @@ func renderMarkdownEx(src string, width int, mermaid bool) string {
 						out = append(out, mermaidFallbackCard(body, width))
 					}
 				} else {
-					for _, fl := range fence {
-						out = append(out, wrap(codeStyle.Render(fl), width)...)
+					painted := highlightByLang(fenceKind, fence)
+					for i, fl := range fence {
+						line := codeStyle.Render(fl)
+						if i < len(painted) && painted[i] != fl {
+							line = painted[i]
+						}
+						out = append(out, wrap(line, width)...)
 					}
 					out = append(out, dimStyle.Render(trim))
 				}

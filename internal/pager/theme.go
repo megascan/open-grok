@@ -162,6 +162,7 @@ func nextThemeName(current string) string {
 func applyTheme(t Theme) {
 	colCyan, colPink, colGold, colRed, colGreen = t.Cyan, t.Pink, t.Gold, t.Red, t.Green
 	colMuted, colBar, colPanel, colClaim = t.Muted, t.Bar, t.Panel, t.Claim
+	setHighlightTheme(t.Name)
 	rebuildStyles(t)
 }
 

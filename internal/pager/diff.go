@@ -190,7 +190,7 @@ func gutterWidth(hunk []diffLine) int {
 	return w
 }
 
-func renderDiffHunks(hunks [][]diffLine) string {
+func renderDiffHunks(path string, hunks [][]diffLine) string {
 	if len(hunks) == 0 {
 		return ""
 	}
@@ -224,7 +224,12 @@ func renderDiffHunks(hunks [][]diffLine) string {
 			if text == "" {
 				text = " "
 			}
-			b.WriteString(dimStyle.Render(gutter) + st.Render(text) + "\n")
+			if hi := highlightLine(path, line.Text); hi != "" && path != "" && hi != line.Text {
+				text = hi
+			} else {
+				text = st.Render(text)
+			}
+			b.WriteString(dimStyle.Render(gutter) + text + "\n")
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

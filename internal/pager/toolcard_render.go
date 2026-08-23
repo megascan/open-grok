@@ -51,7 +51,7 @@ func renderEditCard(title string, args map[string]string, body, result string, f
 	if failed && strings.TrimSpace(result) != "" && len(card.Hunks) == 0 {
 		bodyText = strings.TrimRight(result, "\n")
 	} else if len(card.Hunks) > 0 {
-		bodyText = renderDiffHunks(card.Hunks)
+		bodyText = renderDiffHunks(card.Path, card.Hunks)
 	} else {
 		bodyText = truncateResultBody(result)
 	}
@@ -93,7 +93,8 @@ func renderReadCard(header string, args map[string]string, result string, failed
 	if failed {
 		return renderAccentBlock(header, strings.TrimRight(result, "\n"), true)
 	}
-	shown := truncateIndexedLines(lines, nums, readFirstLines, readLastLines, false)
+	path := toolArgValue(args, "path", "file_path", "target_file")
+	shown := truncateIndexedLines(path, lines, nums, readFirstLines, readLastLines, false)
 	return renderAccentBlockRaw(toolStyle.Render(header), shown, false)
 }
 
@@ -122,10 +123,11 @@ func parseReadContent(result string, fallbackStart int) (lines []string, nums []
 	return lines, nums
 }
 
-func truncateIndexedLines(lines []string, nums []int, first, last int, plusHidden bool) string {
+func truncateIndexedLines(path string, lines []string, nums []int, first, last int, plusHidden bool) string {
 	if len(lines) == 0 {
 		return ""
 	}
+	painted := highlightSourceLines(path, lines)
 	w := 1
 	for _, n := range nums {
 		d := 1
@@ -138,7 +140,11 @@ func truncateIndexedLines(lines []string, nums []int, first, last int, plusHidde
 	}
 	format := func(i int) string {
 		gutter := fmt.Sprintf("%*d  ", w, nums[i])
-		return dimStyle.Render(gutter) + lines[i]
+		text := lines[i]
+		if i < len(painted) {
+			text = painted[i]
+		}
+		return dimStyle.Render(gutter) + text
 	}
 	if len(lines) <= first+last+1 {
 		var b strings.Builder
