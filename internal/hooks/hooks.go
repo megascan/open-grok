@@ -25,29 +25,97 @@ type Event struct {
 	ArgsJSON string `json:"arguments"`
 }
 
+// Status is one hook execution outcome for TUI chrome.
+type Status string
+
+const (
+	StatusSuccess Status = "success"
+	StatusSkipped Status = "skipped"
+	StatusBlocked Status = "blocked"
+	StatusFailed  Status = "failed"
+)
+
+// Run is one hook execution shown under a tool card.
+type Run struct {
+	Name    string
+	Phase   string
+	Status  Status
+	Elapsed time.Duration
+	Output  string
+	Error   string
+	Detail  string
+}
+
+// Outcome is the deny decision plus the runs to render.
+type Outcome struct {
+	Deny   bool
+	Reason string
+	Runs   []Run
+}
+
 // PreToolUse looks for executable hooks and runs them. A hook that exits 2
 // denies the tool; any other failure (missing, crash, timeout) is ignored.
 func PreToolUse(ctx context.Context, cwd, sessionDir, tool, args string) (deny bool, reason string) {
-	ev := Event{Hook: "PreToolUse", Tool: tool, CWD: cwd, Session: sessionDir, ArgsJSON: args}
+	o := RunPre(ctx, cwd, sessionDir, tool, args)
+	return o.Deny, o.Reason
+}
+
+// RunPre executes PreToolUse hooks and records each run for tool-card chrome.
+func RunPre(ctx context.Context, cwd, sessionDir, tool, args string) Outcome {
+	return runPhase(ctx, cwd, sessionDir, "PreToolUse", "pre_tool_use", tool, args, true)
+}
+
+// RunPost executes PostToolUse hooks after a tool has already run.
+func RunPost(ctx context.Context, cwd, sessionDir, tool, args string) Outcome {
+	o := runPhase(ctx, cwd, sessionDir, "PostToolUse", "post_tool_use", tool, args, false)
+	o.Deny = false
+	o.Reason = ""
+	return o
+}
+
+func runPhase(ctx context.Context, cwd, sessionDir, hookName, phase, tool, args string, denyOn2 bool) Outcome {
+	ev := Event{Hook: hookName, Tool: tool, CWD: cwd, Session: sessionDir, ArgsJSON: args}
+	var out Outcome
 	for _, dir := range hookDirs(cwd) {
 		if dir == "" {
 			continue
 		}
-		path := filepath.Join(dir, "PreToolUse")
-		code, out, err := runHook(ctx, path, ev)
+		path := filepath.Join(dir, hookName)
+		start := time.Now()
+		code, text, err := runHook(ctx, path, ev)
 		if err != nil {
 			continue
 		}
-		if code == 2 {
-			return true, "hook denied: " + out
+		run := Run{Name: filepath.Base(path), Phase: phase, Elapsed: time.Since(start), Output: strings.TrimSpace(text)}
+		switch code {
+		case 0:
+			run.Status = StatusSuccess
+		case 2:
+			run.Status = StatusBlocked
+			run.Detail = strings.TrimSpace(text)
+			if denyOn2 {
+				out.Deny = true
+				out.Reason = "hook denied: " + text
+			}
+		default:
+			run.Status = StatusFailed
+			run.Error = strings.TrimSpace(text)
+		}
+		out.Runs = append(out.Runs, run)
+		if out.Deny {
+			return out
 		}
 	}
 	for _, dir := range hookDirs(cwd) {
-		if deny, reason := runImportedJSON(ctx, dir, ev); deny {
-			return true, reason
+		imported := runImportedJSON(ctx, dir, ev, phase, denyOn2)
+		out.Runs = append(out.Runs, imported.Runs...)
+		if imported.Deny {
+			out.Deny = true
+			out.Reason = imported.Reason
+			return out
 		}
 	}
-	return false, ""
+	return out
 }
 
 func hookDirs(cwd string) []string {
@@ -83,21 +151,21 @@ func List(cwd string) []string {
 	return out
 }
 
-func runImportedJSON(ctx context.Context, dir string, ev Event) (bool, string) {
+func runImportedJSON(ctx context.Context, dir string, ev Event, phase string, denyOn2 bool) Outcome {
 	raw, err := os.ReadFile(filepath.Join(dir, "imported-from-claude.json"))
 	if err != nil {
-		return false, ""
+		return Outcome{}
 	}
 	var root map[string]any
 	if json.Unmarshal(raw, &root) != nil {
-		return false, ""
+		return Outcome{}
 	}
 	hooks, _ := root["hooks"].(map[string]any)
 	groups, _ := hooks[ev.Hook].([]any)
 	if len(groups) == 0 {
-		// Claude events are PreToolUse; also try case variants.
 		groups, _ = hooks["PreToolUse"].([]any)
 	}
+	var out Outcome
 	for _, g := range groups {
 		gm, _ := g.(map[string]any)
 		if gm == nil {
@@ -117,16 +185,36 @@ func runImportedJSON(ctx context.Context, dir string, ev Event) (bool, string) {
 			if cmd == "" {
 				continue
 			}
-			code, out, err := runCommandHook(ctx, cmd, ev)
+			start := time.Now()
+			code, text, err := runCommandHook(ctx, cmd, ev)
 			if err != nil {
 				continue
 			}
-			if code == 2 {
-				return true, "hook denied: " + out
+			run := Run{Name: strings.TrimSpace(cmd), Phase: phase, Elapsed: time.Since(start), Output: strings.TrimSpace(text)}
+			if len(run.Name) > 40 {
+				run.Name = run.Name[:40]
+			}
+			switch code {
+			case 0:
+				run.Status = StatusSuccess
+			case 2:
+				run.Status = StatusBlocked
+				run.Detail = strings.TrimSpace(text)
+				if denyOn2 {
+					out.Deny = true
+					out.Reason = "hook denied: " + text
+				}
+			default:
+				run.Status = StatusFailed
+				run.Error = strings.TrimSpace(text)
+			}
+			out.Runs = append(out.Runs, run)
+			if out.Deny {
+				return out
 			}
 		}
 	}
-	return false, ""
+	return out
 }
 
 func runCommandHook(ctx context.Context, command string, ev Event) (int, string, error) {

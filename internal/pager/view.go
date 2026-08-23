@@ -35,6 +35,7 @@ type block struct {
 	at     time.Time
 	folded bool
 	event  sessionEvent
+	hooks  toolHookData
 }
 
 func (m *model) transcriptWidth() int {
@@ -251,7 +252,7 @@ func (m *model) renderToolBlock(idx, w int) string {
 		result = bl.body
 	}
 	_ = w
-	return renderToolCard(bl.title, bl.body, result, failed, bl.folded)
+	return renderToolCard(bl.title, bl.body, result, failed, bl.folded, bl.hooks)
 }
 
 func (m *model) mermaidOn() bool {

@@ -1062,6 +1062,14 @@ func (m *model) applyStream(ev agent.Event) tea.Cmd {
 		}
 		m.setTurnActivity("thinking", "")
 		m.appendBlock(block{kind: kind, title: ev.Tool, body: ev.Text, err: ev.IsError, at: time.Now()})
+		if len(ev.Hooks) > 0 {
+			for i := len(m.blocks) - 1; i >= 0; i-- {
+				if m.blocks[i].kind == blockTool {
+					m.blocks[i].hooks = hookDataFrom(ev.Hooks)
+					break
+				}
+			}
+		}
 	case "compact_started":
 		m.setTurnActivity("compacting", "")
 		m.appendSessionEvent(sessionEvent{kind: sessCompactionStarted, percentage: ev.Percent})

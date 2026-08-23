@@ -98,3 +98,25 @@ func TestPreToolUseReadsLegacyOpenGrokDir(t *testing.T) {
 		t.Fatal(".opengrok/hooks remains a compatibility fallback")
 	}
 }
+
+func TestRunPreRecordsSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell hook")
+	}
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".entropy", "hooks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "PreToolUse")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho ok\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	o := hooks.RunPre(context.Background(), cwd, cwd, "bash", `{}`)
+	if o.Deny {
+		t.Fatalf("deny %q", o.Reason)
+	}
+	if len(o.Runs) != 1 || o.Runs[0].Status != hooks.StatusSuccess || o.Runs[0].Name != "PreToolUse" {
+		t.Fatalf("%+v", o.Runs)
+	}
+}

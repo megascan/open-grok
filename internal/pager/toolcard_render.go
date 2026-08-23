@@ -6,34 +6,36 @@ import (
 	"strings"
 )
 
-func renderToolCard(title, argsBody, result string, failed, folded bool) string {
+func renderToolCard(title, argsBody, result string, failed, folded bool, data toolHookData) string {
 	kind := classifyTool(title)
 	args := parseToolArgs(argsBody)
 	header := toolCallHeaderFull(title, argsBody, result, folded)
+	var card string
 	switch kind {
 	case verbEdit:
-		return renderEditCard(title, args, argsBody, result, failed, folded)
+		card = renderEditCard(title, args, argsBody, result, failed, folded)
 	case verbFile:
-		return renderReadCard(header, args, result, failed, folded)
+		card = renderReadCard(header, args, result, failed, folded)
 	case verbSearch:
-		return renderSearchCard(header, result, failed, folded)
+		card = renderSearchCard(header, result, failed, folded)
 	case verbWebSearch:
-		return renderWebSearchCard(title, args, argsBody, result, failed, folded)
+		card = renderWebSearchCard(title, args, argsBody, result, failed, folded)
 	case verbMemory:
-		return renderMemorySearchCard(header, result, failed, folded)
+		card = renderMemorySearchCard(header, result, failed, folded)
 	case verbMCPSearch:
-		return renderSearchToolsCard(header, result, failed, folded)
+		card = renderSearchToolsCard(header, result, failed, folded)
 	case verbMCP:
-		return renderMCPCard(title, args, argsBody, result, failed, folded)
+		card = renderMCPCard(title, args, argsBody, result, failed, folded)
 	case verbDir:
-		return renderListCard(header, result, failed, folded)
+		card = renderListCard(header, result, failed, folded)
 	case verbWebFetch:
-		return renderFetchCard(header, result, failed, folded)
+		card = renderFetchCard(header, result, failed, folded)
 	case verbCommand:
-		return renderRunCard(args, argsBody, result, failed, folded)
+		card = renderRunCard(args, argsBody, result, failed, folded)
 	default:
-		return renderOtherCard(header, args, argsBody, result, failed, folded)
+		card = renderOtherCard(header, args, argsBody, result, failed, folded)
 	}
+	return applyHookChrome(card, data, folded)
 }
 
 func renderEditCard(title string, args map[string]string, body, result string, failed, folded bool) string {

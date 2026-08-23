@@ -32,6 +32,7 @@ type Event struct {
 	TokensBefore uint64
 	TokensAfter  uint64
 	ElapsedMS    int64
+	Hooks        []hooks.Run
 }
 
 // Runtime is the injectable sampler/tool environment for a turn.
@@ -166,7 +167,7 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 			if emit != nil && call.Name != "exec" && call.Name != "wait" {
 				emit(Event{Kind: "tool", Tool: call.Name, ToolID: call.ID, Text: call.Arguments})
 			}
-			result := dispatchTool(ctx, sess, rt, call)
+			result, hookRuns := dispatchTool(ctx, sess, rt, call)
 			sess.Messages = append(sess.Messages, types.Message{
 				Role:       types.RoleTool,
 				Name:       call.Name,
@@ -177,7 +178,7 @@ func RunTurn(ctx context.Context, sess *Session, rt Runtime, userText string, em
 				"type": "tool_result", "name": call.Name, "id": call.ID, "content": result.Content,
 			})
 			if emit != nil && call.Name != "exec" && call.Name != "wait" {
-				emit(Event{Kind: "tool_result", Tool: call.Name, ToolID: call.ID, Text: result.Content, IsError: result.IsError})
+				emit(Event{Kind: "tool_result", Tool: call.Name, ToolID: call.ID, Text: result.Content, IsError: result.IsError, Hooks: hookRuns})
 			}
 		}
 	}
@@ -198,7 +199,8 @@ func ensureRuntime(sess *Session, rt Runtime) {
 		if t == nil {
 			return tools.Result{Content: "unknown nested tool " + name, IsError: true}
 		}
-		return dispatchPrepared(ctx, sess, t, args)
+		res, _ := dispatchPrepared(ctx, sess, t, args)
+		return res
 	}
 	sess.JS = codemode.New(host, tools.NestedPack())
 }
@@ -319,10 +321,10 @@ func bindCollab(sess *Session, rt Runtime) []tools.Tool {
 	return out
 }
 
-func dispatchTool(ctx context.Context, sess *Session, rt Runtime, call types.ToolCall) tools.Result {
+func dispatchTool(ctx context.Context, sess *Session, rt Runtime, call types.ToolCall) (tools.Result, []hooks.Run) {
 	t := tools.Lookup(rt.Pack, call.Name)
 	if t == nil {
-		return tools.Result{Content: "unknown tool: " + call.Name, IsError: true}
+		return tools.Result{Content: "unknown tool: " + call.Name, IsError: true}, nil
 	}
 	args := json.RawMessage(call.Arguments)
 	if !json.Valid(args) {
@@ -331,9 +333,10 @@ func dispatchTool(ctx context.Context, sess *Session, rt Runtime, call types.Too
 	return dispatchPrepared(ctx, sess, t, args)
 }
 
-func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args json.RawMessage) tools.Result {
-	if deny, reason := hooks.PreToolUse(ctx, sess.CWD, sess.Dir, t.Name(), string(args)); deny {
-		return tools.Result{Content: reason, IsError: true}
+func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args json.RawMessage) (tools.Result, []hooks.Run) {
+	pre := hooks.RunPre(ctx, sess.CWD, sess.Dir, t.Name(), string(args))
+	if pre.Deny {
+		return tools.Result{Content: pre.Reason, IsError: true}, pre.Runs
 	}
 	path := toolPath(sess.CWD, args)
 	dec, reason := workspace.Check(workspace.Request{
@@ -351,24 +354,24 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		ExtraRoots:        sess.ExtraDirs,
 	})
 	if dec == workspace.Deny {
-		return tools.Result{Content: "permission denied: " + reason, IsError: true}
+		return tools.Result{Content: "permission denied: " + reason, IsError: true}, pre.Runs
 	}
 	if dec == workspace.Ask {
 		if sess.Approve == nil {
-			return tools.Result{Content: "permission required for " + t.Name() + " (pass --always-approve to auto-approve)", IsError: true}
+			return tools.Result{Content: "permission required for " + t.Name() + " (pass --always-approve to auto-approve)", IsError: true}, pre.Runs
 		}
 		if !sess.Approve(t, args) {
-			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}
+			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}, pre.Runs
 		}
 	}
 	if t.Name() == "enter_plan_mode" {
 		if !sess.YOLO && sess.Approve != nil && !sess.Approve(t, args) {
-			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}
+			return tools.Result{Content: "permission denied: user rejected " + t.Name(), IsError: true}, pre.Runs
 		}
 		sess.Plan.Enter(filepath.Join(sess.Dir, "plan.md"))
 	}
 	if t.Name() == "exit_plan_mode" {
-		return finishPlanMode(sess)
+		return finishPlanMode(sess), pre.Runs
 	}
 	tc := tools.Context{
 		CWD:           sess.CWD,
@@ -381,7 +384,10 @@ func dispatchPrepared(ctx context.Context, sess *Session, t tools.Tool, args jso
 		Goal:          sess.Goal,
 		AskUser:       sess.AskUser,
 	}
-	return t.Execute(ctx, tc, args)
+	res := t.Execute(ctx, tc, args)
+	post := hooks.RunPost(ctx, sess.CWD, sess.Dir, t.Name(), string(args))
+	runs := append(append([]hooks.Run{}, pre.Runs...), post.Runs...)
+	return res, runs
 }
 
 const emptyPlanPlaceholder = `# No plan written yet
