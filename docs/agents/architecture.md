@@ -1,6 +1,6 @@
 # Architecture
 
-The shipping **`open-grok`** binary is the native Go app in `cmd/open-grok`
+The shipping **`entropy`** binary is the native Go app in `cmd/entropy`
 (see [golang.md](golang.md)). This page documents the historical Rust crate
 map, which remains the behavioral reference for providers, ACP, and tools.
 
@@ -17,7 +17,7 @@ over ACP.
 | `crates/common/` | Shared platform (tool protocol/runtime, Computer Hub, compaction engine, tracing) |
 | `crates/build/` | Build helpers (e.g. protobuf via `xai-proto-build`) |
 | `docs/` | Fork contracts, release notes, agent developer docs |
-| `bin/` | `open-grok-dev`, `setup-dev`, Dotslash `protoc` |
+| `bin/` | `entropy-dev`, `open-grok-dev` (wrapper), `setup-dev`, Dotslash `protoc` |
 | `scripts/` | Release packaging (`build-macos-release.sh`, `build-windows-release.ps1`) |
 | `prod/mc/` | Deployment / managed-config types |
 | `third_party/` | Vendored Mermaid layout stack |
@@ -105,30 +105,40 @@ Leaf / common
 
 ### Binary
 
+Shipping Go product:
+
 ```text
-./bin/open-grok-dev  →  cargo run -p xai-grok-pager-bin --bin open-grok
+./bin/entropy-dev  →  go run ./cmd/entropy
 ```
 
-Composition root: `crates/codegen/xai-grok-pager-bin/src/main.rs`  
-CLI surface: `crates/codegen/xai-grok-pager/src/app/cli.rs`
+Historical Rust reference:
+
+```text
+./bin/open-grok-dev  →  ./bin/entropy-dev   (wrapper)
+cargo run -p xai-grok-pager-bin --bin open-grok
+```
+
+Composition root (Go): `cmd/entropy/main.go`
+Composition root (Rust): `crates/codegen/xai-grok-pager-bin/src/main.rs`
+CLI surface (Rust): `crates/codegen/xai-grok-pager/src/app/cli.rs`
 
 Common commands:
 
 | Command | Meaning |
 | --- | --- |
-| `open-grok` | Interactive TUI |
-| `open-grok -p "…"` | Headless single turn |
-| `open-grok agent stdio` | ACP over stdio (IDE) |
-| `open-grok agent leader` | Long-lived multi-client leader |
-| `open-grok agent serve` | WebSocket agent server |
-| `open-grok login [--codex]` | Provider sign-in |
-| `open-grok update` | Install verified GitHub release |
+| `entropy` | Interactive TUI |
+| `entropy -p "…"` | Headless single turn |
+| `entropy agent stdio` | ACP over stdio (IDE) |
+| `entropy agent leader` | Long-lived multi-client leader |
+| `entropy agent serve` | WebSocket agent server |
+| `entropy login [--codex]` | Provider sign-in |
+| `entropy update` | Install verified GitHub release |
 
 ### Request flow (interactive)
 
 ```text
-open-grok
-  → pager event_loop (app/event_loop.rs)
+entropy
+  → Go pager (internal/pager) or Rust pager event_loop (app/event_loop.rs)
   → AppView / AgentView  (Action → dispatch → Effect)
   → ACP client (pager/src/acp/)
   → shell SessionActor (session/acp_session_impl/)
@@ -158,12 +168,12 @@ open-grok
 
 | Area | Care |
 | --- | --- |
-| Home | `OPENGROK_HOME` / `~/.opengrok` only |
-| Binary name | `open-grok` |
+| Home | `$ENTROPY_HOME` / `~/.entropy` (Go); `$OPENGROK_HOME` / `~/.opengrok` remains a compatibility alias. Never `~/.grok`. |
+| Binary name | `entropy` (Go); Rust reference remains `open-grok` |
 | Codex OAuth + catalog | Separate files from xAI |
 | Code Mode | Ported contract; see `docs/code-mode-port.md` |
-| Auto-update | GitHub Open Grok releases + SHA-256 |
-| Branding | User-facing “Open Grok”; crates still `xai-grok-*` |
+| Auto-update | GitHub releases + SHA-256 (`entropy-*` assets, `open-grok-*` fallback) |
+| Branding | User-facing “Entropy”; crates still `xai-grok-*`; module `github.com/megascan/open-grok` |
 
 ## See also
 

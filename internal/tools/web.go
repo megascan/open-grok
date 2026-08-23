@@ -42,7 +42,7 @@ func (w WebSearch) Execute(ctx context.Context, _ Context, args json.RawMessage)
 	if err != nil {
 		return errResult(err.Error())
 	}
-	req.Header.Set("User-Agent", "open-grok")
+	req.Header.Set("User-Agent", "entropy")
 	client := w.HTTP
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
@@ -83,7 +83,7 @@ func (w WebFetch) Execute(ctx context.Context, _ Context, args json.RawMessage) 
 	if err != nil {
 		return errResult(err.Error())
 	}
-	req.Header.Set("User-Agent", "open-grok")
+	req.Header.Set("User-Agent", "entropy")
 	client := w.HTTP
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}

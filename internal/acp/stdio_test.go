@@ -12,7 +12,7 @@ import (
 )
 
 func TestStdioInitializeAndSessionNew(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n" +
 		`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"."}}` + "\n")
@@ -43,7 +43,7 @@ func TestStdioInitializeAndSessionNew(t *testing.T) {
 }
 
 func TestStdioUnknownMethodIsJSONRPCError(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	in := strings.NewReader(`{"jsonrpc":"2.0","id":9,"method":"session/explode","params":{}}` + "\n")
 	var out bytes.Buffer

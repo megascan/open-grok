@@ -12,7 +12,7 @@ import (
 )
 
 func TestCodexOAuthStoreIsRustShaped(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	_ = os.Unsetenv("OPENAI_API_KEY")
 	_ = os.Unsetenv("CODEX_API_KEY")

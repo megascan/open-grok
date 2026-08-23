@@ -71,7 +71,7 @@ func listWorkspaceFiles(root, query string, hidden bool) []listItem {
 	var hits []listItem
 	skip := map[string]bool{
 		".git": true, "node_modules": true, "target": true, "dist": true,
-		"vendor": true, ".opengrok": true,
+		"vendor": true, ".entropy": true, ".opengrok": true,
 	}
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || len(hits) >= 80 {

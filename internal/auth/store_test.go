@@ -10,7 +10,7 @@ import (
 )
 
 func TestProviderKeysStayIsolated(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	for _, e := range []string{"FIREWORKS_API_KEY", "XAI_API_KEY", "OPENAI_API_KEY"} {
 		t.Setenv(e, "")
@@ -55,7 +55,7 @@ func TestProviderKeysStayIsolated(t *testing.T) {
 }
 
 func TestKimiPlatformAndCodeScopesAreDistinct(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	if err := auth.SaveAPIKey(types.ProviderKimi, "platform", false); err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestKimiPlatformAndCodeScopesAreDistinct(t *testing.T) {
 }
 
 func TestEnvKeyWinsOverStore(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	if err := auth.SaveAPIKey(types.ProviderGemini, "stored", false); err != nil {
 		t.Fatal(err)

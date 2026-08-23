@@ -10,7 +10,7 @@ import (
 )
 
 func TestVersionAndInspectAndModels(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 
 	root := cli.NewRoot()
@@ -55,6 +55,9 @@ func TestVersionAndInspectAndModels(t *testing.T) {
 
 func TestDashboardCommandRegistered(t *testing.T) {
 	root := cli.NewRoot()
+	if root.Name() != "entropy" {
+		t.Fatalf("root command must be entropy, got %q", root.Name())
+	}
 	found := false
 	for _, c := range root.Commands() {
 		if c.Name() == "dashboard" {
@@ -63,7 +66,7 @@ func TestDashboardCommandRegistered(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("open-grok dashboard must exist")
+		t.Fatal("entropy dashboard must exist")
 	}
 }
 

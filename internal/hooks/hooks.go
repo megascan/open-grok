@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/megascan/open-grok/internal/config"
 )
 
 // Event is the JSON payload posted to a hook script on stdin.
@@ -42,9 +44,13 @@ func PreToolUse(ctx context.Context, cwd, sessionDir, tool, args string) (deny b
 }
 
 func hookDirs(cwd string) []string {
-	dirs := []string{filepath.Join(cwd, ".opengrok", "hooks")}
-	if home := os.Getenv("OPENGROK_HOME"); home != "" {
+	dirs := config.ProjectSubdir(cwd, "hooks")
+	if home := config.FirstEnv(config.HomeEnv(), "OPENGROK_HOME"); home != "" {
 		dirs = append(dirs, filepath.Join(home, "hooks"))
+		return dirs
+	}
+	if user, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(user, ".entropy", "hooks"), filepath.Join(user, ".opengrok", "hooks"))
 	}
 	return dirs
 }

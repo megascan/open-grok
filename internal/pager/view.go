@@ -83,7 +83,7 @@ func (m *model) renderBlock(bl block, w int) string {
 	case blockUser:
 		return userLabel.Render("YOU") + stamp + "\n" + renderMarkdown(bl.body, w)
 	case blockAgent:
-		return agentLabel.Render("OPEN GROK") + stamp + "\n" + renderMarkdown(bl.body, w)
+		return agentLabel.Render("ENTROPY") + stamp + "\n" + renderMarkdown(bl.body, w)
 	case blockThinking:
 		return dimStyle.Render("thinking") + "\n" + dimStyle.Render(bl.body)
 	case blockTool:
@@ -117,7 +117,7 @@ func (m *model) renderBlock(bl block, w int) string {
 }
 
 func (m *model) renderHeader() string {
-	left := titleStyle.Render(" Open Grok ") + dimStyle.Render(" "+version.String())
+	left := titleStyle.Render(" Entropy ") + dimStyle.Render(" "+version.String())
 	mid := fmt.Sprintf(" %s  ·  %s", m.opts.Model.Name, m.opts.Model.Provider.DisplayName())
 	status := m.status
 	if m.busy {

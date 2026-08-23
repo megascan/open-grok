@@ -38,13 +38,13 @@ func TestVersionModule(t *testing.T) {
 	if version.String() == "" {
 		t.Fatal("version.String")
 	}
-	if !strings.Contains(version.Display(), "open-grok") {
+	if !strings.Contains(version.Display(), "entropy") {
 		t.Fatalf("version.Display %q", version.Display())
 	}
 }
 
 func TestConfigModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	home := config.Home()
 	if config.NeverGrokHome(home) {
@@ -116,7 +116,7 @@ func TestCatalogModule(t *testing.T) {
 }
 
 func TestAuthModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	if err := auth.SaveAPIKey(types.ProviderOpenRouter, "sk-test-inventory", false); err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestGoalsModule(t *testing.T) {
 }
 
 func TestToolsModulePacksAndExecute(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	dir := t.TempDir()
 	tc := tools.Context{CWD: dir, SessionDir: filepath.Join(dir, "s")}
@@ -340,7 +340,7 @@ func TestCodeModeModule(t *testing.T) {
 }
 
 func TestAgentModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	model := catalog.Model{
 		ID: "mock", Model: "mock", Name: "mock",
@@ -393,20 +393,20 @@ func TestAgentModule(t *testing.T) {
 }
 
 func TestACPModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")
 	var out bytes.Buffer
 	if err := acp.ServeStdio(context.Background(), acp.Options{CWD: t.TempDir(), In: in, Out: &out}); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(out.Bytes(), []byte("open-grok")) {
+	if !bytes.Contains(out.Bytes(), []byte("entropy")) {
 		t.Fatalf("%s", out.String())
 	}
 }
 
 func TestMCPModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	if mcp.LoadServers() == nil {
 		// empty config is a valid empty slice or nil
@@ -418,7 +418,7 @@ func TestMCPModule(t *testing.T) {
 }
 
 func TestSessionBusModule(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	t.Cleanup(sessionbus.Stop)
 	h, err := sessionbus.Start(func(d sessionbus.Delivered) string { return "Accepted" })
@@ -446,7 +446,7 @@ func TestUpdateModule(t *testing.T) {
 }
 
 func TestCLICommandTree(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	root := cli.NewRoot()
 	want := []string{
@@ -491,7 +491,7 @@ func TestCLICommandTree(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("OPENGROK_HOME")) && !bytes.Contains([]byte(buf.String()+""), []byte("open-grok")) {
+	if !bytes.Contains(buf.Bytes(), []byte("ENTROPY_HOME")) && !bytes.Contains([]byte(buf.String()+""), []byte("entropy")) {
 		// doctor prints to stdout via fmt; still must not error
 	}
 }

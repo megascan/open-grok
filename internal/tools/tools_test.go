@@ -50,12 +50,12 @@ func TestGrepFindsLine(t *testing.T) {
 
 func TestBashEcho(t *testing.T) {
 	dir := t.TempDir()
-	args, _ := json.Marshal(map[string]string{"command": "echo open-grok"})
+	args, _ := json.Marshal(map[string]string{"command": "echo entropy"})
 	res := tools.Bash{}.Execute(context.Background(), tools.Context{CWD: dir}, args)
 	if res.IsError {
 		t.Fatal(res.Content)
 	}
-	if got := res.Content; got != "open-grok\n" && got != "open-grok\r\n" && got != "open-grok" {
+	if got := res.Content; got != "entropy\n" && got != "entropy\r\n" {
 		t.Fatalf("bash output %q", got)
 	}
 }

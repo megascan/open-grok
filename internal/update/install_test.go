@@ -16,9 +16,9 @@ import (
 )
 
 func TestInstallVerifiesChecksum(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
-	payload := []byte("open-grok-go-binary")
+	payload := []byte("entropy-go-binary")
 	sum := sha256.Sum256(payload)
 	digest := hex.EncodeToString(sum[:])
 	var assetURL string
@@ -27,14 +27,14 @@ func TestInstallVerifiesChecksum(t *testing.T) {
 		_, _ = w.Write(payload)
 	})
 	mux.HandleFunc("/bin.sha256", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(digest + "  open-grok\n"))
+		_, _ = w.Write([]byte(digest + "  entropy\n"))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	assetURL = srv.URL + "/bin"
 	path, err := update.Install(update.Result{
 		Current:  "test",
-		Asset:    "open-grok",
+		Asset:    "entropy",
 		AssetURL: assetURL,
 		GoOS:     runtime.GOOS,
 		GoArch:   runtime.GOARCH,
@@ -50,6 +50,15 @@ func TestInstallVerifiesChecksum(t *testing.T) {
 		t.Fatalf("installed %q", got)
 	}
 	if !strings.HasPrefix(path, filepath.Join(config.Home(), "bin")) {
-		t.Fatalf("must install under OPENGROK_HOME/bin, got %s", path)
+		t.Fatalf("must install under ENTROPY_HOME/bin, got %s", path)
+	}
+}
+
+func TestAssetNameIsEntropy(t *testing.T) {
+	if got := update.AssetName("linux", "amd64"); got != "entropy-linux-x86_64" {
+		t.Fatalf("linux amd64 asset %q", got)
+	}
+	if got := update.AssetName("windows", "arm64"); got != "entropy-windows-aarch64.exe" {
+		t.Fatalf("windows arm64 asset %q", got)
 	}
 }

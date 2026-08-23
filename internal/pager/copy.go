@@ -49,7 +49,7 @@ func (m *model) copyNthAgent(n int) {
 
 func (m *model) copyText(s string) {
 	backup := filepath.Join(config.Home(), "last-copy.txt")
-	if v := os.Getenv("GROK_COPY_FILE"); v != "" {
+	if v := config.FirstEnv("ENTROPY_COPY_FILE", "GROK_COPY_FILE"); v != "" {
 		backup = v
 	}
 	_ = os.WriteFile(backup, []byte(s), 0o600)

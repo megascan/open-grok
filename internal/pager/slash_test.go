@@ -99,7 +99,7 @@ func TestFuzzyPaletteRanksPrefixFirst(t *testing.T) {
 }
 
 func TestWelcomeListsSessionsAndLogin(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	m, err := newModel(Options{CWD: t.TempDir(), Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}})
 	if err != nil {
@@ -121,7 +121,7 @@ func TestWelcomeListsSessionsAndLogin(t *testing.T) {
 
 func TestLoginSavesKeyUnderOpenGrokHome(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("OPENGROK_HOME", home)
+	t.Setenv("ENTROPY_HOME", home)
 	config.ResetHomeForTest()
 	m, err := newModel(Options{CWD: t.TempDir(), Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}})
 	if err != nil {
@@ -160,7 +160,7 @@ func TestThemeResolverKnowsRustNames(t *testing.T) {
 }
 
 func TestPermissionReplyAlwaysAllow(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	m, err := newModel(Options{CWD: t.TempDir(), Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}, Resume: ""})
 	if err != nil {

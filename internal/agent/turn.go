@@ -491,7 +491,7 @@ func (s *Session) ExportMarkdown() string {
 			b.WriteString(m.Content)
 			b.WriteString("\n\n")
 		case types.RoleAssistant:
-			b.WriteString("## Open Grok\n\n")
+			b.WriteString("## Entropy\n\n")
 			b.WriteString(m.Content)
 			b.WriteString("\n\n")
 		}

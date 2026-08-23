@@ -8,7 +8,7 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 )
 
-// File is the user-level Open Grok configuration (~/.opengrok/config.toml).
+// File is the user-level Entropy configuration (~/.entropy/config.toml).
 type File struct {
 	Model      string         `toml:"model"`
 	YOLO       bool           `toml:"always_approve"`
@@ -134,7 +134,7 @@ func Load() (File, error) {
 
 // DashboardEnabled reports whether the agent dashboard is on (default true).
 func (f File) DashboardEnabled() bool {
-	if os.Getenv("GROK_AGENT_DASHBOARD") == "0" {
+	if EnvIsOff("ENTROPY_AGENT_DASHBOARD", "GROK_AGENT_DASHBOARD") {
 		return false
 	}
 	if f.Dashboard.Enabled == nil {
@@ -167,9 +167,9 @@ func (f File) ShowThinkingOn() bool {
 	return *f.UI.ShowThinking
 }
 
-// MemoryEnabled is on when configured or GROK_MEMORY=1.
+// MemoryEnabled is on when configured or ENTROPY_MEMORY=1 (GROK_MEMORY is an alias).
 func (f File) MemoryEnabled() bool {
-	if os.Getenv("GROK_MEMORY") == "1" || os.Getenv("GROK_MEMORY") == "true" {
+	if EnvIsOn("ENTROPY_MEMORY", "GROK_MEMORY") {
 		return true
 	}
 	return f.Features.Memory

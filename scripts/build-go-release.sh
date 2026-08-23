@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile the native Go open-grok binary for every published platform.
+# Cross-compile the native Go entropy binary for every published platform.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,12 +30,12 @@ for spec in "${targets[@]}"; do
     amd64) arch=x86_64 ;;
     arm64) arch=aarch64 ;;
   esac
-  name="open-grok-${goos}-${arch}"
+  name="entropy-${goos}-${arch}"
   if [[ "$goos" == windows ]]; then
     name="${name}.exe"
   fi
   echo "→ $name"
-  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/open-grok
+  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" -o "dist/${name}" ./cmd/entropy
   (
     cd dist
     if command -v sha256sum >/dev/null 2>&1; then

@@ -57,7 +57,7 @@ type Session struct {
 	AskPlan        func(plan string) string                       `json:"-"`
 }
 
-// NewSession creates a session directory under ~/.opengrok/sessions/<cwd>/<id>.
+// NewSession creates a session directory under ~/.entropy/sessions/<cwd>/<id>.
 func NewSession(cwd string, model catalog.Model, yolo bool) (*Session, error) {
 	id := uuid.NewString()
 	root, err := config.EnsureSessionsCWDDirIn(config.Home(), cwd)

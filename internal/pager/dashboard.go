@@ -44,7 +44,7 @@ func savePins(p map[string]bool) {
 
 func (m *model) openDashboard() {
 	if !m.cfg.DashboardEnabled() {
-		m.appendSys("dashboard disabled (GROK_AGENT_DASHBOARD=0 or [dashboard].enabled=false)")
+		m.appendSys("dashboard disabled (ENTROPY_AGENT_DASHBOARD=0 or [dashboard].enabled=false)")
 		return
 	}
 	if m.screenMd == modeMinimal {
@@ -166,7 +166,7 @@ func (m *model) fillDashPeek() {
 		}
 		label := "YOU"
 		if msg.Role == types.RoleAssistant {
-			label = "OPEN GROK"
+			label = "ENTROPY"
 		}
 		m.items = append([]listItem{{Label: label, Detail: truncate(msg.Content, 120)}}, m.items...)
 		n++
@@ -185,7 +185,7 @@ func (m *model) viewDashboard() string {
 		}
 	}
 	b.WriteString(headerBar.Width(max(20, m.width)).Render(
-		fmt.Sprintf(" Open Grok · Dashboard — %d agents  %s", agents, version.String()),
+		fmt.Sprintf(" Entropy · Dashboard — %d agents  %s", agents, version.String()),
 	) + "\n")
 	if m.dashSearch {
 		b.WriteString(claimStyle.Render(" Search: "+m.dashFilter+"█") + "\n")

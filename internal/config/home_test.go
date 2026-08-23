@@ -10,22 +10,25 @@ import (
 	"github.com/megascan/open-grok/internal/config"
 )
 
-func TestDefaultHomeIsOpengrokNotGrok(t *testing.T) {
+func TestDefaultHomeIsEntropyNotGrok(t *testing.T) {
 	home := config.DefaultHome()
-	if !strings.HasSuffix(home, ".opengrok") {
-		t.Fatalf("default home %q must end with .opengrok", home)
+	if !strings.HasSuffix(home, ".entropy") {
+		t.Fatalf("default home %q must end with .entropy", home)
 	}
 	if config.NeverGrokHome(home) {
 		t.Fatal("default home must not be ~/.grok")
 	}
-	if strings.Contains(home, string(filepath.Separator)+".grok") && !strings.Contains(home, ".opengrok") {
+	if strings.Contains(home, string(filepath.Separator)+".grok"+string(filepath.Separator)) {
 		t.Fatal("must never fall back to ~/.grok")
+	}
+	if strings.HasSuffix(home, ".opengrok") {
+		t.Fatal("Entropy must not use ~/.opengrok as the default home")
 	}
 }
 
-func TestHomeHonorsOPENGROK_HOME(t *testing.T) {
+func TestHomeHonorsENTROPY_HOME(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("OPENGROK_HOME", dir)
+	t.Setenv("ENTROPY_HOME", dir)
 	config.ResetHomeForTest()
 	got := config.Home()
 	if got != dir && !strings.HasPrefix(got, dir) {
@@ -49,11 +52,11 @@ func TestApplicationNameIsPlatformNative(t *testing.T) {
 	dir := t.TempDir()
 	app := config.ApplicationIn(dir)
 	if runtime.GOOS == "windows" {
-		if filepath.Base(app) != "open-grok.exe" {
-			t.Fatalf("windows binary must be open-grok.exe, got %s", app)
+		if filepath.Base(app) != "entropy.exe" {
+			t.Fatalf("windows binary must be entropy.exe, got %s", app)
 		}
-	} else if filepath.Base(app) != "open-grok" {
-		t.Fatalf("unix binary must be open-grok, got %s", app)
+	} else if filepath.Base(app) != "entropy" {
+		t.Fatalf("unix binary must be entropy, got %s", app)
 	}
 }
 
@@ -98,7 +101,21 @@ func TestNeverGrokHome(t *testing.T) {
 	if !config.NeverGrokHome("/Users/me/.grok") {
 		t.Fatal("expected ~/.grok to be flagged")
 	}
+	if config.NeverGrokHome("/Users/me/.entropy") {
+		t.Fatal(".entropy is the allowed home")
+	}
 	if config.NeverGrokHome("/Users/me/.opengrok") {
-		t.Fatal(".opengrok is the allowed home")
+		t.Fatal(".opengrok is a foreign product home, not ~/.grok")
+	}
+}
+
+func TestHomeFallsBackToOPENGROK_HOME(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ENTROPY_HOME", "")
+	t.Setenv("OPENGROK_HOME", dir)
+	config.ResetHomeForTest()
+	got := config.Home()
+	if got != dir && !strings.HasPrefix(got, dir) {
+		t.Fatalf("Home() = %q, want OPENGROK_HOME fallback %q", got, dir)
 	}
 }

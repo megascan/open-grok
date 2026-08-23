@@ -58,7 +58,7 @@ func TestListWorkspaceFilesFindsGoFiles(t *testing.T) {
 }
 
 func TestDashboardOpensAsScreen(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	m, err := newModel(Options{
 		CWD: t.TempDir(), Dashboard: true,
@@ -73,7 +73,7 @@ func TestDashboardOpensAsScreen(t *testing.T) {
 }
 
 func TestSettingsListsCodeModeAndRecap(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	m, err := newModel(Options{CWD: t.TempDir(), Model: catalog.Model{ID: "m", Name: "m", Provider: types.ProviderOpenRouter}})
 	if err != nil {

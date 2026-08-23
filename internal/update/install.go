@@ -15,7 +15,7 @@ import (
 )
 
 // Install downloads the matching GitHub release asset into
-// $OPENGROK_HOME/bin/open-grok after verifying SHA-256 when a sidecar exists.
+// $ENTROPY_HOME/bin/entropy after verifying SHA-256 when a sidecar exists.
 // It never writes to ~/.grok.
 func Install(res Result) (string, error) {
 	if res.AssetURL == "" {
@@ -25,7 +25,7 @@ func Install(res Result) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dest), "open-grok-download-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "entropy-download-*")
 	if err != nil {
 		return "", err
 	}
@@ -37,7 +37,7 @@ func Install(res Result) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "open-grok/"+res.Current)
+	req.Header.Set("User-Agent", "entropy/"+res.Current)
 	resp, err := client.Do(req)
 	if err != nil {
 		_ = tmp.Close()

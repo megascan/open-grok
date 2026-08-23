@@ -10,12 +10,12 @@ import (
 	"github.com/megascan/open-grok/internal/types"
 )
 
-// MemorySearch reads cross-session notes from ~/.opengrok/memory.
+// MemorySearch reads cross-session notes from ~/.entropy/memory.
 type MemorySearch struct{}
 
 func (MemorySearch) Name() string { return "memory_search" }
 func (MemorySearch) Description() string {
-	return "Search persisted Open Grok memory notes under ~/.opengrok/memory."
+	return "Search persisted Entropy memory notes under ~/.entropy/memory."
 }
 func (MemorySearch) Access() types.AccessKind { return types.AccessRead }
 func (MemorySearch) Parameters() map[string]any {
@@ -52,12 +52,12 @@ func (MemorySearch) Execute(_ context.Context, _ Context, args json.RawMessage) 
 	return okResult(capOutput(string(hits), 80_000))
 }
 
-// MemorySave appends a note to ~/.opengrok/memory.
+// MemorySave appends a note to ~/.entropy/memory.
 type MemorySave struct{}
 
 func (MemorySave) Name() string { return "memory_save" }
 func (MemorySave) Description() string {
-	return "Save a short note to ~/.opengrok/memory for later sessions."
+	return "Save a short note to ~/.entropy/memory for later sessions."
 }
 func (MemorySave) Access() types.AccessKind { return types.AccessNone }
 func (MemorySave) Parameters() map[string]any {

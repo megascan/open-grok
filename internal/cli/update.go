@@ -16,7 +16,7 @@ func newUpdateCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "update",
-		Short: "Check for or install verified Open Grok GitHub releases",
+		Short: "Check for or install verified Entropy GitHub releases",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			res, err := update.Check()
 			if err != nil {

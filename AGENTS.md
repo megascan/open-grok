@@ -2,8 +2,9 @@
 
 Instructions for AI coding agents (and humans) working in this repository.
 
-**Product:** Open Grok (`open-grok`) — community fork of [Grok Build](https://github.com/xai-org/grok-build) with ChatGPT Codex, multi-provider support, and Code Mode.  
-**Version file:** [`OPEN_GROK_VERSION`](OPEN_GROK_VERSION)  
+**Product:** Entropy (`entropy`) — native Go coding agent from the Open Grok community fork of [Grok Build](https://github.com/xai-org/grok-build), with ChatGPT Codex, multi-provider support, and Code Mode.
+**Go module:** `github.com/megascan/open-grok` (do not change the import path)
+**Version file:** [`OPEN_GROK_VERSION`](OPEN_GROK_VERSION)
 **Deeper docs:** [`docs/agents/`](docs/agents/) · fork contracts: [`docs/`](docs/) · repo skills: [`.agents/skills/`](.agents/skills/) · end-user guide: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
 
 ---
@@ -12,10 +13,10 @@ Instructions for AI coding agents (and humans) working in this repository.
 
 | Concept | Value |
 | --- | --- |
-| Public binary | `open-grok` (not `grok`) |
-| User state | `$OPENGROK_HOME` or `~/.opengrok` — **never** `~/.grok` |
-| Project config | `.opengrok/` in the repo |
-| Language | **Go 1.22** (`cmd/open-grok`, `internal/`) is the native product. Rust crates under `crates/` are the historical reference. |
+| Public binary | `entropy` (not `grok`; Rust reference binary remains `open-grok`) |
+| User state | `$ENTROPY_HOME` or `~/.entropy` — **never** `~/.grok`. `$OPENGROK_HOME` is an alias. |
+| Project config | `.entropy/` (`.opengrok/` is still scanned as a compatibility fallback) |
+| Language | **Go 1.22** (`cmd/entropy`, `internal/`) is the native product. Rust crates under `crates/` are the historical reference. |
 | Go module | `github.com/megascan/open-grok` — edit per-package files under `internal/` |
 | Root `Cargo.toml` | **Generated / read-only** (Rust reference only) — edit per-crate `Cargo.toml` only |
 
@@ -60,7 +61,7 @@ Full crate map: [`docs/agents/architecture.md`](docs/agents/architecture.md).
 
 ## 3. Non-negotiable rules
 
-1. **Do not fall back to `~/.grok`.** Open Grok state is `$OPENGROK_HOME` / `~/.opengrok` / project `.opengrok/`.
+1. **Do not fall back to `~/.grok`.** Entropy state is `$ENTROPY_HOME` / `~/.entropy` / project `.entropy/`. `$OPENGROK_HOME` and `.opengrok/` remain compatibility aliases.
 2. **Do not edit root `Cargo.toml`.** Change the relevant crate manifest.
 3. **Keep providers isolated.** xAI, Codex, Kimi Platform, Kimi Code, Fireworks AI, DeepSeek direct, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, and OpenRouter credentials, catalogs, caches, hosted tools, and opaque history must not cross. See [`docs/provider-architecture.md`](docs/provider-architecture.md).
 4. **Provider identity comes from model metadata**, never from a model slug or URL alone.
@@ -188,7 +189,7 @@ After any non-xAI profile that denies xAI services, the session export boundary 
 - When adding a tool: implement `xai_tool_runtime::Tool`, register in the correct pack, emit proper ACP tool meta, respect output caps.
 - When changing permissions: update rule docs + unit tests under `xai-grok-workspace/src/permission/`.
 - When changing plan mode: update `plan_mode.rs` **and** `plan_mode_edit_gate` tests.
-- Brand user-facing strings as **Open Grok**; crate names remain `xai-grok-*` (upstream heritage).
+- Brand user-facing Go strings as **Entropy**; crate names remain `xai-grok-*` (upstream heritage).
 - For live provider/settings mutations, preserve FIFO dispatch order, hold sends fail-closed while state is unresolved, and cover send-now, queued, interject, and subagent paths.
 - For auxiliary work (recap, memory, title generation, embeddings), treat the selected provider/model as an explicit route with its own credentials and export policy; do not inherit the active chat provider accidentally.
 
@@ -204,12 +205,12 @@ cargo clippy --locked -p <crate> --all-targets
 cargo test --locked -p <crate> -- <filter>
 
 # Dev binary without installing over a release
-./bin/open-grok-dev --version
+./bin/entropy-dev --version
 ```
 
 See [`docs/agents/development.md`](docs/agents/development.md) for full build/test/release commands.
 
-Interpret failures before broadening the patch: the Rust workspace has long compile/link phases and some suites share global state. Re-run a failing test alone to distinguish a deterministic regression from suite interference, but do not hide repeatable failures. Run `bash -n` on changed shell scripts. Use an isolated `OPENGROK_HOME` for tests and installer smokes.
+Interpret failures before broadening the patch: the Rust workspace has long compile/link phases and some suites share global state. Re-run a failing test alone to distinguish a deterministic regression from suite interference, but do not hide repeatable failures. Run `bash -n` on changed shell scripts. Use an isolated `ENTROPY_HOME` for tests and installer smokes.
 
 Routine editor and agent validation must default to package-scoped `cargo check`, not `cargo build`, `cargo test`, or workspace-wide checks. Cargo is configured to use its machine-aware logical-CPU default; do not add a fixed `-j` cap unless diagnosing resource contention. Run explicit builds/tests only when their linked artifacts or behavior are needed.
 
@@ -239,14 +240,14 @@ Routine editor and agent validation must default to package-scoped `cargo check`
 
 ```sh
 ./bin/setup-dev
-./bin/open-grok-dev                 # TUI from source
-cargo build --locked -p xai-grok-pager-bin --bin open-grok
+./bin/entropy-dev                 # TUI from source (Go)
+cargo build --locked -p xai-grok-pager-bin --bin open-grok   # Rust reference
 
 # Headless one-shot
-./bin/open-grok-dev -p "say hi"
+./bin/entropy-dev -p "say hi"
 
 # Agent / ACP
-./bin/open-grok-dev agent stdio
+./bin/entropy-dev agent stdio
 ```
 
 Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`. The builder requires the pinned arm64 `ripgrep 15.0.0` through `GROK_TOOLS_BUNDLE_RG_PATH`; do not substitute a newer Homebrew binary. Use [`release-open-grok`](.agents/skills/release-open-grok/SKILL.md) for the publication and installer-verification sequence.
@@ -316,7 +317,7 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 | Nested subagents (depth > 1) | Unsupported; task tool stripped at max depth |
 | Replaying Codex compaction items to xAI | Opaque history / export boundary violation |
 | Editing root workspace `Cargo.toml` only | Lost / inconsistent workspace generation |
-| Tests without isolated `OPENGROK_HOME` | Pollutes real user state |
+| Tests without isolated `ENTROPY_HOME` | Pollutes real user state under `~/.entropy` |
 
 ---
 
@@ -341,8 +342,8 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 Durable, non-obvious notes for agents in the Cloud VM (the update script installs `protobuf-compiler` and runs `cargo fetch --locked`). Standard build/test/run commands live in §5–§6 and the [`develop-open-grok`](.agents/skills/develop-open-grok/SKILL.md) skill — use those; only the caveats below are cloud-specific.
 
 - **`protoc` is a hard build dependency.** `xai-grok-tools-api`'s `build.rs` compiles protos, and `xai-proto-build::find_protoc` resolves `protoc` from `$PROTOC` → `bin/protoc` (dotslash) → `PATH`. The update script installs the system `protoc` (`apt install protobuf-compiler`), which satisfies the `PATH` fallback and is all the build needs. If a build fails with a protoc/prost error, `sudo apt-get install -y protobuf-compiler` — it is not a code issue.
-- **`dotslash` is NOT installed here.** `./bin/protoc` and `./bin/setup-dev` require `dotslash` and will fail; the system `protoc` covers the build, so build/test directly with cargo (e.g. `cargo build --locked -p xai-grok-pager-bin --bin open-grok`). `./bin/open-grok-dev` works because it only shells out to `cargo run`.
+- **`dotslash` is NOT installed here.** `./bin/protoc` and `./bin/setup-dev` require `dotslash` and will fail; the system `protoc` covers the build, so build/test directly with cargo (e.g. `cargo build --locked -p xai-grok-pager-bin --bin open-grok`). `./bin/entropy-dev` shells out to `go run ./cmd/entropy`.
 - **First compile is long, not hung.** A cold `cargo check -p xai-grok-pager-bin` is ~3–4 min and a cold `cargo build --bin open-grok` is ~5 min on this VM. Prefer package-scoped `-p <crate>` checks; inspect process activity before assuming a hang.
-- **Running the app end-to-end needs provider auth.** `target/debug/open-grok` / `./bin/open-grok-dev` launch the TUI (account chooser: ChatGPT Codex / xAI Grok). A real agent turn requires credentials — set `XAI_API_KEY` or run `open-grok login`. Without creds, only CLI smokes work: `--version`, `models`, `completions <shell>`, and `inspect` (config/skills discovery). A headless turn is `./bin/open-grok-dev -p "say hi"`.
+- **Running the app end-to-end needs provider auth.** `./bin/entropy-dev` launches the TUI. A real agent turn requires credentials — set `XAI_API_KEY` or run `entropy login`. Without creds, only CLI smokes work: `--version`, `models`, `completions <shell>`, and `inspect`. A headless turn is `./bin/entropy-dev -p "say hi"`.
 - **Hermetic end-to-end without creds:** the PTY e2e suites (`crates/codegen/xai-grok-pager/tests/pty_e2e*`) drive the full pager → shell → mock-inference → render loop against a built-in mock server. They are `#[ignore]` by default, so opt in, e.g. `cargo test --locked -p xai-grok-pager --test pty_e2e_smoke agent_response -- --ignored`. Compiling the pager test crate is heavy (several minutes).
-- **Always use an isolated `OPENGROK_HOME`** (e.g. `export OPENGROK_HOME=/tmp/opengrok-test`) for runtime/tests so real user state under `~/.opengrok` is never touched.
+- **Always use an isolated `ENTROPY_HOME`** (e.g. `export ENTROPY_HOME=/tmp/entropy-test`) for Go runtime/tests so real user state under `~/.entropy` is never touched. Rust reference tests still use `OPENGROK_HOME`.

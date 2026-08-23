@@ -1,4 +1,4 @@
-// Package auth stores provider-isolated credentials under ~/.opengrok.
+// Package auth stores provider-isolated credentials under ~/.entropy.
 //
 // xAI and API-key providers share auth.json with distinct scopes. Codex lives
 // in the separate codex-auth.json file. Credentials never cross providers.
@@ -183,7 +183,7 @@ func ResolveBearer(p types.Provider, envKeys []string, kimiCode bool) (string, s
 	if c, ok := Lookup(p, kimiCode); ok {
 		return c.Key, "store:" + ScopeFor(p, kimiCode), nil
 	}
-	return "", "", fmt.Errorf("not signed in to %s (try `open-grok login %s`)", p.DisplayName(), p.CLIName())
+	return "", "", fmt.Errorf("not signed in to %s (try `entropy login %s`)", p.DisplayName(), p.CLIName())
 }
 
 // Logout removes credentials for one provider, both, or all API-key scopes.

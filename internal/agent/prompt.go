@@ -1,4 +1,4 @@
-// Package agent runs the Open Grok turn loop: sample → plan gate → permissions → tools.
+// Package agent runs the Entropy turn loop: sample → plan gate → permissions → tools.
 package agent
 
 import (
@@ -16,8 +16,8 @@ import (
 // SystemPrompt builds the model-facing instructions for a Direct-tool session.
 func SystemPrompt(model catalog.Model, cwd string, extra string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "You are Open Grok, a native Go coding agent (version %s) running on %s/%s.\n", version.String(), runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&b, "You are not affiliated with xAI or OpenAI. User state lives only under $OPENGROK_HOME or ~/.opengrok — never ~/.grok.\n")
+	fmt.Fprintf(&b, "You are Entropy, a native Go coding agent (version %s) running on %s/%s.\n", version.String(), runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(&b, "You are not affiliated with xAI or OpenAI. User state lives only under $ENTROPY_HOME or ~/.entropy — never ~/.grok.\n")
 	fmt.Fprintf(&b, "Model: %s (%s) via provider %s (%s).\n", model.Name, model.Model, model.Provider.DisplayName(), model.Provider)
 	fmt.Fprintf(&b, "Workspace: %s\n", cwd)
 	fmt.Fprintf(&b, "Today: %s\n\n", time.Now().Format("Monday, 2 January 2006"))

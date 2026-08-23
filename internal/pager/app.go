@@ -248,7 +248,7 @@ func newModel(opt Options) (*model, error) {
 		m.permMode = permAlways
 	}
 	ta := textarea.New()
-	ta.Placeholder = "Message Open Grok…  (type / for commands)"
+	ta.Placeholder = "Message Entropy…  (type / for commands)"
 	ta.Focus()
 	ta.Prompt = "▎ "
 	ta.CharLimit = 32 * 1024
@@ -307,7 +307,7 @@ func (m *model) attachSession(sess *agent.Session) {
 	m.sess.YOLO = m.permMode == permAlways
 	m.sess.PermMode = m.permModeName()
 	m.blocks = nil
-	m.appendBlock(block{kind: blockSystem, body: "Open Grok " + version.String() + "  ·  native Go  ·  " + m.opts.Model.Provider.DisplayName() + " / " + m.opts.Model.Name})
+	m.appendBlock(block{kind: blockSystem, body: "Entropy " + version.String() + "  ·  native Go  ·  " + m.opts.Model.Provider.DisplayName() + " / " + m.opts.Model.Name})
 	m.appendBlock(block{kind: blockSystem, body: "State: " + config.Home() + "  ·  session " + sess.ID})
 	if snap := sess.Goal.Snapshot(); snap != nil {
 		m.appendBlock(block{kind: blockGoal, body: "restored goal (" + string(snap.Status) + "):\n" + snap.Objective + "\n\nActive goals pause across restart. /goal resume to continue."})
@@ -568,7 +568,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 
 func (m *model) View() string {
 	if !m.ready && m.screen == screenChat {
-		return titleStyle.Render("Open Grok…")
+		return titleStyle.Render("Entropy…")
 	}
 	var body string
 	switch m.screen {
@@ -786,5 +786,5 @@ func (m *model) cyclePermMode() {
 }
 
 func sandboxActive() bool {
-	return strings.TrimSpace(os.Getenv("OPENGROK_SANDBOX")) != "" || strings.TrimSpace(os.Getenv("GROK_SANDBOX")) != ""
+	return config.FirstEnv("ENTROPY_SANDBOX", "OPENGROK_SANDBOX", "GROK_SANDBOX") != ""
 }

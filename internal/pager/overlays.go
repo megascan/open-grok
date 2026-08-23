@@ -142,7 +142,7 @@ func (m *model) overlayTitle() string {
 	case overlayTimeline:
 		return "Timeline"
 	}
-	return "Open Grok"
+	return "Entropy"
 }
 
 func (m *model) renderListModal(title string, w int) string {
@@ -544,7 +544,7 @@ func (m *model) openDoctor() {
 		{Label: "never ~/.grok", Detail: onOff(!config.NeverGrokHome(home))},
 		{Label: "tty", Detail: fmt.Sprintf("stdin=%v stdout=%v", isTTY(0), isTTY(1))},
 		{Label: "color", Detail: "lipgloss / 256-color + truecolor themes"},
-		{Label: "clipboard", Detail: "OSC 52 + ~/.opengrok/last-copy.txt backup"},
+		{Label: "clipboard", Detail: "OSC 52 + ~/.entropy/last-copy.txt backup"},
 		{Label: "sandbox", Detail: onOff(sandboxActive())},
 	}
 	st := auth.Status()
@@ -584,10 +584,10 @@ func (m *model) fillExtensions() {
 			m.items = append(m.items, listItem{Label: filepath.Base(h), Detail: h})
 		}
 		if len(m.items) == 0 {
-			m.items = append(m.items, listItem{Label: "(no hooks)", Detail: filepath.Join(cwd, ".opengrok", "hooks")})
+			m.items = append(m.items, listItem{Label: "(no hooks)", Detail: filepath.Join(cwd, ".entropy", "hooks")})
 		}
 	case 1:
-		m.items = dirListing(filepath.Join(config.Home(), "plugins"), filepath.Join(cwd, ".opengrok", "plugins"))
+		m.items = dirListing(append([]string{filepath.Join(config.Home(), "plugins")}, config.ProjectSubdir(cwd, "plugins")...)...)
 	case 2:
 		m.items = dirListing(filepath.Join(config.Home(), "marketplace"))
 	case 3:

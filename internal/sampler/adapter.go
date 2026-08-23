@@ -82,7 +82,7 @@ func (a Adapter) streamSSE(ctx context.Context, url string, payload any, session
 	}
 	if a.Provider == types.ProviderOpenRouter {
 		httpReq.Header.Set("HTTP-Referer", "https://github.com/megascan/open-grok")
-		httpReq.Header.Set("X-Title", "Open Grok")
+		httpReq.Header.Set("X-Title", "Entropy")
 	}
 	if a.Provider.Profile().RequestMetadata == types.MetadataXGrok {
 		// Private xAI headers stay on the xAI adapter only.

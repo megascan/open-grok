@@ -1,4 +1,4 @@
-// Package update checks GitHub Releases for a newer Open Grok Go binary.
+// Package update checks GitHub Releases for a newer Entropy Go binary.
 package update
 
 import (
@@ -33,7 +33,7 @@ func Check() (Result, error) {
 	if err != nil {
 		return r, err
 	}
-	req.Header.Set("User-Agent", "open-grok/"+version.String())
+	req.Header.Set("User-Agent", "entropy/"+version.String())
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -56,7 +56,8 @@ func Check() (Result, error) {
 	}
 	r.Latest = strings.TrimPrefix(body.TagName, "v")
 	r.Newer = r.Latest != "" && r.Latest != r.Current
-	want := assetName(runtime.GOOS, runtime.GOARCH)
+	want := AssetName(runtime.GOOS, runtime.GOARCH)
+	legacy := legacyAssetName(runtime.GOOS, runtime.GOARCH)
 	r.Asset = want
 	for _, a := range body.Assets {
 		if a.Name == want {
@@ -64,11 +65,28 @@ func Check() (Result, error) {
 			break
 		}
 	}
+	if r.AssetURL == "" {
+		for _, a := range body.Assets {
+			if a.Name == legacy {
+				r.Asset = a.Name
+				r.AssetURL = a.URL
+				break
+			}
+		}
+	}
 	return r, nil
 }
 
 // AssetName is the published filename for a GOOS/GOARCH pair.
-func assetName(goos, goarch string) string {
+func AssetName(goos, goarch string) string {
+	return platformAsset("entropy", goos, goarch)
+}
+
+func legacyAssetName(goos, goarch string) string {
+	return platformAsset("open-grok", goos, goarch)
+}
+
+func platformAsset(prefix, goos, goarch string) string {
 	arch := goarch
 	switch goarch {
 	case "amd64":
@@ -76,7 +94,7 @@ func assetName(goos, goarch string) string {
 	case "arm64":
 		arch = "aarch64"
 	}
-	name := "open-grok-" + goos + "-" + arch
+	name := prefix + "-" + goos + "-" + arch
 	if goos == "windows" {
 		name += ".exe"
 	}

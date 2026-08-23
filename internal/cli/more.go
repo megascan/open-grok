@@ -116,8 +116,8 @@ func newDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Check terminal, home, and provider credential availability",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("open-grok %s (go %s %s/%s)\n", version.String(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
-			fmt.Printf("OPENGROK_HOME=%s\n", config.Home())
+			fmt.Printf("entropy %s (go %s %s/%s)\n", version.String(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			fmt.Printf("ENTROPY_HOME=%s\n", config.Home())
 			fmt.Printf("tty stdin=%v stdout=%v\n", term.IsTerminal(int(os.Stdin.Fd())), term.IsTerminal(int(os.Stdout.Fd())))
 			st := auth.Status()
 			for _, p := range types.AllProviders {
@@ -162,7 +162,7 @@ func newCompletionsCmd() *cobra.Command {
 func newMCPCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mcp",
-		Short: "Manage MCP server configurations in ~/.opengrok/config.toml",
+		Short: "Manage MCP server configurations in ~/.entropy/config.toml",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",

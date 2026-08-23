@@ -1,8 +1,8 @@
 <div align="center">
 
-# Open Grok (`open-grok`)
+# Entropy (`entropy`)
 
-**Grok Build with ChatGPT Codex optimizations**
+**Grok Build with ChatGPT Codex optimizations — native Go**
 
 [Install](#install) · [Updates](#updates) · [Sign in](#sign-in-and-use-both-providers) ·
 [Code Mode](#codex-code-mode) · [Build from source](#build-from-source) ·
@@ -15,12 +15,13 @@ the terminal coding agent published by SpaceXAI. It retains the Grok Build TUI,
 headless agent, tools, and Agent Client Protocol support while adding an
 OpenAI Codex provider path and Codex-compatible execution behavior.
 
-The public command is `open-grok`. It can be installed beside the upstream
-`grok` command without replacing it.
+The public command is `entropy`. It can be installed beside the upstream
+`grok` command without replacing it. The GitHub module path remains
+`github.com/megascan/open-grok`.
 
-The shipping application is a **native Go** binary (`cmd/open-grok`) that
+The shipping application is a **native Go** binary (`cmd/entropy`) that
 cross-compiles to Linux, macOS, Windows, and FreeBSD on amd64 and arm64.
-User state stays under `$OPENGROK_HOME` or `~/.opengrok`. Rust crates under
+User state stays under `$ENTROPY_HOME` or `~/.entropy`. Rust crates under
 `crates/` remain as the historical reference implementation.
 
 ## What this fork adds
@@ -50,8 +51,8 @@ User state stays under `$OPENGROK_HOME` or `~/.opengrok`. Rust crates under
   Full-input HTTP turns deliberately do not send `previous_response_id`,
   matching codex-rs; codex-rs reserves ID-based prefix reuse for its validated
   WebSocket path.
-- **ChatGPT Codex OAuth.** `open-grok login --codex` uses the Codex OAuth flow and
-  stores those credentials separately in `~/.opengrok/codex-auth.json`.
+- **ChatGPT Codex OAuth.** `entropy login --codex` uses the Codex OAuth flow and
+  stores those credentials separately in `~/.entropy/codex-auth.json`.
 - **xAI and Codex side by side.** xAI sign-in remains available, `/model` can
   switch an existing conversation between provider-backed models by rebuilding
   the correct harness in place, and `/usage` reports xAI billing and Codex quota
@@ -72,7 +73,7 @@ User state stays under `$OPENGROK_HOME` or `~/.opengrok`. Rust crates under
   file tools, prompt, transport, and model metadata.
 - **Verified release updates.** Release builds check the public Open Grok
   GitHub release feed, verify version and SHA-256 before activation, and keep a
-  canonical versioned binary under `OPENGROK_HOME`.
+  canonical versioned binary under `ENTROPY_HOME`.
 
 The implementation and compatibility contract are documented in
 [`docs/code-mode-port.md`](docs/code-mode-port.md) and
@@ -95,27 +96,29 @@ Apple Silicon macOS or Linux x86_64:
 
 ```sh
 curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash
-open-grok --version
+entropy --version
 ```
 
 64-bit Windows PowerShell:
 
 ```powershell
 irm https://github.com/megascan/open-grok/releases/latest/download/install.ps1 | iex
-open-grok --version
+entropy --version
 ```
 
 Each installer downloads the platform artifact and its `.sha256` file, verifies
-SHA-256, and activates only `open-grok` (`open-grok.exe` on Windows). The
-managed command lives under `${OPENGROK_HOME:-$HOME/.opengrok}/bin/` on macOS
-and Linux or `%OPENGROK_HOME%\bin\` on Windows, which keeps manual installs
-and in-app updates on the same path. It does not create `grok` or `agent`
-aliases.
+SHA-256, and activates `entropy` (`entropy.exe` on Windows). Go release assets
+are named `entropy-<os>-<arch>`. The managed command lives under
+`${ENTROPY_HOME:-$HOME/.entropy}/bin/` on macOS and Linux or `%ENTROPY_HOME%\bin\`
+on Windows, which keeps manual installs and in-app updates on the same path.
+It does not create `grok` or `agent` aliases. Historical Rust installers still
+activate `open-grok` under `OPENGROK_HOME`.
 
 By default, that managed `bin` directory is also added to `PATH`. Set
-`OPEN_GROK_BIN_DIR` to expose a symlink from another absolute directory while
-keeping the canonical managed binary under `OPENGROK_HOME`. When piping the
-installer, export the override first so it is available to `bash`:
+`OPEN_GROK_BIN_DIR` or `ENTROPY_BIN_DIR` to expose a symlink from another
+absolute directory while keeping the canonical managed binary under
+`ENTROPY_HOME`. When piping the installer, export the override first so it is
+available to `bash`:
 
 ```sh
 export OPEN_GROK_BIN_DIR="$HOME/.local/bin"
@@ -144,20 +147,20 @@ source and sign the result with your own identity.
 
 Release builds check for a newer full GitHub Release at launch. When automatic
 updates are enabled, the TUI downloads and verifies the release in the
-background, atomically advances `${OPENGROK_HOME:-$HOME/.opengrok}/bin/open-grok`,
+background, atomically advances `${ENTROPY_HOME:-$HOME/.entropy}/bin/entropy`,
 and offers to restart onto it. The running process is never overwritten in
 place.
 
 Check or update explicitly:
 
 ```sh
-open-grok update --check
-open-grok update --check --json
-open-grok update
+entropy update --check
+entropy update --check --json
+entropy update
 ```
 
 Automatic updates default on and are configurable in Settings or in
-`$OPENGROK_HOME/config.toml`:
+`$ENTROPY_HOME/config.toml`:
 
 ```toml
 [cli]
@@ -166,7 +169,7 @@ auto_update = false
 
 For one launch, pass `--no-auto-update`. For managed environments, set
 `OPENGROK_DISABLE_AUTOUPDATER=1`; the legacy `GROK_DISABLE_AUTOUPDATER` name is
-accepted only for compatibility. Explicit `open-grok update` remains available
+accepted only for compatibility. Explicit `entropy update` remains available
 when background checks are disabled.
 
 ## Sign in and use both providers
@@ -174,15 +177,15 @@ when background checks are disabled.
 Sign in to either provider, or both:
 
 ```sh
-open-grok login                         # xAI browser sign-in
-open-grok login --codex                 # ChatGPT Codex OAuth
-open-grok login --codex --device-auth   # headless/remote Codex flow
+entropy login                         # xAI browser sign-in
+entropy login --codex                 # ChatGPT Codex OAuth
+entropy login --codex --device-auth   # headless/remote Codex flow
 ```
 
 Then launch the TUI and select a model:
 
 ```sh
-open-grok
+entropy
 ```
 
 On first launch, the TUI offers ChatGPT Codex and xAI Grok as separate sign-in
@@ -197,7 +200,7 @@ Codex-selected session can run without xAI authentication, and a provider
 failure in `/usage` does not hide the other provider's result.
 
 Codex catalog data is cached for five minutes in the separate
-`$OPENGROK_HOME/codex_models_cache.json`. The cache is scoped to the Open Grok
+`$ENTROPY_HOME/codex_models_cache.json`. The cache is scoped to the Entropy
 version, endpoint, and Codex account identity; it never shares xAI's
 `models_cache.json`. Authenticated Codex sessions can use the embedded catalog as
 a fallback when the cache or network is unavailable.
@@ -237,13 +240,14 @@ Grok; existing persisted sessions retain their resolved mode when resumed.
 
 ## Build from source
 
-The product is Go 1.22+. `./bin/open-grok-dev` runs `go run ./cmd/open-grok`.
+The product is Go 1.22+. `./bin/entropy-dev` runs `go run ./cmd/entropy`
+(`./bin/open-grok-dev` is a compatibility wrapper).
 
 ```sh
 go test ./...
-go build -o open-grok ./cmd/open-grok
-./open-grok version
-./bin/open-grok-dev --version
+go build -o entropy ./cmd/entropy
+./entropy version
+./bin/entropy-dev --version
 ```
 
 Cross-compile every published platform (Linux, macOS, Windows, FreeBSD ×
@@ -327,13 +331,13 @@ dist/THIRD-PARTY-NOTICES
 
 ## Compatibility with Grok Build
 
-Open Grok uses `~/.opengrok` for user-level runtime state and project-local
-`.opengrok` directories for repository configuration. Set `OPENGROK_HOME` to
-move all user-level Open Grok state, or `OPEN_GROK_BIN_DIR` to add a
-PATH-facing symlink to the canonical managed command. Codex OAuth is stored at
-`~/.opengrok/codex-auth.json` by default.
+Entropy uses `~/.entropy` for user-level runtime state and project-local
+`.entropy` directories for repository configuration. Set `ENTROPY_HOME` to
+move all user-level Entropy state (`OPENGROK_HOME` is accepted as an alias).
+Project `.opengrok/` trees are still scanned for skills, hooks, and workflows.
+Codex OAuth is stored at `~/.entropy/codex-auth.json` by default.
 
-The fork does not fall back to upstream Grok Build state. Credentials, settings,
+The product does not fall back to upstream Grok Build state. Credentials, settings,
 sessions, caches, skills, plugins, and project configuration are isolated from
 an upstream installation.
 
@@ -341,7 +345,9 @@ an upstream installation.
 
 | Path | Contents |
 | --- | --- |
-| `crates/codegen/xai-grok-pager-bin` | Composition-root package for `open-grok` |
+| `cmd/entropy` | Native Go composition root for the `entropy` product binary |
+| `internal/` | Go CLI, pager, agent, auth, sampler, tools, and workspace |
+| `crates/codegen/xai-grok-pager-bin` | Historical Rust composition-root package for `open-grok` |
 | `crates/codegen/xai-grok-pager` | TUI, commands, settings, and rendering |
 | `crates/codegen/xai-grok-shell` | Agent runtime, sessions, provider routing, and headless modes |
 | `crates/codegen/xai-grok-code-mode*` | Codex-compatible Code Mode protocol and runtime |

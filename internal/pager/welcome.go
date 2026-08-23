@@ -33,9 +33,9 @@ func (m *model) refreshWelcome() {
 		})
 	}
 	m.items = append(m.items,
-		listItem{Key: "login", Label: "Login", Detail: "API key or Codex OAuth — stored under ~/.opengrok"},
+		listItem{Key: "login", Label: "Login", Detail: "API key or Codex OAuth — stored under ~/.entropy"},
 		listItem{Key: "settings", Label: "Settings", Detail: "theme, vim, timestamps, screen mode"},
-		listItem{Key: "quit", Label: "Quit", Detail: "leave Open Grok"},
+		listItem{Key: "quit", Label: "Quit", Detail: "leave Entropy"},
 	)
 	if m.cursor >= len(m.items) {
 		m.cursor = 0
@@ -44,7 +44,7 @@ func (m *model) refreshWelcome() {
 
 func (m *model) viewWelcome() string {
 	var b strings.Builder
-	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Open Grok  "+version.String()) + "\n\n")
+	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Entropy  "+version.String()) + "\n\n")
 	b.WriteString(titleStyle.Render("  Welcome") + "\n")
 	b.WriteString(dimStyle.Render("  State: "+config.Home()+"   never ~/.grok") + "\n")
 	b.WriteString(dimStyle.Render("  Model: "+m.opts.Model.Name+" via "+m.opts.Model.Provider.DisplayName()) + "\n\n")
@@ -56,7 +56,7 @@ func (m *model) viewWelcome() string {
 		}
 	}
 	if len(signed) == 0 {
-		b.WriteString(errStyle.Render("  Not signed in — pick Login or run open-grok login") + "\n\n")
+		b.WriteString(errStyle.Render("  Not signed in — pick Login or run entropy login") + "\n\n")
 	} else {
 		b.WriteString(okStyle.Render("  Signed in: "+strings.Join(signed, ", ")) + "\n\n")
 	}
@@ -155,7 +155,7 @@ func (m *model) openLogin(provider string) {
 
 func (m *model) viewLogin() string {
 	var b strings.Builder
-	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Sign in  ·  ~/.opengrok only") + "\n\n")
+	b.WriteString(headerBar.Width(max(20, m.width)).Render(" Sign in  ·  ~/.entropy only") + "\n\n")
 	if m.loginP == "" {
 		b.WriteString(titleStyle.Render("  Choose a provider") + "\n\n")
 		for i, it := range m.items {
@@ -170,10 +170,10 @@ func (m *model) viewLogin() string {
 	}
 	b.WriteString(titleStyle.Render("  "+m.loginP.DisplayName()) + "\n")
 	if m.loginP == types.ProviderCodex {
-		b.WriteString(dimStyle.Render("  Codex OAuth needs a browser (open-grok login --codex).") + "\n")
+		b.WriteString(dimStyle.Render("  Codex OAuth needs a browser (entropy login --codex).") + "\n")
 		b.WriteString(dimStyle.Render("  Paste an API key here to store OPENAI_API_KEY in codex-auth.json.") + "\n\n")
 	} else {
-		b.WriteString(dimStyle.Render("  Paste an API key. It is written owner-only under ~/.opengrok.") + "\n\n")
+		b.WriteString(dimStyle.Render("  Paste an API key. It is written owner-only under ~/.entropy.") + "\n\n")
 	}
 	shown := strings.Repeat("•", len(m.keyBuf))
 	if shown == "" {
@@ -227,7 +227,7 @@ func (m *model) handleLoginKey(msg tea.KeyMsg) tea.Cmd {
 		m.status = "saved " + m.loginP.DisplayName() + " credentials"
 		if m.sess != nil {
 			m.screen = screenChat
-			m.appendBlock(block{kind: blockSystem, body: "signed in to " + m.loginP.DisplayName() + " — credentials under ~/.opengrok, never ~/.grok"})
+			m.appendBlock(block{kind: blockSystem, body: "signed in to " + m.loginP.DisplayName() + " — credentials under ~/.entropy, never ~/.grok"})
 			m.refreshVP()
 			return nil
 		}

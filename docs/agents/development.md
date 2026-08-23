@@ -14,23 +14,23 @@ Also see: root [`README.md`](../../README.md), [`CONTRIBUTING.md`](../../CONTRIB
 
 ```sh
 ./bin/setup-dev
-./bin/open-grok-dev --version
-./bin/open-grok-dev                 # interactive TUI from source
+./bin/entropy-dev --version
+./bin/entropy-dev                 # interactive TUI from source
 
-# Focused build
+# Focused Rust reference build
 cargo build --locked -p xai-grok-pager-bin --bin open-grok
 ./target/debug/open-grok --version
 ```
 
-`./bin/open-grok-dev` runs the workspace binary without overwriting an installed release under `$OPENGROK_HOME/bin/`.
+`./bin/entropy-dev` runs `go run ./cmd/entropy` without overwriting an installed release under `$ENTROPY_HOME/bin/`.
 
 ### Useful modes
 
 ```sh
-./bin/open-grok-dev -p "hello"              # headless
-./bin/open-grok-dev agent stdio             # ACP
-./bin/open-grok-dev login --codex           # Codex OAuth
-OPENGROK_HOME=/tmp/og-test ./bin/open-grok-dev   # isolated state
+./bin/entropy-dev -p "hello"              # headless
+./bin/entropy-dev agent stdio             # ACP
+./bin/entropy-dev login --codex           # Codex OAuth
+ENTROPY_HOME=/tmp/entropy-test ./bin/entropy-dev   # isolated state
 ```
 
 ## Workspace rules

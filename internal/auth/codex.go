@@ -12,7 +12,7 @@ import (
 	"github.com/megascan/open-grok/internal/types"
 )
 
-// CodexFile is the Codex-rs / Open Grok shared shape of ~/.opengrok/codex-auth.json.
+// CodexFile is the Codex-rs / Entropy shared shape of ~/.entropy/codex-auth.json.
 type CodexFile struct {
 	AuthMode     string       `json:"auth_mode,omitempty"`
 	OpenAIAPIKey *string      `json:"OPENAI_API_KEY"`
@@ -145,5 +145,5 @@ func resolveCodexBearer() (string, string, error) {
 	if c, ok := lookupCodex(); ok {
 		return c.Key, "store:codex", nil
 	}
-	return "", "", fmt.Errorf("not signed in to %s (try `open-grok login %s`)", types.ProviderCodex.DisplayName(), types.ProviderCodex.CLIName())
+	return "", "", fmt.Errorf("not signed in to %s (try `entropy login %s`)", types.ProviderCodex.DisplayName(), types.ProviderCodex.CLIName())
 }

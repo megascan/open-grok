@@ -48,7 +48,7 @@ func (c *LiveClient) FetchOpenAIModels(p types.Provider, baseURL, bearer string)
 	}
 	if p == types.ProviderOpenRouter {
 		req.Header.Set("HTTP-Referer", "https://github.com/megascan/open-grok")
-		req.Header.Set("X-Title", "Open Grok")
+		req.Header.Set("X-Title", "Entropy")
 	}
 	resp, err := c.client().Do(req)
 	if err != nil {

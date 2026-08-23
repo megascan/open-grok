@@ -26,7 +26,7 @@ func ServeWS(ctx context.Context, bind, secret string, opt Options) error {
 	}
 	if secret == "" {
 		secret = strings.ReplaceAll(fmt.Sprint(time.Now().UnixNano()), "-", "")
-		fmt.Fprintf(os.Stderr, "open-grok agent serve: generated secret %s\n", secret[:12])
+		fmt.Fprintf(os.Stderr, "entropy agent serve: generated secret %s\n", secret[:12])
 		secret = secret[:12]
 	}
 	mux := http.NewServeMux()
@@ -62,7 +62,7 @@ func ServeWS(ctx context.Context, bind, secret string, opt Options) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "open-grok ACP websocket listening on %s\n", ln.Addr())
+	fmt.Fprintf(os.Stderr, "entropy ACP websocket listening on %s\n", ln.Addr())
 	err = srv.Serve(ln)
 	if err == http.ErrServerClosed {
 		return nil
@@ -101,7 +101,7 @@ func (w wsWriter) Write(p []byte) (int, error) {
 var _ io.Reader = (*wsReader)(nil)
 var _ io.Writer = wsWriter{}
 
-// ServeLeader listens on the Open Grok leader socket and serves ACP JSON-RPC.
+// ServeLeader listens on the Entropy leader socket and serves ACP JSON-RPC.
 func ServeLeader(ctx context.Context, opt Options, noExit bool) error {
 	path := config.LeaderSock()
 	_ = os.Remove(path)
@@ -110,7 +110,7 @@ func ServeLeader(ctx context.Context, opt Options, noExit bool) error {
 		return err
 	}
 	defer ln.Close()
-	fmt.Fprintf(os.Stderr, "open-grok leader listening on %s\n", path)
+	fmt.Fprintf(os.Stderr, "entropy leader listening on %s\n", path)
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()

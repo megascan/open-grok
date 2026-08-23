@@ -1,7 +1,3 @@
-// Package config resolves Open Grok filesystem locations and user configuration.
-//
-// State is isolated to $OPENGROK_HOME or ~/.opengrok. Callers must never fall
-// back to ~/.grok — that path belongs to upstream Grok Build.
 package config
 
 import (
@@ -13,11 +9,14 @@ import (
 )
 
 const (
-	homeEnvName     = "OPENGROK_HOME"
-	defaultHomeName = ".opengrok"
-	binaryName      = "open-grok"
-	windowsBinary   = "open-grok.exe"
-	maxDirnameBytes = 255
+	homeEnvName          = "ENTROPY_HOME"
+	legacyHomeEnvName    = "OPENGROK_HOME"
+	defaultHomeName      = ".entropy"
+	projectDirName       = ".entropy"
+	legacyProjectDirName = ".opengrok"
+	binaryName           = "entropy"
+	windowsBinary        = "entropy.exe"
+	maxDirnameBytes      = 255
 )
 
 var (
@@ -25,7 +24,63 @@ var (
 	cached   string
 )
 
-// Home returns the per-user Open Grok directory: $OPENGROK_HOME or ~/.opengrok.
+// HomeEnv is the environment variable that relocates user state.
+func HomeEnv() string { return homeEnvName }
+
+// BinaryName is the public command (`entropy` / `entropy.exe`).
+func BinaryName() string {
+	if runtime.GOOS == "windows" {
+		return windowsBinary
+	}
+	return binaryName
+}
+
+// ProjectDirName is the per-repo config directory (`.entropy`).
+func ProjectDirName() string { return projectDirName }
+
+// ProjectDir is cwd/.entropy.
+func ProjectDir(cwd string) string {
+	return filepath.Join(cwd, projectDirName)
+}
+
+// ProjectSubdir returns cwd/.entropy/<name> then cwd/.opengrok/<name>
+// so existing project trees keep working after the rename.
+func ProjectSubdir(cwd, name string) []string {
+	return []string{
+		filepath.Join(cwd, projectDirName, name),
+		filepath.Join(cwd, legacyProjectDirName, name),
+	}
+}
+
+// FirstEnv returns the first non-empty environment value among names.
+func FirstEnv(names ...string) string {
+	for _, n := range names {
+		if v := strings.TrimSpace(os.Getenv(n)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// EnvIsOn is true when the first set variable is 1/true/yes/on.
+func EnvIsOn(names ...string) bool {
+	switch strings.ToLower(FirstEnv(names...)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// EnvIsOff is true when the first set variable is 0/false/no/off.
+func EnvIsOff(names ...string) bool {
+	switch strings.ToLower(FirstEnv(names...)) {
+	case "0", "false", "no", "off":
+		return true
+	}
+	return false
+}
+
+// Home returns the per-user Entropy directory: $ENTROPY_HOME or ~/.entropy.
 // The directory is created if it does not exist.
 func Home() string {
 	homeOnce.Do(func() {
@@ -36,20 +91,20 @@ func Home() string {
 	return cached
 }
 
-// ResetHomeForTest clears the cached home. Tests should set OPENGROK_HOME first.
+// ResetHomeForTest clears the cached home. Tests should set ENTROPY_HOME first.
 func ResetHomeForTest() {
 	homeOnce = sync.Once{}
 	cached = ""
 }
 
 func resolveHome() string {
-	if v := strings.TrimSpace(os.Getenv(homeEnvName)); v != "" {
+	if v := FirstEnv(homeEnvName, legacyHomeEnvName); v != "" {
 		return filepath.Clean(v)
 	}
 	return DefaultHome()
 }
 
-// DefaultHome is ~/.opengrok without creating it.
+// DefaultHome is ~/.entropy without creating it.
 func DefaultHome() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -58,11 +113,11 @@ func DefaultHome() string {
 	return filepath.Join(filepath.Clean(home), defaultHomeName)
 }
 
-// UserHome returns the user-global Open Grok home only when one genuinely
+// UserHome returns the user-global Entropy home only when one genuinely
 // resolves, so callers that scan hooks/marketplace do not mistake a project
-// .opengrok tree for the user-global one.
+// .entropy tree for the user-global one.
 func UserHome() (string, bool) {
-	if os.Getenv(homeEnvName) != "" {
+	if FirstEnv(homeEnvName, legacyHomeEnvName) != "" {
 		return Home(), true
 	}
 	if _, err := os.UserHomeDir(); err == nil {
@@ -71,26 +126,22 @@ func UserHome() (string, bool) {
 	return "", false
 }
 
-// Application is $OPENGROK_HOME/bin/open-grok (.exe on Windows).
+// Application is $ENTROPY_HOME/bin/entropy (.exe on Windows).
 func Application() string {
 	return ApplicationIn(Home())
 }
 
 // ApplicationIn returns the managed binary path under an explicit home.
 func ApplicationIn(home string) string {
-	name := binaryName
-	if runtime.GOOS == "windows" {
-		name = windowsBinary
-	}
-	return filepath.Join(home, "bin", name)
+	return filepath.Join(home, "bin", BinaryName())
 }
 
-// SystemConfigDir is /etc/opengrok on Unix and empty on Windows.
+// SystemConfigDir is /etc/entropy on Unix and empty on Windows.
 func SystemConfigDir() string {
 	if runtime.GOOS == "windows" {
 		return ""
 	}
-	return "/etc/opengrok"
+	return "/etc/entropy"
 }
 
 // AuthJSON is the isolated credential store for non-Codex providers.
@@ -103,7 +154,7 @@ func CodexAuthJSON() string {
 	return filepath.Join(Home(), "codex-auth.json")
 }
 
-// ConfigTOML is ~/.opengrok/config.toml.
+// ConfigTOML is ~/.entropy/config.toml.
 func ConfigTOML() string {
 	return filepath.Join(Home(), "config.toml")
 }
@@ -113,7 +164,7 @@ func LeaderSock() string {
 	return filepath.Join(Home(), "leader.sock")
 }
 
-// SessionsRoot is ~/.opengrok/sessions.
+// SessionsRoot is ~/.entropy/sessions.
 func SessionsRoot() string {
 	return filepath.Join(Home(), "sessions")
 }

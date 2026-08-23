@@ -1,7 +1,12 @@
-# Go native Open Grok
+# Go native Entropy
 
-The product binary is a **native Go** application (`cmd/open-grok`). It cross-compiles
-to Linux, macOS, Windows, and FreeBSD on amd64 and arm64 with `CGO_ENABLED=0`.
+The shipping product binary is a **native Go** application (`cmd/entropy`).
+It cross-compiles to Linux, macOS, Windows, and FreeBSD on amd64 and arm64
+with `CGO_ENABLED=0`. The public command is `entropy` (`entropy.exe` on
+Windows). User state lives under `$ENTROPY_HOME` or `~/.entropy` — never
+`~/.grok`. Project config is `.entropy/` (`.opengrok/` is still scanned as a
+compatibility fallback). The Go module path remains
+`github.com/megascan/open-grok`.
 
 Rust crates under `crates/` remain as the historical reference implementation.
 New product work lands in Go.
@@ -9,7 +14,8 @@ New product work lands in Go.
 ## Layout
 
 ```text
-cmd/open-grok          composition root
+cmd/entropy            composition root
+bin/entropy-dev        go run ./cmd/entropy (bin/open-grok-dev is a wrapper)
 internal/cli           Cobra CLI
 internal/pager         Bubble Tea TUI (streaming transcript, tool cards, goal rail)
 internal/agent         turn loop, sessions, tool-mode, compaction, subagents, goals
@@ -22,18 +28,18 @@ internal/auth          provider-isolated auth.json / codex-auth.json
 internal/tools         bash, files, apply_patch, grep, glob, web, plan, skills, memory, task, update_goal, session bus, flat-team mailbox
 internal/workspace     plan-mode edit gate + permission manager
 internal/hooks         PreToolUse fail-open
-internal/config        OPENGROK_HOME / ~/.opengrok (never ~/.grok)
+internal/config        ENTROPY_HOME / ~/.entropy (never ~/.grok; OPENGROK_HOME is an alias)
 internal/mcp           MCP JSON-RPC client (stdio + HTTP) + tool wrapping
 internal/sessionbus    machine-local presence + IPC (list/read/message)
 internal/oauth         ChatGPT Codex browser PKCE + device-code
-internal/update        GitHub release check and install into OPENGROK_HOME/bin
+internal/update        GitHub release check and install into ENTROPY_HOME/bin
 internal/verify        module-by-module inventory tests for public functions
-internal/version       product version
+internal/version       product version (Entropy / entropy)
 ```
 
 ## Invariants preserved
 
-1. `$OPENGROK_HOME` / `~/.opengrok` only.
+1. `$ENTROPY_HOME` / `~/.entropy` only (never `~/.grok`). `$OPENGROK_HOME` is accepted as an alias.
 2. Provider identity comes from model metadata, never a slug or URL.
 3. API backend ≠ credentials.
 4. Plan-mode edits are gated in the tool path before permissions. YOLO does not bypass that gate.
@@ -78,7 +84,7 @@ The native TUI is a Charmbracelet Bubble Tea app (`internal/pager`), not a port 
 ```sh
 go test ./...
 go test ./internal/verify -count=1   # every package's public functions exist and run
-go build -o open-grok ./cmd/open-grok
-./bin/open-grok-dev --version
-bash scripts/build-go-release.sh   # all GOOS/GOARCH into dist/
+go build -o entropy ./cmd/entropy
+./bin/entropy-dev --version
+bash scripts/build-go-release.sh   # all GOOS/GOARCH into dist/entropy-*
 ```

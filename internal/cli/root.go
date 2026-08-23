@@ -1,4 +1,4 @@
-// Package cli is the Cobra command surface for the Open Grok Go binary.
+// Package cli is the Cobra command surface for the Entropy Go binary.
 package cli
 
 import (
@@ -38,12 +38,12 @@ func Execute() error {
 	return NewRoot().Execute()
 }
 
-// NewRoot builds the open-grok command tree.
+// NewRoot builds the entropy command tree.
 func NewRoot() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "open-grok",
-		Short:         "Open Grok with ChatGPT Codex optimizations",
-		Long:          "Open Grok is a native Go coding agent. User state lives in $OPENGROK_HOME or ~/.opengrok.",
+		Use:           "entropy",
+		Short:         "Entropy with ChatGPT Codex optimizations",
+		Long:          "Entropy is a native Go coding agent. User state lives in $ENTROPY_HOME or ~/.entropy.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       version.String(),
@@ -113,7 +113,7 @@ func selectedModel() (catalog.Model, error) {
 		return m, nil
 	}
 	if flagProvider == "" {
-		return catalog.Model{}, fmt.Errorf("unknown model %q — pass --provider (e.g. openrouter) or use `open-grok models --live`", id)
+		return catalog.Model{}, fmt.Errorf("unknown model %q — pass --provider (e.g. openrouter) or use `entropy models --live`", id)
 	}
 	p, ok := types.ParseProvider(flagProvider)
 	if !ok {
@@ -183,7 +183,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return runHeadless(cmd.Context(), dir, model, flagPrompt)
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
-		fmt.Fprintln(os.Stderr, "open-grok: no TTY; pass -p for headless or use `open-grok agent stdio`")
+		fmt.Fprintln(os.Stderr, "entropy: no TTY; pass -p for headless or use `entropy agent stdio`")
 		return nil
 	}
 	return runTUI(cmd.Context(), dir, model)
@@ -243,7 +243,7 @@ func newVersionCmd() *cobra.Command {
 			if asJSON {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				return enc.Encode(map[string]any{
-					"name":    "open-grok",
+					"name":    "entropy",
 					"version": version.String(),
 					"runtime": "go",
 					"goos":    runtime.GOOS,

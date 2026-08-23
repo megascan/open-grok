@@ -33,7 +33,7 @@ func TestTeamMailbox(t *testing.T) {
 }
 
 func TestSessionBusTools(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	t.Cleanup(sessionbus.Stop)
 	host, err := sessionbus.Start(func(d sessionbus.Delivered) string { return "Accepted" })

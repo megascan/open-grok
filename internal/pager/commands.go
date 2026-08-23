@@ -232,7 +232,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 	case "yolo-2":
 		if !sandboxActive() {
-			m.appendSys("/yolo-2 refuses to run without an applied OS sandbox. Start with OPENGROK_SANDBOX=1 or open-grok --sandbox workspace.")
+			m.appendSys("/yolo-2 refuses to run without an applied OS sandbox. Start with ENTROPY_SANDBOX=1.")
 			break
 		}
 		m.permMode = permAlways
@@ -277,7 +277,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.openExtensions(4)
 	case "share":
 		if m.sess != nil {
-			m.copyText("Open Grok session " + m.sess.ID + " · " + m.opts.Model.Name + "\n" + m.sess.ExportMarkdown())
+			m.copyText("Entropy session " + m.sess.ID + " · " + m.opts.Model.Name + "\n" + m.sess.ExportMarkdown())
 		}
 	case "session-info":
 		m.appendSys(m.sessionInfo())
@@ -333,7 +333,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.feedback = ""
 	case "announcements":
 		m.overlay = overlayAnnouncements
-		m.items = []listItem{{Label: "Open Grok native Go", Detail: "The shipping binary is open-grok. Rust crates remain the behavioral reference."}}
+		m.items = []listItem{{Label: "Entropy native Go", Detail: "The shipping binary is entropy. Rust crates remain the behavioral reference."}}
 		m.cursor = 0
 	case "remember":
 		return m.remember(arg)
@@ -501,17 +501,17 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		m.cursor = 0
 	case "release-notes":
 		m.overlay = overlayReleaseNotes
-		m.items = []listItem{{Label: "Open Grok " + version.String(), Detail: "Native Go pager with the Rust slash catalog, permission card, themes, and session surfaces."}}
+		m.items = []listItem{{Label: "Entropy " + version.String(), Detail: "Native Go pager with the Rust slash catalog, permission card, themes, and session surfaces."}}
 		m.cursor = 0
 	case "tutorial":
 		m.openTutorial()
 	case "config-agents":
 		m.overlay = overlayAgents
-		m.items = dirListing(filepath.Join(config.Home(), "agents"), filepath.Join(m.opts.CWD, ".opengrok", "agents"))
+		m.items = dirListing(append([]string{filepath.Join(config.Home(), "agents")}, config.ProjectSubdir(m.opts.CWD, "agents")...)...)
 		m.cursor = 0
 	case "personas":
 		m.overlay = overlayPersonas
-		m.items = dirListing(filepath.Join(config.Home(), "personas"), filepath.Join(m.opts.CWD, ".opengrok", "personas"))
+		m.items = dirListing(append([]string{filepath.Join(config.Home(), "personas")}, config.ProjectSubdir(m.opts.CWD, "personas")...)...)
 		m.cursor = 0
 	case "gboom":
 		m.appendSys("💥 gboom")
@@ -561,7 +561,7 @@ func (m *model) sessionInfo() string {
 		}
 	}
 	return fmt.Sprintf(
-		"session %s\ntitle %s\nmodel %s (%s)\nprovider %s\nbackend %s\nyolo %v\nplan %v\nmode %s\n%d user turns · %d bytes\nworking dirs: %s\n%s\nOpen Grok %s",
+		"session %s\ntitle %s\nmodel %s (%s)\nprovider %s\nbackend %s\nyolo %v\nplan %v\nmode %s\n%d user turns · %d bytes\nworking dirs: %s\n%s\nEntropy %s",
 		m.sess.ID, m.sess.Title, m.opts.Model.ID, m.opts.Model.Name, m.opts.Model.Provider, m.opts.Model.APIBackend,
 		m.sess.YOLO, m.sess.Plan.Active, m.screenMd, turns, bytes, strings.Join(m.sess.ExtraDirs, ", "),
 		m.sess.Goal.StatusLine(), version.String(),
@@ -624,7 +624,7 @@ func (m *model) handleMemory(arg string) tea.Cmd {
 		m.appendSys("memory off")
 	default:
 		if !m.cfg.MemoryEnabled() {
-			m.appendSys("memory is off — /memory on or GROK_MEMORY=1")
+			m.appendSys("memory is off — /memory on or ENTROPY_MEMORY=1")
 			break
 		}
 		body, _ := json.Marshal(map[string]string{"query": arg})
@@ -738,7 +738,7 @@ func (m *model) editPrompt() tea.Cmd {
 	if editor == "" {
 		editor = "vi"
 	}
-	tmp, err := os.CreateTemp("", "opengrok-prompt-*.md")
+	tmp, err := os.CreateTemp("", "entropy-prompt-*.md")
 	if err != nil {
 		m.appendSys(err.Error())
 		return nil
@@ -761,10 +761,7 @@ type editDone struct {
 func (m *model) openWorkflows() {
 	m.overlay = overlayWorkflows
 	m.cursor = 0
-	m.items = dirListing(
-		filepath.Join(m.opts.CWD, ".opengrok", "workflows"),
-		filepath.Join(config.Home(), "workflows"),
-	)
+	m.items = dirListing(append(config.ProjectSubdir(m.opts.CWD, "workflows"), filepath.Join(config.Home(), "workflows"))...)
 }
 
 func (m *model) handleWorkflow(arg string) tea.Cmd {
@@ -780,7 +777,7 @@ func (m *model) handleWorkflow(arg string) tea.Cmd {
 	}
 	name := fields[0]
 	rest := strings.Join(fields[1:], " ")
-	for _, dir := range []string{filepath.Join(m.opts.CWD, ".opengrok", "workflows"), filepath.Join(config.Home(), "workflows")} {
+	for _, dir := range append(config.ProjectSubdir(m.opts.CWD, "workflows"), filepath.Join(config.Home(), "workflows")) {
 		p := filepath.Join(dir, name)
 		for _, ext := range []string{"", ".rhai", ".md"} {
 			data, err := os.ReadFile(p + ext)

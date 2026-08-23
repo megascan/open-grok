@@ -1,4 +1,4 @@
-// Package version reports the Open Grok product identity for the Go native binary.
+// Package version reports the Entropy product identity for the Go native binary.
 package version
 
 import (
@@ -12,7 +12,13 @@ import (
 //go:embed VERSION
 var embedded string
 
-const fallback = "0.0.0-dev"
+const (
+	fallback = "0.0.0-dev"
+	// Product is the user-facing name of the shipping Go application.
+	Product = "Entropy"
+	// CLIName is the public command (`entropy`).
+	CLIName = "entropy"
+)
 
 var (
 	// verOverride is filled by -ldflags at release build time.
@@ -21,8 +27,8 @@ var (
 	ver         string
 )
 
-// String returns the product version from OPEN_GROK_VERSION, the embedded
-// VERSION file, or the Go module VCS revision.
+// String returns the product version from ENTROPY_VERSION, OPEN_GROK_VERSION,
+// the embedded VERSION file, or the Go module VCS revision.
 func String() string {
 	once.Do(func() {
 		ver = resolve()
@@ -31,6 +37,9 @@ func String() string {
 }
 
 func resolve() string {
+	if env := strings.TrimSpace(os.Getenv("ENTROPY_VERSION")); env != "" {
+		return env
+	}
 	if env := strings.TrimSpace(os.Getenv("OPEN_GROK_VERSION")); env != "" {
 		return env
 	}
@@ -52,5 +61,5 @@ func resolve() string {
 
 // Display returns the user-facing version line printed by --version.
 func Display() string {
-	return "open-grok " + String() + " (go)"
+	return CLIName + " " + String() + " (go)"
 }

@@ -1,6 +1,6 @@
 // Package oauth implements ChatGPT Codex OAuth (browser PKCE + device code).
 //
-// Tokens are written to ~/.opengrok/codex-auth.json in the Codex-rs shape so
+// Tokens are written to ~/.entropy/codex-auth.json in the Codex-rs shape so
 // they stay isolated from xAI auth.json. This never uses the xAI AuthManager.
 package oauth
 
@@ -33,7 +33,7 @@ const (
 	callbackWait   = 10 * time.Minute
 )
 
-// Endpoints can be overridden in tests via OPENGROK_CODEX_ISSUER.
+// Endpoints can be overridden in tests via ENTROPY_CODEX_ISSUER (OPENGROK_CODEX_ISSUER is an alias).
 type Endpoints struct {
 	Issuer   string
 	ClientID string
@@ -41,7 +41,10 @@ type Endpoints struct {
 
 // DefaultEndpoints is production ChatGPT Codex OAuth.
 func DefaultEndpoints() Endpoints {
-	issuer := strings.TrimSpace(os.Getenv("OPENGROK_CODEX_ISSUER"))
+	issuer := strings.TrimSpace(os.Getenv("ENTROPY_CODEX_ISSUER"))
+	if issuer == "" {
+		issuer = strings.TrimSpace(os.Getenv("OPENGROK_CODEX_ISSUER"))
+	}
 	if issuer == "" {
 		issuer = codexIssuer
 	}
@@ -90,7 +93,7 @@ func BrowserLogin(ctx context.Context, ep Endpoints, announce bool) (TokenRespon
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if q.Get("error") != "" {
-			http.Error(w, "Open Grok Codex login failed", http.StatusBadRequest)
+			http.Error(w, "Entropy Codex login failed", http.StatusBadRequest)
 			select {
 			case errCh <- fmt.Errorf("codex oauth: %s", q.Get("error_description")):
 			default:
@@ -114,7 +117,7 @@ func BrowserLogin(ctx context.Context, ep Endpoints, announce bool) (TokenRespon
 			}
 			return
 		}
-		fmt.Fprint(w, "<!doctype html><title>Open Grok</title><h1>Signed in to OpenAI Codex</h1><p>You can return to Open Grok.</p>")
+		fmt.Fprint(w, "<!doctype html><title>Entropy</title><h1>Signed in to OpenAI Codex</h1><p>You can return to Entropy.</p>")
 		select {
 		case codeCh <- code:
 		default:
@@ -163,7 +166,7 @@ func DeviceLogin(ctx context.Context, ep Endpoints) (TokenResponse, error) {
 	fmt.Fprintln(os.Stderr, "  "+verify)
 	fmt.Fprintln(os.Stderr, "Then enter this one-time code (expires in 15 minutes):")
 	fmt.Fprintln(os.Stderr, "  "+device.UserCode)
-	fmt.Fprintln(os.Stderr, "Continue only if you started this login in Open Grok.")
+	fmt.Fprintln(os.Stderr, "Continue only if you started this login in Entropy.")
 	_ = openBrowser(verify)
 
 	deadline := time.Now().Add(deviceTimeout)

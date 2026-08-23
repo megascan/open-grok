@@ -23,7 +23,7 @@ type rt func(*http.Request) (*http.Response, error)
 func (f rt) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestTurnLoopWritesFileThroughPlanGate(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{
@@ -72,7 +72,7 @@ func TestTurnLoopWritesFileThroughPlanGate(t *testing.T) {
 }
 
 func TestPlanModeBlocksNonPlanEditsEvenWithYOLO(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{
@@ -106,7 +106,7 @@ func TestPlanModeBlocksNonPlanEditsEvenWithYOLO(t *testing.T) {
 }
 
 func TestUpdateGoalTurnRecordsProgressWithoutCompleting(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{
@@ -156,7 +156,7 @@ func TestUpdateGoalTurnRecordsProgressWithoutCompleting(t *testing.T) {
 }
 
 func TestApproveCallbackAllowsAsk(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{
@@ -203,7 +203,7 @@ func TestApproveCallbackAllowsAsk(t *testing.T) {
 }
 
 func TestApproveRejectStopsTheTool(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{
@@ -238,7 +238,7 @@ func TestApproveRejectStopsTheTool(t *testing.T) {
 }
 
 func TestExitPlanModeAsksThenKeepsPlanOnChanges(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	cwd := t.TempDir()
 	model := catalog.Model{

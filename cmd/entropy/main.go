@@ -1,8 +1,8 @@
-// Command open-grok is the native Go composition root for Open Grok.
+// Command entropy is the native Go composition root for Entropy.
 //
 // It wires the pager TUI, headless agent, ACP transports, and CLI onto the
 // shared config, auth, sampler, tools, and workspace packages. User state
-// lives only under $OPENGROK_HOME or ~/.opengrok — never ~/.grok.
+// lives only under $ENTROPY_HOME or ~/.entropy — never ~/.grok.
 package main
 
 import (

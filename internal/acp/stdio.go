@@ -117,7 +117,7 @@ func (s *server) handle(ctx context.Context, req rpcReq, write func(any)) (any, 
 		return map[string]any{
 			"protocolVersion": 1,
 			"serverInfo": map[string]any{
-				"name":    "open-grok",
+				"name":    "entropy",
 				"version": version.String(),
 			},
 			"agentCapabilities": map[string]any{

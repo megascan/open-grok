@@ -1,4 +1,4 @@
-// Package tools implements the client-side Open Grok tool pack.
+// Package tools implements the client-side Entropy tool pack.
 package tools
 
 import (

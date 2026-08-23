@@ -16,7 +16,7 @@ type Skill struct{}
 
 func (Skill) Name() string { return "skill" }
 func (Skill) Description() string {
-	return "Load a skill by name from .opengrok/skills, ~/.opengrok/skills, or .claude/skills."
+	return "Load a skill by name from .entropy/skills, ~/.entropy/skills, or .claude/skills."
 }
 func (Skill) Access() types.AccessKind { return types.AccessRead }
 func (Skill) Parameters() map[string]any {
@@ -62,6 +62,7 @@ type SkillInfo struct {
 // skills under their vendor dirs are dropped.
 func DiscoverSkills(cwd string) []SkillInfo {
 	roots := []string{
+		filepath.Join(cwd, ".entropy"),
 		filepath.Join(cwd, ".opengrok"),
 		filepath.Join(cwd, ".agents"),
 		filepath.Join(cwd, ".claude"),

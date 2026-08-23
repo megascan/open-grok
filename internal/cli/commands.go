@@ -3,7 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/megascan/open-grok/internal/acp"
 	"github.com/megascan/open-grok/internal/catalog"
@@ -11,7 +11,6 @@ import (
 	"github.com/megascan/open-grok/internal/types"
 	"github.com/megascan/open-grok/internal/version"
 	"github.com/spf13/cobra"
-	"strings"
 )
 
 func newModelsCmd() *cobra.Command {
@@ -59,7 +58,7 @@ func newInspectCmd() *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "inspect",
-		Short: "Show the configuration Open Grok discovers for this directory",
+		Short: "Show the configuration Entropy discovers for this directory",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dir, err := cwd()
 			if err != nil {
@@ -70,7 +69,7 @@ func newInspectCmd() *cobra.Command {
 				"version":       version.String(),
 				"runtime":       "go",
 				"cwd":           dir,
-				"opengrok_home": config.Home(),
+				"entropy_home":  config.Home(),
 				"auth_json":     config.AuthJSON(),
 				"codex_auth":    config.CodexAuthJSON(),
 				"config_toml":   config.ConfigTOML(),
@@ -84,7 +83,7 @@ func newInspectCmd() *cobra.Command {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(info)
 			}
 			w := cmd.OutOrStdout()
-			for _, k := range []string{"version", "runtime", "cwd", "opengrok_home", "auth_json", "codex_auth", "config_toml"} {
+			for _, k := range []string{"version", "runtime", "cwd", "entropy_home", "auth_json", "codex_auth", "config_toml"} {
 				fmt.Fprintf(w, "%s: %v\n", k, info[k])
 			}
 			return nil
@@ -97,7 +96,7 @@ func newInspectCmd() *cobra.Command {
 func newAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agent",
-		Short: "Run Open Grok without the interactive UI",
+		Short: "Run Entropy without the interactive UI",
 	}
 	stdio := &cobra.Command{
 		Use:   "stdio",
@@ -139,7 +138,7 @@ func newAgentCmd() *cobra.Command {
 		},
 	}
 	serve.Flags().StringVar(&bind, "bind", "127.0.0.1:2419", "Listen address")
-	serve.Flags().StringVar(&secret, "secret", os.Getenv("GROK_AGENT_SECRET"), "Bearer token")
+	serve.Flags().StringVar(&secret, "secret", config.FirstEnv("ENTROPY_AGENT_SECRET", "GROK_AGENT_SECRET"), "Bearer token")
 	var noExit bool
 	leader := &cobra.Command{
 		Use:   "leader",

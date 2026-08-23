@@ -9,7 +9,7 @@ import (
 )
 
 func TestBusRoundTrip(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	t.Cleanup(sessionbus.Stop)
 
@@ -48,7 +48,7 @@ func TestBusRoundTrip(t *testing.T) {
 }
 
 func TestUnknownSession(t *testing.T) {
-	t.Setenv("OPENGROK_HOME", t.TempDir())
+	t.Setenv("ENTROPY_HOME", t.TempDir())
 	config.ResetHomeForTest()
 	t.Cleanup(sessionbus.Stop)
 	_, err := sessionbus.Start(nil)
