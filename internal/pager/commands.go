@@ -171,7 +171,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("No active session")
 			break
 		}
-		m.openUsage(0)
+		return m.openUsage(0)
 	case "minimal":
 		if m.sess == nil {
 			m.appendSys("No active session to reopen in minimal mode")
@@ -294,7 +294,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("No active session")
 			break
 		}
-		m.openUsage(2)
+		return m.openUsage(2)
 	case "rename":
 		if m.sess == nil {
 			m.appendSys("No active session")
@@ -510,7 +510,7 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 	case "import-claude":
 		m.openImportClaude()
 	case "usage":
-		m.openUsage(1)
+		return m.openUsage(1)
 	case "cache":
 		m.openCache()
 	case "queue":

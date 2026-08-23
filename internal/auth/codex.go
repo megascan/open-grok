@@ -74,13 +74,17 @@ func SaveCodexAPIKey(key string) error {
 // SaveCodexOAuth writes ChatGPT OAuth tokens into codex-auth.json.
 func SaveCodexOAuth(tok oauth.TokenResponse) error {
 	now := time.Now().UTC()
+	tokens := &CodexTokens{
+		IDToken:      tok.IDToken,
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+	}
+	if id := accountIDFromIDToken(tok.IDToken); id != "" {
+		tokens.AccountID = &id
+	}
 	return persistCodexFile(CodexFile{
-		AuthMode: "chatgpt",
-		Tokens: &CodexTokens{
-			IDToken:      tok.IDToken,
-			AccessToken:  tok.AccessToken,
-			RefreshToken: tok.RefreshToken,
-		},
+		AuthMode:    "chatgpt",
+		Tokens:      tokens,
 		LastRefresh: &now,
 	})
 }
@@ -110,11 +114,15 @@ func lookupCodex() (Credential, bool) {
 
 // RefreshCodexIfNeeded rotates a ChatGPT access token when it is stale.
 func RefreshCodexIfNeeded(ctx context.Context) error {
+	return refreshCodex(ctx, false)
+}
+
+func refreshCodex(ctx context.Context, force bool) error {
 	f, ok := readCodexFile()
 	if !ok || f.Tokens == nil || f.Tokens.RefreshToken == "" {
 		return nil
 	}
-	if f.LastRefresh != nil && time.Since(*f.LastRefresh) < 4*time.Minute {
+	if !force && f.LastRefresh != nil && time.Since(*f.LastRefresh) < 4*time.Minute {
 		return nil
 	}
 	tok, err := oauth.Refresh(ctx, oauth.DefaultEndpoints(), f.Tokens.RefreshToken)
@@ -126,6 +134,9 @@ func RefreshCodexIfNeeded(ctx context.Context) error {
 	}
 	if tok.RefreshToken == "" {
 		tok.RefreshToken = f.Tokens.RefreshToken
+	}
+	if tok.IDToken == f.Tokens.IDToken && f.Tokens.AccountID != nil {
+		// keep stored account id when the id token did not rotate
 	}
 	return SaveCodexOAuth(tok)
 }

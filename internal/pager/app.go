@@ -212,6 +212,8 @@ type model struct {
 	blockBody                                                             string
 	blockScroll                                                           int
 	usageTab                                                              int
+	usageLoading                                                          bool
+	usageLimitText                                                        string
 	shortcutExpand                                                        int
 	gitBranch                                                             string
 	gitWorktree                                                           bool
@@ -534,6 +536,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleLoginOAuthDone(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case usageFetchedMsg:
+		m.usageLoading = false
+		m.usageLimitText = msg.text
 	case suggestionLoadedMsg:
 		m.suggest.onLoaded(msg.text, msg.generation)
 	case permAskMsg:

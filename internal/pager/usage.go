@@ -6,14 +6,16 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/types"
 )
 
-func (m *model) openUsage(tab int) {
+func (m *model) openUsage(tab int) tea.Cmd {
 	m.overlay = overlayUsage
 	m.usageTab = tab % 3
 	m.cursor = 0
+	m.usageLoading = true
+	m.usageLimitText = ""
+	return m.fetchUsageCmd()
 }
 
 func (m *model) renderUsage(w int) string {
@@ -46,21 +48,14 @@ func (m *model) renderUsage(w int) string {
 func (m *model) usageLimitReport() string {
 	var b strings.Builder
 	b.WriteString("Usage limit\n\n")
-	st := auth.Status()
-	any := false
-	for _, p := range types.AllProviders {
-		s, ok := st[p]
-		if !ok {
-			continue
-		}
-		any = true
-		fmt.Fprintf(&b, "%s  ·  %s\n", p.DisplayName(), s)
-		b.WriteString(dimStyle.Render("  quota is provider-hosted — open the provider console") + "\n")
+	switch {
+	case m.usageLoading && m.usageLimitText == "":
+		b.WriteString(dimStyle.Render("Loading usage…"))
+	case m.usageLimitText != "":
+		b.WriteString(m.usageLimitText)
+	default:
+		b.WriteString(formatCombinedUsageSummary(xaiUsageSummary(), formatCodexUsageError("not connected")))
 	}
-	if !any {
-		b.WriteString(dimStyle.Render("signed out — usage unavailable") + "\n")
-	}
-	b.WriteString("\n" + dimStyle.Render("Entropy does not proxy xAI Build credits. Non-xAI providers bill at their own meters."))
 	return b.String()
 }
 
