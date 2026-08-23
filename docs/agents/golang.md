@@ -27,6 +27,8 @@ internal/mcp           MCP JSON-RPC client (stdio + HTTP) + tool wrapping
 internal/sessionbus    machine-local presence + IPC (list/read/message)
 internal/oauth         ChatGPT Codex browser PKCE + device-code
 internal/update        GitHub release check and install into OPENGROK_HOME/bin
+internal/verify        module-by-module inventory tests for public functions
+internal/version       product version
 ```
 
 ## Invariants preserved
@@ -75,6 +77,7 @@ The native TUI is a Charmbracelet Bubble Tea app (`internal/pager`), not a port 
 
 ```sh
 go test ./...
+go test ./internal/verify -count=1   # every package's public functions exist and run
 go build -o open-grok ./cmd/open-grok
 ./bin/open-grok-dev --version
 bash scripts/build-go-release.sh   # all GOOS/GOARCH into dist/

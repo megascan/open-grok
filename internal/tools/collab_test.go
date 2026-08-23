@@ -70,6 +70,17 @@ func contains(s, sub string) bool {
 	})()))
 }
 
+func TestUnboundTeamToolsDoNotPanic(t *testing.T) {
+	res := tools.ListAgents{}.Execute(context.Background(), tools.Context{}, nil)
+	if !res.IsError || !contains(res.Content, "not bound") {
+		t.Fatalf("list %s", res.Content)
+	}
+	res = tools.WaitAgent{}.Execute(context.Background(), tools.Context{}, json.RawMessage(`{"agent_id":"x"}`))
+	if !res.IsError {
+		t.Fatalf("wait %s", res.Content)
+	}
+}
+
 func TestDirectCollabPackNames(t *testing.T) {
 	names := map[string]bool{}
 	for _, ttool := range tools.DefaultPack() {

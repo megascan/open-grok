@@ -155,7 +155,14 @@ func (ListAgents) Access() types.AccessKind { return types.AccessNone }
 func (ListAgents) Parameters() map[string]any {
 	return objectSchema(map[string]any{}, nil)
 }
+func unboundTeam() Result {
+	return errResult("team mailbox is not bound")
+}
+
 func (t ListAgents) Execute(_ context.Context, _ Context, _ json.RawMessage) Result {
+	if t.Box == nil {
+		return unboundTeam()
+	}
 	list := t.Box.snapshot()
 	if len(list) == 0 {
 		return okResult("no child agents")
@@ -179,6 +186,9 @@ func (SendMessage) Parameters() map[string]any {
 	}, []string{"agent_id", "message"})
 }
 func (t SendMessage) Execute(_ context.Context, _ Context, args json.RawMessage) Result {
+	if t.Box == nil {
+		return unboundTeam()
+	}
 	m := unmarshal(args)
 	if err := t.Box.send(str(m["agent_id"]), str(m["message"])); err != nil {
 		return errResult(err.Error())
@@ -229,6 +239,9 @@ func (WaitAgent) Parameters() map[string]any {
 	}, []string{"agent_id"})
 }
 func (t WaitAgent) Execute(_ context.Context, _ Context, args json.RawMessage) Result {
+	if t.Box == nil {
+		return unboundTeam()
+	}
 	m := unmarshal(args)
 	timeout := 30 * time.Second
 	if v, ok := m["timeout"].(float64); ok && v > 0 {

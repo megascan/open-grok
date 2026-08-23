@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -87,11 +88,18 @@ func ServeStdio(ctx context.Context, opt Options) error {
 		if req.Method == "" {
 			continue
 		}
-		res, notify := s.handle(ctx, req, write)
+		res, err := s.handle(ctx, req, write)
 		if len(req.ID) > 0 {
-			write(rpcResp{JSONRPC: "2.0", ID: req.ID, Result: res})
+			if err != nil {
+				code := -32603
+				if strings.HasPrefix(err.Error(), "unknown method") {
+					code = -32601
+				}
+				write(rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: code, Message: err.Error()}})
+			} else {
+				write(rpcResp{JSONRPC: "2.0", ID: req.ID, Result: res})
+			}
 		}
-		_ = notify
 	}
 	return sc.Err()
 }
