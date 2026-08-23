@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/megascan/open-grok/internal/tools"
@@ -89,5 +90,25 @@ func TestAskUserQuestionUsesCallback(t *testing.T) {
 	res := tools.AskUserQuestion{}.Execute(context.Background(), tc, args)
 	if !asked || res.Content != "b" || res.IsError {
 		t.Fatalf("%+v asked=%v", res, asked)
+	}
+
+	var gotQ string
+	tc.AskUser = func(q string, opts []string) string {
+		gotQ = q
+		return "ok"
+	}
+	args, _ = json.Marshal(map[string]any{
+		"questions": []map[string]any{
+			{"question": "Color?", "options": []map[string]any{{"label": "red"}}},
+			{"question": "Size?", "options": []map[string]any{{"label": "m"}}},
+		},
+	})
+	res = tools.AskUserQuestion{}.Execute(context.Background(), tc, args)
+	if res.IsError || !strings.HasPrefix(gotQ, tools.AskUserJSONPrefix) {
+		t.Fatalf("%+v q=%q", res, gotQ)
+	}
+	qs, ok := tools.DecodeAskUserJSON(gotQ)
+	if !ok || len(qs) != 2 || qs[0].Options[0] != "red" {
+		t.Fatalf("%v %+v", ok, qs)
 	}
 }

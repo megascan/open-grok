@@ -378,9 +378,9 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 		}
 		return m.startBTW(arg)
 	case "recap":
-		return m.submit("Recap this conversation: decisions, open questions, and next steps. Be concise.")
+		return m.sendRecap()
 	case "doctor":
-		m.openDoctor()
+		return m.handleDoctor(arg)
 	case "voice":
 		return m.toggleVoice()
 	case "loop":

@@ -6,16 +6,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 
 	"github.com/megascan/open-grok/internal/agent"
-	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/config"
+	"github.com/megascan/open-grok/internal/diagnostics"
 	"github.com/megascan/open-grok/internal/tools"
-	"github.com/megascan/open-grok/internal/types"
-	"github.com/megascan/open-grok/internal/version"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 func newSessionsCmd() *cobra.Command {
@@ -112,27 +108,55 @@ func runSessionsList(cmd *cobra.Command, args []string) error {
 }
 
 func newDoctorCmd() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check terminal, home, and provider credential availability",
+		Short: "Diagnose terminal, clipboard, color, and voice; apply automatic fixes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("entropy %s (go %s %s/%s)\n", version.String(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
-			fmt.Printf("ENTROPY_HOME=%s\n", config.Home())
-			fmt.Printf("tty stdin=%v stdout=%v\n", term.IsTerminal(int(os.Stdin.Fd())), term.IsTerminal(int(os.Stdout.Fd())))
-			st := auth.Status()
-			for _, p := range types.AllProviders {
-				mark := "signed out"
-				if s, ok := st[p]; ok {
-					mark = s
-				}
-				fmt.Printf("  %-16s %s\n", p.CLIName(), mark)
+			rep := diagnostics.Collect()
+			if jsonOut {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				return enc.Encode(rep)
 			}
-			if config.NeverGrokHome(config.Home()) {
-				fmt.Println("ERROR: home resolved to ~/.grok — this is forbidden")
-			}
+			fmt.Fprint(cmd.OutOrStdout(), diagnostics.Format(rep))
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print the report as JSON")
+	var yes bool
+	fix := &cobra.Command{
+		Use:   "fix [id]",
+		Short: "List or apply an automatic terminal fix",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				fmt.Fprint(cmd.OutOrStdout(), diagnostics.FormatFixList())
+				return nil
+			}
+			id, err := diagnostics.ResolveFixID(args[0])
+			if err != nil {
+				return fmt.Errorf("%w\n%s", err, diagnostics.CLIUsage)
+			}
+			if !yes {
+				plan, err := diagnostics.PlanFix(id)
+				if err != nil {
+					return err
+				}
+				fmt.Fprint(cmd.OutOrStdout(), diagnostics.FormatPlan(plan))
+				return nil
+			}
+			plan, err := diagnostics.ApplyFix(id)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), plan.SuccessMessage())
+			return nil
+		},
+	}
+	fix.Flags().BoolVar(&yes, "yes", false, "Apply the fix without a preview")
+	cmd.AddCommand(fix)
+	return cmd
 }
 
 func newCompletionsCmd() *cobra.Command {
@@ -287,13 +311,15 @@ func newMemoryCmd() *cobra.Command {
 func newWrapCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "wrap [command] [args...]",
-		Short: "Run a command with this process's stdin/stdout",
+		Short: "Run a command (including ssh) with this process's stdin/stdout",
+		Long:  "Wrap a child command so clipboard and theme survive SSH. One-off: entropy wrap ssh <host>. Shell alias: alias ssh='entropy wrap ssh'. Apply automatically with entropy doctor fix ssh-wrap.",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := exec.Command(args[0], args[1:]...)
 			c.Stdin = os.Stdin
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
+			c.Env = append(os.Environ(), "ENTROPY_WRAP=1")
 			return c.Run()
 		},
 	}

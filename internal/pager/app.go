@@ -43,9 +43,11 @@ type (
 	btwDeltaMsg struct{ text string }
 	btwDoneMsg  struct{ err error }
 	qAskMsg     struct {
-		Question string
-		Options  []string
-		Reply    chan string
+		Question  string
+		Options   []string
+		Questions []questionItem
+		Index     int
+		Reply     chan string
 	}
 	planAskMsg struct {
 		Plan    string
@@ -200,6 +202,8 @@ type model struct {
 	qCursor                                                               int
 	qFree                                                                 string
 	qTyping                                                               bool
+	doctorReport                                                          string
+	suggest                                                               promptSuggestion
 	plan                                                                  *planAskMsg
 	planFocus                                                             string
 	planScroll                                                            int
@@ -304,6 +308,7 @@ func newModel(opt Options) (*model, error) {
 		simpleMode:        cfg.PrefBool("simple_mode", cfg.UI.SimpleMode, true),
 		expandedGroups:    map[string]bool{},
 		wfDetail:          -1,
+		suggest:           promptSuggestion{enabled: promptSuggestionsEnabled(cfg)},
 	}
 	if m.followUp == "" {
 		m.followUp = "queue"
@@ -443,6 +448,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appendBlock(block{kind: blockSystem, body: "error: " + msg.err.Error(), err: true})
 			}
 			m.refreshVP()
+			m.suggest.clear()
 		}
 		if m.screen == screenDashboard {
 			m.refreshDashboard()
@@ -452,6 +458,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.queue = m.queue[1:]
 			return m, m.submit(next)
 		}
+		if m.shouldFetchSuggestion(msg.err) {
+			return m, m.fetchPromptSuggestion()
+		}
+	case recapDoneMsg:
+		m.applyRecapDone(msg)
+	case suggestionLoadedMsg:
+		m.suggest.onLoaded(msg.text, msg.generation)
 	case permAskMsg:
 		m.perm = &msg
 		m.overlay = overlayPermission
@@ -664,6 +677,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			m.status = "Esc again to clear"
 			return nil, true
 		}
+		if m.suggest.ghostFor("") != "" {
+			m.suggest.dismiss()
+			return nil, true
+		}
 		return nil, true
 	case "ctrl+d":
 		return tea.Quit, true
@@ -705,7 +722,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			}
 			return m.cycleDashDetails(delta), true
 		}
-	case "left", "right":
+	case "left", "right", "ctrl+right":
+		if msg.String() == "ctrl+right" {
+			if m.tryAcceptSuggestion(true) {
+				return nil, true
+			}
+			return nil, true
+		}
+		if msg.String() == "right" && m.suggest.ghostFor(m.ta.Value()) != "" && !m.focusScroll {
+			if m.tryAcceptSuggestion(false) {
+				return nil, true
+			}
+		}
 		if m.dashDetails && m.focusScroll {
 			delta := 1
 			if msg.String() == "left" {
@@ -717,6 +745,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		m.cyclePermMode()
 		return nil, true
 	case "tab":
+		if m.tryAcceptSuggestion(false) {
+			return nil, true
+		}
 		if m.perm != nil && m.permParked {
 			m.permParked = false
 			m.overlay = overlayPermission
@@ -761,6 +792,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			return nil, true
 		}
 		m.ta.Reset()
+		m.suggest.clear()
 		m.overlay = overlayNone
 		if strings.HasPrefix(text, "/") {
 			return m.handleSlash(text), true
@@ -996,8 +1028,18 @@ func (m *model) submitDisplay(display, wire string) tea.Cmd {
 		}
 		rt.AskUser = func(q string, opts []string) string {
 			ch := make(chan string, 1)
+			msg := qAskMsg{Question: q, Options: opts, Reply: ch}
+			if qs, ok := tools.DecodeAskUserJSON(q); ok {
+				for _, item := range qs {
+					msg.Questions = append(msg.Questions, questionItem{Question: item.Question, Options: item.Options, Multi: item.Multi})
+				}
+				if len(msg.Questions) > 0 {
+					msg.Question = msg.Questions[0].Question
+					msg.Options = msg.Questions[0].Options
+				}
+			}
 			if prog != nil {
-				prog.Send(qAskMsg{Question: q, Options: opts, Reply: ch})
+				prog.Send(msg)
 			} else {
 				return ""
 			}

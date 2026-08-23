@@ -4,33 +4,122 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+type questionItem struct {
+	Question string
+	Options  []string
+	Multi    bool
+}
+
+func (msg *qAskMsg) items() []questionItem {
+	if msg == nil {
+		return nil
+	}
+	if len(msg.Questions) > 0 {
+		return msg.Questions
+	}
+	opts := msg.Options
+	if len(opts) == 0 {
+		opts = []string{"yes", "no"}
+	}
+	return []questionItem{{Question: msg.Question, Options: opts}}
+}
+
+func (msg *qAskMsg) current() questionItem {
+	items := msg.items()
+	if len(items) == 0 {
+		return questionItem{Question: "?", Options: []string{"yes", "no"}}
+	}
+	if msg.Index < 0 || msg.Index >= len(items) {
+		return items[0]
+	}
+	return items[idxSafe(msg.Index, len(items))]
+}
+
+func idxSafe(i, n int) int {
+	if i < 0 {
+		return 0
+	}
+	if i >= n {
+		return n - 1
+	}
+	return i
+}
+
+const (
+	maxQuestionDescLines    = 5
+	maxQuestionPreviewLines = 6
+)
+
+func truncateLines(s string, maxLines int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= maxLines {
+		return s
+	}
+	return strings.Join(lines[:maxLines], "\n") + "\n…"
+}
 
 func (m *model) renderQuestion(w int) string {
 	if m.question == nil {
 		return ""
 	}
+	items := m.question.items()
+	cur := m.question.current()
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Question") + "\n\n")
-	b.WriteString(m.question.Question + "\n\n")
-	opts := m.question.Options
+	title := "Question"
+	if len(items) > 1 {
+		title = fmt.Sprintf("Question %d/%d", m.question.Index+1, len(items))
+	}
+	b.WriteString(titleStyle.Render(title) + "\n\n")
+	b.WriteString(truncateLines(cur.Question, maxQuestionDescLines) + "\n\n")
+	opts := cur.Options
 	if len(opts) == 0 {
 		opts = []string{"yes", "no"}
 	}
+	rowCount := len(opts) + 1 // sticky Other
+	if m.qCursor >= rowCount {
+		m.qCursor = rowCount - 1
+	}
 	for i, o := range opts {
 		key := optionHotkey(i)
-		line := fmt.Sprintf("%s  %s", key, o)
+		marker := "(○)"
 		if i == m.qCursor {
-			line = selStyle.Render("▸ " + line)
-		} else {
-			line = "  " + line
+			marker = "(●)"
+		}
+		label := o
+		if utf8.RuneCountInString(label) > 80 {
+			runes := []rune(label)
+			label = string(runes[:80]) + "…"
+		}
+		line := fmt.Sprintf(" %s %s %s", key, marker, label)
+		if i == m.qCursor {
+			line = selStyle.Render(line)
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n  z  " + dimStyle.Render("free text: "+m.qFree) + "\n")
-	b.WriteString("\n" + dimStyle.Render("1–9 a–f pick  ·  tab wrap  ·  enter  ·  shift+x dismiss  ·  esc park"))
+	otherMarker := "(○)"
+	otherLabel := "Other"
+	if m.qCursor == len(opts) {
+		otherMarker = "(●)"
+		if m.qTyping {
+			otherLabel = "Other  ❯ " + m.qFree + "█"
+		} else if m.qFree != "" {
+			otherLabel = "Other  ❯ " + m.qFree
+		}
+	} else if m.qFree != "" {
+		otherLabel = "Other  ❯ " + m.qFree
+	}
+	otherLine := fmt.Sprintf(" z %s %s", otherMarker, otherLabel)
+	if m.qCursor == len(opts) {
+		otherLine = selStyle.Render(otherLine)
+	}
+	b.WriteString(otherLine + "\n")
+	b.WriteString("\n" + dimStyle.Render("1–9 a–f pick  ·  j/k  ·  tab wrap  ·  enter  ·  ←/→ questions  ·  shift+x dismiss  ·  esc park"))
+	_ = maxQuestionPreviewLines
 	return modalBox.Width(w).Render(b.String())
 }
 
@@ -61,12 +150,15 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 	if m.question == nil {
 		return nil
 	}
-	opts := m.question.Options
+	cur := m.question.current()
+	opts := cur.Options
 	if len(opts) == 0 {
 		opts = []string{"yes", "no"}
 	}
+	rowCount := len(opts) + 1
 	s := msg.String()
 	if s == "z" && !m.qTyping {
+		m.qCursor = len(opts)
 		m.qTyping = true
 		return nil
 	}
@@ -74,7 +166,6 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 		switch msg.Type {
 		case tea.KeyEsc:
 			m.qTyping = false
-			m.qFree = ""
 		case tea.KeyEnter:
 			m.qTyping = false
 			m.replyQuestion(strings.TrimSpace(m.qFree))
@@ -93,22 +184,34 @@ func (m *model) handleQuestionKey(msg tea.KeyMsg) tea.Cmd {
 			m.qCursor--
 		}
 	case "down", "j":
-		if m.qCursor+1 < len(opts) {
+		if m.qCursor+1 < rowCount {
 			m.qCursor++
 		}
 	case "tab":
-		m.qCursor = (m.qCursor + 1) % len(opts)
+		m.qCursor = (m.qCursor + 1) % rowCount
 	case "shift+tab":
 		if m.qCursor == 0 {
-			m.qCursor = len(opts) - 1
+			m.qCursor = rowCount - 1
 		} else {
 			m.qCursor--
 		}
 	case "left", "h", "[":
-		// previous question — single-question card is a no-op wrap
+		if n := len(m.question.items()); n > 1 {
+			m.question.Index = (m.question.Index + n - 1) % n
+			m.qCursor = 0
+			m.qFree = ""
+		}
 	case "right", "l", "]":
-		// next question — single-question card is a no-op wrap
+		if n := len(m.question.items()); n > 1 {
+			m.question.Index = (m.question.Index + 1) % n
+			m.qCursor = 0
+			m.qFree = ""
+		}
 	case "enter":
+		if m.qCursor == len(opts) {
+			m.qTyping = true
+			return nil
+		}
 		if m.qCursor >= 0 && m.qCursor < len(opts) {
 			m.replyQuestion(opts[m.qCursor])
 		}
@@ -132,6 +235,9 @@ func (m *model) replyQuestion(ans string) {
 	}
 	ch := m.question.Reply
 	m.question = nil
+	m.qTyping = false
+	m.qFree = ""
+	m.qCursor = 0
 	if m.overlay == overlayQuestion {
 		m.overlay = overlayNone
 	}

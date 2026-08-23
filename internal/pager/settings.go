@@ -315,6 +315,8 @@ func (m *model) settingValue(d settingDef) string {
 		return onOff(m.cfg.UI.RenderMermaid)
 	case "show_thinking_blocks":
 		return onOff(m.thinkingOn)
+	case "prompt_suggestions":
+		return onOff(m.suggest.enabled)
 	case "respect_manual_folds":
 		return onOff(m.cfg.UI.RespectFolds)
 	case "group_tool_verbs":
@@ -464,6 +466,12 @@ func (m *model) toggleSetting(key string) tea.Cmd {
 		m.mouseOn = !m.mouseOn
 	case "show_thinking_blocks":
 		m.thinkingOn = !m.thinkingOn
+	case "prompt_suggestions":
+		m.suggest.enabled = !m.suggest.enabled
+		m.cfg.SetPrefBool("prompt_suggestions", m.suggest.enabled)
+		if !m.suggest.enabled {
+			m.suggest.clear()
+		}
 	case "memory.enabled":
 		m.cfg.Features.Memory = !m.cfg.Features.Memory
 	case "permission_mode":

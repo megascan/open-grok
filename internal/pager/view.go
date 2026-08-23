@@ -161,6 +161,18 @@ func (m *model) mermaidOn() bool {
 	return m.cfg.PrefBool("render_mermaid", m.cfg.UI.RenderMermaid, true)
 }
 
+func (m *model) renderPromptInput() string {
+	w := max(20, m.width-2)
+	text := m.ta.Value()
+	ghost := m.suggest.ghostFor(text)
+	if ghost != "" && !strings.Contains(text, "\n") && !m.focusScroll {
+		cursor := "█"
+		body := "▎ " + text + cursor + dimStyle.Render(ghost)
+		return inputBox.Width(w).Render(body)
+	}
+	return inputBox.Width(w).Render(m.ta.View())
+}
+
 func fmtTokens(n int) string {
 	switch {
 	case n < 1000:
@@ -315,6 +327,9 @@ func (m *model) renderFooter() string {
 	if m.focusScroll {
 		hint = "tab prompt  ·  j/k nav  ·  y copy  ·  e expand"
 	}
+	if g := m.suggest.ghostFor(m.ta.Value()); g != "" && !m.focusScroll {
+		hint = "tab accept  ·  ctrl+right one word  ·  esc dismiss"
+	}
 	val := strings.TrimSpace(m.ta.Value())
 	if strings.HasPrefix(val, "/") {
 		matches := FuzzySlash(val, m.screenMd)
@@ -351,7 +366,7 @@ func (m *model) viewChat() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, m.vp.View(), m.renderSidebar())
 	}
 	chips := m.renderChips()
-	input := inputBox.Width(max(20, m.width-2)).Render(m.ta.View())
+	input := m.renderPromptInput()
 	if panel := m.renderBtwPanel(); panel != "" {
 		input = panel + "\n" + input
 	}

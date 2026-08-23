@@ -493,7 +493,17 @@ func TestCLICommandTree(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("ENTROPY_HOME")) && !bytes.Contains([]byte(buf.String()+""), []byte("entropy")) {
-		// doctor prints to stdout via fmt; still must not error
+	if !bytes.Contains(buf.Bytes(), []byte("Environment")) {
+		t.Fatalf("doctor report missing Environment: %s", buf.String())
+	}
+	if have["doctor"].Commands() == nil {
+		t.Fatal("doctor subcommands")
+	}
+	docSub := map[string]bool{}
+	for _, c := range have["doctor"].Commands() {
+		docSub[c.Name()] = true
+	}
+	if !docSub["fix"] {
+		t.Fatal("doctor missing fix")
 	}
 }

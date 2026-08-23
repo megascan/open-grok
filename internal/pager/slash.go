@@ -74,7 +74,7 @@ var slashCatalog = []slashCmd{
 	{Name: "workflows", Help: "live workflow run dashboard", Mode: modeFull, Category: "workflows"},
 	{Name: "btw", Help: "aside to the agent without interrupting the turn", Category: "session"},
 	{Name: "recap", Aliases: []string{"summarize"}, Help: "summarize the conversation so far", Category: "session"},
-	{Name: "doctor", Aliases: []string{"terminal-setup", "terminal-check", "terminal-info"}, Help: "check terminal, clipboard, color, and home", Category: "help"},
+	{Name: "doctor", Aliases: []string{"terminal-setup", "terminal-check", "terminal-info"}, Help: "Check this session and show available fixes", Category: "help"},
 	{Name: "voice", Help: "toggle dictation (Ctrl+Space/F8; Esc/Enter to stop)", Category: "input"},
 	{Name: "loop", Help: "run a prompt on a recurring interval", Category: "scheduling"},
 	{Name: "imagine", Help: "generate an image from a description", Category: "media"},

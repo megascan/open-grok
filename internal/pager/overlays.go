@@ -9,14 +9,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/megascan/open-grok/internal/agent"
-	"github.com/megascan/open-grok/internal/auth"
 	"github.com/megascan/open-grok/internal/catalog"
 	"github.com/megascan/open-grok/internal/config"
 	"github.com/megascan/open-grok/internal/foreign"
 	"github.com/megascan/open-grok/internal/hooks"
 	"github.com/megascan/open-grok/internal/tools"
-	"github.com/megascan/open-grok/internal/types"
-	"github.com/megascan/open-grok/internal/version"
 )
 
 func (m *model) viewWithOverlay(base string) string {
@@ -62,6 +59,8 @@ func (m *model) renderOverlay() string {
 	switch m.overlay {
 	case overlayQuestion:
 		return m.renderQuestion(w)
+	case overlayDoctor:
+		return m.renderDoctor(w)
 	case overlayPlan:
 		return m.renderPlanApproval(w)
 	case overlayCancelTurn:
@@ -106,6 +105,10 @@ func (m *model) renderOverlay() string {
 		if m.confirmKind == "rewind" {
 			body = "Rewind the last exchange?  y yes  ·  n cancel"
 		}
+		if strings.HasPrefix(m.confirmKind, "doctor-fix:") {
+			title = "Doctor fix"
+			body = doctorConfirmBody(m.confirmKind)
+		}
 		return modalBox.Width(w).Render(titleStyle.Render(title) + "\n\n" + body)
 	case overlayFeedback:
 		return modalBox.Width(w).Render(titleStyle.Render("Feedback") + "\n\n" + m.feedback + "█\n\n" + dimStyle.Render("enter send  ·  esc discard"))
@@ -114,7 +117,7 @@ func (m *model) renderOverlay() string {
 	case overlayTheme:
 		return m.renderListModal("Theme (live preview)", w)
 	case overlayDashboard, overlayResume, overlayHistory, overlayModel,
-		overlayDoctor, overlayDocs, overlayTutorial, overlayExtensions,
+		overlayDocs, overlayTutorial, overlayExtensions,
 		overlayPersonas, overlayFind,
 		overlayHelp, overlayPrivacy, overlayAnnouncements, overlayReleaseNotes,
 		overlayQueue, overlayTasks, overlayCache,
@@ -300,6 +303,22 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.overlay == overlayLogin {
 		return m.handleLoginKey(msg), true
 	}
+	if m.overlay == overlayDoctor && len(m.items) == 0 {
+		switch msg.String() {
+		case "esc":
+			m.overlay = overlayNone
+			return nil, true
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			return nil, true
+		case "down", "j":
+			m.cursor++
+			return nil, true
+		}
+		return nil, true
+	}
 	if m.overlay == overlaySettings {
 		return m.handleSettingsKey(msg), true
 	}
@@ -381,6 +400,8 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 				_ = id
 			} else if kind == "rewind" {
 				m.doRewind()
+			} else if strings.HasPrefix(kind, "doctor-fix:") {
+				m.applyDoctorFix(strings.TrimPrefix(kind, "doctor-fix:"))
 			}
 		case "n", "esc":
 			m.overlay = overlayNone
@@ -576,6 +597,11 @@ func (m *model) pickOverlay() tea.Cmd {
 			return nil
 		}
 		m.appendSys(it.Detail)
+	case overlayDoctor:
+		if it.Key != "" {
+			m.confirmKind = "doctor-fix:" + it.Key
+			m.overlay = overlayConfirm
+		}
 		return nil
 	case overlayFind:
 		m.jumpFind(it.Key)
@@ -738,30 +764,6 @@ func (m *model) openModels() {
 			Key: mod.ID, Label: mod.Name, Detail: string(mod.Provider) + "  " + string(mod.APIBackend),
 		})
 	}
-}
-
-func (m *model) openDoctor() {
-	m.overlay = overlayDoctor
-	m.cursor = 0
-	home := config.Home()
-	items := []listItem{
-		{Label: "version", Detail: version.String()},
-		{Label: "home", Detail: home},
-		{Label: "never ~/.grok", Detail: onOff(!config.NeverGrokHome(home))},
-		{Label: "tty", Detail: fmt.Sprintf("stdin=%v stdout=%v", isTTY(0), isTTY(1))},
-		{Label: "color", Detail: "lipgloss / 256-color + truecolor themes"},
-		{Label: "clipboard", Detail: "OSC 52 + ~/.entropy/last-copy.txt backup"},
-		{Label: "sandbox", Detail: onOff(sandboxActive())},
-	}
-	st := auth.Status()
-	for _, p := range types.AllProviders {
-		mark := "signed out"
-		if s, ok := st[p]; ok {
-			mark = s
-		}
-		items = append(items, listItem{Label: p.DisplayName(), Detail: mark})
-	}
-	m.items = items
 }
 
 func (m *model) openDocs() {

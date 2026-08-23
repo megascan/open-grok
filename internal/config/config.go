@@ -100,7 +100,8 @@ type ModelsSection struct {
 
 // FeatSection holds optional product features.
 type FeatSection struct {
-	Memory bool `toml:"memory"`
+	Memory       bool  `toml:"memory"`
+	SessionRecap *bool `toml:"session_recap"`
 }
 
 // CLISection controls leader attach defaults.
