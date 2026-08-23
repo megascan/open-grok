@@ -27,17 +27,19 @@ func (m *model) renderUsage(w int) string {
 		}
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Usage") + "\n")
-	b.WriteString(strings.Join(heads, " ") + "\n")
-	b.WriteString(dimStyle.Render("h/l tabs  ·  y copy session id  ·  esc") + "\n\n")
+	writeAccent(&b, strings.Join(heads, " "))
+	writeAccent(&b, dimStyle.Render(usageShortcutHint))
+	writeAccent(&b, "")
+	var body string
 	switch m.usageTab {
 	case 0:
-		b.WriteString(m.contextReport())
+		body = m.contextReport()
 	case 1:
-		b.WriteString(m.usageLimitReport())
+		body = m.usageLimitReport()
 	default:
-		b.WriteString(m.sessionInfo())
+		body = m.sessionInfo()
 	}
+	writeAccentLines(&b, strings.TrimRight(body, "\n"))
 	return modalBox.Width(w).Render(b.String())
 }
 
@@ -76,7 +78,7 @@ func (m *model) handleUsageKey(msg tea.KeyMsg) tea.Cmd {
 		m.usageTab = 1
 	case "3":
 		m.usageTab = 2
-	case "y":
+	case "y", "c":
 		if m.sess != nil {
 			return m.copyText(m.sess.ID, false)
 		}
@@ -93,9 +95,11 @@ func (m *model) openCache() {
 
 func (m *model) renderCache(w int) string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Prompt cache") + "\n\n")
-	b.WriteString(m.cacheReport())
-	b.WriteString("\n\n" + dimStyle.Render("esc close"))
+	writeAccent(&b, titleStyle.Render("Prompt cache"))
+	writeAccent(&b, "")
+	writeAccentLines(&b, strings.TrimRight(m.cacheReport(), "\n"))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("esc close"))
 	return modalBox.Width(w).Render(b.String())
 }
 

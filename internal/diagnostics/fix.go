@@ -124,6 +124,20 @@ func (p Plan) SuccessMessage() string {
 	return fmt.Sprintf("Added `%s` to `%s`.", p.Line, p.Path)
 }
 
+// FormatFixPreview is the question-card preview for `/doctor fix` (Rust format_fix_preview).
+func FormatFixPreview(p Plan) string {
+	var b strings.Builder
+	b.WriteString("Doctor Fix\n\n")
+	fmt.Fprintf(&b, "Fix: %s\n", p.ID.String())
+	fmt.Fprintf(&b, "File: %s\n", p.Path)
+	if p.WillWrite {
+		fmt.Fprintf(&b, "\nText to add:\n%s\n", p.Line)
+	} else {
+		b.WriteString("\nText to add: None. The requested setting is already configured.\n")
+	}
+	return b.String()
+}
+
 // PlanFix builds the managed-block write without touching disk.
 func PlanFix(id DiagnosticID) (Plan, error) {
 	spec, ok := specFor(id)

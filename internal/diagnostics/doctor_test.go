@@ -68,6 +68,25 @@ func TestApplyTmuxClipboardFix(t *testing.T) {
 	}
 }
 
+func TestFormatFixPreview(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BYOBU", "")
+	t.Setenv("BYOBU_BACKEND", "")
+	t.Setenv("BYOBU_CONFIG_DIR", "")
+	plan, err := PlanFix(TmuxClipboardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := FormatFixPreview(plan)
+	if !strings.Contains(text, "Doctor Fix") || !strings.Contains(text, "Fix: terminal.tmux-clipboard") {
+		t.Fatalf("%s", text)
+	}
+	if !strings.Contains(text, "Text to add:") || !strings.Contains(text, TmuxClipboardLine) {
+		t.Fatalf("%s", text)
+	}
+}
+
 func TestHumanFixCommand(t *testing.T) {
 	if HumanFixCommand(SSHWrapID) != "entropy doctor fix ssh-wrap" {
 		t.Fatal(HumanFixCommand(SSHWrapID))

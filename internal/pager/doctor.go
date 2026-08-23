@@ -1,7 +1,6 @@
 package pager
 
 import (
-	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,9 +26,13 @@ func (m *model) renderDoctor(w int) string {
 	if end > len(lines) {
 		end = len(lines)
 	}
-	shown := strings.Join(lines[start:end], "\n")
-	hint := dimStyle.Render("j/k scroll  ·  /doctor fix  ·  esc close")
-	return modalBox.Width(w).Render(titleStyle.Render("Doctor") + "\n\n" + shown + "\n\n" + hint)
+	var b strings.Builder
+	writeAccent(&b, titleStyle.Render("Doctor"))
+	writeAccent(&b, "")
+	writeAccentLines(&b, strings.Join(lines[start:end], "\n"))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("j/k scroll  ·  /doctor fix  ·  esc close"))
+	return modalBox.Width(w).Render(b.String())
 }
 
 func (m *model) openDoctor() {
@@ -76,8 +79,7 @@ func (m *model) handleDoctor(args string) tea.Cmd {
 			m.appendSys(err.Error() + "\n" + diagnostics.Usage)
 			return nil
 		}
-		m.confirmKind = "doctor-fix:" + id.Handle
-		m.overlay = overlayConfirm
+		m.openConfirm("doctor-fix:" + id.Handle)
 		return nil
 	default:
 		m.appendSys(diagnostics.Usage)
@@ -99,7 +101,7 @@ func (m *model) applyDoctorFix(handle string) {
 	m.appendSys(plan.SuccessMessage())
 }
 
-func doctorConfirmBody(kind string) string {
+func doctorFixPreview(kind string) string {
 	handle := strings.TrimPrefix(kind, "doctor-fix:")
 	id, err := diagnostics.ResolveFixID(handle)
 	if err != nil {
@@ -109,8 +111,9 @@ func doctorConfirmBody(kind string) string {
 	if err != nil {
 		return err.Error()
 	}
-	if plan.AlreadyOK {
-		return plan.SuccessMessage() + "  y / n"
-	}
-	return fmt.Sprintf("Add `%s` to `%s`?  y yes  ·  n cancel", plan.Line, plan.Path)
+	return diagnostics.FormatFixPreview(plan)
+}
+
+func doctorConfirmBody(kind string) string {
+	return doctorFixPreview(kind)
 }

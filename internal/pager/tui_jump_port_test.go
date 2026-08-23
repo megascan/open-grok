@@ -345,8 +345,14 @@ func TestChatPrivacyBannerAndPlanPlaceholder(t *testing.T) {
 		t.Fatal("banner should show")
 	}
 	view := stripANSI(m.viewChat())
-	if !strings.Contains(view, "Help improve Entropy") {
+	if !strings.Contains(view, "Help improve Open Grok") {
 		t.Fatalf("chat missing privacy banner:\n%s", view)
+	}
+	if !strings.Contains(view, "SpaceXAI") || !strings.Contains(view, "Read Terms and Privacy Policy") {
+		t.Fatalf("privacy copy:\n%s", view)
+	}
+	if !strings.Contains(view, "[Opt in]") || !strings.Contains(view, "[Opt out]") {
+		t.Fatalf("privacy buttons:\n%s", view)
 	}
 	m.plan = &planAskMsg{HasPlan: false, Plan: ""}
 	body := stripANSI(m.renderPlanApproval(72))

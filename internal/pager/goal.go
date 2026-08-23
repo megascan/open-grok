@@ -26,16 +26,25 @@ func (m *model) handleGoalOverlayKey(msg tea.KeyMsg) tea.Cmd {
 
 func (m *model) renderGoalDetail(w int) string {
 	if m.sess == nil || m.sess.Goal == nil {
-		return modalBox.Width(w).Render(titleStyle.Render("Goal") + "\n\n" + dimStyle.Render("no session"))
+		var b strings.Builder
+		writeAccent(&b, titleStyle.Render("Goal"))
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("no session"))
+		return modalBox.Width(w).Render(b.String())
 	}
 	snap := m.sess.Goal.Snapshot()
 	if snap == nil {
-		return modalBox.Width(w).Render(titleStyle.Render("Goal") + "\n\n" + dimStyle.Render("No goal. /goal <objective> [--budget <tokens>]"))
+		var b strings.Builder
+		writeAccent(&b, titleStyle.Render("Goal"))
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("No goal. /goal <objective> [--budget <tokens>]"))
+		return modalBox.Width(w).Render(b.String())
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Goal") + "  " + m.goalBadge() + "\n")
-	fmt.Fprintf(&b, "%s  ·  %s  ·  %s\n\n", snap.Status, snap.Phase, formatElapsed(uint64(snap.ElapsedMS)))
-	b.WriteString(renderMarkdown(snap.Objective, w-6) + "\n")
+	writeAccent(&b, titleStyle.Render("Goal")+"  "+m.goalBadge())
+	writeAccent(&b, fmt.Sprintf("%s  ·  %s  ·  %s", snap.Status, snap.Phase, formatElapsed(uint64(snap.ElapsedMS))))
+	writeAccent(&b, "")
+	writeAccentLines(&b, strings.TrimRight(renderMarkdown(snap.Objective, w-6), "\n"))
 	if snap.TokenBudget != nil && *snap.TokenBudget > 0 {
 		used := 0
 		if m.sess != nil {
@@ -49,27 +58,32 @@ func (m *model) renderGoalDetail(w int) string {
 		}
 		fill := int(pct * 24)
 		bar := strings.Repeat("█", fill) + strings.Repeat("░", 24-fill)
-		fmt.Fprintf(&b, "\nbudget  %s  %s / %s\n", bar, fmtTokens(used), fmtTokens(int(*snap.TokenBudget)))
+		writeAccent(&b, "")
+		writeAccent(&b, fmt.Sprintf("budget  %s  %s / %s", bar, fmtTokens(used), fmtTokens(int(*snap.TokenBudget))))
 	}
 	if snap.PauseMessage != "" {
-		b.WriteString("\n" + errStyle.Render(snap.PauseMessage) + "\n")
+		writeAccent(&b, "")
+		writeAccent(&b, errStyle.Render(snap.PauseMessage))
 	}
 	if snap.CompletionClaimed {
-		b.WriteString("\n" + claimStyle.Render("claim (run /goal complete to verify):") + "\n")
-		b.WriteString(dimStyle.Render(truncate(snap.CompletionSummary, 400)) + "\n")
+		writeAccent(&b, "")
+		writeAccent(&b, claimStyle.Render("claim (run /goal complete to verify):"))
+		writeAccent(&b, dimStyle.Render(truncate(snap.CompletionSummary, 400)))
 	}
 	if n := len(snap.Progress); n > 0 {
-		b.WriteString("\n" + dimStyle.Render("progress") + "\n")
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("progress"))
 		start := 0
 		if n > 15 {
 			start = n - 15
 		}
 		for _, p := range snap.Progress[start:] {
-			b.WriteString(bulletMd.Render("• ") + p + "\n")
+			writeAccent(&b, bulletMd.Render("• ")+p)
 		}
 	}
 	if n := len(snap.History); n > 0 {
-		b.WriteString("\n" + dimStyle.Render("history") + "\n")
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("history"))
 		start := 0
 		if n > 12 {
 			start = n - 12
@@ -82,10 +96,11 @@ func (m *model) renderGoalDetail(w int) string {
 			if !h.At.IsZero() {
 				line += "  " + h.At.Format(time.Kitchen)
 			}
-			b.WriteString(dimStyle.Render("· "+line) + "\n")
+			writeAccent(&b, dimStyle.Render("· "+line))
 		}
 	}
-	b.WriteString("\n" + dimStyle.Render("esc / g close  ·  /goal pause resume complete clear"))
+	writeAccent(&b, "")
+	writeAccent(&b, dimStyle.Render("esc / g close  ·  /goal pause resume complete clear"))
 	return modalBox.Width(w).Render(b.String())
 }
 

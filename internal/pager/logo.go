@@ -35,11 +35,18 @@ func (m *model) welcomeLogo() string {
 }
 
 func privacyBanner() string {
+	return privacyBannerAt(80)
+}
+
+func privacyBannerAt(width int) string {
+	title := privacyBannerTitle
+	if width > 0 && width < len(privacyBannerTitle)+1+len(privacyOptOutLabel)+1+len(privacyOptInLabel) {
+		title = privacyBannerCompactTitle
+	}
 	var b strings.Builder
-	b.WriteString(claimStyle.Render("  Help improve Entropy") + "\n")
-	b.WriteString(dimStyle.Render("  Off by default. Opt-in to allow coding data (prompts, traces, metrics)") + "\n")
-	b.WriteString(dimStyle.Render("  for training and debugging. Change anytime via /privacy.") + "\n")
-	b.WriteString(dimStyle.Render("  [Opt in]  /privacy    [Opt out]  dismiss this banner") + "\n")
+	b.WriteString(claimStyle.Render("  "+title) + dimStyle.Render("  "+privacyOptOutLabel+"  "+privacyOptInLabel) + "\n")
+	b.WriteString(dimStyle.Render("  "+privacyBannerDesc) + "\n")
+	b.WriteString(dimStyle.Render("  "+privacyBannerLegal) + "\n")
 	return b.String()
 }
 

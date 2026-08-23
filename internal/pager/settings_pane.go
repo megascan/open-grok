@@ -24,10 +24,39 @@ const (
 	feedbackBlockedOverlay      = "Close or answer what's open before sending feedback"
 	planWaitingLabel            = "Waiting on plan approval"
 	planEmptyTitle              = "No plan written — approve or request changes"
+	privacyBannerTitle          = "Help improve Open Grok"
+	privacyBannerCompactTitle   = "Improve Open Grok"
+	privacyBannerDesc           = "Off by default. Opt-in to allow SpaceXAI to retain coding data, e.g., prompts, traces, & metrics, for training and debugging purposes. Change anytime via settings."
+	privacyBannerLegal          = "Read Terms and Privacy Policy."
+	privacyOptInLabel           = "[Opt in]"
+	privacyOptOutLabel          = "[Opt out]"
+	shortcutsModalTitle         = "Keyboard Shortcuts"
+	worktreeDialogTitle         = "New Worktree"
+	worktreeNamePrefix          = "Name (optional): "
+	deleteSessionQuestion       = "Delete this session permanently?"
+	deleteSessionApplyLabel     = "Delete"
+	deleteSessionApplyDesc      = "Remove history and return home"
+	deleteSessionCancelDesc     = "Keep the session"
+	doctorFixQuestion           = "Apply this fix?"
+	doctorFixApplyDesc          = "Make the changes shown above."
+	doctorFixCancelDesc         = "Do not change the configuration."
+	resumePendingHint           = "y confirm delete  ·  n cancel"
+	resumePickerHint            = "↑↓ nav  ·  / search  ·  f filter  ·  d delete"
+	usageShortcutHint           = "Tab switch  ·  ↑/↓ scroll  ·  c copy session ID  ·  Esc close"
 )
 
 func writeAccent(b *strings.Builder, s string) {
 	b.WriteString(titleStyle.Render(permAccentBar) + "  " + s + "\n")
+}
+
+func writeAccentLines(b *strings.Builder, s string) {
+	if s == "" {
+		writeAccent(b, "")
+		return
+	}
+	for _, line := range strings.Split(s, "\n") {
+		writeAccent(b, line)
+	}
 }
 
 func radioRow(hotkey, label string, cursor bool) string {

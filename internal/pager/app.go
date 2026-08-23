@@ -171,7 +171,9 @@ type model struct {
 	echoOn                                                                bool
 	extTab                                                                int
 	docsIdx                                                               int
-	confirmKind                                                           string
+	confirmKind, resumePending                                            string
+	confirmCursor                                                         int
+	resumeFilter                                                          resumeSourceFilter
 	feedback                                                              string
 	perm                                                                  *permAskMsg
 	permQueue                                                             []permAskMsg

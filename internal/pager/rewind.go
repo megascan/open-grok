@@ -1,7 +1,6 @@
 package pager
 
 import (
-	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -62,23 +61,26 @@ func (m *model) renderRewind(w int) string {
 	var b strings.Builder
 	switch m.rewindPhase {
 	case rewindCancelOffer:
-		b.WriteString(titleStyle.Render("A turn is currently running.") + "\n")
-		b.WriteString(dimStyle.Render("Would you like to cancel it before rewinding?") + "\n\n")
-		b.WriteString(m.radioRow(0, m.rewindCursor, "y", "Cancel turn and rewind") + "\n")
-		b.WriteString(m.radioRow(1, m.rewindCursor, "n", "Let it finish") + "\n")
+		writeAccent(&b, titleStyle.Render("A turn is currently running."))
+		writeAccent(&b, dimStyle.Render("Would you like to cancel it before rewinding?"))
+		writeAccent(&b, "")
+		writeAccent(&b, radioRow("y", "Cancel turn and rewind", m.rewindCursor == 0))
+		writeAccent(&b, radioRow("n", "Let it finish", m.rewindCursor == 1))
 	case rewindConfirm:
 		preview := m.rewindPreview
 		if preview == "" {
 			preview = "this turn"
 		}
-		b.WriteString(titleStyle.Render("Rewind conversation to “"+truncate(preview, max(12, w-28))+"”?") + "\n\n")
-		b.WriteString(m.radioRow(0, m.rewindCursor, "y", "Yes") + "\n")
-		b.WriteString(m.radioRow(1, m.rewindCursor, "a", "Yes, and don't ask again") + "\n")
-		b.WriteString(m.radioRow(2, m.rewindCursor, "n", "No") + "\n")
+		writeAccent(&b, titleStyle.Render("Rewind conversation to “"+truncate(preview, max(12, w-28))+"”?"))
+		writeAccent(&b, "")
+		writeAccent(&b, radioRow("y", "Yes", m.rewindCursor == 0))
+		writeAccent(&b, radioRow("a", "Yes, and don't ask again", m.rewindCursor == 1))
+		writeAccent(&b, radioRow("n", "No", m.rewindCursor == 2))
 	default:
-		b.WriteString(titleStyle.Render("Rewind to which turn?") + "\n\n")
+		writeAccent(&b, titleStyle.Render("Rewind to which turn?"))
+		writeAccent(&b, "")
 		if len(m.rewindPoints) == 0 {
-			b.WriteString(dimStyle.Render("(empty)") + "\n")
+			writeAccent(&b, dimStyle.Render("(empty)"))
 			break
 		}
 		start := 0
@@ -90,27 +92,16 @@ func (m *model) renderRewind(w int) string {
 			if i < start || i >= start+limit {
 				continue
 			}
-			line := "· " + truncate(p.Preview, max(20, w-8))
+			line := "\u00b7 " + truncate(p.Preview, max(20, w-8))
 			if i == m.rewindCursor {
 				line = selStyle.Render(line)
 			}
-			b.WriteString(line + "\n")
+			writeAccent(&b, line)
 		}
-		b.WriteString("\n" + dimStyle.Render("j/k  ·  enter  ·  esc"))
+		writeAccent(&b, "")
+		writeAccent(&b, dimStyle.Render("j/k  ·  enter  ·  esc"))
 	}
 	return modalBox.Width(w).Render(b.String())
-}
-
-func (m *model) radioRow(idx, cursor int, key, label string) string {
-	marker := "(○)"
-	if idx == cursor {
-		marker = "(●)"
-	}
-	line := fmt.Sprintf(" %s %s %s", key, marker, label)
-	if idx == cursor {
-		return selStyle.Render(line)
-	}
-	return line
 }
 
 func (m *model) handleRewindKey(msg tea.KeyMsg) tea.Cmd {

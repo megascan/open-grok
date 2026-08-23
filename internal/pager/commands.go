@@ -109,8 +109,11 @@ func (m *model) runSlash(name, arg string) tea.Cmd {
 			m.appendSys("No active session to delete")
 			break
 		}
-		m.confirmKind = "delete"
-		m.overlay = overlayConfirm
+		if m.question != nil {
+			m.appendSys(feedbackBlockedQuestion)
+			break
+		}
+		m.openConfirm("delete")
 	case "new":
 		return m.handleNew()
 	case "fork":

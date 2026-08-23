@@ -22,11 +22,11 @@ func (m *model) openWorktreeDialog() {
 }
 
 func (m *model) renderWorktreeDialog(w int) string {
-	body := titleStyle.Render("New worktree") + "\n\n" +
-		dimStyle.Render("Empty label uses a timestamp. Entropy then opens a session in the new tree.") + "\n\n" +
-		dimStyle.Render("Name (optional): ") + m.worktreeLabel + "█\n\n" +
-		dimStyle.Render("enter create  ·  esc cancel")
-	return modalBox.Width(w).Render(body)
+	var b strings.Builder
+	writeAccent(&b, titleStyle.Render(worktreeDialogTitle))
+	writeAccent(&b, dimStyle.Render(worktreeNamePrefix)+m.worktreeLabel+"█")
+	writeAccent(&b, dimStyle.Render("enter = create   esc = cancel"))
+	return modalBox.Width(w).Render(b.String())
 }
 
 func (m *model) handleWorktreeKey(msg tea.KeyMsg) tea.Cmd {

@@ -214,8 +214,12 @@ func TestResumePickerListsAllCWDAndArmsDelete(t *testing.T) {
 		t.Fatalf("picker items %+v", m.items)
 	}
 	m.handleOverlayKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
-	if m.overlay != overlayConfirm || m.confirmKind != "delete-welcome:"+s2.ID {
-		t.Fatalf("d must arm delete, overlay=%d kind=%s", m.overlay, m.confirmKind)
+	if m.overlay != overlayResume || m.resumePending != s2.ID {
+		t.Fatalf("d must arm pending delete, overlay=%d pending=%s", m.overlay, m.resumePending)
+	}
+	view := stripANSI(m.renderListModal(m.overlayTitle(), 72))
+	if !strings.Contains(view, resumePendingHint) || !strings.Contains(view, permAccentBar) {
+		t.Fatalf("pending chrome:\n%s", view)
 	}
 }
 

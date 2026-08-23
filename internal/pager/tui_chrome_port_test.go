@@ -406,3 +406,139 @@ func TestCancelTurnAccentBar(t *testing.T) {
 		t.Fatalf("%s", view)
 	}
 }
+
+func TestPrivacyBannerMatchesRustCopy(t *testing.T) {
+	text := stripANSI(privacyBanner())
+	if !strings.Contains(text, privacyBannerTitle) {
+		t.Fatalf("title:\n%s", text)
+	}
+	if strings.Contains(text, "Help improve Entropy") {
+		t.Fatal("fork branding leaked into 1:1 banner title")
+	}
+	if !strings.Contains(text, privacyBannerDesc) || !strings.Contains(text, privacyBannerLegal) {
+		t.Fatalf("body:\n%s", text)
+	}
+}
+
+func TestRewindOverlayUsesAccentAndRadios(t *testing.T) {
+	m := testModel(t)
+	m.rewindPhase = rewindConfirm
+	m.rewindPreview = "ship it"
+	m.rewindCursor = 0
+	view := stripANSI(m.renderRewind(72))
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+	if !strings.Contains(view, "Rewind conversation to") || !strings.Contains(view, "Yes, and don't ask again") {
+		t.Fatalf("confirm:\n%s", view)
+	}
+	if !strings.Contains(view, "("+pickerDotFilled+")") {
+		t.Fatal("radio")
+	}
+	m.rewindPhase = rewindPicker
+	m.rewindPoints = []rewindPoint{{MsgIndex: 0, Preview: "hello"}}
+	view = stripANSI(m.renderRewind(72))
+	if !strings.Contains(view, "Rewind to which turn?") || !strings.Contains(view, "\u00b7 hello") {
+		t.Fatalf("picker:\n%s", view)
+	}
+}
+
+func TestConfirmOverlayQuestionChrome(t *testing.T) {
+	m := testModel(t)
+	sess, err := agent.NewSession(m.opts.CWD, m.opts.Model, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.sess = sess
+	m.openConfirm("delete")
+	view := stripANSI(m.renderConfirm(72))
+	if !strings.Contains(view, deleteSessionQuestion) {
+		t.Fatalf("title:\n%s", view)
+	}
+	if !strings.Contains(view, permAccentBar) || !strings.Contains(view, deleteSessionApplyLabel) {
+		t.Fatalf("chrome:\n%s", view)
+	}
+	if !strings.Contains(view, deleteSessionApplyDesc) || !strings.Contains(view, deleteSessionCancelDesc) {
+		t.Fatalf("descs:\n%s", view)
+	}
+	m.question = &qAskMsg{Question: "busy?", Options: []string{"yes"}}
+	m.overlay = overlayNone
+	m.handleSlash("/delete")
+	if lastSys(m) != feedbackBlockedQuestion {
+		t.Fatalf("blocked %q", lastSys(m))
+	}
+}
+
+func TestUsageModalTabChromeAndCopyHint(t *testing.T) {
+	m := testModel(t)
+	if err := m.openSession(Options{CWD: t.TempDir(), Model: m.opts.Model}); err != nil {
+		t.Fatal(err)
+	}
+	m.openUsage(0)
+	view := stripANSI(m.renderUsage(72))
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+	if !strings.Contains(view, "Context usage") || !strings.Contains(view, usageShortcutHint) {
+		t.Fatalf("tabs:\n%s", view)
+	}
+}
+
+func TestWorktreeDialogMatchesRustChrome(t *testing.T) {
+	m := testModel(t)
+	view := stripANSI(m.renderWorktreeDialog(60))
+	if !strings.Contains(view, worktreeDialogTitle) || !strings.Contains(view, worktreeNamePrefix) {
+		t.Fatalf("%s", view)
+	}
+	if !strings.Contains(view, permAccentBar) || !strings.Contains(view, "enter = create") {
+		t.Fatalf("hints:\n%s", view)
+	}
+}
+
+func TestShortcutsModalTitleMatchesRust(t *testing.T) {
+	m := testModel(t)
+	m.openShortcuts()
+	view := stripANSI(m.renderShortcuts(60))
+	if !strings.Contains(view, shortcutsModalTitle) || !strings.Contains(view, permAccentBar) {
+		t.Fatalf("%s", view)
+	}
+}
+
+func TestResumeSourceFilterCyclesAndHidesForeign(t *testing.T) {
+	m := testModel(t)
+	if m.resumeFilter.label() != "Grok" {
+		t.Fatalf("default %q", m.resumeFilter.label())
+	}
+	if !m.resumeFilter.matches("local") || m.resumeFilter.matches("claude") {
+		t.Fatal("grok filter")
+	}
+	m.resumeFilter = m.resumeFilter.next()
+	if m.resumeFilter.label() != "External" || !m.resumeFilter.matches("codex") {
+		t.Fatalf("external %q", m.resumeFilter.label())
+	}
+	m.resumeFilter = m.resumeFilter.next()
+	if m.resumeFilter.label() != "All" || !m.resumeFilter.matches("cursor") {
+		t.Fatalf("all %q", m.resumeFilter.label())
+	}
+}
+
+func TestDoctorFixConfirmUsesQuestionCopy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+	t.Setenv("BYOBU", "")
+	t.Setenv("BYOBU_BACKEND", "")
+	t.Setenv("BYOBU_CONFIG_DIR", "")
+	m := testModel(t)
+	m.openConfirm("doctor-fix:tmux-clipboard")
+	view := stripANSI(m.renderConfirm(72))
+	if !strings.Contains(view, doctorFixQuestion) || !strings.Contains(view, "Apply") {
+		t.Fatalf("question:\n%s", view)
+	}
+	if !strings.Contains(view, "Doctor Fix") || !strings.Contains(view, "set -g set-clipboard on") {
+		t.Fatalf("preview:\n%s", view)
+	}
+	if !strings.Contains(view, permAccentBar) {
+		t.Fatal("accent")
+	}
+}

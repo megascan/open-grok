@@ -102,16 +102,7 @@ func (m *model) renderOverlay() string {
 	case overlayPermission:
 		return m.renderPermission(w)
 	case overlayConfirm:
-		title := "Confirm"
-		body := "Delete this session?  y yes  ·  n cancel"
-		if m.confirmKind == "rewind" {
-			body = "Rewind the last exchange?  y yes  ·  n cancel"
-		}
-		if strings.HasPrefix(m.confirmKind, "doctor-fix:") {
-			title = "Doctor fix"
-			body = doctorConfirmBody(m.confirmKind)
-		}
-		return modalBox.Width(w).Render(titleStyle.Render(title) + "\n\n" + body)
+		return m.renderConfirm(w)
 	case overlayFeedback:
 		return m.renderFeedback(w)
 	case overlaySettings:
@@ -171,7 +162,7 @@ func (m *model) overlayTitle() string {
 	case overlayReleaseNotes:
 		return "Release notes"
 	case overlayShortcuts:
-		return "Shortcuts"
+		return shortcutsModalTitle
 	case overlayGoal:
 		return "Goal"
 	case overlayUsage:
@@ -197,7 +188,7 @@ func (m *model) overlayTitle() string {
 	case overlayTimeline:
 		return "Jump to which turn?"
 	case overlayWorktree:
-		return "New worktree"
+		return worktreeDialogTitle
 	}
 	return "Entropy"
 }
@@ -301,13 +292,16 @@ func formatContextWindow(tokens int) string {
 
 func (m *model) renderListModal(title string, w int) string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(title) + "\n")
-	if m.filter != "" {
-		b.WriteString(dimStyle.Render("filter: "+m.filter) + "\n")
+	writeAccent(&b, titleStyle.Render(title))
+	if m.overlay == overlayResume {
+		writeAccent(&b, dimStyle.Render("source: "+m.resumeFilter.label()))
 	}
-	b.WriteByte('\n')
+	if m.filter != "" {
+		writeAccent(&b, dimStyle.Render("filter: "+m.filter))
+	}
+	writeAccent(&b, "")
 	if len(m.items) == 0 {
-		b.WriteString(dimStyle.Render("(empty)") + "\n")
+		writeAccent(&b, dimStyle.Render("(empty)"))
 	}
 	start := 0
 	limit := 16
@@ -318,24 +312,85 @@ func (m *model) renderListModal(title string, w int) string {
 		if i < start || i >= start+limit {
 			continue
 		}
+		if it.Header {
+			writeAccent(&b, titleStyle.Render(it.Label))
+			continue
+		}
 		line := it.Label
 		if it.Detail != "" {
 			line += "  " + dimStyle.Render(it.Detail)
-		}
-		if it.Header {
-			b.WriteString(titleStyle.Render(it.Label) + "\n")
-			continue
 		}
 		if i == m.cursor {
 			line = selStyle.Render("▸ " + it.Label + "  " + it.Detail)
 		} else {
 			line = "  " + line
 		}
-		b.WriteString(line + "\n")
+		writeAccent(&b, line)
 	}
-	b.WriteString("\n" + dimStyle.Render("↑↓  enter  ·  esc close  ·  type to filter"))
+	writeAccent(&b, "")
+	hint := "↑↓  enter  ·  esc close  ·  type to filter"
 	if m.overlay == overlayResume {
-		b.WriteString(dimStyle.Render("  ·  d delete"))
+		if m.resumePending != "" {
+			hint = resumePendingHint
+		} else {
+			hint = resumePickerHint
+		}
+	}
+	writeAccent(&b, dimStyle.Render(hint))
+	return modalBox.Width(w).Render(b.String())
+}
+
+type confirmOption struct {
+	key, label, desc string
+}
+
+func (m *model) openConfirm(kind string) {
+	m.confirmKind = kind
+	m.confirmCursor = 0
+	m.overlay = overlayConfirm
+}
+
+func (m *model) confirmContent() (title, preview string, opts []confirmOption) {
+	switch {
+	case strings.HasPrefix(m.confirmKind, "doctor-fix:"):
+		preview = doctorFixPreview(m.confirmKind)
+		return doctorFixQuestion, preview, []confirmOption{
+			{key: "y", label: "Apply", desc: doctorFixApplyDesc},
+			{key: "n", label: "Cancel", desc: doctorFixCancelDesc},
+		}
+	case m.confirmKind == "rewind":
+		return "Rewind the last exchange?", "", []confirmOption{
+			{key: "y", label: "Yes", desc: ""},
+			{key: "n", label: "No", desc: ""},
+		}
+	default:
+		return deleteSessionQuestion, "", []confirmOption{
+			{key: "y", label: deleteSessionApplyLabel, desc: deleteSessionApplyDesc},
+			{key: "n", label: "Cancel", desc: deleteSessionCancelDesc},
+		}
+	}
+}
+
+func (m *model) renderConfirm(w int) string {
+	title, preview, opts := m.confirmContent()
+	var b strings.Builder
+	writeAccent(&b, titleStyle.Render(title))
+	writeAccent(&b, "")
+	if preview != "" {
+		lines := strings.Split(preview, "\n")
+		if len(lines) > 12 {
+			lines = append(lines[:12], "…")
+		}
+		for _, line := range lines {
+			writeAccent(&b, dimStyle.Render(line))
+		}
+		writeAccent(&b, "")
+	}
+	for i, o := range opts {
+		writeAccent(&b, radioRow(o.key, o.label, i == m.confirmCursor))
+		if o.desc != "" {
+			writeAccent(&b, dimStyle.Render("    "+o.desc))
+		}
 	}
 	return modalBox.Width(w).Render(b.String())
 }
@@ -495,13 +550,42 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			return cmd, true
 		}
 	}
+	if m.overlay == overlayResume && m.resumePending != "" {
+		switch msg.String() {
+		case "y":
+			id := m.resumePending
+			m.resumePending = ""
+			m.confirmDelete(id)
+			m.fillSessions("resume")
+			return nil, true
+		case "n":
+			m.resumePending = ""
+			return nil, true
+		case "esc":
+			m.resumePending = ""
+			m.overlay = overlayNone
+			m.filter = ""
+			return nil, true
+		default:
+			m.resumePending = ""
+		}
+	}
 	if m.overlay == overlayResume && msg.String() == "d" {
 		if m.cursor < len(m.items) {
 			it := m.items[m.cursor]
 			if strings.HasPrefix(it.Key, "resume:") {
-				m.confirmKind = "delete-welcome:" + strings.TrimPrefix(it.Key, "resume:")
-				m.overlay = overlayConfirm
+				m.resumePending = strings.TrimPrefix(it.Key, "resume:")
 			}
+		}
+		return nil, true
+	}
+	if m.overlay == overlayResume && msg.String() == "f" {
+		m.resumeFilter = m.resumeFilter.next()
+		saved := m.filter
+		m.fillSessions("resume")
+		if saved != "" {
+			m.filter = saved
+			m.applyOverlayFilter()
 		}
 		return nil, true
 	}
@@ -531,27 +615,27 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	case overlayConfirm:
+		opts := 2
 		switch msg.String() {
-		case "y", "enter":
-			kind := m.confirmKind
-			m.overlay = overlayNone
-			m.confirmKind = ""
-			if strings.HasPrefix(kind, "delete-welcome:") {
-				m.confirmDelete(strings.TrimPrefix(kind, "delete-welcome:"))
-			} else if kind == "delete" && m.sess != nil {
-				id := m.sess.ID
-				_ = agent.DeleteSession(m.sess)
-				m.sess = nil
-				m.screen = screenWelcome
-				m.refreshWelcome()
-				_ = id
-			} else if kind == "rewind" {
-				m.doRewind()
-			} else if strings.HasPrefix(kind, "doctor-fix:") {
-				m.applyDoctorFix(strings.TrimPrefix(kind, "doctor-fix:"))
+		case "up", "k":
+			if m.confirmCursor > 0 {
+				m.confirmCursor--
 			}
+			return nil, true
+		case "down", "j":
+			if m.confirmCursor+1 < opts {
+				m.confirmCursor++
+			}
+			return nil, true
+		case "y":
+			m.confirmCursor = 0
+			return m.applyConfirm(), true
 		case "n", "esc":
 			m.overlay = overlayNone
+			m.confirmKind = ""
+			return nil, true
+		case "enter":
+			return m.applyConfirm(), true
 		}
 		return nil, true
 	}
@@ -572,7 +656,7 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	case "up", "k":
-		if m.overlay == overlayHelp {
+		if m.overlay == overlayHelp || m.overlay == overlayResume {
 			m.stepSelectableCursor(-1)
 		} else if m.cursor > 0 {
 			m.cursor--
@@ -580,7 +664,7 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		m.previewOverlay()
 		return nil, true
 	case "down", "j":
-		if m.overlay == overlayHelp {
+		if m.overlay == overlayHelp || m.overlay == overlayResume {
 			m.stepSelectableCursor(1)
 		} else if m.cursor+1 < len(m.items) {
 			m.cursor++
@@ -602,7 +686,12 @@ func (m *model) handleOverlayKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "enter":
 		return m.pickOverlay(), true
 	}
-	if msg.Type == tea.KeyRunes && m.overlay != overlayPrivacy && m.overlay != overlayTimeline {
+	if msg.Type == tea.KeyRunes && m.overlay != overlayPrivacy && m.overlay != overlayTimeline && m.overlay != overlayResume {
+		m.filter += string(msg.Runes)
+		m.applyOverlayFilter()
+		return nil, true
+	}
+	if m.overlay == overlayResume && msg.Type == tea.KeyRunes && msg.String() != "f" && msg.String() != "d" {
 		m.filter += string(msg.Runes)
 		m.applyOverlayFilter()
 		return nil, true
@@ -663,6 +752,30 @@ func (m *model) applyOverlayFilter() {
 	if m.cursor >= len(m.items) {
 		m.cursor = 0
 	}
+}
+
+func (m *model) applyConfirm() tea.Cmd {
+	if m.confirmCursor != 0 {
+		m.overlay = overlayNone
+		m.confirmKind = ""
+		return nil
+	}
+	kind := m.confirmKind
+	m.overlay = overlayNone
+	m.confirmKind = ""
+	if strings.HasPrefix(kind, "delete-welcome:") {
+		m.confirmDelete(strings.TrimPrefix(kind, "delete-welcome:"))
+	} else if kind == "delete" && m.sess != nil {
+		_ = agent.DeleteSession(m.sess)
+		m.sess = nil
+		m.screen = screenWelcome
+		m.refreshWelcome()
+	} else if kind == "rewind" {
+		m.doRewind()
+	} else if strings.HasPrefix(kind, "doctor-fix:") {
+		m.applyDoctorFix(strings.TrimPrefix(kind, "doctor-fix:"))
+	}
+	return nil
 }
 
 func (m *model) pickOverlay() tea.Cmd {
@@ -770,8 +883,7 @@ func (m *model) pickOverlay() tea.Cmd {
 		m.appendSys(it.Detail)
 	case overlayDoctor:
 		if it.Key != "" {
-			m.confirmKind = "doctor-fix:" + it.Key
-			m.overlay = overlayConfirm
+			m.openConfirm("doctor-fix:" + it.Key)
 		}
 		return nil
 	case overlayFind:
@@ -850,7 +962,74 @@ func (m *model) openTheme() {
 
 func (m *model) openResume() {
 	m.overlay = overlayResume
+	m.resumePending = ""
+	m.filter = ""
 	m.fillSessions("resume")
+}
+
+type resumeSourceFilter int
+
+const (
+	resumeFilterGrok resumeSourceFilter = iota
+	resumeFilterExternal
+	resumeFilterAll
+	resumeFilterLocal
+	resumeFilterRemote
+)
+
+func (f resumeSourceFilter) label() string {
+	switch f {
+	case resumeFilterExternal:
+		return "External"
+	case resumeFilterAll:
+		return "All"
+	case resumeFilterLocal:
+		return "Local"
+	case resumeFilterRemote:
+		return "Remote"
+	default:
+		return "Grok"
+	}
+}
+
+func (f resumeSourceFilter) next() resumeSourceFilter {
+	switch f {
+	case resumeFilterGrok:
+		return resumeFilterExternal
+	case resumeFilterExternal:
+		return resumeFilterAll
+	case resumeFilterAll:
+		return resumeFilterLocal
+	case resumeFilterLocal:
+		return resumeFilterRemote
+	default:
+		return resumeFilterGrok
+	}
+}
+
+func (f resumeSourceFilter) matches(source string) bool {
+	foreign := isForeignPickerSource(source)
+	switch f {
+	case resumeFilterGrok:
+		return !foreign
+	case resumeFilterLocal:
+		return source == "local" || source == "both"
+	case resumeFilterRemote:
+		return source == "remote" || source == "both" || source == "conversation"
+	case resumeFilterExternal:
+		return foreign
+	default:
+		return true
+	}
+}
+
+func isForeignPickerSource(source string) bool {
+	switch strings.ToLower(source) {
+	case "claude", "codex", "cursor":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *model) fillSessions(kind string) {
@@ -878,25 +1057,39 @@ func (m *model) fillSessions(kind string) {
 		}
 	}
 	for _, repo := range order {
-		m.items = append(m.items, listItem{Key: "group:" + repo, Label: repo, Detail: "—"})
+		var rows []listItem
 		for _, s := range groups[repo] {
+			if !m.resumeFilter.matches("local") {
+				continue
+			}
 			title := s.Title
 			if title == "" {
 				title = "(untitled)"
 			}
-			m.items = append(m.items, listItem{
-				Key: "resume:" + s.ID, Label: "  " + shortID(s.ID) + "  " + title,
+			rows = append(rows, listItem{
+				Key:    "resume:" + s.ID,
+				Label:  "  " + shortID(s.ID) + "  " + title,
 				Detail: s.UpdatedAt.Format("15:04") + "  " + s.ModelID + "  " + s.CWD,
 			})
 		}
+		if len(rows) == 0 {
+			continue
+		}
+		m.items = append(m.items, listItem{Key: "group:" + repo, Label: repo, Header: true})
+		m.items = append(m.items, rows...)
 	}
 	for _, f := range foreign.ScanRecent(m.opts.CWD) {
+		src := strings.ToLower(f.Tool)
+		if !m.resumeFilter.matches(src) {
+			continue
+		}
 		m.items = append(m.items, listItem{
 			Key:    "foreign:" + f.Tool + ":" + f.ID,
 			Label:  "[" + f.Tool + "] " + f.Title,
 			Detail: f.UpdatedAt.Format("15:04") + "  " + f.CWD,
 		})
 	}
+	m.firstSelectableItem()
 	_ = kind
 }
 

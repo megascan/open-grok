@@ -86,13 +86,14 @@ func (m *model) shortcutItems(filter string) []listItem {
 
 func (m *model) renderShortcuts(w int) string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Shortcuts") + "\n")
+	writeAccent(&b, titleStyle.Render(shortcutsModalTitle))
 	if m.filter != "" {
-		b.WriteString(dimStyle.Render("filter: "+m.filter) + "\n")
+		writeAccent(&b, dimStyle.Render("filter: "+m.filter))
 	}
-	b.WriteString(dimStyle.Render("type to search  ·  enter expand  ·  esc close") + "\n\n")
+	writeAccent(&b, dimStyle.Render("type to search  ·  enter expand  ·  esc close"))
+	writeAccent(&b, "")
 	if len(m.items) == 0 {
-		b.WriteString(dimStyle.Render("(no matches)") + "\n")
+		writeAccent(&b, dimStyle.Render("(no matches)"))
 	}
 	start, limit := 0, 16
 	if m.cursor >= limit {
@@ -103,7 +104,7 @@ func (m *model) renderShortcuts(w int) string {
 			continue
 		}
 		if strings.HasPrefix(it.Key, "hdr:") {
-			b.WriteString(titleStyle.Render(it.Label) + "\n")
+			writeAccent(&b, titleStyle.Render(it.Label))
 			continue
 		}
 		line := it.Label
@@ -112,9 +113,9 @@ func (m *model) renderShortcuts(w int) string {
 		} else {
 			line = "  " + line
 		}
-		b.WriteString(line + "\n")
+		writeAccent(&b, line)
 		if i == m.cursor && m.shortcutExpand == i {
-			b.WriteString(dimStyle.Render("    "+it.Detail) + "\n")
+			writeAccent(&b, dimStyle.Render("    "+it.Detail))
 		}
 	}
 	return modalBox.Width(w).Render(b.String())
