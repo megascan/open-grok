@@ -246,7 +246,8 @@ fn startup_codex_freshness_required(
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
             | PrimaryProvider::Gemini
-            | PrimaryProvider::OpenRouter => false,
+            | PrimaryProvider::OpenRouter
+            | PrimaryProvider::Nvidia => false,
         },
     }
 }
@@ -276,7 +277,8 @@ fn plan_startup_auth(
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
             | PrimaryProvider::Gemini
-            | PrimaryProvider::OpenRouter => StartupAuthPlan::Ready,
+            | PrimaryProvider::OpenRouter
+            | PrimaryProvider::Nvidia => StartupAuthPlan::Ready,
         };
     }
     match selected_provider {
@@ -293,7 +295,8 @@ fn plan_startup_auth(
         | PrimaryProvider::Zai
         | PrimaryProvider::Runinfra
         | PrimaryProvider::Gemini
-        | PrimaryProvider::OpenRouter => StartupAuthPlan::Ready,
+        | PrimaryProvider::OpenRouter
+        | PrimaryProvider::Nvidia => StartupAuthPlan::Ready,
     }
 }
 

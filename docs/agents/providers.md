@@ -1,6 +1,6 @@
 # Multi-provider architecture
 
-How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, **Z AI**, **RunInfra**, **Google Gemini**, **OpenCode Go**, and **OpenRouter** without leaking credentials, tools, or opaque history.
+How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, **Z AI**, **RunInfra**, **Google Gemini**, **OpenCode Go**, **OpenRouter**, and **NVIDIA Build** without leaking credentials, tools, or opaque history.
 
 **Canonical contracts:**
 
@@ -43,6 +43,24 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | Google Gemini | Chat | none | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
 | OpenRouter | Chat | none | client function tools | API key only | **denied** |
+| NVIDIA Build | Chat | none | client function tools | API key only | **denied** |
+
+### NVIDIA Build ([build.nvidia.com](https://build.nvidia.com/))
+
+NVIDIA Build is an isolated, API-key-only OpenAI-compatible provider. Its base
+URL is `https://integrate.api.nvidia.com/v1`; use Chat Completions for inference
+and `GET /v1/models` for dynamic model discovery. The live list is
+authoritative: empty catalog if no key or the request fails, with no curated
+fallback. Non-chat ids whose slug contains embed, clip, reward, translate,
+diffusion, retriever, detector, or ising are dropped. NVIDIA accepts standard
+client function tools, keeps top-level `reasoning_effort` for known reasoning
+families (default High; Xhigh/Ultra remap to Max), does not provide native
+hosted web search, and must not receive xAI credentials, private metadata, or
+xAI-only exports. Stored keys stay on `integrate.api.nvidia.com`;
+`NVIDIA_API_KEY` (or alias `NGC_API_KEY`) may follow `OPENGROK_NVIDIA_API_BASE_URL`.
+401 is fatal. Context windows by normalized id: kimi-k3 / deepseek-v4 / glm-5.2
+/ muse-glimmer / nemotron-3-ultra / nemotron-3-super → 1_000_000; kimi-k2.6 →
+262_144; gpt-oss → 131_072; else 200_000.
 
 ### Wafer AI ([wafer.ai](https://www.wafer.ai/))
 
@@ -183,6 +201,10 @@ Wafer AI
   xai-grok-shell/src/wafer_models.rs            # dynamic /models catalog, trusted host
   auth/storage.rs                               # wafer::api_key (generic provider scope)
 
+NVIDIA Build
+  xai-grok-shell/src/nvidia_models.rs           # live /models catalog, trusted host
+  auth/storage.rs                               # nvidia::api_key (generic provider scope)
+
 Z AI
   xai-grok-shell/src/zai_models.rs              # dynamic /models catalog + curated fallback, trusted host
   auth/storage.rs                               # zai::api_key (generic provider scope)
@@ -234,6 +256,7 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | Google Gemini | `auth.json` scope `gemini::api_key` or `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Settings / `/login gemini` / environment |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Settings / `/login opencode-go` |
 | OpenRouter | `auth.json` scope `openrouter::api_key` or `OPENROUTER_API_KEY` | Settings / `/login openrouter` / environment |
+| NVIDIA Build | `auth.json` scope `nvidia::api_key` or `NVIDIA_API_KEY` / `NGC_API_KEY` | Settings / `/login nvidia` / environment |
 | Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |
 
@@ -278,6 +301,11 @@ Also isolated:
     models are omitted. An empty enabled list keeps the full live catalog;
     a non-empty list is an optional allowlist. Stored keys are sent only to
     `https://openrouter.ai`.
+19. **NVIDIA Build is API-key-only and provider-local.** `NVIDIA_API_KEY` /
+    `NGC_API_KEY` stored keys are sent only to `https://integrate.api.nvidia.com`;
+    live `/models` is authoritative with no curated fallback. Known reasoning
+    families keep top-level `reasoning_effort`. NVIDIA has no native hosted
+    web search and no Responses dialect.
 
 ## Sampling, routing, compaction
 
@@ -289,15 +317,15 @@ Also isolated:
 
 ### Adapter differences (summary)
 
-| Behavior | xAI | Codex | Kimi | Fireworks | DeepSeek | Meta | Wafer | OpenCode Go | OpenRouter |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Private headers | `x-grok-*` | stripped | stripped | stripped | stripped | stripped | stripped | stripped | stripped |
-| Doom-loop opt-in | yes | no | no | no | no | no | no | no | no |
-| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A | N/A |
-| Prompt cache key | no | session id | no | no | no | no | no | no | no |
-| Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no | no |
-| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A | N/A |
-| Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend | strips service tier / message model IDs |
+| Behavior | xAI | Codex | Kimi | Fireworks | DeepSeek | Meta | Wafer | OpenCode Go | OpenRouter | NVIDIA |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Private headers | `x-grok-*` | stripped | stripped | stripped | stripped | stripped | stripped | stripped | stripped | stripped |
+| Doom-loop opt-in | yes | no | no | no | no | no | no | no | no | no |
+| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A | N/A | N/A |
+| Prompt cache key | no | session id | no | no | no | no | no | no | no | no |
+| Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no | no | no |
+| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A | N/A | N/A |
+| Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend | strips service tier / message model IDs | keeps effort; remaps Xhigh/Ultra to Max |
 
 ### Compaction
 

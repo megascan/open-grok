@@ -617,6 +617,10 @@ impl SettingsModalState {
         self.try_open_provider_login_secret("wafer_api_key")
     }
 
+    pub fn try_open_nvidia_provider_login(&mut self) -> bool {
+        self.try_open_provider_login_secret("nvidia_api_key")
+    }
+
     pub fn try_open_zai_provider_login(&mut self) -> bool {
         self.try_open_provider_login_secret("zai_api_key")
     }

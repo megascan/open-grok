@@ -144,6 +144,24 @@ fn next_wafer_operation_generation(app: &mut AppView) -> u64 {
     app.wafer_operation_generation
 }
 
+fn remember_loaded_nvidia_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Nvidia)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_nvidia_rebind_agents.extend(targets);
+}
+
+fn next_nvidia_operation_generation(app: &mut AppView) -> u64 {
+    app.nvidia_operation_generation = app.nvidia_operation_generation.wrapping_add(1).max(1);
+    app.nvidia_runtime_update_pending = true;
+    app.nvidia_operation_generation
+}
+
 fn remember_loaded_zai_sessions(app: &mut AppView) {
     let mut targets = Vec::new();
     for (&agent_id, agent) in &mut app.agents {
@@ -451,6 +469,29 @@ pub(in crate::app::dispatch) fn clear_wafer_api_key(app: &mut AppView) -> Vec<Ef
     let generation = next_wafer_operation_generation(app);
     app.show_toast("Removing Wafer AI API key…");
     vec![Effect::UpdateWaferApiKey {
+        generation,
+        key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_nvidia_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_nvidia_sessions(app);
+    let generation = next_nvidia_operation_generation(app);
+    app.show_toast("Saving NVIDIA Build API key and refreshing models…");
+    vec![Effect::UpdateNvidiaApiKey {
+        generation,
+        key: Some(key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_nvidia_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_nvidia_sessions(app);
+    let generation = next_nvidia_operation_generation(app);
+    app.show_toast("Removing NVIDIA Build API key…");
+    vec![Effect::UpdateNvidiaApiKey {
         generation,
         key: None,
     }]
@@ -2873,6 +2914,8 @@ pub(in crate::app::dispatch) fn set_default_model(
         Some(PrimaryProvider::Gemini)
     } else if app.pending_openrouter_rebind_agents.contains(&aid) {
         Some(PrimaryProvider::OpenRouter)
+    } else if app.pending_nvidia_rebind_agents.contains(&aid) {
+        Some(PrimaryProvider::Nvidia)
     } else {
         Some(PrimaryProvider::Kimi)
     };
@@ -2915,6 +2958,9 @@ pub(in crate::app::dispatch) fn set_default_model(
                 }
                 Some(PrimaryProvider::OpenRouter) => {
                     app.cancel_pending_openrouter_rebind(aid);
+                }
+                Some(PrimaryProvider::Nvidia) => {
+                    app.cancel_pending_nvidia_rebind(aid);
                 }
                 Some(PrimaryProvider::Xai | PrimaryProvider::Codex) | None => {}
             }

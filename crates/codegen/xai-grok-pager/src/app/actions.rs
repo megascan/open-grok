@@ -690,6 +690,10 @@ pub enum Action {
     },
     /// Remove the UI-stored Wafer AI credential.
     ClearWaferApiKey,
+    SetNvidiaApiKey {
+        key: crate::settings::SecretInput,
+    },
+    ClearNvidiaApiKey,
     /// Save the Z AI API key from the dedicated masked editor.
     SetZaiApiKey {
         key: crate::settings::SecretInput,
@@ -845,6 +849,7 @@ pub enum Action {
     OpenOpenRouterApiKeyEditor,
     /// Open Settings directly in the secure Wafer AI API-key editor.
     OpenWaferApiKeyEditor,
+    OpenNvidiaApiKeyEditor,
     /// Open Settings directly in the secure Z AI API-key editor.
     OpenZaiApiKeyEditor,
     /// Open Settings directly in the secure RunInfra API-key editor.
@@ -1704,6 +1709,10 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    UpdateNvidiaApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
     /// Update the Z AI credential, then refresh its dynamic model catalog.
     UpdateZaiApiKey {
         generation: u64,
@@ -1809,6 +1818,13 @@ pub enum Effect {
         generation: u64,
     },
     RebindWaferModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+    },
+    RebindNvidiaModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,
@@ -2903,6 +2919,14 @@ pub enum TaskResult {
         error: Option<String>,
         models: Option<acp::SessionModelState>,
     },
+    NvidiaApiKeyUpdated {
+        configured: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
     /// Completion of a Z AI credential update and dynamic catalog refresh.
     ZaiApiKeyUpdated {
         configured: bool,
@@ -2975,6 +2999,14 @@ pub enum TaskResult {
     },
     /// Completion of an automatic Wafer sampler/model rebind.
     WaferModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        result: Result<(), SwitchModelError>,
+    },
+    NvidiaModelRebindComplete {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,

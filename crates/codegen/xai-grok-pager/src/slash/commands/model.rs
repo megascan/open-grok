@@ -154,6 +154,7 @@ fn model_provider_label(info: &acp::ModelInfo) -> Option<&str> {
         Some("opencode_go" | "opencode-go") => Some("OpenCode Go"),
         Some("openrouter" | "open_router" | "open-router") => Some("OpenRouter"),
         Some("wafer" | "wafer_ai") => Some("Wafer AI"),
+        Some("nvidia" | "nvidia_build" | "nvidia-nim" | "nim" | "ngc") => Some("NVIDIA Build"),
         Some("zai" | "z_ai" | "z-ai") => Some("Z AI"),
         Some("runinfra" | "run_infra" | "run-infra") => Some("RunInfra"),
         Some(

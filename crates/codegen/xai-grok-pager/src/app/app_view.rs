@@ -426,6 +426,7 @@ pub enum PrimaryProvider {
     Runinfra,
     Gemini,
     OpenRouter,
+    Nvidia,
 }
 
 pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
@@ -489,6 +490,13 @@ impl PrimaryProvider {
             || provider.eq_ignore_ascii_case("open-router")
         {
             Some(Self::OpenRouter)
+        } else if provider.eq_ignore_ascii_case("nvidia")
+            || provider.eq_ignore_ascii_case("nvidia_build")
+            || provider.eq_ignore_ascii_case("nvidia-nim")
+            || provider.eq_ignore_ascii_case("nim")
+            || provider.eq_ignore_ascii_case("ngc")
+        {
+            Some(Self::Nvidia)
         } else {
             None
         }
@@ -812,6 +820,9 @@ pub struct AppView {
     pub(crate) openrouter_operation_generation: u64,
     pub(crate) openrouter_runtime_update_pending: bool,
     pub(crate) pending_openrouter_rebind_agents: std::collections::HashSet<AgentId>,
+    pub(crate) nvidia_operation_generation: u64,
+    pub(crate) nvidia_runtime_update_pending: bool,
+    pub(crate) pending_nvidia_rebind_agents: std::collections::HashSet<AgentId>,
     pub(crate) opencode_go_models:
         Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub(crate) opencode_go_enabled_models: Vec<String>,
@@ -1588,6 +1599,17 @@ impl AppView {
         }
     }
 
+    pub(crate) fn cancel_pending_nvidia_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_nvidia_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
     pub(crate) fn cancel_pending_zai_rebind(&mut self, agent_id: AgentId) -> bool {
         let removed = self.pending_zai_rebind_agents.remove(&agent_id);
         if let Some(agent) = self.agents.get_mut(&agent_id) {
@@ -1663,7 +1685,8 @@ impl AppView {
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
             | PrimaryProvider::Gemini
-            | PrimaryProvider::OpenRouter => {
+            | PrimaryProvider::OpenRouter
+            | PrimaryProvider::Nvidia => {
                 // Preserve the xAI snapshot only when crossing out of xAI.
                 // A non-xAI <-> non-xAI transition sees already-cleared
                 // controls and must not overwrite the saved xAI state with
@@ -2012,6 +2035,9 @@ impl AppView {
             openrouter_operation_generation: 0,
             openrouter_runtime_update_pending: false,
             pending_openrouter_rebind_agents: Default::default(),
+            nvidia_operation_generation: 0,
+            nvidia_runtime_update_pending: false,
+            pending_nvidia_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             openrouter_models: Vec::new(),
@@ -6674,6 +6700,9 @@ pub(crate) mod tests {
             openrouter_operation_generation: 0,
             openrouter_runtime_update_pending: false,
             pending_openrouter_rebind_agents: Default::default(),
+            nvidia_operation_generation: 0,
+            nvidia_runtime_update_pending: false,
+            pending_nvidia_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             openrouter_models: Vec::new(),

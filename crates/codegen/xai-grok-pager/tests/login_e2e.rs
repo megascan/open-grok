@@ -38,6 +38,7 @@ fn login_argument_completion_lists_all_providers() {
             ("RunInfra", "runinfra"),
             ("Google Gemini", "gemini"),
             ("OpenRouter", "openrouter"),
+            ("NVIDIA Build", "nvidia"),
         ]
     );
     for row in &snapshot.matches[2..] {
@@ -71,6 +72,9 @@ fn login_provider_completion_filters_by_provider_aliases() {
         ("zai", "zai"),
         ("fireworks", "fireworks"),
         ("openrouter", "openrouter"),
+        ("nvidia", "nvidia"),
+        ("nim", "nvidia"),
+        ("ngc", "nvidia"),
     ] {
         let text = format!("/login {query}");
         controller.refresh(&state, &text, text.len(), &models);

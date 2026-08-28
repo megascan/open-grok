@@ -37,6 +37,7 @@ Codex provider does not override an explicit model API key.
 | Google Gemini | Chat | none | client function tools | no | standard only | provider API key | denied |
 | OpenCode Go | Chat, Messages | none | client function tools | no | standard only | provider API key | denied |
 | OpenRouter | Chat | none | client function tools | no | standard only | provider API key | denied |
+| NVIDIA Build | Chat | none | client function tools | no | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
@@ -76,6 +77,14 @@ Inference maps `reasoning_effort` onto OpenRouter's nested
 `reasoning` object, accepts `delta.reasoning` thinking tokens, and never
 inherits xAI request metadata, credentials, or exports. It has no native hosted
 web-search capability.
+NVIDIA Build is a plain OpenAI-compatible Chat Completions provider at
+`https://integrate.api.nvidia.com/v1`: it uses provider-local API-key auth
+(`NVIDIA_API_KEY` / `NGC_API_KEY`), discovers models from `GET /models` with
+no curated fallback, and exposes only standard client function tools. Known
+reasoning families keep top-level `reasoning_effort` (`none`/`minimal`/`low`/
+`medium`/`high`/`max`). It has no Responses dialect, hosted tools, native web
+search, or xAI export path. Stored keys stay on `https://integrate.api.nvidia.com`.
+
 Wafer AI is a plain OpenAI-compatible Chat Completions provider at
 `https://pass.wafer.ai/v1`: it uses provider-local API-key auth, discovers
 models from `GET /v1/models`, and exposes only standard client function tools.
