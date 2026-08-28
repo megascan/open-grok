@@ -444,6 +444,24 @@ impl SessionActor {
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
         let web_search = self.rebuild_spec.web_search_state();
+        if matches!(tool_name, "spawn_agent" | "interrupt_agent") {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && self
+                    .models_manager
+                    .model_supports_codex_multi_agent_v2(&sampling.model);
+        }
+        if tool_name == "send_user_message_async" {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && self.rebuild_spec.subagent_depth == 0
+                && self
+                    .models_manager
+                    .model_experimental_supported_tools(&sampling.model)
+                    .iter()
+                    .any(|tool| tool == "send_user_message_async");
+        }
         if tool_name == "web_search" {
             return web_search.allowed_for_provider(provider);
         }
@@ -467,7 +485,7 @@ impl SessionActor {
             // Memory storage and FTS are local/provider-neutral. Semantic
             // search may independently use the user's connected xAI embedding
             // route while chat runs through Codex.
-            "memory_search" | "memory_get" => self.memory.is_enabled(),
+            "memory_search" | "experience_search" | "memory_get" => self.memory.is_enabled(),
             _ => true,
         }
     }
@@ -831,6 +849,10 @@ impl SessionActor {
             self.rebuild_spec.multi_agent_policy_enabled,
         );
         let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
+        let use_responses_lite = self.models_manager.model_uses_responses_lite(&cfg.model);
+        let experimental_supported_tools = self
+            .models_manager
+            .model_experimental_supported_tools(&cfg.model);
         let stream_tool_calls = crate::agent::config::resolve_stream_tool_calls_inject(
             self.models_manager
                 .model_stream_tool_calls_override(&cfg.model)
@@ -910,6 +932,8 @@ impl SessionActor {
                 .active_sampling_config()
                 .supports_standalone_web_search,
             codex_multi_agent_v2,
+            use_responses_lite,
+            experimental_supported_tools,
             codex_permissions,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),

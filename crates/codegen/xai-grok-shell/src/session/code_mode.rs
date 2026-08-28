@@ -57,7 +57,7 @@ pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
 /// Human-interaction tools must remain model-visible in Code Mode Only: a
 /// JavaScript callback cannot safely own an ACP question whose answer pauses
 /// the model turn. Collaboration lifecycle tools also stay direct, matching
-/// GPT-5.6 Sol's Codex multi-agent-v2 `DirectModelOnly` exposure.
+/// Codex multi-agent-v2 `DirectModelOnly` exposure.
 ///
 /// The plan-mode lifecycle tools are on the list for the same reason as
 /// `ask_user_question`: `exit_plan_mode` parks the turn on the user's plan
@@ -72,10 +72,13 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
         name,
         "ask_user_question"
             | "request_user_input"
+            | "send_user_message_async"
             | "enter_plan_mode"
             | "exit_plan_mode"
             | "task"
             | "spawn_subagent"
+            | "spawn_agent"
+            | "interrupt_agent"
             | "agent_swarm"
             | "swarm_wait"
             | "workflow"
@@ -1053,9 +1056,6 @@ pub(crate) fn to_code_mode_tool_definition(
 ) -> CodeModeToolDefinition {
     let raw_name = definition.function.name.clone();
     let (kind, input_schema) = if raw_name == APPLY_PATCH_TOOL_NAME {
-        // GPT-5.6 Sol's pinned Codex profile exposes apply_patch as a
-        // free-form nested tool. The shell dispatcher adapts the raw patch
-        // string back into Grok Build's existing `{ patch }` function input.
         (CodeModeToolKind::Freeform, None)
     } else {
         (
@@ -1858,6 +1858,11 @@ mod tests {
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
+                "send_user_message_async",
+                Some("Send a nonblocking user message"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
                 "read_file",
                 Some("Read a file"),
                 json!({"type": "object"}),
@@ -1865,6 +1870,16 @@ mod tests {
             GrokToolDefinition::function(
                 "spawn_subagent",
                 Some("Launch a subagent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "spawn_agent",
+                Some("Launch a named native agent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "interrupt_agent",
+                Some("Interrupt a named agent"),
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
@@ -1899,6 +1914,7 @@ mod tests {
         for direct_only in [
             "ask_user_question",
             "request_user_input",
+            "send_user_message_async",
             "enter_plan_mode",
             "exit_plan_mode",
             "task",

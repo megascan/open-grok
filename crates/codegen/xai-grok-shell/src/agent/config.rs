@@ -4285,6 +4285,12 @@ struct DefaultModelJson {
     subagent_context_default: Option<SubagentContextMode>,
     /// Codex model-catalog execution contract. Unknown versions stay disabled.
     multi_agent_version: Option<String>,
+    #[serde(default)]
+    use_responses_lite: bool,
+    #[serde(default)]
+    experimental_supported_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apply_patch_tool_type: Option<String>,
     #[serde(default = "default_agent_type")]
     agent_type: String,
     inference_idle_timeout_secs: Option<u64>,
@@ -4433,6 +4439,9 @@ fn default_models(
                 subagent_context_default: m.subagent_context_default,
                 codex_multi_agent_v2: m.provider == ModelProvider::Codex
                     && m.multi_agent_version.as_deref() == Some("v2"),
+                use_responses_lite: m.use_responses_lite,
+                experimental_supported_tools: m.experimental_supported_tools,
+                apply_patch_tool_type: m.apply_patch_tool_type,
                 auth_scheme: None,
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
@@ -4516,6 +4525,12 @@ pub struct ModelEntryConfig {
     /// Whether this Codex model advertises `multi_agent_version = "v2"`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_multi_agent_v2: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_responses_lite: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub experimental_supported_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_patch_tool_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4746,6 +4761,9 @@ impl ConfigModelOverride {
             entry.info.tool_mode = None;
             entry.info.subagent_context_default = None;
             entry.info.codex_multi_agent_v2 = false;
+            entry.info.use_responses_lite = false;
+            entry.info.experimental_supported_tools.clear();
+            entry.info.apply_patch_tool_type = None;
             entry.info.auth_scheme = AuthScheme::default();
             entry.info.extra_headers.clear();
             entry.info.agent_type = if entry.info.provider == ModelProvider::Codex {
@@ -4925,6 +4943,12 @@ pub struct ModelInfo {
     /// independent from which reasoning efforts happen to be advertised.
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub experimental_supported_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_patch_tool_type: Option<String>,
     pub auth_scheme: AuthScheme,
     pub extra_headers: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -5008,6 +5032,9 @@ impl ModelInfo {
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
+            apply_patch_tool_type: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -5053,6 +5080,9 @@ impl ModelInfo {
             tool_mode: entry.tool_mode,
             subagent_context_default: entry.subagent_context_default,
             codex_multi_agent_v2: entry.codex_multi_agent_v2,
+            use_responses_lite: entry.use_responses_lite,
+            experimental_supported_tools: entry.experimental_supported_tools.clone(),
+            apply_patch_tool_type: entry.apply_patch_tool_type.clone(),
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
             query_params: IndexMap::new(),
@@ -6070,6 +6100,9 @@ pub fn resolve_aux_model_sampling_config(
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                use_responses_lite: false,
+                experimental_supported_tools: Vec::new(),
+                apply_patch_tool_type: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 query_params: IndexMap::new(),
@@ -6379,6 +6412,8 @@ pub fn sampling_config_for_model(
         supports_standalone_web_search: supports_standalone_web_search(info, uses_codex_oauth),
         // Preserve the live Codex `multi_agent_version` contract through the sampler.
         codex_multi_agent_v2: supports_codex_multi_agent_v2(info),
+        use_responses_lite: info.use_responses_lite,
+        experimental_supported_tools: info.experimental_supported_tools.clone(),
         codex_permissions: None,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
@@ -6484,6 +6519,9 @@ fn resolve_hidden_default_web_search_sampling_config(
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
+            apply_patch_tool_type: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -8076,6 +8114,9 @@ reasoning_effort = "low"
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                use_responses_lite: false,
+                experimental_supported_tools: Vec::new(),
+                apply_patch_tool_type: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 query_params: IndexMap::new(),
@@ -9523,6 +9564,9 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
+            apply_patch_tool_type: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -9689,6 +9733,9 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
+            apply_patch_tool_type: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -10185,6 +10232,9 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
+            apply_patch_tool_type: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -14206,6 +14256,9 @@ default = "grok-4.5"
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                use_responses_lite: false,
+                experimental_supported_tools: Vec::new(),
+                apply_patch_tool_type: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 query_params: IndexMap::new(),

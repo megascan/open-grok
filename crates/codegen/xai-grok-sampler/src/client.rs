@@ -111,10 +111,34 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     deserialize_response_event_for_adapter(data, provider_adapter(ModelProvider::Xai))
 }
 
+#[cfg(test)]
 fn deserialize_response_event_for_adapter(
     data: &str,
     adapter: &dyn ProviderAdapter,
 ) -> Result<rs::ResponseStreamEvent> {
+    deserialize_response_event_for_tools(data, adapter, false)
+}
+
+fn deserialize_response_event_for_tools(
+    data: &str,
+    adapter: &dyn ProviderAdapter,
+    native_multi_agent: bool,
+) -> Result<rs::ResponseStreamEvent> {
+    let codex_data = if adapter.provider() == ModelProvider::Codex {
+        let mut value: serde_json::Value = serde_json::from_str(data)?;
+        if !native_multi_agent && has_encrypted_function_calls(&value) {
+            return Err(SamplingError::InvalidConfiguration(
+                "Encrypted agent arguments require advertised native collaboration tools",
+            ));
+        }
+        if native_multi_agent {
+            preserve_codex_function_metadata(&mut value);
+        }
+        Some(value.to_string())
+    } else {
+        None
+    };
+    let data = codex_data.as_deref().unwrap_or(data);
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
@@ -138,6 +162,62 @@ fn deserialize_response_event_for_adapter(
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+fn has_native_multi_agent_tools(body: &serde_json::Value) -> bool {
+    fn native(tool: &serde_json::Value) -> bool {
+        (matches!(
+            tool.get("name").and_then(serde_json::Value::as_str),
+            Some("spawn_agent" | "send_message" | "followup_task")
+        ) && tool
+            .pointer("/parameters/properties/message/encrypted")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+            || (tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace")
+                && tool
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|tools| tools.iter().any(native)))
+    }
+    body.get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| tools.iter().any(native))
+}
+
+fn preserve_codex_function_metadata(value: &mut serde_json::Value) {
+    if let Some(item) = value.get_mut("item") {
+        xai_grok_sampling_types::conversation::encode_codex_function_call(item);
+    }
+    let response = if value.get("response").is_some() {
+        value.get_mut("response").expect("response exists")
+    } else {
+        value
+    };
+    if let Some(output) = response
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in output {
+            xai_grok_sampling_types::conversation::encode_codex_function_call(item);
+        }
+    }
+}
+
+fn has_encrypted_function_calls(value: &serde_json::Value) -> bool {
+    let response = value.get("response").unwrap_or(value);
+    response
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(value.get("item"))
+        .any(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                && item
+                    .get("encrypted_function_args")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arguments| !arguments.is_empty())
+        })
 }
 
 /// Absorb Codex's forward-compatible `response.metadata` side channel.
@@ -399,6 +479,7 @@ fn normalize_response_output_item(item: &mut serde_json::Value) {
     fill_missing_custom_tool_call_id(item);
     fill_missing_compaction_output_id(item);
     fill_missing_web_search_action(item);
+    normalize_web_search_action(item);
 }
 
 /// async-openai 0.33.1 requires `CompactionBody.id`, while the Responses
@@ -434,6 +515,42 @@ fn fill_missing_web_search_action(item: &mut serde_json::Value) {
             "action".to_owned(),
             xai_grok_sampling_types::sentinel_web_search_action_json(),
         );
+    }
+}
+
+fn normalize_web_search_action(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("web_search_call") {
+        return;
+    }
+
+    let Some(action) = item
+        .get_mut("action")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    match action.get("type").and_then(serde_json::Value::as_str) {
+        Some("search") => {
+            if let Some(sources) = action
+                .get_mut("sources")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                sources
+                    .retain(|source| source.get("url").is_some_and(serde_json::Value::is_string));
+            }
+        }
+        Some("find" | "find_in_page")
+            if !action.get("url").is_some_and(serde_json::Value::is_string) =>
+        {
+            item.insert(
+                "action".to_owned(),
+                xai_grok_sampling_types::sentinel_web_search_action_json(),
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1168,6 +1285,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    use_responses_lite: bool,
     codex_permissions: Option<crate::config::CodexPermissions>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     service_tier: Option<String>,
@@ -1470,6 +1588,7 @@ impl SamplingClient {
         );
 
         let max_retries = crate::retry::resolve_max_retries(config.max_retries);
+        let use_responses_lite = config.uses_responses_lite();
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
@@ -1481,6 +1600,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            use_responses_lite,
             codex_permissions: config.codex_permissions,
             reasoning_effort: config.reasoning_effort,
             service_tier: config.service_tier,
@@ -1609,6 +1729,8 @@ impl SamplingClient {
         }
 
         self.provider_adapter.sanitize_headers(&mut headers);
+        self.provider_adapter
+            .apply_responses_lite_header(&mut headers, self.defaults.use_responses_lite);
 
         self.provider_adapter
             .apply_turn_state_header(&mut headers, self.codex_turn_state.as_ref());
@@ -2197,6 +2319,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -2592,6 +2715,7 @@ impl SamplingClient {
         })?;
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        let native_multi_agent = has_native_multi_agent_tools(&request_body);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -2608,6 +2732,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -2673,8 +2798,19 @@ impl SamplingClient {
             });
         }
 
+        if self.defaults.provider == ModelProvider::Codex
+            && !native_multi_agent
+            && has_encrypted_function_calls(&serde_json::from_slice::<serde_json::Value>(&bytes)?)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "Encrypted agent arguments require advertised native collaboration tools",
+            ));
+        }
         let response_obj = (|| {
             let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            if self.defaults.provider == ModelProvider::Codex && native_multi_agent {
+                preserve_codex_function_metadata(&mut value);
+            }
             if self.provider_adapter.normalizes_response_events() {
                 normalize_response_compat(&mut value, "completed");
             }
@@ -2772,6 +2908,7 @@ impl SamplingClient {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        let native_multi_agent = has_native_multi_agent_tools(&request_body);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         xai_grok_sampling_types::strip_sentinel_web_search_actions(&mut request_body);
         patch_custom_tool_output_wire_fields(
@@ -2784,6 +2921,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -2946,9 +3084,10 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            let decoded = deserialize_response_event_for_adapter(
+                            let decoded = deserialize_response_event_for_tools(
                                 data,
                                 provider_adapter_for_stream,
+                                native_multi_agent,
                             );
                             if decoded.as_ref().is_err_and(|error| {
                                 provider_adapter_for_stream
@@ -3710,6 +3849,75 @@ mod tests {
     }
 
     #[test]
+    fn native_agent_decoder_requires_codex_and_an_advertised_encrypted_schema() {
+        let tool = serde_json::json!({"type":"function","name":"send_message","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}});
+        assert!(has_native_multi_agent_tools(
+            &serde_json::json!({"tools":[tool.clone()]})
+        ));
+        assert!(!has_native_multi_agent_tools(
+            &serde_json::json!({"input":[{"role":"user","content":tool}]})
+        ));
+        assert!(!has_native_multi_agent_tools(
+            &serde_json::json!({"tools":[{"type":"function","name":"send_message","parameters":{"properties":{"message":{"type":"string"}}}}]})
+        ));
+        let mut event = serde_json::json!({
+            "type":"response.output_item.done","sequence_number":1,"output_index":0,
+            "item":{"type":"function_call","id":"fc_native","call_id":"call_native","name":"send_message",
+                "namespace":"collaboration","status":"completed","arguments":"{\"target\":\"/root/worker\",\"message\":\"opaque-test-content\"}"}
+        });
+        for provider in [ModelProvider::Codex, ModelProvider::Xai] {
+            for enabled in [false, true] {
+                let decoded = deserialize_response_event_for_tools(
+                    &event.to_string(),
+                    provider_adapter(provider),
+                    enabled,
+                )
+                .unwrap();
+                let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = decoded else {
+                    panic!("output item")
+                };
+                let rs::OutputItem::FunctionCall(call) = event.item else {
+                    panic!("function call")
+                };
+                assert_eq!(
+                    xai_grok_sampling_types::conversation::decode_codex_function_call_id(
+                        &call.call_id
+                    )
+                    .is_some(),
+                    enabled && provider == ModelProvider::Codex
+                );
+            }
+        }
+        event["item"]["encrypted_function_args"] = serde_json::json!(["message"]);
+        assert!(
+            deserialize_response_event_for_tools(
+                &event.to_string(),
+                provider_adapter(ModelProvider::Codex),
+                false
+            )
+            .is_err()
+        );
+        let decoded = deserialize_response_event_for_tools(
+            &event.to_string(),
+            provider_adapter(ModelProvider::Codex),
+            true,
+        )
+        .unwrap();
+        let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = decoded else {
+            panic!("output item")
+        };
+        let rs::OutputItem::FunctionCall(call) = event.item else {
+            panic!("function call")
+        };
+        assert_eq!(
+            xai_grok_sampling_types::conversation::decode_codex_function_call_id(&call.call_id)
+                .unwrap()
+                .1["encrypted_function_args"],
+            serde_json::json!(["message"])
+        );
+    }
+
+    #[test]
     fn splice_extra_tool_entries_creates_tools_array_when_absent() {
         let mut body = serde_json::json!({});
         splice_extra_tool_entries(&mut body, vec![serde_json::json!({ "type": "web_search" })]);
@@ -3907,11 +4115,41 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
             codex_permissions: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+        }
+    }
+
+    #[test]
+    fn responses_lite_covers_both_compaction_protocols() {
+        let client = SamplingClient::new(SamplerConfig {
+            provider: ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
+            use_responses_lite: true,
+            ..minimal_config()
+        })
+        .unwrap();
+        for remote_v2 in [false, true] {
+            let request = ConversationRequest::from_items(vec![
+                xai_grok_sampling_types::ConversationItem::user("Preserve this context"),
+            ]);
+            let body = client
+                .codex_compaction_request_body(&request, "Compact instructions", remote_v2)
+                .unwrap();
+            assert!(body.get("instructions").is_none());
+            assert!(body.get("tools").is_none());
+            assert_eq!(body["input"][0]["type"], "additional_tools");
+            assert_eq!(
+                body["input"][1]["content"][0]["text"],
+                "Compact instructions"
+            );
+            assert_eq!(body["reasoning"]["context"], "all_turns");
+            assert_eq!(body["parallel_tool_calls"], false);
         }
     }
 
@@ -5852,6 +6090,145 @@ mod tests {
         assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
             &call.action
         ));
+    }
+
+    #[test]
+    fn codex_web_search_item_done_ignores_sources_without_urls() {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item": {
+                "id": "ws_sources",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "agent benchmarks",
+                    "sources": [
+                        { "type": "url", "url": "https://example.com/first" },
+                        { "type": "url" },
+                        { "type": "url", "url": null },
+                        { "type": "url", "url": "https://example.com/second" }
+                    ]
+                }
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("search sources without URLs should not fail the stream");
+        let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = event else {
+            panic!("expected ResponseOutputItemDone");
+        };
+        let rs::OutputItem::WebSearchCall(call) = event.item else {
+            panic!("expected WebSearchCall");
+        };
+        let rs::WebSearchToolCallAction::Search(action) = call.action else {
+            panic!("expected search action");
+        };
+        assert_eq!(action.query, "agent benchmarks");
+        assert_eq!(
+            action
+                .sources
+                .expect("valid sources are retained")
+                .into_iter()
+                .map(|source| source.url)
+                .collect::<Vec<_>>(),
+            ["https://example.com/first", "https://example.com/second"]
+        );
+    }
+
+    #[test]
+    fn codex_web_search_in_completed_output_ignores_sources_without_urls() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 9,
+            "response": {
+                "created_at": 0,
+                "id": "resp_sources",
+                "model": "gpt-5.6-sol",
+                "object": "response",
+                "output": [{
+                    "id": "ws_sources",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "agent benchmarks",
+                        "sources": [
+                            { "type": "url" },
+                            { "type": "url", "url": "https://example.com/valid" }
+                        ]
+                    }
+                }],
+                "status": "completed"
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("terminal output should tolerate search sources without URLs");
+        let rs::ResponseStreamEvent::ResponseCompleted(event) = event else {
+            panic!("expected response.completed");
+        };
+        let [rs::OutputItem::WebSearchCall(call)] = event.response.output.as_slice() else {
+            panic!("expected a single WebSearchCall output item");
+        };
+        let rs::WebSearchToolCallAction::Search(action) = &call.action else {
+            panic!("expected search action");
+        };
+        assert_eq!(
+            action
+                .sources
+                .as_ref()
+                .expect("valid sources are retained")
+                .iter()
+                .map(|source| source.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://example.com/valid"]
+        );
+    }
+
+    #[test]
+    fn codex_web_search_find_action_without_url_uses_sentinel() {
+        for action_type in ["find", "find_in_page"] {
+            let event = serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": {
+                    "id": "ws_find",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": action_type,
+                        "pattern": "benchmark methodology"
+                    }
+                }
+            })
+            .to_string();
+            assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+            let event = deserialize_response_event_for_adapter(
+                &event,
+                provider_adapter(ModelProvider::Codex),
+            )
+            .unwrap_or_else(|error| panic!("{action_type} without URL should parse: {error}"));
+            let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = event else {
+                panic!("expected ResponseOutputItemDone");
+            };
+            let rs::OutputItem::WebSearchCall(call) = event.item else {
+                panic!("expected WebSearchCall");
+            };
+            assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
+                &call.action
+            ));
+        }
     }
 
     #[test]
