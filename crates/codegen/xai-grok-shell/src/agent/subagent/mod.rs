@@ -1198,6 +1198,7 @@ fn refresh_kimi_sampling_config_for_spawn(
             | ModelProvider::Runinfra
             | ModelProvider::Gemini
             | ModelProvider::OpenRouter
+            | ModelProvider::Nvidia
     ) {
         return Ok(());
     }

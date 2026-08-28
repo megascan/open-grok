@@ -28,6 +28,7 @@ use crate::openrouter_models::{
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::runinfra_models::{RuninfraModelsCatalog, RuninfraModelsClient};
 use crate::sampling::SamplerConfig as SamplingConfig;
+use crate::nvidia_models::{NvidiaModelsCatalog, NvidiaModelsClient};
 use crate::wafer_models::{WaferModelsCatalog, WaferModelsClient};
 use crate::zai_models::{ZaiModelsCatalog, ZaiModelsClient};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -143,6 +144,7 @@ fn task_model_credential_error(requested: &str, entry: &ModelEntry) -> Option<St
             | ModelProvider::Zai
             | ModelProvider::Runinfra
             | ModelProvider::Gemini
+            | ModelProvider::Nvidia
     ) {
         return None;
     }
@@ -222,6 +224,7 @@ struct Inner {
     /// Provider-isolated Gemini catalog. The curated four-model list is
     /// authoritative; live `/models` may only enrich those entries.
     gemini_catalog: RwLock<Option<GeminiModelsCatalog>>,
+    nvidia_catalog: RwLock<Option<NvidiaModelsCatalog>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
     // ── Owned context for self-contained refresh ────────────────
@@ -242,6 +245,7 @@ struct Inner {
     zai_client: ZaiModelsClient,
     runinfra_client: RuninfraModelsClient,
     gemini_client: GeminiModelsClient,
+    nvidia_client: NvidiaModelsClient,
     /// Serialize Codex cache/network refreshes. Session startup waits for an
     /// already-running refresh so it resolves against the same catalog rather
     /// than racing past the initial `OnlineIfUncached` request.
@@ -256,6 +260,7 @@ struct Inner {
     zai_refresh_lock: tokio::sync::Mutex<()>,
     runinfra_refresh_lock: tokio::sync::Mutex<()>,
     gemini_refresh_lock: tokio::sync::Mutex<()>,
+    nvidia_refresh_lock: tokio::sync::Mutex<()>,
     /// Invalidates a refresh result when Codex logout races an in-flight
     /// `/models` request. Logout increments this before clearing the cache;
     /// only a refresh that started in the current generation may publish.
@@ -273,6 +278,7 @@ struct Inner {
     zai_catalog_generation: AtomicU64,
     runinfra_catalog_generation: AtomicU64,
     gemini_catalog_generation: AtomicU64,
+    nvidia_catalog_generation: AtomicU64,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
@@ -479,6 +485,7 @@ impl ModelsManager {
                 zai_catalog: RwLock::new(None),
                 runinfra_catalog: RwLock::new(None),
                 gemini_catalog: RwLock::new(None),
+                nvidia_catalog: RwLock::new(None),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
                 auth_manager,
@@ -498,6 +505,7 @@ impl ModelsManager {
                 zai_client: ZaiModelsClient::new(),
                 runinfra_client: RuninfraModelsClient::new(),
                 gemini_client: GeminiModelsClient::new(),
+                nvidia_client: NvidiaModelsClient::new(),
                 codex_refresh_lock: tokio::sync::Mutex::new(()),
                 kimi_refresh_lock: tokio::sync::Mutex::new(()),
                 fireworks_refresh_lock: tokio::sync::Mutex::new(()),
@@ -509,6 +517,7 @@ impl ModelsManager {
                 zai_refresh_lock: tokio::sync::Mutex::new(()),
                 runinfra_refresh_lock: tokio::sync::Mutex::new(()),
                 gemini_refresh_lock: tokio::sync::Mutex::new(()),
+                nvidia_refresh_lock: tokio::sync::Mutex::new(()),
                 codex_catalog_generation: AtomicU64::new(0),
                 kimi_catalog_generation: AtomicU64::new(0),
                 fireworks_catalog_generation: AtomicU64::new(0),
@@ -520,6 +529,7 @@ impl ModelsManager {
                 zai_catalog_generation: AtomicU64::new(0),
                 runinfra_catalog_generation: AtomicU64::new(0),
                 gemini_catalog_generation: AtomicU64::new(0),
+                nvidia_catalog_generation: AtomicU64::new(0),
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
                 fetches_in_flight: AtomicUsize::new(0),
@@ -595,6 +605,7 @@ impl ModelsManager {
             None,
             None,
             None,
+            None,
         );
 
         // Validate only against a real catalog; a bundled-only first run defers
@@ -655,6 +666,7 @@ impl ModelsManager {
         self.start_zai_models_query();
         self.start_runinfra_models_query();
         self.start_gemini_models_query();
+        self.start_nvidia_models_query();
     }
 
     /// Refresh the authenticated ChatGPT Codex catalog after the agent has a
@@ -1250,6 +1262,72 @@ impl ModelsManager {
         }
     }
 
+    fn start_nvidia_models_query(&self) {
+        if !self.inner.nvidia_client.has_usable_api_key() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("NVIDIA model query deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_nvidia_models().await {
+                tracing::warn!(%error, "NVIDIA model query failed; keeping current models");
+            }
+        });
+    }
+
+    pub(crate) async fn refresh_nvidia_models(&self) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.nvidia_refresh_lock.lock().await;
+        let generation = self.inner.nvidia_catalog_generation.load(Ordering::Acquire);
+        let client = self.inner.nvidia_client.clone();
+        let Some(refreshed) = client.query().await? else {
+            tracing::debug!("NVIDIA model query skipped: no NVIDIA API key");
+            return Ok(false);
+        };
+        if generation != self.inner.nvidia_catalog_generation.load(Ordering::Acquire)
+            || !client.catalog_matches_current_credential(&refreshed)
+        {
+            tracing::debug!(
+                "discarded NVIDIA model query completed after catalog clear or credential change"
+            );
+            return Ok(false);
+        }
+        let count = refreshed.entries().len();
+        let authoritative = refreshed.is_authoritative();
+        *self.inner.nvidia_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, authoritative, "NVIDIA model catalog refreshed");
+        Ok(true)
+    }
+
+    pub(crate) fn clear_nvidia_models(&self) -> bool {
+        self.inner
+            .nvidia_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.nvidia_catalog.write().take().is_some();
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog
+    }
+
+    pub(crate) async fn apply_nvidia_credential_change(&self) -> anyhow::Result<bool> {
+        if self.inner.nvidia_client.has_usable_api_key() {
+            self.refresh_nvidia_models().await
+        } else {
+            self.clear_nvidia_models();
+            Ok(false)
+        }
+    }
+
     fn start_zai_models_query(&self) {
         if !self.inner.zai_client.has_usable_api_key() {
             return;
@@ -1592,6 +1670,7 @@ impl ModelsManager {
             let zai_catalog = self.inner.zai_catalog.read();
             let runinfra_catalog = self.inner.runinfra_catalog.read();
             let gemini_catalog = self.inner.gemini_catalog.read();
+            let nvidia_catalog = self.inner.nvidia_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
             let openrouter_catalog = self.inner.openrouter_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
@@ -1612,6 +1691,7 @@ impl ModelsManager {
                 runinfra_catalog.as_ref(),
                 gemini_catalog.as_ref(),
                 openrouter_catalog.as_ref(),
+                nvidia_catalog.as_ref(),
             )
         };
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
@@ -2157,6 +2237,7 @@ impl ModelsManager {
             let zai_catalog = self.inner.zai_catalog.read();
             let runinfra_catalog = self.inner.runinfra_catalog.read();
             let gemini_catalog = self.inner.gemini_catalog.read();
+            let nvidia_catalog = self.inner.nvidia_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
             let openrouter_catalog = self.inner.openrouter_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
@@ -2173,6 +2254,7 @@ impl ModelsManager {
                 runinfra_catalog.as_ref(),
                 gemini_catalog.as_ref(),
                 openrouter_catalog.as_ref(),
+                nvidia_catalog.as_ref(),
             )
         };
         self.inner.catalog.write().models = catalog;
@@ -2518,6 +2600,7 @@ impl ModelsManager {
         self.start_zai_models_query();
         self.start_runinfra_models_query();
         self.start_gemini_models_query();
+        self.start_nvidia_models_query();
         if self.inner.catalog.read().has_fetched_real_catalog {
             tracing::debug!(
                 "skipping startup background model refresh: fresh cache already loaded"

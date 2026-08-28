@@ -1468,6 +1468,7 @@ mod is_hidden_tests {
         assert!(!boundary.observe(ModelProvider::Runinfra));
         assert!(!boundary.observe(ModelProvider::Gemini));
         assert!(!boundary.observe(ModelProvider::OpenRouter));
+        assert!(!boundary.observe(ModelProvider::Nvidia));
         assert!(!boundary.observe(ModelProvider::Codex));
         assert!(!boundary.observe(ModelProvider::Xai));
         assert!(!boundary.allows_xai_export());

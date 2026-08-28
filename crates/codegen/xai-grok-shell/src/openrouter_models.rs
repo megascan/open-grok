@@ -557,6 +557,7 @@ mod tests {
             None,
             None,
             Some(catalog),
+            None,
         )
     }
 

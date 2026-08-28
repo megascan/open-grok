@@ -3007,6 +3007,14 @@ impl SessionActor {
                         "OpenRouter API-key authentication cannot be refreshed automatically",
                     ));
                 }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Nvidia,
+                    ..
+                } => {
+                    return Err(acp::Error::internal_error().data(
+                        "NVIDIA API-key authentication cannot be refreshed automatically",
+                    ));
+                }
             };
             auth_retry_schedule.reset_on_success();
             codex_auth_retry_attempted = false;

@@ -241,6 +241,14 @@ fn apply_provider_endpoint_defaults(record: &mut CustomModelRecord) {
                 record.env_key = Some(crate::openrouter_models::OPENROUTER_API_KEY_ENV.to_owned());
             }
         }
+        Some("nvidia" | "nvidia_build" | "nvidia-nim" | "nim" | "ngc")
+            if record.base_url.is_none() =>
+        {
+            record.base_url = Some(crate::nvidia_models::api_base_url());
+            if record.env_key.is_none() {
+                record.env_key = Some(crate::nvidia_models::NVIDIA_API_KEY_ENV.to_owned());
+            }
+        }
         _ => {}
     }
 }
@@ -261,9 +269,10 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
             Ok(ModelProvider::Gemini)
         }
         "openrouter" | "open_router" | "open-router" => Ok(ModelProvider::OpenRouter),
+        "nvidia" | "nvidia_build" | "nvidia-nim" | "nim" | "ngc" => Ok(ModelProvider::Nvidia),
         other => bail!(
             "invalid provider `{other}`; expected xai, codex, kimi, fireworks, \
-             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, or openrouter"
+             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, openrouter, or nvidia"
         ),
     }
 }
@@ -426,6 +435,20 @@ mod tests {
         assert_eq!(
             gemini.env_key.as_deref(),
             Some(crate::gemini_models::GEMINI_API_KEY_ENV)
+        );
+
+        let (nvidia, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("nvidia".into()),
+            ..record("nvidia:extra", "moonshotai/kimi-k3")
+        })
+        .unwrap();
+        assert_eq!(
+            nvidia.base_url.as_deref(),
+            Some(crate::nvidia_models::api_base_url().as_str())
+        );
+        assert_eq!(
+            nvidia.env_key.as_deref(),
+            Some(crate::nvidia_models::NVIDIA_API_KEY_ENV)
         );
     }
 
