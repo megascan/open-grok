@@ -665,6 +665,11 @@ const CUSTOM_MODEL_PROVIDER_CHOICES: &[EnumChoice] = &[
         display: "OpenRouter",
         description: "OpenRouter catalog.",
     },
+    EnumChoice {
+        canonical: "nvidia",
+        display: "NVIDIA Build",
+        description: "NVIDIA Build Chat Completions (NVIDIA_API_KEY).",
+    },
 ];
 
 const CUSTOM_MODEL_BACKEND_CHOICES: &[EnumChoice] = &[
@@ -1376,6 +1381,17 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: false,
         },
         SettingMeta {
+            key: "nvidia_api_key",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "NVIDIA Build API key",
+            description: "API key for NVIDIA Build. Saving refreshes its dynamic model catalog from integrate.api.nvidia.com.",
+            keywords: &["nvidia", "nim", "ngc", "build", "api", "key", "credential", "models", "chat"],
+            kind: SettingKind::Secret,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
             key: "zai_api_key",
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
@@ -1582,7 +1598,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             label: "Provider",
             description: "Optional ModelProvider. Inherit leaves provider unset so the catalog key decides.",
             keywords: &[
-                "custom", "model", "provider", "zai", "runinfra", "gemini", "wafer", "kimi", "xai",
+                "custom", "model", "provider", "zai", "runinfra", "gemini", "wafer", "nvidia", "kimi", "xai",
             ],
             kind: SettingKind::Enum {
                 default: "",
@@ -1597,7 +1613,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Models,
             owner: SettingOwner::Pager,
             label: "Base URL",
-            description: "Optional API base URL. Z AI / Wafer fill their default when this is left empty.",
+            description: "Optional API base URL. Z AI / Wafer / NVIDIA fill their default when this is left empty.",
             keywords: &["custom", "model", "base", "url", "endpoint"],
             kind: SettingKind::String {
                 default: "",

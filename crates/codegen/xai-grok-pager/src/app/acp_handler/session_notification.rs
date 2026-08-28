@@ -176,6 +176,8 @@ pub(super) fn handle_session_notification_with_origin(
         Some(crate::app::app_view::PrimaryProvider::Gemini)
     } else if app.pending_openrouter_rebind_agents.contains(&parent_id) {
         Some(crate::app::app_view::PrimaryProvider::OpenRouter)
+    } else if app.pending_nvidia_rebind_agents.contains(&parent_id) {
+        Some(crate::app::app_view::PrimaryProvider::Nvidia)
     } else {
         Some(crate::app::app_view::PrimaryProvider::Kimi)
     };
@@ -1537,6 +1539,9 @@ pub(super) fn handle_session_notification_with_origin(
         }
         Some(crate::app::app_view::PrimaryProvider::OpenRouter) => {
             app.cancel_pending_openrouter_rebind(parent_id);
+        }
+        Some(crate::app::app_view::PrimaryProvider::Nvidia) => {
+            app.cancel_pending_nvidia_rebind(parent_id);
         }
         Some(
             crate::app::app_view::PrimaryProvider::Xai

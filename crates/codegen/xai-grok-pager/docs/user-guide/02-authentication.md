@@ -80,6 +80,24 @@ open-grok
 
 Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `open-grok logout` or delete `~/.opengrok/auth.json`.
 
+### NVIDIA Build
+
+NVIDIA Build uses an isolated API key with the OpenAI-compatible Chat Completions
+API. It does not use Open Grok's xAI or Codex login flows. Set the key before
+starting Open Grok, or connect it in a session with `/login nvidia`:
+
+```bash
+export NVIDIA_API_KEY="nvapi-..."
+open-grok
+```
+
+`NGC_API_KEY` is accepted as an alias. NVIDIA uses `https://integrate.api.nvidia.com/v1`
+and discovers available models from `GET /v1/models`; the live list is
+authoritative and non-chat ids are filtered out. Known reasoning families
+keep a top-level `reasoning_effort` menu. Its key and model catalog remain
+isolated from other providers and NVIDIA sessions cannot export data to
+xAI-only services.
+
 ### Wafer AI
 
 Wafer AI uses an isolated API key with the OpenAI-compatible Chat Completions

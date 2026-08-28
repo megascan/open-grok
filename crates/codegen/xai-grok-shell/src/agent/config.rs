@@ -4391,6 +4391,10 @@ fn default_models(
                     crate::openrouter_models::OPENROUTER_API_KEY_ENV,
                 ));
             }
+            if m.provider == ModelProvider::Nvidia {
+                m.base_url = Some(crate::nvidia_models::api_base_url());
+                m.env_key = Some(crate::nvidia_models::env_keys());
+            }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
                 .context_window
@@ -4753,7 +4757,8 @@ impl ConfigModelOverride {
                 | ModelProvider::Runinfra
                 | ModelProvider::Gemini
                 | ModelProvider::OpenCodeGo
-                | ModelProvider::OpenRouter => ApiBackend::ChatCompletions,
+                | ModelProvider::OpenRouter
+                | ModelProvider::Nvidia => ApiBackend::ChatCompletions,
             };
             if self.base_url.is_none() {
                 entry.info.base_url.clear();
@@ -5702,6 +5707,7 @@ fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) ->
                 || (provider.is_gemini() && crate::gemini_models::is_trusted_api_base_url(base_url))
                 || (provider.is_open_router()
                     && crate::openrouter_models::is_trusted_api_base_url(base_url))
+                || (provider.is_nvidia() && crate::nvidia_models::is_trusted_api_base_url(base_url))
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_xai_api_bearer_url(base_url)
@@ -7744,6 +7750,8 @@ reasoning_effort = "low"
             "openrouter-stored-secret",
         )
         .expect("store OpenRouter key");
+        store_provider_api_key(home.path(), ModelProvider::Nvidia, "nvidia-stored-secret")
+            .expect("store NVIDIA key");
 
         let mut meta = test_model_entry(
             "meta:muse-spark-1.2",
@@ -7866,6 +7874,31 @@ reasoning_effort = "low"
                 .is_none()
         );
         assert!(!openrouter_proxy.has_usable_provider_credentials_at(home.path()));
+
+        let mut nvidia = test_model_entry(
+            "nvidia:moonshotai/kimi-k3",
+            crate::nvidia_models::NVIDIA_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        nvidia.info.provider = ModelProvider::Nvidia;
+        nvidia.env_key = Some(crate::nvidia_models::env_keys());
+        let nvidia_creds = resolve_credentials_at_home(&nvidia, None, home.path());
+        assert_eq!(
+            nvidia_creds.api_key.as_deref(),
+            Some("nvidia-stored-secret")
+        );
+        assert!(nvidia.has_usable_provider_credentials_at(home.path()));
+
+        let mut nvidia_proxy = nvidia.clone();
+        nvidia_proxy.info.base_url = "https://proxy.example/v1".to_owned();
+        assert!(
+            resolve_credentials_at_home(&nvidia_proxy, None, home.path())
+                .api_key
+                .is_none()
+        );
+        assert!(!nvidia_proxy.has_usable_provider_credentials_at(home.path()));
     }
 
     #[test]

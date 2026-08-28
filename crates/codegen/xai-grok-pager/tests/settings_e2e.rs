@@ -60,6 +60,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "meta_api_key",
     "opencode_go_api_key",
     "wafer_api_key",
+    "nvidia_api_key",
     "zai_api_key",
     "runinfra_api_key",
     "gemini_api_key",
@@ -787,6 +788,7 @@ fn enter_on_each_provider_api_key_opens_matching_empty_secret_editor() {
         "meta_api_key",
         "opencode_go_api_key",
         "wafer_api_key",
+    "nvidia_api_key",
         "zai_api_key",
         "runinfra_api_key",
         "gemini_api_key",
@@ -1342,6 +1344,7 @@ fn mouse_click_on_each_provider_key_value_opens_matching_secret_editor() {
         "meta_api_key",
         "opencode_go_api_key",
         "wafer_api_key",
+    "nvidia_api_key",
         "zai_api_key",
         "runinfra_api_key",
         "gemini_api_key",
@@ -3019,6 +3022,7 @@ fn registry_kind_membership_through_pr_14() {
             "perplexity_api_key",
             "runinfra_api_key",
             "wafer_api_key",
+    "nvidia_api_key",
             "zai_api_key",
         ],
         "Secret kind membership drift",
@@ -3154,6 +3158,9 @@ fn defaults_round_trip_through_registry() {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
             "wafer_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
+            "nvidia_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
             "zai_api_key" => {

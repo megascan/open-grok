@@ -48,6 +48,19 @@ pub(in crate::app::dispatch) fn fireworks_api_key_status() -> crate::settings::S
     }
 }
 
+pub(in crate::app::dispatch) fn nvidia_api_key_status() -> crate::settings::SecretStatus {
+    if xai_grok_shell::nvidia_models::environment_api_key_is_configured() {
+        crate::settings::SecretStatus::EnvironmentOverride
+    } else if xai_grok_shell::auth::provider_api_key_is_configured(
+        &xai_grok_tools::util::grok_home::grok_home(),
+        xai_grok_shell::sampling::types::ModelProvider::Nvidia,
+    ) {
+        crate::settings::SecretStatus::Stored
+    } else {
+        crate::settings::SecretStatus::Missing
+    }
+}
+
 pub(in crate::app::dispatch) fn wafer_api_key_status() -> crate::settings::SecretStatus {
     if xai_grok_shell::wafer_models::environment_api_key_is_configured() {
         crate::settings::SecretStatus::EnvironmentOverride
@@ -172,6 +185,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let meta_api_key_status = meta_api_key_status();
     let opencode_go_api_key_status = opencode_go_api_key_status();
     let wafer_api_key_status = wafer_api_key_status();
+    let nvidia_api_key_status = nvidia_api_key_status();
     let zai_api_key_status = zai_api_key_status();
     let runinfra_api_key_status = runinfra_api_key_status();
     let gemini_api_key_status = gemini_api_key_status();
@@ -220,6 +234,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 meta_api_key_status,
                 opencode_go_api_key_status,
                 wafer_api_key_status,
+                nvidia_api_key_status,
                 zai_api_key_status,
                 runinfra_api_key_status,
                 gemini_api_key_status,
@@ -384,6 +399,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let meta_api_key_status = meta_api_key_status();
     let opencode_go_api_key_status = opencode_go_api_key_status();
     let wafer_api_key_status = wafer_api_key_status();
+    let nvidia_api_key_status = nvidia_api_key_status();
     let zai_api_key_status = zai_api_key_status();
     let runinfra_api_key_status = runinfra_api_key_status();
     let gemini_api_key_status = gemini_api_key_status();
@@ -446,6 +462,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         meta_api_key_status,
         opencode_go_api_key_status,
         wafer_api_key_status,
+        nvidia_api_key_status,
         zai_api_key_status,
         runinfra_api_key_status,
         gemini_api_key_status,
@@ -697,6 +714,32 @@ pub(in crate::app::dispatch) fn dispatch_open_wafer_api_key_editor(
     let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
     if !state.try_open_wafer_provider_login() {
         tracing::error!(target: "settings", "Wafer API-key setting is missing from the registry");
+        return vec![];
+    }
+    if let Some(agent) = get_visible_agent_mut(app) {
+        agent.active_modal = Some(ActiveModal::Settings {
+            state: Box::new(state),
+        });
+    } else if matches!(app.active_view, ActiveView::AgentDashboard)
+        && let Some(dashboard) = app.dashboard.as_mut()
+    {
+        dashboard.settings_modal = Some(Box::new(state));
+    }
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn dispatch_open_nvidia_api_key_editor(
+    app: &mut AppView,
+) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalState;
+
+    let registry = app.settings_registry.clone();
+    let ui_snapshot = app.current_ui.clone();
+    let pager_snapshot = build_pager_snapshot(app);
+    let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
+    if !state.try_open_nvidia_provider_login() {
+        tracing::error!(target: "settings", "NVIDIA API-key setting is missing from the registry");
         return vec![];
     }
     if let Some(agent) = get_visible_agent_mut(app) {
@@ -1286,6 +1329,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         meta_api_key_status: meta_api_key_status(),
         opencode_go_api_key_status: opencode_go_api_key_status(),
         wafer_api_key_status: wafer_api_key_status(),
+        nvidia_api_key_status: nvidia_api_key_status(),
         zai_api_key_status: zai_api_key_status(),
         runinfra_api_key_status: runinfra_api_key_status(),
         gemini_api_key_status: gemini_api_key_status(),
@@ -1718,6 +1762,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ) => Some(Action::ClearOpenCodeGoApiKey),
         ("wafer_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
             Some(Action::ClearWaferApiKey)
+        }
+        ("nvidia_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
+            Some(Action::ClearNvidiaApiKey)
         }
         ("zai_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
             Some(Action::ClearZaiApiKey)

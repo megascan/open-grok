@@ -31,6 +31,7 @@ pub(crate) mod model_image_input;
 pub mod opencode_go_models;
 pub mod openrouter_models;
 pub mod runinfra_models;
+pub mod nvidia_models;
 pub mod wafer_models;
 pub mod zai_models;
 pub use xai_grok_bundle as bundle;

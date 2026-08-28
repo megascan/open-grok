@@ -1036,6 +1036,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "opencode_go_api_key",
             // Wafer AI isolated credential.
             "wafer_api_key",
+            "nvidia_api_key",
             // Z AI isolated credential.
             "zai_api_key",
             // RunInfra isolated credential.

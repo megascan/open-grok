@@ -622,6 +622,8 @@ pub(super) fn dispatch_send_prompt_inner(
                         crate::app::dispatch::settings::ui::opencode_go_api_key_status(),
                     wafer_api_key_status: crate::app::dispatch::settings::ui::wafer_api_key_status(
                     ),
+                    nvidia_api_key_status:
+                        crate::app::dispatch::settings::ui::nvidia_api_key_status(),
                     zai_api_key_status: crate::app::dispatch::settings::ui::zai_api_key_status(),
                     runinfra_api_key_status:
                         crate::app::dispatch::settings::ui::runinfra_api_key_status(),

@@ -2621,6 +2621,7 @@ fn live_provider_entry(
         xai_grok_sampling_types::ModelProvider::OpenRouter => {
             crate::openrouter_models::api_base_url()
         }
+        xai_grok_sampling_types::ModelProvider::Nvidia => crate::nvidia_models::api_base_url(),
         _ => entry.info.base_url,
     };
     (key.to_owned(), entry)
@@ -2893,5 +2894,72 @@ fn config_models_survive_and_override_gemini_catalog_replace() {
         .expect("non-Gemini custom models must be untouched by a Gemini catalog apply");
     assert_eq!(custom.info.model, "llama3");
     assert_ne!(custom.info.provider, ModelProvider::Gemini);
+    assert_eq!(custom.info.context_window.get(), 128_000);
+}
+
+#[test]
+fn config_models_survive_and_override_nvidia_catalog_replace() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "nvidia:extra".to_string(),
+        config::ConfigModelOverride {
+            model: Some("nvidia-extra".to_string()),
+            provider: Some(ModelProvider::Nvidia),
+            context_window: Some(400_000),
+            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "nvidia:moonshotai/kimi-k3".to_string(),
+        config::ConfigModelOverride {
+            context_window: Some(750_000),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "my-ollama".to_string(),
+        config::ConfigModelOverride {
+            model: Some("llama3".to_string()),
+            context_window: Some(128_000),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let nvidia_live = IndexMap::from([live_provider_entry(
+        "nvidia:moonshotai/kimi-k3",
+        "moonshotai/kimi-k3",
+        ModelProvider::Nvidia,
+        200_000,
+    )]);
+
+    let catalog = resolve_model_catalog_with_live_nvidia_entries(&cfg, None, Some(nvidia_live));
+
+    let extra = catalog
+        .get("nvidia:extra")
+        .expect("custom NVIDIA model must survive a live catalog that omits it");
+    assert_eq!(extra.info.model, "nvidia-extra");
+    assert_eq!(extra.info.provider, ModelProvider::Nvidia);
+    assert_eq!(extra.info.context_window.get(), 400_000);
+
+    let overridden = catalog
+        .get("nvidia:moonshotai/kimi-k3")
+        .expect("live NVIDIA catalog entry must remain after override");
+    assert_eq!(overridden.info.model, "moonshotai/kimi-k3");
+    assert_eq!(overridden.info.provider, ModelProvider::Nvidia);
+    assert_eq!(
+        overridden.info.context_window.get(),
+        750_000,
+        "user [model.nvidia:moonshotai/kimi-k3] context_window must win over the live catalog"
+    );
+
+    let custom = catalog
+        .get("my-ollama")
+        .expect("non-NVIDIA custom models must be untouched by an NVIDIA catalog apply");
+    assert_eq!(custom.info.model, "llama3");
+    assert_ne!(custom.info.provider, ModelProvider::Nvidia);
     assert_eq!(custom.info.context_window.get(), 128_000);
 }

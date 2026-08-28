@@ -97,8 +97,8 @@ Fill the draft fields, then turn on **Save custom model**:
 | Catalog key | Table name / catalog key (`[model.<key>]`), for example `zai:glm-special` or `my-ollama`. Letters, digits, `:`, `.`, `-`, and `_` only; no spaces or newlines. |
 | Model id | Wire model id sent to the API. |
 | Name | Optional display name in the picker. |
-| Provider | `(inherit)` (empty) or `zai`, `runinfra`, `gemini`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`, `openrouter`. |
-| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI, RunInfra, Google Gemini, Wafer, or OpenRouter to use that provider's default endpoint. |
+| Provider | `(inherit)` (empty) or `zai`, `runinfra`, `gemini`, `wafer`, `nvidia`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`, `openrouter`. |
+| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI, RunInfra, Google Gemini, Wafer, NVIDIA Build, or OpenRouter to use that provider's default endpoint. |
 | Context window | Token window used for auto-compaction (`1000`–`4000000`; default `200000`). |
 | API backend | `chat_completions` (default), `responses`, or `messages`. |
 | Env key | Environment variable that holds the API key. Prefer this over putting a key in the file. |
@@ -116,6 +116,7 @@ Google Gemini defaults to
 `https://generativelanguage.googleapis.com/v1beta/openai/` and
 `env_key = "GEMINI_API_KEY"`.
 Wafer does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`.
+NVIDIA Build does the same with `https://integrate.api.nvidia.com/v1` and `NVIDIA_API_KEY`.
 OpenRouter does the same with `https://openrouter.ai/api/v1` and
 `OPENROUTER_API_KEY`. That keeps API-key-only providers from inheriting an
 empty or xAI endpoint.
@@ -246,10 +247,10 @@ When you override a built-in model, Grok starts with the default configuration (
 ### Priority Order
 
 1. Your config (`[model.*]`, including tables written from Settings) -- highest priority
-2. Live provider catalogs (Z AI, RunInfra, Google Gemini, Wafer, and OpenRouter `/models`, plus other prefetched `/v1/models` lists)
+2. Live provider catalogs (Z AI, RunInfra, Google Gemini, Wafer, NVIDIA Build, and OpenRouter `/models`, plus other prefetched `/v1/models` lists)
 3. Hardcoded defaults -- lowest priority
 
-A live Z AI, RunInfra, Google Gemini, Wafer, or OpenRouter catalog replace rebuilds that provider's picker
+A live Z AI, RunInfra, Google Gemini, Wafer, NVIDIA Build, or OpenRouter catalog replace rebuilds that provider's picker
 entries, then Open Grok re-applies `[model.*]`. Custom models that the
 remote list does not return stay in the catalog, and field overrides on a
 live id (for example a larger `context_window`) win.
@@ -333,6 +334,29 @@ context_window = 1000000
 max_completion_tokens = 384000
 reasoning_effort = "high"
 ```
+
+### NVIDIA Build
+
+NVIDIA Build provides an OpenAI-compatible Chat Completions endpoint. Its
+catalog is live-only: Open Grok queries `GET /v1/models` at
+`https://integrate.api.nvidia.com/v1` and does not invent a static list.
+Non-chat ids are filtered out. Known reasoning families expose
+`none`/`minimal`/`low`/`medium`/`high`/`max` with default High. Set
+`NVIDIA_API_KEY` (or `NGC_API_KEY`) and select one of the returned ids:
+
+```toml
+[model.nvidia-kimi]
+model = "moonshotai/kimi-k3"
+name = "Kimi K3"
+provider = "nvidia"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_backend = "chat_completions"
+env_key = "NVIDIA_API_KEY"
+```
+
+NVIDIA accepts standard client function tools. It has no native hosted web
+search, Responses API, OAuth flow, or xAI-only export path. Keep the NVIDIA
+API key provider-local.
 
 ### Wafer AI
 

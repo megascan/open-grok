@@ -451,6 +451,7 @@ pub struct PagerLocalSnapshot {
     pub opencode_go_api_key_status: SecretStatus,
     /// Status-only mirror for the Wafer AI API-key source.
     pub wafer_api_key_status: SecretStatus,
+    pub nvidia_api_key_status: SecretStatus,
     /// Status-only mirror for the Z AI API-key source.
     pub zai_api_key_status: SecretStatus,
     /// Status-only mirror for the RunInfra API-key source.
@@ -552,6 +553,7 @@ impl Default for PagerLocalSnapshot {
             meta_api_key_status: SecretStatus::Missing,
             opencode_go_api_key_status: SecretStatus::Missing,
             wafer_api_key_status: SecretStatus::Missing,
+            nvidia_api_key_status: SecretStatus::Missing,
             zai_api_key_status: SecretStatus::Missing,
             runinfra_api_key_status: SecretStatus::Missing,
             gemini_api_key_status: SecretStatus::Missing,
@@ -1097,6 +1099,7 @@ pub fn current_value_for(
         "meta_api_key" => Some(SettingValue::SecretStatus(pager.meta_api_key_status)),
         "opencode_go_api_key" => Some(SettingValue::SecretStatus(pager.opencode_go_api_key_status)),
         "wafer_api_key" => Some(SettingValue::SecretStatus(pager.wafer_api_key_status)),
+        "nvidia_api_key" => Some(SettingValue::SecretStatus(pager.nvidia_api_key_status)),
         "zai_api_key" => Some(SettingValue::SecretStatus(pager.zai_api_key_status)),
         "runinfra_api_key" => Some(SettingValue::SecretStatus(pager.runinfra_api_key_status)),
         "gemini_api_key" => Some(SettingValue::SecretStatus(pager.gemini_api_key_status)),
@@ -1480,6 +1483,7 @@ mod tests {
                     | "meta_api_key"
                     | "opencode_go_api_key"
                     | "wafer_api_key"
+                    | "nvidia_api_key"
                     | "zai_api_key"
                     | "runinfra_api_key"
                     | "gemini_api_key"

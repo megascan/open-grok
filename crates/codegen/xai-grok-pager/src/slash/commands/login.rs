@@ -20,6 +20,7 @@ pub(crate) fn provider_items(
     runinfra_status: Option<crate::settings::SecretStatus>,
     gemini_status: Option<crate::settings::SecretStatus>,
     openrouter_status: Option<crate::settings::SecretStatus>,
+    nvidia_status: Option<crate::settings::SecretStatus>,
 ) -> Vec<ArgItem> {
     let api_key_description = |status: Option<crate::settings::SecretStatus>| match status {
         Some(status) => format!("API key · {}", status.display()),
@@ -35,6 +36,7 @@ pub(crate) fn provider_items(
     let runinfra_description = api_key_description(runinfra_status);
     let gemini_description = api_key_description(gemini_status);
     let openrouter_description = api_key_description(openrouter_status);
+    let nvidia_description = api_key_description(nvidia_status);
     vec![
         ArgItem {
             display: "xAI Grok".to_owned(),
@@ -112,6 +114,12 @@ pub(crate) fn provider_items(
             insert_text: "openrouter".to_owned(),
             description: openrouter_description,
         },
+        ArgItem {
+            display: "NVIDIA Build".to_owned(),
+            match_text: "nvidia nvidia build nvidia-nim nim ngc api key chat completions dynamic models".to_owned(),
+            insert_text: "nvidia".to_owned(),
+            description: nvidia_description,
+        },
     ]
 }
 
@@ -135,8 +143,11 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
             Ok(Action::OpenGeminiApiKeyEditor)
         }
         "openrouter" | "open-router" | "open_router" => Ok(Action::OpenOpenRouterApiKeyEditor),
+        "nvidia" | "nvidia-build" | "nvidia_build" | "nvidia-nim" | "nim" | "ngc" => {
+            Ok(Action::OpenNvidiaApiKeyEditor)
+        }
         _ => Err(format!(
-            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, /login opencode-go, or /login openrouter",
+            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, /login opencode-go, /login openrouter, or /login nvidia",
             args.trim()
         )),
     }
@@ -148,11 +159,11 @@ impl SlashCommand for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter"
+        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, OpenRouter, or NVIDIA Build"
     }
 
     fn usage(&self) -> &str {
-        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]"
+        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter|nvidia]"
     }
 
     fn takes_args(&self) -> bool {
@@ -165,7 +176,7 @@ impl SlashCommand for LoginCommand {
 
     fn suggest_args(&self, _ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
         Some(provider_items(
-            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         ))
     }
 

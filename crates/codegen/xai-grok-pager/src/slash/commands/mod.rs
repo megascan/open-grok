@@ -721,6 +721,15 @@ mod tests {
         }
     }
     #[test]
+    fn login_nvidia_selects_secure_api_key_editor() {
+        for provider in [" nvidia ", "nvidia-build", "nvidia_build", "nvidia-nim", "nim", "ngc"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::OpenNvidiaApiKeyEditor)
+            ));
+        }
+    }
+    #[test]
     fn login_runinfra_selects_secure_api_key_editor() {
         for provider in [" runinfra ", "run-infra", "run_infra"] {
             assert!(matches!(
@@ -757,6 +766,7 @@ mod tests {
             Some(crate::settings::SecretStatus::Missing),
             Some(crate::settings::SecretStatus::Stored),
             Some(crate::settings::SecretStatus::Missing),
+            Some(crate::settings::SecretStatus::Stored),
         );
         assert_eq!(
             items
@@ -775,7 +785,8 @@ mod tests {
                 "zai",
                 "runinfra",
                 "gemini",
-                "openrouter"
+                "openrouter",
+                "nvidia"
             ]
         );
         assert_eq!(items[2].description, "API key · saved");

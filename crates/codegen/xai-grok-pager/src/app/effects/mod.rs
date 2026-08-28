@@ -86,6 +86,10 @@ static WAFER_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 static WAFER_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
 static NEXT_WAFER_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
 static LATEST_WAFER_MUTATION: AtomicU64 = AtomicU64::new(0);
+static NVIDIA_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static NVIDIA_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
+static NEXT_NVIDIA_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static LATEST_NVIDIA_MUTATION: AtomicU64 = AtomicU64::new(0);
 static ZAI_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static ZAI_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
 static NEXT_ZAI_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
@@ -705,6 +709,43 @@ async fn apply_wafer_models(tx: &AcpAgentTx) -> Result<WaferModelsApply, String>
     Ok(WaferModelsApply { warning, models })
 }
 
+fn next_nvidia_transport_token() -> u64 {
+    NEXT_NVIDIA_TRANSPORT_TOKEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+struct NvidiaModelsApply {
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+}
+
+async fn apply_nvidia_models(tx: &AcpAgentTx) -> Result<NvidiaModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/nvidia/models/apply",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize NVIDIA models apply params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("NVIDIA models apply returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("NVIDIA models apply returned an invalid catalog: {error}"))?;
+    Ok(NvidiaModelsApply { warning, models })
+}
+
 fn next_zai_transport_token() -> u64 {
     NEXT_ZAI_TRANSPORT_TOKEN
         .fetch_add(1, Ordering::SeqCst)
@@ -1165,6 +1206,76 @@ pub(crate) fn execute(
                         generation,
                         stale: !is_latest_kimi_transport_token(
                             &LATEST_META_KEY,
+                            transport_token,
+                        ),
+                        warning: Some(warning),
+                        error: None,
+                        models: None,
+                    },
+                }
+            });
+        }
+        Effect::UpdateNvidiaApiKey { generation, key } => {
+            let transport_token = next_nvidia_transport_token();
+            publish_kimi_transport_token(&LATEST_NVIDIA_MUTATION, transport_token);
+            let mut mutation_ticket = NVIDIA_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let configured = key.is_some();
+                let _guard = NVIDIA_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(&LATEST_NVIDIA_MUTATION, transport_token) {
+                    return TaskResult::NvidiaApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: true,
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Nvidia,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Nvidia,
+                    ),
+                };
+                if let Err(error) = storage_result {
+                    return TaskResult::NvidiaApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_NVIDIA_MUTATION,
+                            transport_token,
+                        ),
+                        warning: None,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                        models: None,
+                    };
+                }
+                match apply_nvidia_models(&tx).await {
+                    Ok(applied) => TaskResult::NvidiaApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_NVIDIA_MUTATION,
+                            transport_token,
+                        ),
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                    },
+                    Err(warning) => TaskResult::NvidiaApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_NVIDIA_MUTATION,
                             transport_token,
                         ),
                         warning: Some(warning),
@@ -4583,6 +4694,51 @@ pub(crate) fn execute(
                         }
                     });
                 TaskResult::OpenRouterModelRebindComplete {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort,
+                    generation,
+                    result,
+                }
+            });
+        }
+        Effect::RebindNvidiaModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = effort.map(|eff| {
+                    use xai_grok_shell::sampling::types::{
+                        REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
+                    };
+                    let mut metadata = acp::Meta::new();
+                    metadata.insert(
+                        REASONING_EFFORT_META_KEY.to_string(),
+                        reasoning_effort_meta_value(eff),
+                    );
+                    metadata
+                });
+                let request =
+                    acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone())
+                        .meta(meta);
+                let result = acp_send(request, &tx).await.map(|_| ()).map_err(|error| {
+                    if let Some(typed) =
+                        xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError::from_acp_error(&error)
+                    {
+                        SwitchModelError::IncompatibleAgent {
+                            error: typed,
+                            prev_model_id: None,
+                        }
+                    } else {
+                        SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                    }
+                });
+                TaskResult::NvidiaModelRebindComplete {
                     agent_id,
                     session_id,
                     model_id,

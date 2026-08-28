@@ -327,6 +327,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -344,6 +345,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
     runinfra_catalog: Option<&crate::runinfra_models::RuninfraModelsCatalog>,
     gemini_catalog: Option<&crate::gemini_models::GeminiModelsCatalog>,
     openrouter_catalog: Option<&crate::openrouter_models::OpenRouterModelsCatalog>,
+    nvidia_catalog: Option<&crate::nvidia_models::NvidiaModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     resolve_model_catalog_with_live_provider_entries(
         cfg,
@@ -359,6 +361,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
         runinfra_catalog.map(crate::runinfra_models::RuninfraModelsCatalog::entries),
         gemini_catalog.map(crate::gemini_models::GeminiModelsCatalog::entries),
         openrouter_catalog,
+        nvidia_catalog.map(crate::nvidia_models::NvidiaModelsCatalog::entries),
     )
 }
 
@@ -379,6 +382,7 @@ fn resolve_model_catalog_with_live_provider_entries(
     runinfra_entries: Option<IndexMap<String, ModelEntry>>,
     gemini_entries: Option<IndexMap<String, ModelEntry>>,
     openrouter_catalog: Option<&crate::openrouter_models::OpenRouterModelsCatalog>,
+    nvidia_entries: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
@@ -447,9 +451,13 @@ fn resolve_model_catalog_with_live_provider_entries(
         catalog.extend(openrouter_catalog.entries());
     }
 
-    // Live Wafer/Z AI/RunInfra/Gemini/OpenRouter catalogs replace that
-    // provider's partition. Re-apply `[model.*]` so user custom/override
-    // entries win after the replace.
+    if let Some(nvidia_entries) = nvidia_entries {
+        catalog.retain(|_, entry| {
+            entry.info.provider != xai_grok_sampling_types::ModelProvider::Nvidia
+        });
+        catalog.extend(nvidia_entries);
+    }
+
     apply_config_model_overrides(cfg, &mut catalog);
 
     let enabled_open_code_go = cfg
@@ -639,6 +647,7 @@ pub(crate) fn resolve_model_catalog_with_live_wafer_and_zai_entries(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -660,6 +669,7 @@ pub(crate) fn resolve_model_catalog_with_live_runinfra_entries(
         None,
         None,
         runinfra_entries,
+        None,
         None,
         None,
     )
@@ -685,6 +695,31 @@ pub(crate) fn resolve_model_catalog_with_live_gemini_entries(
         None,
         gemini_entries,
         None,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_model_catalog_with_live_nvidia_entries(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    nvidia_entries: Option<IndexMap<String, ModelEntry>>,
+) -> IndexMap<String, ModelEntry> {
+    resolve_model_catalog_with_live_provider_entries(
+        cfg,
+        prefetched,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nvidia_entries,
     )
 }
 
