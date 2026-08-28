@@ -1254,6 +1254,10 @@ pub enum ModelProvider {
     /// catalog; an empty enabled list keeps every discovered text model.
     #[serde(alias = "open_router", alias = "open-router")]
     OpenRouter,
+    /// NVIDIA Build OpenAI-compatible Chat Completions API
+    /// (`https://integrate.api.nvidia.com/v1`).
+    #[serde(alias = "nvidia_build", alias = "nvidia_nim", alias = "nim", alias = "ngc")]
+    Nvidia,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1631,6 +1635,25 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// NVIDIA Build's OpenAI-compatible Chat Completions API. NVIDIA supports
+    /// ordinary client-side function tools and top-level `reasoning_effort`,
+    /// but does not provide hosted tools, web search, Responses, or
+    /// provider-managed OAuth authentication.
+    pub const NVIDIA: Self = Self {
+        provider: ModelProvider::Nvidia,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1687,6 +1710,10 @@ impl ProviderProfile {
         self.provider.is_open_router()
     }
 
+    pub const fn is_nvidia(self) -> bool {
+        self.provider.is_nvidia()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1720,6 +1747,7 @@ impl ModelProvider {
             Self::Runinfra => "runinfra",
             Self::Gemini => "gemini",
             Self::OpenRouter => "openrouter",
+            Self::Nvidia => "nvidia",
         }
     }
 
@@ -1738,6 +1766,7 @@ impl ModelProvider {
             Self::Runinfra => "RunInfra",
             Self::Gemini => "Google Gemini",
             Self::OpenRouter => "OpenRouter",
+            Self::Nvidia => "NVIDIA Build",
         }
     }
 
@@ -1800,6 +1829,10 @@ impl ModelProvider {
         matches!(self, Self::OpenRouter)
     }
 
+    pub const fn is_nvidia(self) -> bool {
+        matches!(self, Self::Nvidia)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1815,6 +1848,7 @@ impl ModelProvider {
             Self::Runinfra => ProviderProfile::RUNINFRA,
             Self::Gemini => ProviderProfile::GEMINI,
             Self::OpenRouter => ProviderProfile::OPENROUTER,
+            Self::Nvidia => ProviderProfile::NVIDIA,
         }
     }
 }
@@ -2253,6 +2287,22 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::Nvidia,
+                id: "nvidia",
+                name: "NVIDIA Build",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -2279,6 +2329,7 @@ mod tests {
             assert_eq!(profile.is_runinfra(), case.provider.is_runinfra());
             assert_eq!(profile.is_gemini(), case.provider.is_gemini());
             assert_eq!(profile.is_open_router(), case.provider.is_open_router());
+            assert_eq!(profile.is_nvidia(), case.provider.is_nvidia());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,
@@ -2313,6 +2364,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Nvidia,
         ] {
             for backend in [
                 ApiBackend::ChatCompletions,

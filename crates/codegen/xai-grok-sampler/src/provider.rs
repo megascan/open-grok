@@ -610,6 +610,40 @@ impl ProviderAdapter for OpenRouterProvider {
     }
 }
 
+/// NVIDIA Build is an OpenAI-compatible Chat Completions provider. It keeps
+/// top-level `reasoning_effort` (NVIDIA's enum is none/minimal/low/medium/
+/// high/max) and drops OpenRouter nested `reasoning`, Z AI `thinking`,
+/// Grok-internal `service_tier`, xAI `search_parameters`, and per-message
+/// `model_id`. Native `reasoning_content` is left on the wire for replay.
+#[derive(Debug)]
+pub struct NvidiaProvider;
+
+impl ProviderAdapter for NvidiaProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Nvidia
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.reasoning = None;
+        request.thinking = None;
+        request.service_tier = None;
+        request.search_parameters = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
+        if let Some(effort) = request.reasoning_effort {
+            request.reasoning_effort = Some(normalize_nvidia_reasoning_effort(effort));
+        }
+    }
+}
+
+fn normalize_nvidia_reasoning_effort(effort: ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ReasoningEffort::Xhigh | ReasoningEffort::Ultra => ReasoningEffort::Max,
+        other => other,
+    }
+}
+
 fn normalize_openrouter_reasoning_effort(effort: ReasoningEffort) -> ReasoningEffort {
     match effort {
         ReasoningEffort::Ultra => ReasoningEffort::Max,
@@ -745,9 +779,10 @@ static ZAI_PROVIDER: ZaiProvider = ZaiProvider;
 static RUNINFRA_PROVIDER: RuninfraProvider = RuninfraProvider;
 static GEMINI_PROVIDER: GeminiProvider = GeminiProvider;
 static OPENROUTER_PROVIDER: OpenRouterProvider = OpenRouterProvider;
+static NVIDIA_PROVIDER: NvidiaProvider = NvidiaProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 12] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 13] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -796,6 +831,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 12] = [
         provider: ModelProvider::OpenRouter,
         adapter: &OPENROUTER_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::Nvidia,
+        adapter: &NVIDIA_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -815,6 +854,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Runinfra => PROVIDER_REGISTRY[9].adapter,
         ModelProvider::Gemini => PROVIDER_REGISTRY[10].adapter,
         ModelProvider::OpenRouter => PROVIDER_REGISTRY[11].adapter,
+        ModelProvider::Nvidia => PROVIDER_REGISTRY[12].adapter,
     }
 }
 
@@ -1725,6 +1765,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Nvidia,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -1755,6 +1796,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Nvidia,
         ] {
             let mut request = base_request();
             let original = request.clone();
@@ -1886,6 +1928,19 @@ mod tests {
         );
         assert!(runinfra.validate_backend(&ApiBackend::Responses).is_err());
         assert!(runinfra.validate_backend(&ApiBackend::Messages).is_err());
+
+        let nvidia = provider_adapter(ModelProvider::Nvidia);
+        assert_eq!(nvidia.prompt_cache_key(Some("session")), None);
+        assert!(!nvidia.supports_turn_state(&ApiBackend::Responses));
+        assert!(!nvidia.sends_doom_loop_opt_in());
+        assert!(!nvidia.normalizes_response_events());
+        assert!(
+            nvidia
+                .validate_backend(&ApiBackend::ChatCompletions)
+                .is_ok()
+        );
+        assert!(nvidia.validate_backend(&ApiBackend::Responses).is_err());
+        assert!(nvidia.validate_backend(&ApiBackend::Messages).is_err());
     }
 
     #[test]
@@ -2290,6 +2345,96 @@ mod tests {
         assert_eq!(
             normalize_openrouter_reasoning_effort(ReasoningEffort::Xhigh),
             ReasoningEffort::Xhigh
+        );
+    }
+
+    #[test]
+    fn nvidia_keeps_reasoning_effort_and_function_tools_and_rejects_responses() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, SearchParameters, ToolDefinition};
+
+        let assistant = ChatRequestMessage::assistant(
+            "previous turn",
+            "moonshotai/kimi-k3",
+            Some("native thoughts".to_owned()),
+        );
+        let mut request = ChatCompletionRequest::new("moonshotai/kimi-k3", vec![assistant]);
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.95);
+        request.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        request.reasoning = Some(ChatReasoningConfig::effort(ReasoningEffort::High));
+        request.thinking = Some(ChatThinkingMode::enabled());
+        request.service_tier = Some("priority".to_owned());
+        request.search_parameters = Some(SearchParameters {
+            mode: Some("on".to_owned()),
+            sources: None,
+            from_date: None,
+            to_date: None,
+            return_citations: None,
+            max_search_results: None,
+        });
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"]
+            }),
+        )]);
+
+        provider_adapter(ModelProvider::Nvidia).sanitize_chat_request(&mut request);
+
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        assert_eq!(
+            request.messages[0].reasoning_content.as_deref(),
+            Some("native thoughts")
+        );
+        assert_eq!(request.service_tier, None);
+        assert!(request.reasoning.is_none());
+        assert!(request.thinking.is_none());
+        assert!(request.search_parameters.is_none());
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(0.95));
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(wire["reasoning_effort"], "max");
+        assert!(wire.get("reasoning").is_none());
+        assert!(wire.get("thinking").is_none());
+        assert!(wire.get("search_parameters").is_none());
+        assert!(wire.get("service_tier").is_none());
+        assert_eq!(wire["messages"][0]["reasoning_content"], "native thoughts");
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+
+        let mut ultra =
+            ChatCompletionRequest::new("openai/gpt-oss-120b", vec![ChatRequestMessage::user("hi")]);
+        ultra.reasoning_effort = Some(ReasoningEffort::Ultra);
+        provider_adapter(ModelProvider::Nvidia).sanitize_chat_request(&mut ultra);
+        assert_eq!(ultra.reasoning_effort, Some(ReasoningEffort::Max));
+
+        let mut high =
+            ChatCompletionRequest::new("moonshotai/kimi-k3", vec![ChatRequestMessage::user("hi")]);
+        high.reasoning_effort = Some(ReasoningEffort::High);
+        provider_adapter(ModelProvider::Nvidia).sanitize_chat_request(&mut high);
+        assert_eq!(high.reasoning_effort, Some(ReasoningEffort::High));
+
+        assert!(
+            provider_adapter(ModelProvider::Nvidia)
+                .validate_backend(&ApiBackend::Responses)
+                .is_err()
+        );
+        assert_eq!(
+            normalize_nvidia_reasoning_effort(ReasoningEffort::Xhigh),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            normalize_nvidia_reasoning_effort(ReasoningEffort::None),
+            ReasoningEffort::None
         );
     }
 
