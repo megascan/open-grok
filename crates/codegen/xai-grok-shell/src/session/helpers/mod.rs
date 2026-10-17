@@ -6,6 +6,7 @@ pub mod memory_flush;
 pub mod prepared_compaction_history;
 pub mod prompt_suggest;
 pub mod replay;
+pub mod rewind_preview;
 pub mod session_compact;
 pub mod session_recap;
 pub mod session_summary;

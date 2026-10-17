@@ -81,6 +81,67 @@ fn test_actor_with_remote_sync(
     test_actor_inner(info, storage, remote_sync, false)
 }
 
+#[tokio::test]
+async fn external_agent_boundary_ack_survives_session_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("external-boundary"),
+        cwd: dir.path().to_string_lossy().into_owned(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage.clone());
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CloseXaiExportAndAck { respond_to })
+        .unwrap();
+    response.await.unwrap().unwrap();
+    assert!(!actor.handle.provider_boundary.allows_xai_export());
+    actor.stop().await;
+
+    let mut summary = storage.load_summary(&info).await.unwrap();
+    assert!(summary.ever_used_codex);
+    let reopened =
+        initialize_provider_boundary(storage.as_ref(), &info, &mut summary, ModelProvider::Xai)
+            .await
+            .unwrap();
+    assert!(!reopened.allows_xai_export());
+}
+
+#[tokio::test]
+async fn external_agent_boundary_write_failure_is_reported_and_memory_stays_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("external-boundary-failure"),
+        cwd: dir.path().to_string_lossy().into_owned(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info, storage);
+    break_summary_writes(dir.path());
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CloseXaiExportAndAck { respond_to })
+        .unwrap();
+    assert!(response.await.unwrap().is_err());
+    assert!(!actor.handle.provider_boundary.allows_xai_export());
+    actor.stop().await;
+}
+
 fn notification(info: &Info, text: &str) -> acp::SessionNotification {
     acp::SessionNotification::new(
         info.id.clone(),

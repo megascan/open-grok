@@ -875,3 +875,20 @@ fn rewind_grouped_swarm_card_prunes_stale_swarm_refs_and_keeps_future_progress_u
         "stale swarm refs must stay pruned after follow-up updates"
     );
 }
+
+#[test]
+fn rewind_cancel_offer_orders_cancel_before_fetch() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::RewindCancelOffer, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CancelTurnThenFetchRewindPoints {
+            agent_id: AgentId(0),
+            ..
+        }]
+    ));
+    assert!(matches!(
+        app.agents[&AgentId(0)].rewind_state.as_ref().unwrap().phase,
+        crate::views::rewind::RewindPhase::Loading
+    ));
+}

@@ -6,6 +6,7 @@
     dead_code
 )]
 mod flags;
+pub mod sandbox;
 pub use flags::*;
 mod memory;
 pub use memory::*;
@@ -500,6 +501,12 @@ pub struct ConsentGate {
 /// - Callers can distinguish "server said false" from "server didn't say"
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteSettings {
+    /// Per-command sandbox rollout, parsed tolerantly without changing legacy profiles.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_config::sandbox_mode::optional_sandbox_mode"
+    )]
+    pub sandbox_mode: Option<xai_grok_config::sandbox_mode::SandboxMode>,
     /// When `Some(true)`, the server recommends enabling leader mode.
     /// Used as a fallback when the user hasn't set `[cli] use_leader` locally.
     #[serde(default)]
@@ -1022,6 +1029,12 @@ pub struct RemoteSettings {
     /// layer in `resolve_auto_permission_mode_enabled` (client default ON).
     #[serde(default)]
     pub auto_mode: Option<serde_json::Value>,
+    /// Remote defaults for bounded recap generation.
+    #[serde(default)]
+    pub session_recap_config: Option<serde_json::Value>,
+    /// Remote defaults for bounded turn summaries.
+    #[serde(default)]
+    pub turn_summary_config: Option<serde_json::Value>,
     /// Soft default permission mode (`"ask"` / `"auto"` / `"always-approve"` /
     /// `"default"`). Used only when no effective TOML permission key is set.
     #[serde(default)]

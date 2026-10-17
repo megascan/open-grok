@@ -466,6 +466,23 @@ fn maybe_show_send_now_tip(app: &mut AppView) {
     }
 }
 
+pub(in crate::app::dispatch) const LOAD_FAILED_NOTICE: &str =
+    "This session didn't open. Open it again with /resume, or start a new one with /new.";
+
+fn refuse_on_failed_tab(agent: &mut crate::app::agent_view::AgentView, minimal: bool) -> bool {
+    if !agent.load_failed {
+        return false;
+    }
+    if minimal {
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(LOAD_FAILED_NOTICE.to_owned()));
+    } else {
+        agent.show_toast(LOAD_FAILED_NOTICE);
+    }
+    true
+}
+
 /// Body of [`dispatch_send_prompt`], parameterized over whether to consume
 /// the prompt textarea after the command is processed.
 ///
@@ -494,7 +511,7 @@ pub(super) fn dispatch_send_prompt_inner(
     // the common funnel so every submit path is covered, before any early-return
     // guard below.
     app.pending_action = None;
-    // Promote interim + hard-reset; merge only when consuming the composer.
+    // Promote interim and stop capture; merge only when consuming the composer.
     let interim = voice_stop_on_submit(app);
     let text = if consume_input {
         merge_prompt_with_voice_interim(text, interim)
@@ -530,6 +547,14 @@ pub(super) fn dispatch_send_prompt_inner(
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+
+    // Local recovery commands remain usable after a failed load.
+    let runs_locally = !literal
+        && (text.trim().starts_with('/')
+            || crate::slash::commands::exit::is_exit_alias(text.trim()));
+    if !runs_locally && refuse_on_failed_tab(agent, screen_mode_is_minimal) {
+        return vec![];
+    }
 
     // Paste-then-immediate-send: an image probe from a just-pasted Cmd+V is
     // still off-thread. Stash this send and re-issue it once the probe completes
@@ -776,6 +801,17 @@ pub(super) fn dispatch_send_prompt_inner(
                 CommandResult::PassThrough(text.clone())
             }
         };
+
+        // Refuse model-bound commands before taking the composer's images.
+        if matches!(
+            exec_result,
+            CommandResult::QueueCommand(_)
+                | CommandResult::InjectSkill { .. }
+                | CommandResult::PassThrough(_)
+        ) && refuse_on_failed_tab(agent, screen_mode_is_minimal)
+        {
+            return vec![];
+        }
 
         // One snapshot owns the chips and images; the composer's image state is
         // not read again below.
@@ -1174,6 +1210,9 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    if refuse_on_failed_tab(agent, app.screen_mode.is_minimal()) {
+        return vec![];
+    }
     // Submitting a bash command retires any edit-contextual ephemeral tip.
     agent.ephemeral_tip.clear_on_submit();
     agent.release_hook_block_hold();

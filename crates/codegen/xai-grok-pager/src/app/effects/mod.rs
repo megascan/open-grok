@@ -5,7 +5,9 @@
 //! spawns them as async tasks on a [`JoinSet`].  When tasks complete,
 //! the event loop converts their output into [`TaskResult`] and feeds it
 //! back through dispatch.
+mod antigravity;
 mod helpers;
+mod rewind_order;
 use super::actions;
 use super::session_title_resolve::worktree_resume_failure_message;
 #[allow(unused_imports)]
@@ -2636,6 +2638,73 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             tasks.spawn(async move { send_auth_cancel(&tx, request_seq).await });
         }
+        Effect::LoginAntigravity { agent_id } => {
+            let cwd = cwd.to_path_buf();
+            let (url_tx, url_rx) = tokio::sync::oneshot::channel::<(String, bool, bool)>();
+            let (shown_tx, shown_rx) = tokio::sync::oneshot::channel();
+            tasks.spawn(async move {
+                let (url, opened, copied) = match url_rx.await {
+                    Ok((url, opened, copied)) => (Some(actions::SensitiveAuthUrl(url)), opened, copied),
+                    Err(_) => (None, false, false),
+                };
+                TaskResult::AntigravityLoginUrlReady {
+                    agent_id,
+                    url, opened, copied, shown: Some(shown_tx),
+                }
+            });
+            tasks.spawn(async move {
+                let result = async {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(), cwd,
+                    ).map_err(|e| e.to_string())?;
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let mut url_tx = Some(url_tx);
+                    let login = xai_grok_shell::agent::antigravity_acp::login_user(
+                        &launch,
+                        move |url| {
+                            if let Some(tx) = url_tx.take() {
+                                let url = url.to_owned();
+                                tokio::spawn(async move {
+                                    let opened = antigravity::open_authorization_url(&url).await;
+                                    let copied = if !opened && agent_id.is_none() {
+                                        let clipboard_url = url.clone();
+                                        matches!(tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            tokio::task::spawn_blocking(move || {
+                                                crate::clipboard::SystemClipboard::try_set(&clipboard_url).reported_success()
+                                            }),
+                                        ).await, Ok(Ok(true)))
+                                    } else { false };
+                                    let _ = tx.send((url, opened, copied));
+                                });
+                            }
+                        },
+                        &cancel,
+                    );
+                    match tokio::time::timeout(std::time::Duration::from_secs(600), login).await {
+                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Err(_) => Err("Antigravity sign-in timed out".to_owned()),
+                    }
+                }.await;
+                // Process the URL event before completion can dismiss its modal.
+                let _ = shown_rx.await;
+                TaskResult::AntigravityAuthComplete { agent_id, logout: false, result }
+            });
+        }
+        Effect::LogoutAntigravity { agent_id } => {
+            let cwd = cwd.to_path_buf();
+            tasks.spawn(async move {
+                let result = async {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(), cwd,
+                    ).map_err(|e| e.to_string())?;
+                    xai_grok_shell::agent::antigravity_acp::logout_user(
+                        &launch, &tokio_util::sync::CancellationToken::new(),
+                    ).await.map_err(|e| e.to_string())
+                }.await;
+                TaskResult::AntigravityAuthComplete { agent_id, logout: true, result }
+            });
+        }
         Effect::LoginCodex { agent_id, purpose } => {
             let tx = acp_tx.clone();
             let (fallback_tx, fallback_rx) =
@@ -4036,6 +4105,7 @@ pub(crate) fn execute(
             cancel_subagents,
             trigger,
             rewind_if_no_output,
+            rewind_prompt_id,
         } => {
             let tx = acp_tx.clone();
             let trigger_str = trigger.map(|t| t.as_wire_str());
@@ -4053,16 +4123,12 @@ pub(crate) fn execute(
                         ),
                     );
                     let send_start = std::time::Instant::now();
-                    let mut meta = serde_json::json!({ "cancelSubagents": cancel_subagents });
-                    if let Some(t) = trigger_str {
-                        meta["cancelTrigger"] = t.into();
-                    }
-                    if rewind_if_no_output {
-                        meta["rewindIfNoOutput"] = true.into();
-                        meta["rewindIfPristine"] = true.into();
-                    }
-                    let req = acp::CancelNotification::new(session_id.clone())
-                        .meta(meta.as_object().cloned());
+                    let meta = rewind_order::cancel_meta(
+                        cancel_subagents,
+                        trigger_str,
+                        rewind_if_no_output.then_some(rewind_prompt_id.as_deref()).flatten(),
+                    );
+                    let req = acp::CancelNotification::new(session_id.clone()).meta(Some(meta));
                     let result = acp_send(req, &tx).await;
                     ulog::info(
                         "cancel.acp_send.done",
@@ -5109,6 +5175,48 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::SwitchModelWithWindow { agent_id, request_id, session_id, model_id, source_model_id, effort, window } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                use xai_grok_shell::sampling::types::{
+                    CONTEXT_WINDOW_META_KEY, REASONING_EFFORT_META_KEY,
+                    context_window_meta_value, reasoning_effort_meta_value,
+                };
+                let mut meta = acp::Meta::new();
+                meta.insert(CONTEXT_WINDOW_META_KEY.to_owned(), context_window_meta_value(window));
+                if let Some(effort) = effort {
+                    meta.insert(REASONING_EFFORT_META_KEY.to_owned(), reasoning_effort_meta_value(effort));
+                }
+                let req = acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(Some(meta));
+                let result = acp_send(req, &tx).await.map(|_| ()).map_err(|error| {
+                    if xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError::from_acp_error(&error).is_some() {
+                        SwitchModelError::Other("This model needs a new session. Switch to it first, then select the context window.".into())
+                    } else {
+                        SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                    }
+                });
+                TaskResult::ModelWindowSwitchComplete { agent_id, request_id, session_id, model_id, source_model_id, effort, window, result }
+            });
+        }
+        Effect::SwitchContextWindow { agent_id, request_id, session_id, model_id, effort, window } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                use xai_grok_shell::sampling::types::{
+                    CONTEXT_WINDOW_META_KEY, REASONING_EFFORT_META_KEY,
+                    context_window_meta_value, reasoning_effort_meta_value,
+                };
+                let mut meta = acp::Meta::new();
+                meta.insert(CONTEXT_WINDOW_META_KEY.to_owned(), context_window_meta_value(window));
+                if let Some(effort) = effort {
+                    meta.insert(REASONING_EFFORT_META_KEY.to_owned(), reasoning_effort_meta_value(effort));
+                }
+                let req = acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(Some(meta));
+                let result = acp_send(req, &tx).await.map(|_| ()).map_err(|error| {
+                    SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                });
+                TaskResult::ContextWindowComplete { agent_id, request_id, session_id, model_id, effort, window, result }
+            });
+        }
         Effect::ProbeClipboardAttachment { ctx, change_count } => {
             tasks
                 .spawn(async move {
@@ -5910,44 +6018,22 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchSkillsList { agent_id, session_id: _ } => {
+        Effect::FetchSkillsList { agent_id, session_id, refresh, fetch } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "cwd": "."
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/skills/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize skills/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                Vec<
-                                    xai_grok_tools::implementations::skills::types::SkillInfo,
-                                >,
-                            >(inner.get("skills").cloned().unwrap_or_default())
-                                .map_err(|_| "couldn't load skills".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(&format!("couldn't load skills: {e}")),
-                            )
-                        }
-                    };
-                    TaskResult::SkillsListLoaded {
-                        agent_id,
-                        result,
-                    }
-                });
+            tasks.spawn(async move {
+                use xai_grok_shell::extensions::skills::{SKILLS_LIST_METHOD, SkillsListRequest};
+                let params = SkillsListRequest { cwd: ".".to_owned(), session_id: Some(session_id.clone()), refresh };
+                let req = acp::ExtRequest::new(SKILLS_LIST_METHOD,
+                    serde_json::value::to_raw_value(&params).expect("serialize skills/list params").into());
+                let result = match acp_send(req, &tx).await {
+                    Ok(resp) => crate::acp::skills_listing::parse_reply(resp.0.get()).map_err(|error| {
+                        tracing::warn!(%error, "skills list reply did not parse");
+                        "couldn't load skills".to_string()
+                    }),
+                    Err(error) => Err(sanitize_user_error(&format!("couldn't load skills: {error}"))),
+                };
+                TaskResult::SkillsListLoaded { agent_id, session_id, fetch, result }
+            });
         }
         Effect::FetchWorkflowsList { agent_id, session_id } => {
             let tx = acp_tx.clone();
@@ -5991,7 +6077,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::ToggleSkill { agent_id, session_id: _, skill_name, enabled } => {
+        Effect::ToggleSkill { agent_id, session_id, fetch, skill_name, enabled } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -6008,17 +6094,10 @@ pub(crate) fn execute(
                     );
                     let result = match acp_send(req, &tx).await {
                         Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            let parsed = serde_json::from_value::<
-                                Vec<
-                                    xai_grok_tools::implementations::skills::types::SkillInfo,
-                                >,
-                            >(inner.get("skills").cloned().unwrap_or_default())
-                                .map_err(|_| "couldn't toggle skill".to_string());
+                            let parsed = crate::acp::skills_listing::parse_reply(resp.0.get()).map_err(|error| {
+                                tracing::warn!(%error, "skills toggle reply did not parse");
+                                "couldn't toggle skill".to_string()
+                            });
                             if parsed.is_ok() {
                                 let refresh = acp::ExtRequest::new(
                                     "x.ai/skills/refresh-baseline",
@@ -6038,6 +6117,8 @@ pub(crate) fn execute(
                     };
                     TaskResult::SkillsToggleDone {
                         agent_id,
+                        session_id,
+                        fetch,
                         result,
                     }
                 });
@@ -7733,62 +7814,11 @@ pub(crate) fn execute(
         }
         Effect::FetchRewindPoints { agent_id, session_id } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/rewind/points",
-                        serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "sessionId": session_id.0.to_string()
-                    }),
-                            )
-                            .expect("serialize rewind/points params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            if let Some(err) = wrapper
-                                .get("error")
-                                .filter(|v| !v.is_null())
-                            {
-                                return TaskResult::RewindPointsFailed {
-                                    agent_id,
-                                    error: err.as_str().unwrap_or("unknown error").to_string(),
-                                };
-                            }
-                            let result_val = wrapper
-                                .get("result")
-                                .cloned()
-                                .unwrap_or(wrapper.clone());
-                            match serde_json::from_value::<
-                                crate::views::rewind::RewindPointsResponse,
-                            >(result_val) {
-                                Ok(r) => {
-                                    TaskResult::RewindPointsLoaded {
-                                        agent_id,
-                                        points: r.rewind_points,
-                                    }
-                                }
-                                Err(e) => {
-                                    TaskResult::RewindPointsFailed {
-                                        agent_id,
-                                        error: format!("invalid response: {e}"),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::RewindPointsFailed {
-                                agent_id,
-                                error: sanitize_user_error(&e.to_string()),
-                            }
-                        }
-                    }
-                });
+            tasks.spawn(async move { rewind_order::fetch(&tx, agent_id, session_id).await });
+        }
+        Effect::CancelTurnThenFetchRewindPoints { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { rewind_order::cancel_then_fetch(&tx, agent_id, session_id).await });
         }
         Effect::RewindExecute { agent_id, session_id, target_prompt_index } => {
             let tx = acp_tx.clone();

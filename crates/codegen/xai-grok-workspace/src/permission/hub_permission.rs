@@ -75,6 +75,10 @@ pub fn hitl_permission_live_enabled() -> bool {
 pub trait PermissionHookTransport: Send + Sync {
     /// Emit the permission-request `payload` and return chat's decision reply.
     async fn request_permission(&self, payload: Value) -> Result<Value, String>;
+
+    /// The held connection ended before its card was answered. The default
+    /// transport cannot dismiss it; any late answer must be ignored.
+    async fn withdraw_permission(&self, _hold_id: &str) {}
 }
 /// Hub-backed permission transport (weak server handle; upgrades per request).
 pub struct ToolServerPermissionTransport {
@@ -126,6 +130,10 @@ impl PermissionHookTransport for ToolServerPermissionTransport {
             .with_label_values(&[outcome])
             .observe(start.elapsed().as_secs_f64());
         reply_result.map_err(|e| e.to_string())
+    }
+
+    async fn withdraw_permission(&self, hold_id: &str) {
+        tracing::debug!(hold_id, session = ?self.session_id, "sandbox card withdrawn locally; hub has no card withdrawal frame");
     }
 }
 fn scope_for_access(access: &AccessKind) -> &'static str {

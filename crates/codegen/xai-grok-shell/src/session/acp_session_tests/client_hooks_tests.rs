@@ -669,6 +669,159 @@ async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_ou
     }).await;
 }
 
+#[derive(Clone, Debug)]
+struct BlockingPathTool {
+    entered: tokio::sync::mpsc::UnboundedSender<String>,
+    normal_release: Arc<tokio::sync::Notify>,
+    nested_release: Arc<tokio::sync::Notify>,
+}
+
+impl xai_grok_tools::types::tool_metadata::ToolMetadata for BlockingPathTool {
+    fn kind(&self) -> xai_grok_tools::types::tool::ToolKind {
+        xai_grok_tools::types::tool::ToolKind::Other
+    }
+    fn tool_namespace(&self) -> xai_grok_tools::types::tool::ToolNamespace {
+        xai_grok_tools::types::tool::ToolNamespace::MCP
+    }
+    fn description_template(&self) -> &str {
+        "blocking path test tool"
+    }
+}
+
+impl xai_tool_runtime::Tool for BlockingPathTool {
+    type Args = serde_json::Value;
+    type Output = xai_grok_tools::types::output::ToolOutput;
+    fn id(&self) -> xai_tool_protocol::ToolId {
+        xai_tool_protocol::ToolId::new("blocking_path_tool").unwrap()
+    }
+    fn description(
+        &self,
+        _: &xai_tool_runtime::ListToolsContext,
+    ) -> xai_tool_types::ToolDescription {
+        xai_tool_types::ToolDescription::new("blocking_path_tool", "blocking path test tool")
+    }
+    async fn run(
+        &self,
+        _: xai_tool_runtime::ToolCallContext,
+        args: serde_json::Value,
+    ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
+        let label = args["label"].as_str().unwrap().to_owned();
+        let _ = self.entered.send(label.clone());
+        match label.as_str() {
+            "normal" => self.normal_release.notified().await,
+            "nested-first" => self.nested_release.notified().await,
+            _ => {}
+        }
+        Ok(xai_grok_tools::types::output::ToolOutput::MCP(
+            xai_grok_tools::types::output::MCPOutput::okay_output(
+                "blocking_path_tool".into(),
+                "mock".into(),
+                label,
+            ),
+        ))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nested_and_normal_dispatch_share_file_locks_and_release_on_cancel() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+        *actor.agent.borrow_mut() = test_agent_with_tools(vec![
+            xai_grok_tools::registry::types::ToolConfig::from_id("Codex:apply_patch"),
+        ]).await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let normal_release = Arc::new(tokio::sync::Notify::new());
+        let nested_release = Arc::new(tokio::sync::Notify::new());
+        actor.agent.borrow().tool_bridge().clone().register_mcp_tools(
+            "blocking_path_tool".into(),
+            BlockingPathTool { entered: entered_tx, normal_release: normal_release.clone(), nested_release: nested_release.clone() },
+            Some(serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"label":{"type":"string"}}})),
+        ).await.unwrap();
+        spawn_run_responder(gateway_rx, |_| serde_json::json!({}));
+        actor.workspace_ops.bind_local_session(
+            &actor.session_id_string(), actor.tool_context.cwd.as_path().to_path_buf(),
+            actor.tool_context.hunk_tracker_handle.clone(), actor.agent.borrow().tool_bridge().toolset(), None,
+        ).unwrap();
+        let actor = std::rc::Rc::new(actor);
+        let normal = {
+            let actor = actor.clone();
+            tokio::task::spawn_local(async move {
+                let call = crate::sampling::types::ToolCallResponse {
+                    id: "normal-lock".into(), kind: "function".into(),
+                    function: crate::sampling::types::ToolCallFunction::new(
+                        "blocking_path_tool", serde_json::json!({"path":"/tmp/lock-a","label":"normal"}).to_string(),
+                    ),
+                };
+                actor.execute_tool_calls(vec![call], None).await
+            })
+        };
+        async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap()
+        }
+        assert_eq!(next(&mut entered_rx).await, "normal");
+        let nested = |label: &'static str, path: &'static str, cancel: tokio_util::sync::CancellationToken| {
+            let actor = actor.clone();
+            tokio::task::spawn_local(async move {
+                let (progress, _receiver) = xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                actor.dispatch_code_mode_nested_tool(
+                    xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                        cell_id: xai_grok_code_mode_protocol::CellId::new("lock-cell".into()),
+                        runtime_tool_call_id: label.into(),
+                        tool_name: xai_grok_code_mode_protocol::ToolName::plain("blocking_path_tool"),
+                        tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                        input: Some(serde_json::json!({"path":path,"label":label})),
+                    }, cancel, progress,
+                ).await
+            })
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = nested("nested-first", "/tmp/lock-a", cancel.clone());
+        let other = nested("nested-other", "/tmp/lock-b", tokio_util::sync::CancellationToken::new());
+        assert_eq!(next(&mut entered_rx).await, "nested-other");
+        other.await.unwrap().unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv()).await.is_err());
+        normal_release.notify_one();
+        assert_eq!(next(&mut entered_rx).await, "nested-first");
+        normal.await.unwrap().unwrap();
+        let second = nested("nested-second", "/tmp/lock-a", tokio_util::sync::CancellationToken::new());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv()).await.is_err());
+        cancel.cancel();
+        assert!(first.await.unwrap().is_err());
+        assert_eq!(next(&mut entered_rx).await, "nested-second");
+        second.await.unwrap().unwrap();
+
+        // A pathless multi-file patch must wait even when its target differs
+        // from a currently running path-aware edit.
+        let holder = nested("nested-first", "/tmp/lock-a", tokio_util::sync::CancellationToken::new());
+        assert_eq!(next(&mut entered_rx).await, "nested-first");
+        let dir = tempfile::tempdir().unwrap();
+        let patched_file = dir.path().join("patched.txt");
+        let patch_text = format!("*** Begin Patch\n*** Add File: {}\n+created\n*** End Patch", patched_file.display());
+        let patch = {
+            let actor = actor.clone();
+            tokio::task::spawn_local(async move {
+                let (progress, _receiver) = xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                actor.dispatch_code_mode_nested_tool(
+                    xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                        cell_id: xai_grok_code_mode_protocol::CellId::new("patch-cell".into()),
+                        runtime_tool_call_id: "patch".into(),
+                        tool_name: xai_grok_code_mode_protocol::ToolName::plain("apply_patch"),
+                        tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Freeform,
+                        input: Some(serde_json::Value::String(patch_text)),
+                    }, tokio_util::sync::CancellationToken::new(), progress,
+                ).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!patch.is_finished());
+        assert!(!patched_file.exists());
+        nested_release.notify_one();
+        holder.await.unwrap().unwrap();
+        patch.await.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(patched_file).unwrap(), "created\n");
+    }).await;
+}
+
 impl xai_grok_tools::types::tool_metadata::ToolMetadata for McpErrorResultTool {
     fn kind(&self) -> xai_grok_tools::types::tool::ToolKind {
         xai_grok_tools::types::tool::ToolKind::Other
@@ -1169,6 +1322,7 @@ async fn post_tool_use_dispatch_merges_file_then_client_contributions() {
                 coercion_note: None,
                 dispatch_target_name: None,
                 is_read_only: false,
+                is_edit: false,
                 rewriting_hook: None,
                 additional_context: Vec::new(),
             };

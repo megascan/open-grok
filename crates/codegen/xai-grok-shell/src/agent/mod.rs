@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod antigravity_acp;
 pub mod app;
 pub mod auth_method;
 pub mod chat_modes;

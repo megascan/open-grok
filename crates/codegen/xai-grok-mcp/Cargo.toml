@@ -74,5 +74,8 @@ xai-computer-hub-sdk = { workspace = true }
 # the deterministic timing tests in `liveness.rs`.
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+
 [lints]
 workspace = true

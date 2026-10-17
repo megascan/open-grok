@@ -116,6 +116,7 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
             &model,
             None,
             Some(Some(ReasoningEffort::High)),
+            Some(std::num::NonZeroU64::new(500_000)),
             Some(policy),
         )
         .await
@@ -132,20 +133,23 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
         Some(policy),
         "model identity and its resolved transport must share one summary patch",
     );
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection.map(std::num::NonZeroU64::get), Some(500_000));
     adapter.update_current_model(&info, &model).await.unwrap();
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection.map(std::num::NonZeroU64::get), Some(500_000));
     assert_eq!(
             adapter.read_summary_sync(&info).unwrap().reasoning_effort,
             Some(ReasoningEffort::High),
             "model-only update must not wipe the persisted effort",
         );
     adapter
-        .update_current_model_and_agent(&info, &model, None, Some(None), None)
+        .update_current_model_and_agent(&info, &model, None, Some(None), Some(None), None)
         .await
         .unwrap();
     assert_eq!(
             adapter.read_summary_sync(&info).unwrap().reasoning_effort,
             None,
         );
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection, None);
 }
 #[tokio::test]
 async fn mark_ever_used_codex_is_monotonic_and_previous_turn_model_persists() {
@@ -1264,6 +1268,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        context_window_selection: None,
         resolved_tool_policy: None,
         previous_turn_model: None,
         ever_used_codex: false,

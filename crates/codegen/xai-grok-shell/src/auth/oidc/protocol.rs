@@ -249,6 +249,7 @@ pub(super) fn build_grok_auth(
         user_blocked_reason: user_info.user_blocked_reason,
         team_blocked_reasons: user_info.team_blocked_reasons,
         coding_data_retention_opt_out: user_info.coding_data_retention_opt_out,
+        can_administer_team: None,
         has_grok_code_access: None,
         refresh_token: tokens.refresh_token,
         expires_at: tokens.expires_in.map(|s| now + Duration::seconds(s as i64)),

@@ -4,12 +4,17 @@ mod bash_permission_script;
 pub mod claude_settings;
 mod exec_risk;
 mod gate_preflight;
+mod hub_gate;
 mod hub_permission;
+mod lease;
 mod manager;
 mod policy;
 mod prompter;
 pub mod resolution;
 pub mod rules;
+mod sandbox_gate;
+mod sandbox_network;
+pub mod sandbox_wire;
 mod shell_access;
 mod state;
 pub mod types;
@@ -52,6 +57,15 @@ macro_rules! wire_enum {
         }
     };
 }
+pub(crate) use hub_gate::{PromptGate, SessionApproval, ToolApprovalGate, grant_dir_for};
+pub(crate) use sandbox_gate::{
+    SandboxPath, SettleContext, ViolationSettlement, refuse_mode_layer_write, settle_violation,
+};
+pub use sandbox_network::{
+    GrantView, HoldAnswer, SandboxNetworkDecider, SandboxNetworkDeciderConfig, ViolationSink,
+    WebFetchDomainFile, WebFetchDomains,
+};
+pub(crate) use state::StateFileAccess;
 pub(crate) use wire_enum;
 
 pub use auto_mode::{
@@ -71,6 +85,7 @@ pub use hub_permission::{
     PermissionHookTransport, ToolServerPermissionTransport, access_kind_for_hub_tool,
     hitl_permission_live_enabled, prompt_outcome_allows, request_permission_via_hub,
 };
+pub use lease::{LeaseRevoked, PermissionLeaseRegistry, UnrestrictedPermissionLease};
 
 /// Zero-init this module's metric families. See [`crate::init_metrics`].
 pub(crate) fn init_metrics() {

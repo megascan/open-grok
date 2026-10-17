@@ -114,6 +114,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tim
 filetime = { workspace = true }
 futures-executor = "0.3"
 tempfile = { workspace = true }
+xai-grok-test-support = { workspace = true }
 
 [lints]
 workspace = true

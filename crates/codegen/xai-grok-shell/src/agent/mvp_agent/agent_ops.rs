@@ -3484,6 +3484,16 @@ impl MvpAgent {
             );
             info.meta = Some(map);
         }
+        if let Some(window) = session_id
+            .and_then(|sid| self.resident_handle(sid))
+            .and_then(|handle| std::num::NonZeroU64::new(handle.context_window_selection.load(std::sync::atomic::Ordering::Relaxed)))
+            && let Some(info) = available_models.iter_mut().find(|info| info.model_id == model_id)
+        {
+            info.meta.get_or_insert_default().insert(
+                xai_grok_sampling_types::CONTEXT_WINDOW_META_KEY.to_owned(),
+                xai_grok_sampling_types::context_window_meta_value(window),
+            );
+        }
         acp::SessionModelState::new(model_id, available_models)
     }
     pub(super) fn session_config_options(

@@ -2045,7 +2045,7 @@ fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Opt
                 agent,
                 session_id.clone(),
                 /* cancel_subagents */ true,
-                /* rewind_if_no_output */ false,
+                /* rewind_prompt_id */ None,
             ));
         }
         let running: Vec<String> = agent
@@ -2368,6 +2368,16 @@ pub(super) fn dispatch_dashboard_permission_select(
         }
         return vec![];
     }
+    if let Some(perm) = agent.permission_queue.front()
+        && crate::app::sandbox_permission::is_sandbox(&perm.request.request)
+        && (option_id.0.as_ref() != "sandbox:deny"
+            || !perm.options.iter().any(|o| o.option_id == option_id))
+    {
+        if let Some(d) = app.dashboard.as_mut() {
+            d.set_error_toast("Open the full session to review sandbox approvals");
+        }
+        return vec![];
+    }
     let Some(perm) = agent.permission_queue.pop_front() else {
         return vec![];
     };
@@ -2442,7 +2452,16 @@ pub(super) fn dispatch_dashboard_permission_followup(
         }
         None => acp::RequestPermissionOutcome::Cancelled,
     };
-    let meta = if !text.trim().is_empty() {
+    let meta = if crate::app::sandbox_permission::is_sandbox(&perm.request.request) {
+        let decision = if text.trim().is_empty() {
+            serde_json::json!({"outcome":"reject"})
+        } else {
+            serde_json::json!({"outcome":"reject", "followup_message":text})
+        };
+        serde_json::json!({"sandbox_decision":decision})
+            .as_object()
+            .cloned()
+    } else if !text.trim().is_empty() {
         serde_json::json!({ "followup_message": text })
             .as_object()
             .cloned()

@@ -409,6 +409,7 @@ pub(super) fn test_summary(session_id: &str, cwd: &str, title: &str) -> Summary 
         agent: Default::default(),
         sandbox_profile: None,
         reasoning_effort: None,
+        context_window_selection: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
         last_recap: None,

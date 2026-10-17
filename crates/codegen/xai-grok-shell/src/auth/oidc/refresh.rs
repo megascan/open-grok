@@ -271,6 +271,7 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
         coding_data_retention_opt_out: auth.coding_data_retention_opt_out,
     };
     let mut new_auth = build_grok_auth(tokens, user_info, issuer, client_id);
+    new_auth.can_administer_team = auth.can_administer_team;
     let idp_rotated = new_auth.refresh_token.is_some();
     // Keep old refresh token if IdP didn't rotate it
     if new_auth.refresh_token.is_none() {

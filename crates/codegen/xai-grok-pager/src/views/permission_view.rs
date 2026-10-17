@@ -276,6 +276,9 @@ pub struct PermissionViewState {
     // See the "Queue-level prompt stashing" section in the plan.
 
     // -- Layout cache --
+    /// Last area where this sandbox card was rendered completely.
+    pub sandbox_visible_area: Option<Rect>,
+
     /// Cached options area height (for scroll calculations).
     pub options_area_height: usize,
 
@@ -527,6 +530,23 @@ fn permission_chrome_height(state: &PermissionViewState, content_w: usize) -> u1
         h = h.saturating_add(1);
     }
     h.saturating_add(1) // gap before options
+}
+
+/// Approvals require all sandbox details and option labels to fit the last rendered panel.
+pub(crate) fn sandbox_card_fits(state: &PermissionViewState, area: Rect) -> bool {
+    if !state.args_expanded || area.width <= 5 || area.height == 0 {
+        return false;
+    }
+    let width = area.width.saturating_sub(5) as usize;
+    let total = permission_chrome_height(state, width)
+        .saturating_add(state.options.len() as u16)
+        .saturating_add(1);
+    state.title.width() <= width
+        && state
+            .options
+            .iter()
+            .all(|o| o.name.width().saturating_add(6) <= width)
+        && total <= area.height
 }
 
 /// Compute the total height the permission view should occupy.
@@ -1891,7 +1911,9 @@ fn build_permission_option_line<'a>(
 
     let sc = shortcut_char(index);
 
-    if option.kind == acp::PermissionOptionKind::RejectOnce {
+    if option.kind == acp::PermissionOptionKind::RejectOnce
+        && option.option_id.0.as_ref() != "sandbox:deny"
+    {
         return build_reject_once_line(sc, is_cursor, row_bg, followup_text, theme);
     }
 
@@ -2211,6 +2233,7 @@ mod tests {
             args_expanded: false,
             desc_scroll: 0,
             subagent_label: Some("subagent: worker".to_string()),
+            sandbox_visible_area: None,
             options_area_height: 0,
             options_scroll_offset: 0,
         }
@@ -2367,6 +2390,7 @@ mod tests {
             args_expanded: false,
             desc_scroll: 0,
             subagent_label: None,
+            sandbox_visible_area: None,
             options_area_height: 0,
             options_scroll_offset: 0,
         }

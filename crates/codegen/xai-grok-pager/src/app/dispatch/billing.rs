@@ -506,8 +506,7 @@ pub(super) fn handle_usage_fetched(
     }
 
     if let Some(agent) = app.agents.get_mut(&agent_id) {
-        let mut text =
-            crate::views::usage::format_combined_usage_summary(&xai_summary, &codex_summary);
+        let text = crate::views::usage::format_combined_usage_summary(&xai_summary, &codex_summary);
         agent.scrollback.push_block(RenderBlock::System(
             crate::scrollback::blocks::SystemMessageBlock::new(text),
         ));

@@ -454,6 +454,35 @@ pub fn draw_frame(
 ) {
     let _ = terminal.backend_mut().queue(BeginSynchronizedUpdate);
     let _ = terminal.autoresize();
+    render_and_present(terminal, cursor, render_fn);
+}
+
+/// Draw after the caller adopted the terminal size and began a synchronized update.
+pub fn draw_frame_at_adopted_size(
+    terminal: &mut PagerTerminal,
+    cursor: &mut CursorState,
+    render_fn: impl FnOnce(
+        &mut Frame,
+        &mut Vec<LinkSpan>,
+    ) -> (
+        Option<(u16, u16)>,
+        Option<crate::terminal::overlay::PostFlush>,
+    ),
+) {
+    render_and_present(terminal, cursor, render_fn);
+}
+
+fn render_and_present(
+    terminal: &mut PagerTerminal,
+    cursor: &mut CursorState,
+    render_fn: impl FnOnce(
+        &mut Frame,
+        &mut Vec<LinkSpan>,
+    ) -> (
+        Option<(u16, u16)>,
+        Option<crate::terminal::overlay::PostFlush>,
+    ),
+) {
     let mut link_spans: Vec<LinkSpan> = Vec::new();
     let (cursor_pos, post_flush_escapes) = {
         let mut frame = terminal.get_frame();
@@ -472,6 +501,9 @@ pub fn draw_frame(
         let _ = post_flush.write_to(terminal.backend_mut());
     }
     cursor.apply(action, terminal.backend_mut());
+    if let CursorAction::Reposition(x, y) | CursorAction::Show(x, y) = action {
+        terminal.record_cursor_position(ratatui::layout::Position::new(x, y));
+    }
     let _ = terminal.backend_mut().queue(EndSynchronizedUpdate);
     let _ = terminal.backend_mut().flush();
 }

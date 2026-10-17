@@ -268,6 +268,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
             state
                 .pager_snapshot
                 .copy_custom_model_draft_from(&previous_draft);
+            close_locked_consent_chooser(state);
         }
     }
     if let Some(mut snapshot) = dashboard_snapshot
@@ -279,6 +280,16 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
         snapshot.copy_custom_model_draft_from(&state.pager_snapshot);
         state.ui_snapshot = ui_snapshot;
         state.pager_snapshot = snapshot;
+        close_locked_consent_chooser(state);
+    }
+}
+
+fn close_locked_consent_chooser(state: &mut crate::views::settings_modal::SettingsModalState) {
+    use crate::views::settings_modal::SettingsModalMode;
+    if state.pager_snapshot.coding_data_sharing_lock.is_some()
+        && matches!(state.mode(), SettingsModalMode::PickingEnum { key, .. } if crate::settings::is_consent_chooser(key))
+    {
+        state.transition_to_browse();
     }
 }
 

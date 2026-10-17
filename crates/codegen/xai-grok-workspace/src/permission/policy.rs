@@ -141,6 +141,14 @@ impl CompiledPolicy {
         self.config.rules.len()
     }
 
+    /// Conservative test for an external process that cannot be mediated per tool.
+    pub(crate) fn has_restrictive_rules(&self) -> bool {
+        self.config
+            .rules
+            .iter()
+            .any(|rule| matches!(rule.action, RuleAction::Deny | RuleAction::Ask))
+    }
+
     /// Append runtime session-scoped allow rules (e.g. from `/add-dir`) and
     /// refresh the derived gates. Rules keep the standard precedence — deny
     /// and ask rules from any layer still outrank appended allows.

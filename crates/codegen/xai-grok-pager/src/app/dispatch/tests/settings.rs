@@ -1046,6 +1046,96 @@ fn dispatch_open_settings_focus_skips_the_chooser_only_when_locked() {
         "an account with edit permission is not locked by policy"
     );
 }
+
+#[test]
+fn auth_meta_lock_closes_open_consent_chooser() {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalMode;
+    use xai_grok_shell::auth::AuthMeta;
+
+    for (dashboard, meta) in [
+        (
+            false,
+            AuthMeta {
+                is_zdr: true,
+                ..Default::default()
+            },
+        ),
+        (
+            true,
+            AuthMeta {
+                team_name: Some("Acme".into()),
+                team_role: Some("member".into()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::OpenSettingsFocus {
+                key: "coding_data_sharing",
+            },
+            &mut app,
+        );
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        let Some(ActiveModal::Settings { state }) = agent.active_modal.take() else {
+            panic!("settings modal must be open");
+        };
+        assert!(matches!(
+            state.mode(),
+            SettingsModalMode::PickingEnum { .. }
+        ));
+        if dashboard {
+            let mut dashboard_state = crate::views::dashboard::DashboardState::new();
+            dashboard_state.settings_modal = Some(state);
+            app.dashboard = Some(dashboard_state);
+            app.active_view = ActiveView::AgentDashboard;
+        } else {
+            agent.active_modal = Some(ActiveModal::Settings { state });
+        }
+
+        app.apply_auth_meta(&meta);
+        let state = if dashboard {
+            app.dashboard
+                .as_ref()
+                .unwrap()
+                .settings_modal
+                .as_deref()
+                .unwrap()
+        } else {
+            let Some(ActiveModal::Settings { state }) = &app.agents[&AgentId(0)].active_modal
+            else {
+                panic!("settings modal must remain open");
+            };
+            state
+        };
+        assert!(matches!(state.mode(), SettingsModalMode::Browse));
+        assert_eq!(
+            state.focused_setting().map(|(key, _)| key),
+            Some("coding_data_sharing")
+        );
+        assert!(state.pager_snapshot.coding_data_sharing_lock.is_some());
+    }
+}
+
+#[test]
+fn auth_meta_lock_keeps_unrelated_setting_chooser_open() {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalMode;
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::OpenSettingsFocus { key: "theme" }, &mut app);
+    app.apply_auth_meta(&xai_grok_shell::auth::AuthMeta {
+        is_zdr: true,
+        ..Default::default()
+    });
+    let Some(ActiveModal::Settings { state }) = &app.agents[&AgentId(0)].active_modal else {
+        panic!("settings modal must remain open");
+    };
+    assert!(matches!(
+        state.mode(),
+        SettingsModalMode::PickingEnum { key: "theme", .. }
+    ));
+}
 /// `dispatch_open_reset_confirm` moves the Settings modal state
 /// into the new `ResetSettingsConfirm` variant, preserving it
 /// across the confirm dialog's lifecycle. The dispatch arm is
@@ -2369,6 +2459,7 @@ fn set_simple_mode_propagates_to_every_agent() {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,

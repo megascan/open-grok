@@ -93,11 +93,20 @@ pub(crate) struct SkillsToggleRequest {
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+pub const SKILLS_LIST_METHOD: &str = "x.ai/skills/list";
+pub const SKILLS_TOGGLE_METHOD: &str = "x.ai/skills/toggle";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillsListRequest {
     /// Working directory for skill discovery context.
     pub cwd: String,
+    /// Optional session context; discovery is scoped by cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<acp::SessionId>,
+    /// The shell always rescans skill folders.
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,11 +115,29 @@ struct WorkflowsListRequest {
     session_id: acp::SessionId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillsListResponse {
     /// All discovered skills.
     pub skills: Vec<SkillInfo>,
+    /// Folder scan errors supplied by backends that report them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_errors: Vec<SkillScanError>,
+}
+
+impl From<Vec<SkillInfo>> for SkillsListResponse {
+    fn from(skills: Vec<SkillInfo>) -> Self {
+        Self {
+            skills,
+            scan_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillScanError {
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -471,10 +498,10 @@ pub async fn handle(
             super::to_ext_response(Ok(SkillsResetResponse { skills, message }))
         }
 
-        "x.ai/skills/list" => {
+        SKILLS_LIST_METHOD => {
             let req: SkillsListRequest = serde_json::from_str(args.params.get())?;
             let skills = reload_skills(&req.cwd, plugin_registry, compat).await;
-            super::to_ext_response(Ok(SkillsListResponse { skills }))
+            super::to_ext_response(Ok(SkillsListResponse::from(skills)))
         }
 
         "x.ai/workflows/list" => {
@@ -559,7 +586,7 @@ pub async fn handle(
             }))
         }
 
-        "x.ai/skills/toggle" => {
+        SKILLS_TOGGLE_METHOD => {
             let req: SkillsToggleRequest = serde_json::from_str(args.params.get())?;
             let cwd = req.cwd.as_deref().unwrap_or(".");
 
@@ -600,7 +627,7 @@ pub async fn handle(
                     s
                 })
                 .collect();
-            super::to_ext_response(Ok(SkillsListResponse { skills }))
+            super::to_ext_response(Ok(SkillsListResponse::from(skills)))
         }
 
         _ => Err(acp::Error::method_not_found()),

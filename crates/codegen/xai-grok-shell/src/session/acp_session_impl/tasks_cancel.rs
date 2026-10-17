@@ -19,6 +19,7 @@ pub(super) struct CancelOutcome {
     /// leaves the session idle is the loop's call.
     pub(super) turn_stopped: bool,
     pub(super) settled: bool,
+    pub(super) capture_queued: bool,
 }
 
 impl CancelOutcome {
@@ -27,6 +28,7 @@ impl CancelOutcome {
             barrier: WakeBarrier::Clear,
             turn_stopped: false,
             settled: false,
+            capture_queued: false,
         }
     }
 }
@@ -241,6 +243,7 @@ impl SessionActor {
             barrier: WakeBarrier::Clear,
             turn_stopped,
             settled: true,
+            capture_queued: false,
         }
     }
 
@@ -469,6 +472,7 @@ impl SessionActor {
             rewound_input,
             had_queued_user_prompt,
             turn_epoch,
+            captures_cancelled_turn,
         ) = {
             let mut state = self.state.lock().await;
             debug_assert!(
@@ -584,6 +588,16 @@ impl SessionActor {
                 return CancelOutcome::noop();
             }
 
+            // Capture only the committed running human turn, never a rewind,
+            // teardown, synthetic wake or unpromoted queue entry.
+            let captures_cancelled_turn = kind != Some(crate::session::CancelKind::Teardown)
+                && !kill_background_tasks
+                && rewound_input.is_none()
+                && matches!(&finalization, CancelFinalization::Keep(_))
+                && cancelled_prompt_id
+                    .as_deref()
+                    .is_some_and(|id| Self::is_capturable_front(&state, id));
+
             // Decide which queued inputs get resolved with `Cancelled` now vs.
             // preserved for the post-cancel drain:
             //
@@ -666,6 +680,7 @@ impl SessionActor {
                 rewound_input,
                 had_queued_user_prompt,
                 turn_epoch,
+                captures_cancelled_turn,
             )
         };
         // Authoritative cancel identity: the task actually torn down. The pin
@@ -899,6 +914,14 @@ impl SessionActor {
                 }))
                 .ok();
         }
+        // Persist while the exact prompt/epoch/task finalization lease is still
+        // held. The actor loop starts the worker after the lease is released.
+        let capture_queued = if captures_cancelled_turn {
+            let source_prompt_index = *self.tool_context.prompt_index.lock().await;
+            self.enqueue_v2_capture_job(source_prompt_index).await
+        } else {
+            false
+        };
         let settled = match &mut finalization {
             CancelFinalization::Keep(lease) => self.finish_finalization_lease(lease).await,
             CancelFinalization::Rewind => false,
@@ -914,6 +937,7 @@ impl SessionActor {
             },
             turn_stopped,
             settled,
+            capture_queued,
         }
     }
 }

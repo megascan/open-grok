@@ -271,7 +271,7 @@ fn session_tracker(
         .ok_or_else(|| WorkspaceError::SessionNotFound(sid.to_owned()))?;
     Ok(session.hunk_tracker().clone())
 }
-/// Ancestor hop budget when locating `.grok/repos.json`.
+/// Ancestor hop budget when locating `.opengrok/repos.json`.
 ///
 /// Grove rewrite is one hop (`/workspace/app` → `/workspace`). Desktop
 /// workspaces can sit deeper than that; this is a backstop only. Primary
@@ -281,12 +281,12 @@ const REPOS_MANIFEST_MAX_ANCESTOR_HOPS: usize = 16;
 /// `root_cwd` (post-grove-rewrite agent cwd) and walking up.
 ///
 /// Does not escape the sandbox workspace or load `~/.opengrok/repos.json` /
-/// `$GROK_HOME/repos.json` (user-global, not a provisioned workspace).
+/// `$OPENGROK_HOME/repos.json` (user-global, not a provisioned workspace).
 fn repos_manifest_search_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
     let rel = xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH;
     let home = dirs::home_dir();
     let mut global_manifests = Vec::with_capacity(2);
-    if let Some(v) = std::env::var_os("GROK_HOME")
+    if let Some(v) = std::env::var_os("OPENGROK_HOME")
         && !v.is_empty()
     {
         global_manifests.push(std::path::PathBuf::from(v).join("repos.json"));
@@ -1574,6 +1574,119 @@ impl WorkspaceOps {
             client: WorkspaceClient::with_connected_flag((*harness).clone(), connected),
         }
     }
+    /// The local workspace's shared sandbox. Proxy workspaces enforce on their server.
+    async fn command_sandbox(
+        &self,
+        remote: Option<&xai_grok_config_types::RemoteSettings>,
+    ) -> WorkspaceResult<Option<Arc<crate::sandbox::WorkspaceSandbox>>> {
+        let Self::Local { handle } = self else {
+            return Ok(None);
+        };
+        let shared = &handle.shared;
+        let root = shared.root_cwd.clone();
+        let control_dir = shared.workspace_home.clone();
+        let settings = remote.cloned();
+        let sandbox = shared
+            .sandbox
+            .get_or_init(|| async move {
+                let mut config =
+                    crate::sandbox::WorkspaceSandboxConfig::for_root(root, control_dir);
+                config.remote = settings;
+                crate::sandbox::WorkspaceSandbox::serve(config).await
+            })
+            .await;
+        sandbox.update_remote(remote);
+        if let Err(error) = sandbox.sync_network().await {
+            tracing::warn!(%error, "sandbox egress proxy unavailable; enforced commands have no network");
+        }
+        Ok(Some(Arc::clone(sandbox)))
+    }
+
+    /// Return the workspace-owned launch hook for local shell backends.
+    /// The hook resolves current settings at each spawn, including when currently off.
+    pub async fn sandbox_launch(
+        &self,
+        remote: Option<&xai_grok_config_types::RemoteSettings>,
+    ) -> WorkspaceResult<Option<Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>>> {
+        Ok(self
+            .command_sandbox(remote)
+            .await?
+            .map(|sandbox| sandbox as Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>))
+    }
+
+    /// Drive a local shell tool through per-call ownership, egress and at
+    /// most one approved replay. Call only after the shell's normal plan,
+    /// hook and permission checks. Dropping the stream releases its call.
+    pub fn run_sandbox_shell_call<F>(
+        &self,
+        session_id: &str,
+        call_id: String,
+        command: Option<String>,
+        owner_transport: Option<Arc<dyn crate::permission::PermissionHookTransport>>,
+        mut dispatch: F,
+    ) -> xai_tool_runtime::ToolStream<xai_grok_tools::types::output::ToolRunResult>
+    where
+        F: FnMut() -> xai_tool_runtime::ToolStream<xai_grok_tools::types::output::ToolRunResult>
+            + Send
+            + 'static,
+    {
+        let Self::Local { handle } = self else {
+            return dispatch();
+        };
+        let Some(session) = handle.session(session_id) else {
+            return xai_tool_runtime::terminal_only(Err(xai_tool_runtime::ToolError::new(
+                xai_tool_runtime::ToolErrorKind::PermissionDenied,
+                "sandbox session is unavailable",
+            )));
+        };
+        if handle.shared.sandbox().is_none() {
+            return xai_tool_runtime::terminal_only(Err(xai_tool_runtime::ToolError::new(
+                xai_tool_runtime::ToolErrorKind::PermissionDenied,
+                "workspace sandbox is unavailable",
+            )));
+        }
+        crate::sandbox::result_path::run_shell_call_with_owner(
+            handle.clone(),
+            session,
+            call_id,
+            command,
+            false,
+            owner_transport,
+            dispatch,
+        )
+    }
+
+    /// Check before every command sent to an external ACP terminal. Such a terminal cannot be
+    /// wrapped locally and must refuse when enforcement is required or cannot be established.
+    pub async fn sandbox_requires_local_enforcement(&self) -> WorkspaceResult<bool> {
+        let Some(sandbox) = self.command_sandbox(None).await? else {
+            // A proxy's sandbox mode is enforced by the remote workspace and is
+            // not observable here. Do not send an unwrapped command on an
+            // assumption that the remote workspace is unrestricted.
+            return Ok(true);
+        };
+        tokio::task::spawn_blocking(move || {
+            sandbox.mode() != xai_grok_sandbox::command::SandboxMode::Off
+        })
+        .await
+        .map_err(|error| WorkspaceError::JoinError(error.to_string()))
+    }
+
+    /// Enroll a local session's permission leases in sandbox-mode transitions.
+    /// Remote mode cannot be proven here, so proxy workspaces return `None`.
+    pub fn register_sandbox_mode_lease_fence(
+        &self,
+        permission: crate::permission::PermissionHandle,
+    ) -> Option<crate::sandbox_mode_fence::SandboxModeLeaseRegistration> {
+        match self {
+            Self::Local { handle } => Some(crate::sandbox_mode_fence::register_permission(
+                &handle.shared.root_cwd,
+                permission,
+            )),
+            Self::Proxy { .. } => None,
+        }
+    }
+
     /// Whether this handle routes through the server (proxy mode).
     pub fn is_proxy(&self) -> bool {
         matches!(self, Self::Proxy { .. })
@@ -1977,7 +2090,7 @@ mod tests {
             base_branch: "main".into(),
             session_branch: "conv/1".into(),
         }]);
-        std::fs::create_dir_all(tmp.path().join(".grok")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".opengrok")).unwrap();
         std::fs::write(
             tmp.path()
                 .join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
@@ -2026,7 +2139,7 @@ mod tests {
             base_branch: "".into(),
             session_branch: "conv/1".into(),
         }]);
-        std::fs::create_dir_all(sandbox_ws.join(".grok")).unwrap();
+        std::fs::create_dir_all(sandbox_ws.join(".opengrok")).unwrap();
         std::fs::write(
             sandbox_ws.join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
             one.to_json_bytes().unwrap(),
@@ -2043,7 +2156,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
         assert_eq!(
             dirs,
@@ -2059,7 +2172,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _home = crate::TestEnvGuard::unset("HOME");
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
         assert!(
             dirs.contains(&std::path::PathBuf::from("/workspace/app")),
@@ -2071,13 +2184,27 @@ mod tests {
         );
     }
     #[test]
+    fn repos_manifest_search_dirs_ignores_upstream_grok_home() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let open_grok_home = tempfile::tempdir().unwrap();
+        let _home = crate::TestEnvGuard::set("HOME", home.path());
+        let _open_grok = crate::TestEnvGuard::set("OPENGROK_HOME", open_grok_home.path());
+        let _upstream = crate::TestEnvGuard::set("GROK_HOME", &workspace.path().join(".opengrok"));
+        let dirs = repos_manifest_search_dirs(workspace.path());
+        assert!(dirs.contains(&workspace.path().to_path_buf()));
+    }
+    #[test]
     fn repos_manifest_search_dirs_skips_user_global_grok_home() {
         let _lock = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let start = home.path().join("src").join("org").join("app");
         let dirs = repos_manifest_search_dirs(&start);
         assert!(dirs.contains(&start));
@@ -2085,7 +2212,7 @@ mod tests {
         assert!(dirs.contains(&home.path().join("src")));
         assert!(
             !dirs.iter().any(|d| d == home.path()),
-            "must not probe $HOME/.grok/repos.json: {dirs:?}"
+            "must not probe $HOME/.opengrok/repos.json: {dirs:?}"
         );
     }
     /// Sync + `block_on` so `ENV_TEST_LOCK` is not held across `.await`
@@ -2097,7 +2224,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let global = RepoManifest::new(vec![ProvisionedRepo {
             name: "global".into(),
             repository: "acme/global".into(),
@@ -2105,9 +2232,9 @@ mod tests {
             base_branch: "main".into(),
             session_branch: "x".into(),
         }]);
-        std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+        std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
         std::fs::write(
-            home.path().join(".grok").join("repos.json"),
+            home.path().join(".opengrok").join("repos.json"),
             global.to_json_bytes().unwrap(),
         )
         .unwrap();
@@ -2301,7 +2428,7 @@ mod tests {
             url: None,
             url_raw: None,
             timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
+            source_dir: std::path::PathBuf::from("/home/u/.opengrok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::File,
         };
@@ -2431,7 +2558,7 @@ mod tests {
             url: None,
             url_raw: None,
             timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
+            source_dir: std::path::PathBuf::from("/home/u/.opengrok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::Managed,
         };

@@ -5116,3 +5116,92 @@ fn daemon_generate_image_refusal_is_a_failed_card_with_the_reason() {
     assert!(!block.is_success());
     assert_eq!(block.error.as_deref(), Some(reason));
 }
+
+/// Helper: returns whether the tracker defers an Execute tool as background when its first InProgress update carries `input` as raw_input.
+fn bg_deferred_for_input(id: &str, input: serde_json::Value) -> bool {
+    let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+        acp::ToolCallId::new(Arc::from(id)),
+        acp::ToolCallUpdateFields::new()
+            .status(Some(acp::ToolCallStatus::InProgress))
+            .raw_input(Some(input)),
+    ));
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_update(
+        tool_call(id, acp::ToolKind::Execute, "Execute `sleep 9999`"),
+        &meta(),
+        &mut sb,
+    );
+    tracker.handle_update(update, &meta(), &mut sb);
+    tracker.bg_deferred_tools.contains_key(id)
+}
+/// The tracker defers `block_until_ms: 0` the same way as `is_background: true`.
+/// A positive `block_until_ms` stays a foreground call.
+#[test]
+fn bg_tool_detected_from_block_until_ms_zero() {
+    assert!(
+        bg_deferred_for_input(
+            "tc-zero",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 0})
+        ),
+        "block_until_ms: 0 must defer like is_background: true"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-wait",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 30_000})
+        ),
+        "a positive block is a foreground call"
+    );
+}
+/// The tracker reads the input the same way as `BashTool::resolve_block_until_ms`.
+#[test]
+fn bg_tool_follows_bash_block_precedence() {
+    assert!(
+        bg_deferred_for_input(
+            "tc-str",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": "0"})
+        ),
+        "a string-encoded zero block backgrounds"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-mixed",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 30_000, "is_background": true})
+        ),
+        "an explicit positive block wins over a leftover is_background flag"
+    );
+    assert!(
+        bg_deferred_for_input(
+            "tc-timeout",
+            serde_json::json!({"command": "sleep 9999", "timeout": 0})
+        ),
+        "a legacy timeout: 0 backgrounds under the single-knob contract"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-timeout-pos",
+            serde_json::json!({"command": "sleep 9999", "timeout": 5000})
+        ),
+        "a positive legacy timeout is a foreground call"
+    );
+}
+
+#[test]
+fn hidden_user_message_keeps_the_pending_echo_skip() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.expect_user_echo();
+    let mut hide_meta = acp::Meta::new();
+    hide_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+    assert!(!tracker.handle_update(
+        user_message_with_chunk_meta(
+            "<timestamp>Wed</timestamp>\n<system_notification>done</system_notification>",
+            hide_meta,
+        ),
+        &meta(),
+        &mut sb,
+    ));
+    assert!(!tracker.handle_update(user_message("Reply with SECOND"), &meta(), &mut sb));
+    assert!(!tracker.expects_user_echo());
+}

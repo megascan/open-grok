@@ -5,6 +5,7 @@
 //! (loopback-only TCP, or a 0600 Unix socket) and is never exposed through
 //! the sandbox port mapping. `/logs` returns the raw daemon log: treat its
 //! output as sensitive and keep the log stream free of secrets.
+//! An owner can serve its own routes on the same listener with [`serve_with`].
 
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::net::Ipv4Addr;
@@ -373,7 +374,7 @@ fn tail_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn router(ctx: DiagContext) -> Router {
+fn router(ctx: DiagContext, extra_routes: Router) -> Router {
     Router::new()
         .route(
             "/ready",
@@ -395,6 +396,18 @@ fn router(ctx: DiagContext) -> Router {
         )
         .route("/logs", get(logs))
         .with_state(ctx)
+        // A fallback, not `merge`: an overlapping extra route cannot shadow (or panic on) a frozen built-in route.
+        .fallback_service(extra_routes)
+}
+
+/// What [`serve_with`] serves besides `/ready` and `/statusz`.
+#[derive(Debug, Default)]
+pub struct DiagServeOptions {
+    /// The daemon log served by `/logs` (`None` means `/logs` is 404).
+    pub log_file: Option<PathBuf>,
+    /// Routes owned by the caller, served on the same listener.
+    /// They only see requests whose path no built-in route matches, so the built-in contracts stay intact.
+    pub extra_routes: Router,
 }
 
 /// Bind the listener and spawn the server task. Binding happens before this
@@ -405,10 +418,32 @@ pub async fn serve(
     handle: DiagHandle,
     log_file: Option<PathBuf>,
 ) -> anyhow::Result<BoundDiag> {
+    serve_with(
+        listener,
+        handle,
+        DiagServeOptions {
+            log_file,
+            ..DiagServeOptions::default()
+        },
+    )
+    .await
+}
+
+/// [`serve`] plus caller-owned routes on the same listener.
+pub async fn serve_with(
+    listener: DiagListener,
+    handle: DiagHandle,
+    options: DiagServeOptions,
+) -> anyhow::Result<BoundDiag> {
+    let DiagServeOptions {
+        log_file,
+        extra_routes,
+    } = options;
     let ctx = DiagContext {
         handle,
         log_file: log_file.map(Arc::new),
     };
+    let app = router(ctx, extra_routes);
     match listener {
         #[cfg(unix)]
         DiagListener::Unix(path) => {
@@ -424,7 +459,7 @@ pub async fn serve(
                 );
             }
             let task = tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router(ctx)).await {
+                if let Err(e) = axum::serve(listener, app).await {
                     tracing::warn!(error = %e, "diagnostics server exited");
                 }
             });
@@ -440,7 +475,7 @@ pub async fn serve(
                 .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"))?;
             let local = listener.local_addr()?;
             let task = tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router(ctx)).await {
+                if let Err(e) = axum::serve(listener, app).await {
                     tracing::warn!(error = %e, "diagnostics server exited");
                 }
             });
@@ -451,6 +486,150 @@ pub async fn serve(
             })
         }
     }
+}
+
+/// Create or validate one private directory under an existing trusted parent.
+/// Call this for each nested directory before using its contents. Callers must
+/// protect the trusted parent against untrusted same-user processes as well.
+#[cfg(unix)]
+pub fn prepare_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened = directory.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    let uid = unsafe { libc::geteuid() };
+    if !opened.is_dir()
+        || opened.uid() != uid
+        || opened.mode() & 0o077 != 0
+        || !current.is_dir()
+        || current.dev() != opened.dev()
+        || current.ino() != opened.ino()
+    {
+        return Err(anyhow!("private directory is not owner-only or changed"));
+    }
+    Ok(())
+}
+
+/// Serve privileged caller routes on an owner-only Unix socket in a private
+/// directory. The caller must also exclude that directory from untrusted
+/// sandboxes; Unix owner permissions alone do not isolate same-user commands.
+///
+/// A sidecar advisory lock prevents cooperating server instances from
+/// replacing each other's listener. Existing non-sockets, foreign sockets,
+/// and live listeners are never unlinked. A stale owner-owned socket is
+/// removed only while holding the lock. The lock file remains on disk.
+#[cfg(unix)]
+pub async fn serve_private_routes(path: PathBuf, routes: Router) -> anyhow::Result<BoundDiag> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow!("private socket requires a parent directory"))?;
+    prepare_private_directory(parent)?;
+    let uid = unsafe { libc::geteuid() };
+
+    let lock_path = parent.join(".control.sock.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let lock_fd = lock.metadata()?;
+    let lock_path_meta = fs::symlink_metadata(&lock_path)?;
+    if !lock_fd.is_file()
+        || lock_fd.uid() != uid
+        || lock_fd.nlink() != 1
+        || lock_fd.dev() != lock_path_meta.dev()
+        || lock_fd.ino() != lock_path_meta.ino()
+    {
+        return Err(anyhow!(
+            "private socket lock is not an owner-owned regular file"
+        ));
+    }
+    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(anyhow!(
+            "private socket lock unavailable: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let locked_path = fs::symlink_metadata(&lock_path)?;
+    if lock_fd.dev() != locked_path.dev() || lock_fd.ino() != locked_path.ino() {
+        return Err(anyhow!("private socket lock changed during acquisition"));
+    }
+
+    match fs::symlink_metadata(&path) {
+        Ok(existing) => {
+            if !existing.file_type().is_socket() || existing.uid() != uid {
+                return Err(anyhow!(
+                    "refusing to replace non-socket or foreign private socket"
+                ));
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::net::UnixStream::connect(&path),
+            )
+            .await
+            {
+                Ok(Ok(_)) => return Err(anyhow!("private socket already has a live listener")),
+                Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Ok(Err(error)) => {
+                    return Err(anyhow!("cannot verify private socket is stale: {error}"));
+                }
+                Err(_) => return Err(anyhow!("private socket stale check timed out")),
+            }
+            let current = fs::symlink_metadata(&path)?;
+            if !current.file_type().is_socket()
+                || current.uid() != uid
+                || current.dev() != existing.dev()
+                || current.ino() != existing.ino()
+            {
+                return Err(anyhow!("private socket changed during stale check"));
+            }
+            fs::remove_file(&path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = UnixListener::bind(&path)
+        .map_err(|error| anyhow!("bind private socket {}: {error}", path.display()))?;
+    if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(&path);
+        return Err(anyhow!(
+            "cannot restrict private socket permissions: {error}"
+        ));
+    }
+    let socket = fs::symlink_metadata(&path)?;
+    if !socket.file_type().is_socket() || socket.uid() != uid || socket.mode() & 0o077 != 0 {
+        return Err(anyhow!("private socket is not owner-only"));
+    }
+    let task = tokio::spawn(async move {
+        let _lock = lock;
+        if let Err(error) = axum::serve(listener, routes).await {
+            tracing::warn!(%error, "private route server exited");
+        }
+    });
+    Ok(BoundDiag {
+        addr: format!("unix:{}", path.display()),
+        port: None,
+        task,
+    })
 }
 
 /// A successfully bound diagnostics server.
@@ -917,6 +1096,123 @@ mod tests {
         let parsed: Value = serde_json::from_str(&body[json_start..=json_end]).expect("json");
         assert_eq!(parsed["launch_id"], "nonce-uds");
         assert_eq!(parsed["state"], "connected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_routes_bind_owner_only_and_do_not_replace_live_server() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let private = dir.path().join("private");
+        fs::create_dir(&private).expect("private dir");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).expect("mode");
+        let sock = private.join("control.sock");
+        let routes = || Router::new().route("/lifecycle/test", get(|| async { "ok" }));
+        assert!(serve_private_routes(sock.clone(), routes()).await.is_err());
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).expect("mode");
+        let first = serve_private_routes(sock.clone(), routes())
+            .await
+            .expect("private bind");
+        assert_eq!(
+            0o700,
+            fs::metadata(&private).expect("dir").permissions().mode() & 0o777
+        );
+        assert_eq!(
+            0o600,
+            fs::metadata(&sock).expect("socket").permissions().mode() & 0o777
+        );
+        assert!(serve_private_routes(sock.clone(), routes()).await.is_err());
+        let mut stream = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect");
+        stream
+            .write_all(b"GET /lifecycle/test HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("response");
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        first.task.abort();
+        let _ = first.task.await;
+        let rebound = serve_private_routes(sock, routes())
+            .await
+            .expect("replace stale socket");
+        rebound.task.abort();
+        let _ = rebound.task.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_routes_reject_files_and_symlinks_without_touching_them() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let private = dir.path().join("private");
+        fs::create_dir(&private).expect("private dir");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).expect("mode");
+        let sock = private.join("control.sock");
+        fs::write(&sock, "keep").expect("existing file");
+        assert!(
+            serve_private_routes(sock.clone(), Router::new())
+                .await
+                .is_err()
+        );
+        assert_eq!("keep", fs::read_to_string(&sock).expect("file intact"));
+        fs::remove_file(&sock).expect("remove test file");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").expect("victim");
+        symlink(&victim, &sock).expect("socket symlink");
+        assert!(
+            serve_private_routes(sock.clone(), Router::new())
+                .await
+                .is_err()
+        );
+        assert_eq!("keep", fs::read_to_string(&victim).expect("victim intact"));
+        fs::remove_file(&sock).expect("remove symlink");
+        fs::remove_file(private.join(".control.sock.lock")).expect("remove lock");
+        symlink(&victim, private.join(".control.sock.lock")).expect("lock symlink");
+        assert!(serve_private_routes(sock, Router::new()).await.is_err());
+        assert_eq!("keep", fs::read_to_string(&victim).expect("victim intact"));
+        let alias = dir.path().join("alias");
+        symlink(&private, &alias).expect("parent symlink");
+        assert!(
+            serve_private_routes(alias.join("control.sock"), Router::new())
+                .await
+                .is_err()
+        );
+        assert!(prepare_private_directory(&alias).is_err());
+        let nested = private.join("handlers");
+        symlink(&private, &nested).expect("nested state symlink");
+        assert!(prepare_private_directory(&nested).is_err());
+    }
+
+    #[tokio::test]
+    async fn extra_routes_are_served_without_shadowing_builtin_routes() {
+        let extra_routes = Router::new()
+            .route("/extra", get(|| async { "extra" }))
+            .route("/ready", get(|| async { "shadowed" }));
+        let bound = serve_with(
+            DiagListener::Tcp(0),
+            DiagHandle::new(Some("nonce-extra".to_owned())),
+            DiagServeOptions {
+                log_file: None,
+                extra_routes,
+            },
+        )
+        .await
+        .expect("bind");
+        let port = bound.port.expect("tcp port");
+
+        let (status, _, body) = get_text(port, "/extra").await;
+        assert_eq!(200, status);
+        assert_eq!("extra", body);
+
+        let (status, ready) = get_json(port, "/ready").await;
+        assert_eq!(503, status, "the built-in /ready still answers");
+        assert_eq!(ready["launch_id"], "nonce-extra");
+
+        let (status, _, _) = get_text(port, "/missing").await;
+        assert_eq!(404, status);
     }
 
     #[tokio::test]

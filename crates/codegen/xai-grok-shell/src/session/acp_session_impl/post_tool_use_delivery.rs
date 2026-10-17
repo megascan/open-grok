@@ -1,6 +1,7 @@
 use super::*;
 use xai_grok_hooks::dispatcher::{
-    AdditionalContext, OutputReplacement, PostToolUseBlock, PostToolUseResult, SelectedReplacement,
+    AdditionalContext, OutputReplacement, PostToolUseBlock, PostToolUseResult, ReplacementChoice,
+    ReplacementKind, SelectedReplacement,
 };
 use xai_grok_hooks::event::{MAX_HOOK_OUTPUT_REPLACEMENT_CHARS, clip_text};
 use xai_grok_hooks::result::HookRunResult;
@@ -18,25 +19,21 @@ struct Rejection {
 }
 
 pub(super) fn plan_post_tool_use_delivery(
-    result: PostToolUseResult,
+    mut result: PostToolUseResult,
     output: &ToolsToolOutput,
     reminder_tag: &str,
     results: &mut [HookRunResult],
 ) -> PostToolUseDelivery {
-    let tool_is_mcp = matches!(output, ToolsToolOutput::MCP(_));
-    let selected = if tool_is_mcp {
-        latest_replacement(result.builtin_replacement, result.mcp_replacement)
+    let kind = if matches!(output, ToolsToolOutput::MCP(_)) {
+        ReplacementKind::Mcp
     } else {
-        if let Some(mcp) = result.mcp_replacement {
-            downgrade_run(
-                results,
-                mcp.run_index,
-                "updatedMCPToolOutput does not match the tool's kind",
-            );
-        }
-        result.builtin_replacement
+        ReplacementKind::Builtin
     };
-    let (model_output, rejection) = post_tool_use_model_output(selected, output, reminder_tag);
+    let ReplacementChoice { chosen, rejected } = result.take_replacement(kind);
+    for rejection in rejected {
+        downgrade_run(results, rejection.run_index, &rejection.reason);
+    }
+    let (model_output, rejection) = post_tool_use_model_output(chosen, output, reminder_tag);
     if let Some(Rejection { run_index, reason }) = rejection {
         downgrade_run(results, run_index, &reason);
     }
@@ -69,20 +66,6 @@ fn downgrade_run(results: &mut [HookRunResult], run_index: usize, reason: &str) 
             http_info: http_info.clone(),
             system_message: system_message.clone(),
         };
-    }
-}
-
-fn latest_replacement(
-    builtin: Option<SelectedReplacement>,
-    mcp: Option<SelectedReplacement>,
-) -> Option<SelectedReplacement> {
-    match (builtin, mcp) {
-        (Some(builtin), Some(mcp)) => Some(if mcp.run_index > builtin.run_index {
-            mcp
-        } else {
-            builtin
-        }),
-        (builtin, mcp) => builtin.or(mcp),
     }
 }
 
@@ -130,20 +113,18 @@ fn post_tool_use_rendered_replacement(
     replacement: OutputReplacement,
     output: &ToolsToolOutput,
 ) -> RenderedReplacement {
+    if matches!(output, ToolsToolOutput::MCP(_)) {
+        let hook_name = replacement.hook_name.clone();
+        let rendered = replacement.mcp_output_text();
+        return RenderedReplacement::Replace {
+            hook_name,
+            rendered,
+        };
+    }
+
     let OutputReplacement {
         hook_name, value, ..
     } = replacement;
-
-    if matches!(output, ToolsToolOutput::MCP(_)) {
-        let rendered = match value {
-            serde_json::Value::String(text) => text,
-            other => other.to_string(),
-        };
-        return RenderedReplacement::Replace {
-            hook_name,
-            rendered: clip_text(&rendered, MAX_HOOK_OUTPUT_REPLACEMENT_CHARS),
-        };
-    }
 
     match serde_json::from_value::<ToolsToolOutput>(value) {
         Ok(candidate) if std::mem::discriminant(&candidate) == std::mem::discriminant(output) => {

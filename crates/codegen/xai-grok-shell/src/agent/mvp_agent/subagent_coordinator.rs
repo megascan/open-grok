@@ -98,7 +98,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 let parent_sid = acp::SessionId::new(parent_sid);
                 this.resident_handle(&parent_sid)
             };
-            if let Some(handle) = parent_handle {
+            if let Some(handle) = parent_handle.as_ref() {
                 let (parent_mcp_pool, client_hooks, parent_tools) = tokio::join!(
                     handle.snapshot_mcp_pool(),
                     handle.snapshot_client_hooks(),
@@ -118,7 +118,8 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     .then_some(parent_tools);
                 }
             }
-            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway).await
+            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway, parent_handle.as_ref())
+                .await
         })
     }
     fn validate_type(

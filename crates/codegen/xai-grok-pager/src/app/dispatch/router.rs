@@ -1,8 +1,14 @@
 //! Top-level action router: maps actions and action results to handlers.
+
+fn next_context_switch_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 use super::auth::{
-    dispatch_cancel_login, dispatch_choose_startup_codex, dispatch_choose_startup_xai,
-    dispatch_login, dispatch_login_codex, dispatch_logout, dispatch_logout_codex,
-    dispatch_open_login_provider_picker, dispatch_submit_auth_code, dispatch_switch_account,
+    dispatch_antigravity_auth, dispatch_cancel_login, dispatch_choose_startup_codex,
+    dispatch_choose_startup_xai, dispatch_login, dispatch_login_codex, dispatch_logout,
+    dispatch_logout_codex, dispatch_open_login_provider_picker, dispatch_submit_auth_code,
+    dispatch_switch_account,
 };
 use super::billing::dispatch_open_supergrok_url;
 use super::ctx::{
@@ -815,17 +821,22 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
-            if let Some(ref mut modal) = agent.extensions_modal {
-                modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-                modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
-            }
             let Some(session_id) = agent.session.session_id.clone() else {
                 return vec![];
             };
+            let Some(ref mut modal) = agent.extensions_modal else {
+                return vec![];
+            };
+            modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
+            modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
+            let refresh = modal.active_tab == crate::views::extensions_modal::ExtensionsTab::Skills;
+            let fetch = modal.next_skills_fetch();
             vec![
                 Effect::FetchSkillsList {
                     agent_id: id,
                     session_id: session_id.clone(),
+                    refresh,
+                    fetch,
                 },
                 Effect::FetchWorkflowsList {
                     agent_id: id,
@@ -940,15 +951,20 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
             };
-            let Some(agent) = app.agents.get(&id) else {
+            let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
             let Some(session_id) = agent.session.session_id.clone() else {
                 return vec![];
             };
+            let Some(modal) = agent.extensions_modal.as_mut() else {
+                return vec![];
+            };
+            let fetch = modal.next_skills_fetch();
             vec![Effect::ToggleSkill {
                 agent_id: id,
                 session_id,
+                fetch,
                 skill_name,
                 enabled,
             }]
@@ -1007,6 +1023,10 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if agent.session.pending_context_switch.is_some() {
+                agent.show_toast("Finishing the context-window change before switching models…");
+                return vec![];
+            }
             if agent.session.model_switch_pending && agent.session.provider_rebind_pending {
                 agent.show_toast("Finishing the Kimi service change before switching models…");
                 return vec![];
@@ -1047,6 +1067,89 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 effort,
                 service_tier,
                 prev_model_id: None,
+            }]
+        }
+        Action::SwitchModelWithWindow {
+            model_id,
+            effort,
+            window,
+        } => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get_mut(&id) else {
+                return vec![];
+            };
+            if agent.session.model_switch_pending || agent.session.provider_rebind_pending {
+                agent.show_toast("Wait for the current model change to finish.");
+                return vec![];
+            }
+            let Some(session_id) = agent.session.session_id.clone() else {
+                agent.show_toast("No active session yet; retry once it starts.");
+                return vec![];
+            };
+            if !agent
+                .session
+                .models
+                .context_window_options_for(&model_id)
+                .contains(&window.get())
+            {
+                agent.show_toast("This model does not support that context window.");
+                return vec![];
+            }
+            let source_model_id = agent.session.models.current.clone();
+            agent.session.model_switch_pending = true;
+            let request_id = next_context_switch_id();
+            agent.session.pending_context_switch =
+                Some((session_id.clone(), model_id.clone(), window, request_id));
+            vec![Effect::SwitchModelWithWindow {
+                agent_id: id,
+                request_id,
+                session_id,
+                model_id,
+                source_model_id,
+                effort,
+                window,
+            }]
+        }
+        Action::SwitchContextWindow { window } => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get_mut(&id) else {
+                return vec![];
+            };
+            if agent.session.model_switch_pending || agent.session.provider_rebind_pending {
+                agent.show_toast("Wait for the current model change to finish.");
+                return vec![];
+            }
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return vec![];
+            };
+            let Some(model_id) = agent.session.models.current.clone() else {
+                return vec![];
+            };
+            if !agent
+                .session
+                .models
+                .context_window_options()
+                .contains(&window.get())
+            {
+                agent.show_toast("This model does not support that context window.");
+                return vec![];
+            }
+            let effort = agent.session.models.reasoning_effort;
+            agent.session.model_switch_pending = true;
+            let request_id = next_context_switch_id();
+            agent.session.pending_context_switch =
+                Some((session_id.clone(), model_id.clone(), window, request_id));
+            vec![Effect::SwitchContextWindow {
+                agent_id: id,
+                request_id,
+                session_id,
+                model_id,
+                effort,
+                window,
             }]
         }
         Action::AnnouncementsHide => {
@@ -1340,6 +1443,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PermissionCancel => dispatch_permission_cancel(app),
         Action::Logout => dispatch_logout(app),
         Action::LogoutCodex => dispatch_logout_codex(app),
+        Action::LogoutAntigravity => dispatch_antigravity_auth(app, true),
         Action::SwitchAccount => dispatch_switch_account(app),
         Action::CheckSubscription => vec![Effect::CheckSubscription { verify: None }],
         Action::OpenSupergrokUrl => dispatch_open_supergrok_url(app),
@@ -1404,6 +1508,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenGeminiApiKeyEditor => dispatch_open_gemini_api_key_editor(app),
         Action::Login => dispatch_login(app),
         Action::LoginCodex => dispatch_login_codex(app),
+        Action::LoginAntigravity => dispatch_antigravity_auth(app, false),
         Action::ChooseStartupCodex => dispatch_choose_startup_codex(app),
         Action::ChooseStartupXai => dispatch_choose_startup_xai(app),
         Action::CancelLogin => dispatch_cancel_login(app),

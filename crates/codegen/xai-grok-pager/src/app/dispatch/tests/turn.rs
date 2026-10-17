@@ -1550,7 +1550,15 @@ fn cancel_rewind_removes_all_combined_segment_blocks() {
         (first_id, last_id)
     };
 
-    let _ = dispatch(Action::CancelTurn, &mut app);
+    let effects = dispatch(Action::CancelTurn, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CancelTurn {
+            rewind_if_no_output: true,
+            rewind_prompt_id: Some(prompt_id),
+            ..
+        }] if prompt_id == "p-combo"
+    ));
 
     let agent = &app.agents[&id];
     assert!(
@@ -1566,6 +1574,35 @@ fn cancel_rewind_removes_all_combined_segment_blocks() {
         "first\n\nsecond",
         "the joined combined text is restored into the composer"
     );
+}
+
+/// An unidentifiable in-flight turn cannot safely be rewound on the server.
+#[test]
+fn cancel_without_prompt_identity_keeps_in_flight_prompt() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("sent prompt".into()), &mut app);
+    let entry = app.agents[&id]
+        .session
+        .in_flight_prompt
+        .as_ref()
+        .unwrap()
+        .scrollback_entry;
+    app.agents.get_mut(&id).unwrap().session.current_prompt_id = None;
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CancelTurn {
+            rewind_if_no_output: false,
+            rewind_prompt_id: None,
+            ..
+        }]
+    ));
+    let agent = &app.agents[&id];
+    assert!(agent.scrollback.index_of_id(entry).is_some());
+    assert!(agent.prompt.text().is_empty());
+    assert!(agent.session.state.is_cancelling());
 }
 
 /// A cancel landing before first server activity must NOT rewind the stashed

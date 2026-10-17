@@ -937,7 +937,8 @@ impl SessionActor {
                 });
         let signature = response
             .reasoning_items()
-            .find_map(|r| r.encrypted_content.clone());
+            .filter_map(|r| r.encrypted_content.clone())
+            .last();
         XaiSessionUpdate::ResponseCompleted {
             message_id: response.message_id.clone(),
             stop_reason: response.raw_stop_reason.clone(),

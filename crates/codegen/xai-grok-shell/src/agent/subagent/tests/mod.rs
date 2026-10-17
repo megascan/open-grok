@@ -2318,6 +2318,8 @@ async fn cancel_pending_at_promote_removes_fresh_worktree_preserves_resumed() {
 fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
         info: crate::agent::config::ModelInfo {
+            notice: None,
+            context_windows: Vec::new(),
             max_request_bytes: None,
             reasoning_effort_server_default: false,
             variants: Vec::new(),

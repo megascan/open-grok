@@ -350,6 +350,7 @@ fn release_queued_prompt_from(app: &mut AppView, agent_id: Option<AgentId>) -> V
         return Vec::new();
     }
     if !agent.is_parked_on_sendable_wait()
+        || agent.session.pending_context_switch.is_some()
         || agent.session.loading_replay
         || agent.expect_send_now_cancel.is_some()
     {
@@ -1294,12 +1295,15 @@ pub(super) fn dispatch_queue_interject_shared(
 ) -> Vec<Effect> {
     if let ActiveView::Agent(agent_id) = app.active_view
         && let Some(agent) = app.agents.get_mut(&agent_id)
-        && agent.session.provider_rebind_pending
+        && (agent.session.provider_rebind_pending || agent.session.pending_context_switch.is_some())
     {
-        // The server-owned row remains in place because no mutation effect is
-        // emitted. Do not let this force-send path bypass the fail-closed hold
-        // with a sampler that still owns an old Kimi credential.
-        agent.show_toast("Kimi service update in progress; send now is paused");
+        // Keep the server-owned row in place until its route is resolved.
+        let notice = if agent.session.pending_context_switch.is_some() {
+            "Model change in progress; send now is paused"
+        } else {
+            "Kimi service update in progress; send now is paused"
+        };
+        agent.show_toast(notice);
         return vec![];
     }
     match active_agent_session_id(app) {

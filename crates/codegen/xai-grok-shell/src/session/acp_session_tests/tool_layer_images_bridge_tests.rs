@@ -194,6 +194,7 @@ fn prepared_post_tool_use_call(id: &str, tool_name: &str) -> PreparedToolCall {
         coercion_note: None,
         dispatch_target_name: None,
         is_read_only: false,
+        is_edit: false,
         rewriting_hook: None,
         additional_context: Vec::new(),
     }

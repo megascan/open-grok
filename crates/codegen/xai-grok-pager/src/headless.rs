@@ -35,7 +35,9 @@ use crate::headless::reducer::{
 mod ext_protocol;
 mod mcp_init;
 mod reducer;
+mod signals;
 use ext_protocol::{ExtEvent, handle_ext_notification, reply_headless_ext_method};
+use signals::HeadlessSignals;
 
 mod cli;
 pub use cli::{HeadlessPrompt, OutputFormat, parse_json_schema, parse_permission_rules_lenient};
@@ -875,6 +877,7 @@ pub async fn run_single_turn(
     verbatim: bool,
     options: HeadlessOptions,
 ) -> Result<()> {
+    let signals = HeadlessSignals::install().await?;
     // Stamp proxy requests as headless before the agent issues its first request.
     xai_grok_shell::http::set_process_client_mode_headless();
 
@@ -1072,7 +1075,7 @@ pub async fn run_single_turn(
         }
     };
     // Cancel + join on every return path (success or bail).
-    let _agent_guard = AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
+    let agent_guard = AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
     let (acp_tx, mut acp_rx) = (spawned.channel.tx, spawned.channel.rx);
     crate::unified_log::init(acp_tx.clone());
     crate::unified_log::info(
@@ -1337,8 +1340,10 @@ pub async fn run_single_turn(
     let mut prompt_done_at: Option<Instant> = None;
     // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
     let mut connection_closed = false;
+    let mut terminated_by_signal = None;
 
     if let Some(mut prompt_fut) = prompt_fut {
+        let deferred_exit = signals.defer_exit();
         loop {
             if emitter.write_error.is_some() {
                 tracing::warn!("headless: stdout write failed; stopping the stream loop");
@@ -1392,6 +1397,7 @@ pub async fn run_single_turn(
 
             tokio::select! {
                 biased;
+                () = deferred_exit.signalled() => break,
                 msg = acp_rx.recv() => {
                     let Some(msg) = msg else {
                         emitter.on_error("Connection closed unexpectedly", None);
@@ -1443,6 +1449,8 @@ pub async fn run_single_turn(
             }
         }
 
+        terminated_by_signal = deferred_exit.release();
+
         // Final drain-to-empty so the reaper sees work buffered right at exit (the timeout path skips draining).
         drain_pending_acp_messages(
             &mut acp_rx,
@@ -1463,11 +1471,19 @@ pub async fn run_single_turn(
         }
     }
 
-    crate::unified_log::flush_blocking().await;
+    flush_unified_log_at_exit(crate::unified_log::flush_blocking(), terminated_by_signal).await;
 
     if track_active {
         // Non-blocking flock so a slow/network ~/.opengrok can't hang exit.
         let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
+    }
+    if let Some(code) = terminated_by_signal {
+        tracing::info!(
+            exit_code = code,
+            "headless: a signal during the turn ends the run"
+        );
+        drop(agent_guard);
+        crate::app::signal_handler::force_exit(code);
     }
     // A mid-turn ACP close already reaped above; return that error before the normal outcome.
     if connection_closed {
@@ -1654,6 +1670,23 @@ fn reap_request_for_work(
         ),
     };
     Ok(acp::ExtRequest::new(method, params.into()))
+}
+
+/// Bound logging on a signalled exit if the shell cannot answer the flush request.
+const SIGNAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn flush_unified_log_at_exit(
+    flush: impl std::future::Future<Output = ()>,
+    terminated_by_signal: Option<i32>,
+) {
+    if terminated_by_signal.is_none() {
+        flush.await;
+    } else if tokio::time::timeout(SIGNAL_FLUSH_TIMEOUT, flush)
+        .await
+        .is_err()
+    {
+        tracing::warn!("headless: unified log flush timed out at exit");
+    }
 }
 
 /// Best-effort kill of background work still pending when headless exits

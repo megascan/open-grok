@@ -102,6 +102,7 @@ pub struct WorkspaceSession {
     /// Auto-approve (YOLO) state. Seeded from `session.bind` metadata,
     /// refreshed by each before-turn hook.
     pub(crate) yolo_mode: std::sync::atomic::AtomicBool,
+    pub(crate) approval: crate::permission::SessionApproval,
     /// Session-lifetime terminal backend (background-task registry +
     /// persistent shell). Created once at session construction; every toolset
     /// re-resolve reuses it, so background tasks and shell state survive
@@ -267,6 +268,7 @@ impl WorkspaceSession {
             mcp_tool_ids: tokio::sync::Mutex::new(Vec::new()),
             viewer_ctx,
             yolo_mode: std::sync::atomic::AtomicBool::new(false),
+            approval: crate::permission::SessionApproval::default(),
             system_notifications,
             system_notify_handle,
             #[allow(dead_code)]
@@ -627,6 +629,11 @@ pub struct WorkspaceShared {
     /// Workspace root directory. Independent of any session — stored
     /// here so it survives session creation/deletion.
     pub(crate) root_cwd: std::path::PathBuf,
+    pub(crate) sandbox: tokio::sync::OnceCell<Arc<crate::sandbox::WorkspaceSandbox>>,
+    #[cfg(test)]
+    pub(crate) test_hub_approval_gate: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    pub(crate) test_after_hub_approval: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(crate) sessions: RwLock<HashMap<String, Arc<WorkspaceSession>>>,
     pub(crate) session_factory: Arc<dyn SessionContextFactory>,
     pub(crate) mcp_tools_snapshot: arc_swap::ArcSwap<Vec<ToolConfig>>,
@@ -743,6 +750,9 @@ pub struct WorkspaceShared {
     pub(crate) client_fs_hash_memo: crate::file_system::client_fs::FileHashMemo,
 }
 impl WorkspaceShared {
+    pub(crate) fn sandbox(&self) -> Option<Arc<crate::sandbox::WorkspaceSandbox>> {
+        self.sandbox.get().cloned()
+    }
     /// Workspace root directory.
     pub fn root_cwd(&self) -> &std::path::Path {
         &self.root_cwd

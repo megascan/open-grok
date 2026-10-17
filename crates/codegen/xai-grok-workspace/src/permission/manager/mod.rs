@@ -23,6 +23,9 @@ use crate::permission::exec_risk::{
     git_words_have_unsafe_query_option, script_may_invoke_git, segment_exec_facts,
 };
 use crate::permission::gate_preflight::GatePreflight;
+use crate::permission::lease::{
+    ActorLeaseGuard, PermissionLeaseRegistry, UnrestrictedPermissionLease,
+};
 use crate::permission::policy::{CompiledPolicy, ShellWord};
 use crate::permission::prompter::{AcpPrompter, PromptOutcome, PromptOutcomeKind};
 use crate::permission::shell_access::{
@@ -32,7 +35,8 @@ use crate::permission::shell_access::{
 use crate::permission::state::{PermissionState, persist_state, replace_state_on_disk};
 use crate::permission::types::{
     AccessKind, ClientType, Decision, EditPolicy, PermissionCommand, PermissionEvent,
-    PermissionRequest, PermissionResolution, PermissionRule, PromptPolicy, RequestPathContext,
+    PermissionLeaseResult, PermissionRequest, PermissionResolution, PermissionRule, PromptPolicy,
+    RequestPathContext,
 };
 use xai_grok_mcp::servers::parse_mcp_qualified_name;
 use xai_grok_paths::AbsPathBuf;
@@ -43,6 +47,7 @@ use xai_grok_tools::types::resources::resolve_model_path;
 
 mod bash_grants;
 mod bash_policy_allow;
+mod hub_grants;
 pub mod reasons;
 mod request_classification;
 
@@ -54,6 +59,7 @@ pub use bash_policy_allow::broad_allow_floor_requires_prompt;
 use bash_policy_allow::{
     broad_allow_deferred, configured_filename_allow, requires_recovered_classification,
 };
+pub(crate) use hub_grants::{protected_target, record_prompt_outcome, session_grant_for_hub};
 pub use request_classification::{AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT};
 use request_classification::{
     AUTO_DENY_GUIDANCE, ClassificationOutcome, ClassificationSource, DenialCounters,
@@ -81,6 +87,8 @@ impl Drop for InFlightGuard {
 pub enum PermissionHandle {
     Actor {
         cmd_tx: mpsc::UnboundedSender<PermissionCommand>,
+        /// Serializes external-process grants and policy transitions.
+        lease_registry: Arc<PermissionLeaseRegistry>,
         yolo_state: Arc<AtomicBool>,
         /// Auto mode (LLM classifier) — mutually exclusive with yolo at runtime.
         auto_state: Arc<AtomicBool>,
@@ -169,7 +177,10 @@ pub(crate) fn web_fetch_deny_key_from_url(url: &str) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
-fn denied_web_fetch_domain<'a>(host: &str, disallowed: &'a HashSet<String>) -> Option<&'a str> {
+pub(crate) fn denied_web_fetch_domain<'a>(
+    host: &str,
+    disallowed: &'a HashSet<String>,
+) -> Option<&'a str> {
     if disallowed.is_empty() {
         return None;
     }
@@ -936,6 +947,46 @@ pub(crate) fn evaluate_bash_segments_inner(
 }
 
 impl PermissionHandle {
+    /// Revoke external-process grants before a shell-owned restriction changes
+    /// (for example, plan mode or the client hook registry).
+    pub fn revoke_unrestricted_leases(&self) {
+        if let PermissionHandle::Actor { lease_registry, .. } = self {
+            lease_registry.transition(|| ());
+        }
+    }
+
+    /// Validate the actor's current permission state for an unrestricted
+    /// external process. Shell-level restrictions must be checked separately.
+    pub async fn acquire_unrestricted_lease(&self) -> Option<UnrestrictedPermissionLease> {
+        let PermissionHandle::Actor {
+            cmd_tx,
+            lease_registry,
+            ..
+        } = self
+        else {
+            // AllowAll is not evidence of an explicit user-selected mode.
+            return None;
+        };
+        // A transition can be queued between the handle's enqueue and the
+        // actor's validation. Retry stale snapshots, but bound contention.
+        for _ in 0..16 {
+            let (respond_to, response) = oneshot::channel();
+            lease_registry
+                .enqueue_snapshot(|revision| {
+                    cmd_tx.send(PermissionCommand::AcquireUnrestrictedLease {
+                        revision,
+                        respond_to,
+                    })
+                })
+                .ok()?;
+            match response.await.ok()? {
+                PermissionLeaseResult::Granted(lease) => return Some(lease),
+                PermissionLeaseResult::Restricted => return None,
+                PermissionLeaseResult::Changed => continue,
+            }
+        }
+        None
+    }
     pub fn allow_all() -> Self {
         PermissionHandle::AllowAll
     }
@@ -944,6 +995,7 @@ impl PermissionHandle {
     pub fn set_yolo_mode(&self, enabled: bool) {
         if let PermissionHandle::Actor {
             cmd_tx,
+            lease_registry,
             yolo_state,
             auto_state,
             yolo_pin,
@@ -953,14 +1005,16 @@ impl PermissionHandle {
             // Clamp the Arc synchronously so `is_yolo_mode()` is correct
             // immediately (no optimistic-true window); the raw request is still
             // forwarded so the actor logs the refusal once and re-clamps.
-            let clamped = clamp_yolo(enabled, *yolo_pin);
-            yolo_state.store(clamped, Ordering::Relaxed);
-            if clamped {
-                auto_state.store(false, Ordering::Relaxed);
-            }
-            if let Err(e) = cmd_tx.send(PermissionCommand::SetYoloMode(enabled)) {
-                tracing::error!(?e, "failed to send yolo mode command");
-            }
+            lease_registry.transition(|| {
+                let clamped = clamp_yolo(enabled, *yolo_pin);
+                yolo_state.store(clamped, Ordering::Relaxed);
+                if clamped {
+                    auto_state.store(false, Ordering::Relaxed);
+                }
+                if let Err(e) = cmd_tx.send(PermissionCommand::SetYoloMode(enabled)) {
+                    tracing::error!(?e, "failed to send yolo mode command");
+                }
+            });
         }
     }
 
@@ -969,18 +1023,21 @@ impl PermissionHandle {
     pub fn set_auto_mode(&self, enabled: bool) {
         if let PermissionHandle::Actor {
             cmd_tx,
+            lease_registry,
             yolo_state,
             auto_state,
             ..
         } = self
         {
-            auto_state.store(enabled, Ordering::Relaxed);
-            if enabled {
-                yolo_state.store(false, Ordering::Relaxed);
-            }
-            if let Err(e) = cmd_tx.send(PermissionCommand::SetAutoMode(enabled)) {
-                tracing::error!(?e, "failed to send auto mode command");
-            }
+            lease_registry.transition(|| {
+                auto_state.store(enabled, Ordering::Relaxed);
+                if enabled {
+                    yolo_state.store(false, Ordering::Relaxed);
+                }
+                if let Err(e) = cmd_tx.send(PermissionCommand::SetAutoMode(enabled)) {
+                    tracing::error!(?e, "failed to send auto mode command");
+                }
+            });
         }
     }
 
@@ -1051,11 +1108,18 @@ impl PermissionHandle {
     /// No-op under [`PermissionHandle::AllowAll`] (everything is already
     /// allowed) and for a shut-down actor.
     pub fn add_session_rules(&self, rules: Vec<PermissionRule>) {
-        if let PermissionHandle::Actor { cmd_tx, .. } = self
+        if let PermissionHandle::Actor {
+            cmd_tx,
+            lease_registry,
+            ..
+        } = self
             && !rules.is_empty()
-            && let Err(e) = cmd_tx.send(PermissionCommand::AddSessionRules { rules })
         {
-            tracing::error!(?e, "failed to send add-session-rules command");
+            lease_registry.transition(|| {
+                if let Err(e) = cmd_tx.send(PermissionCommand::AddSessionRules { rules }) {
+                    tracing::error!(?e, "failed to send add-session-rules command");
+                }
+            });
         }
     }
 
@@ -1063,10 +1127,17 @@ impl PermissionHandle {
     /// Subagent-shared managers lose them everywhere, which is exactly the
     /// desired semantics: the grant was session-working-dir-scoped.
     pub fn reset_session_rules(&self) {
-        if let PermissionHandle::Actor { cmd_tx, .. } = self
-            && let Err(e) = cmd_tx.send(PermissionCommand::ResetSessionRules)
+        if let PermissionHandle::Actor {
+            cmd_tx,
+            lease_registry,
+            ..
+        } = self
         {
-            tracing::error!(?e, "failed to send reset-session-rules command");
+            lease_registry.transition(|| {
+                if let Err(e) = cmd_tx.send(PermissionCommand::ResetSessionRules) {
+                    tracing::error!(?e, "failed to send reset-session-rules command");
+                }
+            });
         }
     }
 
@@ -1081,10 +1152,17 @@ impl PermissionHandle {
 
     /// Reset per-tool permission state back to defaults.
     pub fn reset_state(&self) {
-        if let PermissionHandle::Actor { cmd_tx, .. } = self
-            && let Err(e) = cmd_tx.send(PermissionCommand::ResetState)
+        if let PermissionHandle::Actor {
+            cmd_tx,
+            lease_registry,
+            ..
+        } = self
         {
-            tracing::error!(?e, "failed to send reset state command");
+            lease_registry.transition(|| {
+                if let Err(e) = cmd_tx.send(PermissionCommand::ResetState) {
+                    tracing::error!(?e, "failed to send reset state command");
+                }
+            });
         }
     }
 
@@ -1608,8 +1686,12 @@ fn spawn_permission_manager_with_pin(
     let in_flight_actor = in_flight.clone();
     let user_prompt_notify = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<()>>));
     let user_prompt_notify_actor = user_prompt_notify.clone();
+    let lease_registry = Arc::new(PermissionLeaseRegistry::default());
+    let lease_registry_actor = lease_registry.clone();
+    let has_read_denies = !deny_read_globs.is_empty();
 
     let _task = tokio::task::spawn_local(async move {
+        let _lease_guard = ActorLeaseGuard(lease_registry_actor.clone());
         let client_id_ref = client_identifier.as_deref();
         let (mut store, mut state) =
             crate::permission::state::CachedStateStore::resolve_and_load(&cwd, client_id_ref).await;
@@ -1680,7 +1762,36 @@ fn spawn_permission_manager_with_pin(
             .eq(DEFAULT_ALLOWED_DOMAINS.iter().copied());
         while let Some(cmd) = rx.recv().await {
             match cmd {
+                PermissionCommand::AcquireUnrestrictedLease {
+                    revision,
+                    respond_to,
+                } => {
+                    if let Some(fresh) = store.reload_if_changed().await {
+                        if fresh.has_explicit_denials() {
+                            lease_registry_actor.transition(|| ());
+                        }
+                        state.merge_grants_from(fresh);
+                    }
+                    let unrestricted = yolo_mode
+                        && yolo_pin.is_none()
+                        && !has_read_denies
+                        && !state.has_explicit_denials()
+                        && !matches!(prompt_policy, PromptPolicy::Deny)
+                        && !compiled_policy
+                            .as_ref()
+                            .is_some_and(CompiledPolicy::has_restrictive_rules);
+                    let result = if unrestricted {
+                        match lease_registry_actor.issue(revision) {
+                            Some(lease) => PermissionLeaseResult::Granted(lease),
+                            None => PermissionLeaseResult::Changed,
+                        }
+                    } else {
+                        PermissionLeaseResult::Restricted
+                    };
+                    let _ = respond_to.send(result);
+                }
                 PermissionCommand::SetYoloMode(enabled) => {
+                    lease_registry_actor.transition(|| ());
                     // Authoritative re-clamp: no client can enable yolo under
                     // the pin, whatever ingestion path set it.
                     let clamped = clamp_yolo(enabled, yolo_pin);
@@ -1697,6 +1808,7 @@ fn spawn_permission_manager_with_pin(
                     }
                 }
                 PermissionCommand::SetAutoMode(enabled) => {
+                    lease_registry_actor.transition(|| ());
                     tracing::info!("auto permission mode set to: {}", enabled);
                     auto_mode = enabled;
                     auto_state_actor.store(enabled, Ordering::Relaxed);
@@ -1722,6 +1834,7 @@ fn spawn_permission_manager_with_pin(
                     project_instructions = instructions;
                 }
                 PermissionCommand::AddSessionRules { rules } => {
+                    lease_registry_actor.transition(|| ());
                     // No config policy exists (manager spawned with None)?
                     // Materialize one from the appended rules so they still
                     // evaluate — with the default Ask prompt policy, matching
@@ -1729,9 +1842,11 @@ fn spawn_permission_manager_with_pin(
                     match compiled_policy.as_mut() {
                         Some(policy) => policy.append_rules(rules),
                         None => {
-                            let mut config = crate::permission::types::PermissionConfig::default();
-                            config.rules = rules;
-                            compiled_policy = Some(CompiledPolicy::new(config));
+                            let mut policy = CompiledPolicy::new(
+                                crate::permission::types::PermissionConfig::default(),
+                            );
+                            policy.append_rules(rules);
+                            compiled_policy = Some(policy);
                         }
                     }
                     tracing::info!(
@@ -1743,6 +1858,7 @@ fn spawn_permission_manager_with_pin(
                     );
                 }
                 PermissionCommand::ResetSessionRules => {
+                    lease_registry_actor.transition(|| ());
                     let dropped = compiled_policy
                         .as_mut()
                         .map(|policy| policy.reset_session_rules())
@@ -1750,6 +1866,7 @@ fn spawn_permission_manager_with_pin(
                     tracing::info!(dropped, "Reset session-scoped permission rules");
                 }
                 PermissionCommand::ResetState => {
+                    lease_registry_actor.transition(|| ());
                     state = PermissionState::default();
                     // Replace, not merge: persist_state unions on-disk grants
                     // back in, which would resurrect everything a reset is
@@ -1916,6 +2033,9 @@ fn spawn_permission_manager_with_pin(
                         AccessKind::Bash(_) | AccessKind::MCPTool { .. } | AccessKind::WebFetch(_)
                     ) && let Some(fresh) = store.reload_if_changed().await
                     {
+                        if fresh.has_explicit_denials() {
+                            lease_registry_actor.transition(|| ());
+                        }
                         state.merge_grants_from(fresh);
                     }
 
@@ -2787,6 +2907,7 @@ fn spawn_permission_manager_with_pin(
                                     Decision::Reject("User rejected the execution".to_owned())
                                 }
                                 PromptOutcome::RejectAlwaysBashCommand(prefix) => {
+                                    lease_registry_actor.transition(|| ());
                                     state.disallowed_bash_commands.insert(prefix.clone());
                                     persist_state(&cwd, &state, client_id_ref).await;
                                     Decision::Reject(format!(
@@ -2977,6 +3098,7 @@ fn spawn_permission_manager_with_pin(
                                                 "RejectAlwaysMcpTool tool_name mismatch; persisting access-kind name"
                                             );
                                         }
+                                        lease_registry_actor.transition(|| ());
                                         state.disallowed_mcp_tools.insert(access_name.clone());
                                         persist_state(&cwd, &state, client_id_ref).await;
                                         Decision::Reject(format!(
@@ -3001,6 +3123,7 @@ fn spawn_permission_manager_with_pin(
                                                 "RejectAlwaysDomain mismatch; persisting access-URL domain"
                                             );
                                         }
+                                        lease_registry_actor.transition(|| ());
                                         state.disallowed_web_fetch_domains.insert(domain.clone());
                                         persist_state(&cwd, &state, client_id_ref).await;
                                         Decision::Reject(format!(
@@ -3086,6 +3209,7 @@ fn spawn_permission_manager_with_pin(
     (
         PermissionHandle::Actor {
             cmd_tx: tx,
+            lease_registry,
             yolo_state,
             auto_state,
             side_query_wired,
@@ -3105,6 +3229,8 @@ mod tests {
 
     #[path = "bash_filename_arguments_tests.rs"]
     mod bash_filename_arguments_tests;
+    #[path = "lease_tests.rs"]
+    mod lease_tests;
 
     // ── Managed-policy pin: yolo clamp + persisted bash clamp ──
 
@@ -4266,6 +4392,7 @@ mod tests {
     fn handle_with_cmd_tx(cmd_tx: mpsc::UnboundedSender<PermissionCommand>) -> PermissionHandle {
         PermissionHandle::Actor {
             cmd_tx,
+            lease_registry: Arc::new(PermissionLeaseRegistry::default()),
             yolo_state: Arc::new(AtomicBool::new(false)),
             auto_state: Arc::new(AtomicBool::new(false)),
             side_query_wired: Arc::new(AtomicBool::new(false)),

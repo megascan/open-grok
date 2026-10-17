@@ -2226,11 +2226,41 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 legacy: _,
                 oauth,
                 codex,
+                antigravity,
                 device_auth,
                 devbox,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                if antigravity {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        anyhow::bail!("Antigravity sign-in requires an interactive terminal");
+                    }
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(),
+                        std::env::current_dir()?,
+                    )?;
+                    let cancel = CancellationToken::new();
+                    let login = xai_grok_shell::agent::antigravity_acp::login_user(
+                        &launch,
+                        |url| eprintln!("Open this link to sign in to Antigravity:\n{url}"),
+                        &cancel,
+                    );
+                    tokio::pin!(login);
+                    let result = tokio::select! {
+                        result = &mut login => result,
+                        _ = tokio::signal::ctrl_c() => {
+                            cancel.cancel();
+                            login.await
+                        }
+                    };
+                    result.map_err(|error| anyhow::anyhow!(
+                        "Antigravity sign-in failed: {error}. Install the ACP runtime with scripts/install-antigravity-acp.sh or set OPENGROK_ANTIGRAVITY_ACP."
+                    ))?;
+                    println!("Connected Antigravity.");
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 if codex {
                     let account = xai_grok_shell::codex_auth::run_cli_login(device_auth).await?;
                     let label = account
@@ -2248,8 +2278,25 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout { codex, all } => {
+            Command::Logout {
+                codex,
+                all,
+                antigravity,
+            } => {
                 init_tracing_simple("cli");
+                if antigravity {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(),
+                        std::env::current_dir()?,
+                    )?;
+                    xai_grok_shell::agent::antigravity_acp::logout_user(
+                        &launch,
+                        &CancellationToken::new(),
+                    )
+                    .await?;
+                    println!("Signed out of Antigravity.");
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 if codex || all {
                     let removed = xai_grok_shell::codex_auth::run_cli_logout().await?;
                     println!(

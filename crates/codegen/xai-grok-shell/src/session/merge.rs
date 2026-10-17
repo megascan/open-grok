@@ -530,6 +530,7 @@ mod tests {
             num_messages: 10,
             num_chat_messages: 5,
             current_model_id: acp::ModelId::new("test-model"),
+            context_window_selection: None,
             resolved_tool_policy: None,
             previous_turn_model: None,
             ever_used_codex: false,

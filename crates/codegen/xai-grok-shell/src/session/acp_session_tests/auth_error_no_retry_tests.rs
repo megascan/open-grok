@@ -1684,6 +1684,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     85,
                     None,
                     None,
+                    None,
+                    Vec::new(),
                 )
                 .await;
 
@@ -1797,6 +1799,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                     85,
                     None,
                     None,
+                    None,
+                    Vec::new(),
                 )
                 .await;
 

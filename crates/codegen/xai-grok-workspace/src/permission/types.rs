@@ -335,6 +335,11 @@ impl PermissionRequest {
 }
 #[allow(clippy::large_enum_variant)]
 pub enum PermissionCommand {
+    /// Ask the actor to validate an unrestricted external-process lease.
+    AcquireUnrestrictedLease {
+        revision: u64,
+        respond_to: oneshot::Sender<PermissionLeaseResult>,
+    },
     Request {
         request: PermissionRequest,
         respond_to: oneshot::Sender<PermissionResolution>,
@@ -363,6 +368,13 @@ pub enum PermissionCommand {
     /// Reset per-tool permission state back to defaults.
     ResetState,
     Shutdown,
+}
+
+/// Result of validating a permission lease at the actor.
+pub enum PermissionLeaseResult {
+    Granted(super::UnrestrictedPermissionLease),
+    Restricted,
+    Changed,
 }
 impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
     fn from(input: &xai_grok_tools::types::ToolInput) -> Self {
@@ -538,7 +550,7 @@ pub enum ToolFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
     Unknown,
-    /// User-writable `~/.grok/requirements.toml` — untrusted for keeping a
+    /// User-writable `~/.opengrok/requirements.toml` — untrusted for keeping a
     /// catch-all allow under the pin (a restricted user can edit it).
     Requirements {
         path: std::path::PathBuf,
@@ -789,6 +801,7 @@ mod tests {
         let input = ToolInput::Bash(BashToolInput {
             command: "cargo test".into(),
             timeout: None,
+            block_until_ms: None,
             description: "run tests".into(),
             is_background: false,
         });

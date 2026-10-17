@@ -174,6 +174,7 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 xai-interjection-core = { workspace = true }
 xai-grok-status-line = { path = "../xai-grok-status-line", features = ["test-support"] }
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }

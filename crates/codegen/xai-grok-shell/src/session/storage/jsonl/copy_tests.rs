@@ -1032,6 +1032,7 @@ async fn copy_session_data_with_model_override() {
             &default_model_id(),
             None,
             None,
+            None,
             Some(source_policy),
         )
         .await

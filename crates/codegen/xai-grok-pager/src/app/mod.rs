@@ -52,6 +52,7 @@ pub(crate) mod mode_switch;
 mod mouse;
 mod queue_edit;
 mod reader_thread;
+pub(crate) mod sandbox_permission;
 pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
 pub mod signal_handler;
@@ -2308,3 +2309,5 @@ mod tests {
         print_relaunch_failure_hint(&"exec failed", "pipe-sid", false, &mut writer);
     }
 }
+
+mod voice_state;

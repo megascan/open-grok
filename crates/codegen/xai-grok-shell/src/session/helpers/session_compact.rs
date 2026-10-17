@@ -16,6 +16,10 @@ pub use xai_chat_state::compaction_utils::{
     extract_messages_since_last_user, extract_real_user_queries, is_synthetic_extracted_query,
 };
 use xai_grok_sampler::SamplerConfig as SamplingConfig;
+
+#[cfg(test)]
+#[path = "session_compact_reasoning_effort_tests.rs"]
+mod reasoning_effort_tests;
 /// Short, self-narrating compaction prompt used by the short-prompt harness only.
 /// Frames the call as "summarize for a successor assistant who only sees
 /// the user's original query plus this summary." Wrapped in
@@ -573,6 +577,7 @@ pub(crate) async fn generate_session_compact(
             let mut message =
                 ChatCompletionRequest::new(sampling_config.model.to_owned(), chat_messages)
                     .with_temperature(1.0);
+            message.reasoning_effort = sampling_config.reasoning_effort;
             if !tools.is_empty() {
                 message = message
                     .with_tools(
@@ -676,6 +681,7 @@ pub(crate) async fn generate_session_compact(
                 hosted_tools,
                 model: Some(sampling_config.model.to_owned()),
                 temperature: Some(1.0),
+                reasoning_effort: sampling_config.reasoning_effort,
                 x_grok_conv_id: Some(session_id.to_string()),
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
@@ -797,6 +803,7 @@ pub(crate) async fn generate_session_compact(
                 hosted_tools,
                 model: Some(sampling_config.model.to_owned()),
                 temperature: Some(1.0),
+                reasoning_effort: sampling_config.reasoning_effort,
                 x_grok_conv_id: Some(session_id.to_string()),
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
@@ -894,6 +901,7 @@ pub(crate) async fn generate_session_compact(
                 tools,
                 tool_choice: Some(conversation_tool_choice),
                 temperature: Some(1.0),
+                reasoning_effort: sampling_config.reasoning_effort,
                 x_grok_conv_id: Some(session_id.to_string()),
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),

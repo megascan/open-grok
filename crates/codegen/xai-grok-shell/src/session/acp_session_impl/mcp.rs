@@ -1092,10 +1092,13 @@ impl SessionActor {
         .await
         .map_err(|e| e.to_string())?;
         attach_elicitation_tx(&*self.mcp_state.lock().await, &new_client);
-        new_client
-            .ensure_initialized()
-            .await
-            .map_err(|e| e.to_string())?;
+        {
+            let _request = new_client.begin_outbound_request();
+            new_client
+                .ensure_initialized()
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         if !self.is_stdio_server_configured(server).await {
             drop(new_client);
             return Err(format!(

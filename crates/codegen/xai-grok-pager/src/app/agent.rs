@@ -823,6 +823,9 @@ pub struct AgentSession {
     /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
     /// drops the in-flight RPC — else a lost completion jams the queue forever.
     pub model_switch_pending: bool,
+    /// The context-window RPC currently holding this session's sends.
+    pub(crate) pending_context_switch:
+        Option<(acp::SessionId, acp::ModelId, std::num::NonZeroU64, u64)>,
     pub hook_block_hold: bool,
     pub blocked_prompt: Option<BlockedPromptContext>,
     /// A provider settings/key change requires this session's sampler to be
@@ -958,6 +961,7 @@ impl AgentSession {
         self.tracker.expect_user_echo();
         self.state = AgentState::TurnRunning;
         self.in_flight_prompt = None;
+        self.models.set_served_model_name(None);
     }
     /// Finish the current turn: cleanup tracker, set state to Idle.
     ///
@@ -1245,6 +1249,7 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,

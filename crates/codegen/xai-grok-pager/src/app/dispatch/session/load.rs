@@ -204,6 +204,7 @@ fn dispatch_load_session_ungated(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             provider_rebind_pending: false,
             hook_block_hold: false,
             blocked_prompt: None,
@@ -1129,6 +1130,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             provider_rebind_pending: false,
             hook_block_hold: false,
             blocked_prompt: None,
@@ -1382,6 +1384,9 @@ pub(in crate::app::dispatch) fn handle_session_load_failed(
         agent.session.loading_replay = false;
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
+        agent.unbind_session_id();
+        agent.load_failed = true;
+        restore_prompts_held_during_load(agent);
         agent
             .scrollback
             .push_block(RenderBlock::session_event(SessionEvent::TurnFailed {
@@ -1390,6 +1395,63 @@ pub(in crate::app::dispatch) fn handle_session_load_failed(
             }));
     }
     vec![]
+}
+
+fn restore_prompts_held_during_load(agent: &mut AgentView) {
+    if let crate::app::agent_view::PromptMode::EditingQueued {
+        id,
+        server_id: None,
+        ..
+    } = agent.prompt_mode
+    {
+        if agent.prompt.text().trim().is_empty() {
+            agent.exit_editing_mode();
+        } else {
+            agent.save_local_queued_edit(id);
+        }
+    }
+    let held: Vec<_> = agent.session.pending_prompts.drain(..).collect();
+    if held.is_empty() {
+        return;
+    }
+    if agent.prompt.text().is_empty()
+        && let [row] = held.as_slice()
+    {
+        agent
+            .prompt
+            .restore(crate::views::prompt_widget::StashedPrompt::from_submission(
+                row.text.clone(),
+                row.images.clone(),
+                row.chip_elements.clone(),
+            ));
+        agent.prompt_input_mode = if row.kind == crate::app::agent::QueueEntryKind::BashCommand {
+            crate::app::agent_view::PromptInputMode::Bash
+        } else {
+            crate::app::agent_view::PromptInputMode::Normal
+        };
+        return;
+    }
+    let mut dropped_images = 0;
+    let lines: Vec<String> = held
+        .into_iter()
+        .map(|mut row| {
+            dropped_images += row.images.len();
+            crate::prompt_images::drain_and_cleanup(&mut row.images);
+            match row.kind {
+                crate::app::agent::QueueEntryKind::BashCommand => format!("!{}", row.text),
+                _ => row.text,
+            }
+        })
+        .collect();
+    let images = match dropped_images {
+        0 => String::new(),
+        1 => " (1 image dropped)".to_owned(),
+        n => format!(" ({n} images dropped)"),
+    };
+    agent.scrollback.push_block(RenderBlock::system(format!(
+        "Not sent, since the session didn't open{images}:\n{}",
+        lines.join("\n")
+    )));
 }
 
 /// Resume a persisted Codex session only after its independent provider auth

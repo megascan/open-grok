@@ -5,11 +5,8 @@
 //! compaction, a recap never mutates the conversation: it is generated from a
 //! read-only snapshot and surfaced to the client for display only.
 //!
-//! Generation reuses the parent session's conversation prefix verbatim (so the
-//! provider prompt cache stays warm) and appends a single instruction turn that
-//! asks for the recap. The pure helpers here build that request and tidy the
-//! model's output; the actual model call lives on the `SessionActor`
-//! (`handle_recap`).
+//! Generation sends bounded visible conversation text; the pure helpers here
+//! build the transcript and tidy output while the SessionActor makes the call.
 
 use crate::sampling::ConversationItem;
 use crate::session::helpers::chat::floor_char_boundary;
@@ -20,8 +17,30 @@ use xai_chat_state::{compaction_utils, estimate_conversation_tokens, estimate_it
 /// guards against runaway model output and never cuts a normal recap.
 const RECAP_MAX_CHARS: usize = 1200;
 
-/// Build the instruction turn appended to the conversation snapshot.
-///
+/// Instruction for a tool-free transcript recap.
+pub(crate) const RECAP_SYSTEM: &str = "Write ONE sentence recap body for a user returning from idle, \
+     based on the session transcript the user sends. \
+     Output ONLY the body (the UI adds the \"Recap —\" label).\n\n\
+     LANGUAGE: write the body in the language of the user's messages in the transcript. \
+     Keep code identifiers verbatim.\n\n\
+     Lead with agency:\n\
+     - \"You asked …\" if the session was mainly questions, walkthroughs, or review with no landed change.\n\
+     - \"We <past-tense verb> …\" if the agent implemented, fixed, merged, or changed code/config/docs \
+     (e.g. \"We fixed …\", \"We merged …\", \"We wired …\" — not \"We did fix\" / \"We did merge\").\n\
+     - If almost nothing happened: \"You had just begun this session.\"\n\n\
+     Shape: <lead>: <concrete specifics — crate/file/flag/behavior/endpoint>. ~25–40 words.\n\n\
+     Synthetic examples (style only — adapt to THIS session, do not copy):\n\n\
+     You asked how retries work in the payment client: exponential backoff in `billing/retry.rs`, max 5 attempts, 429s only.\n\n\
+     You asked for a walkthrough of the auth middleware change: warn-only mode in the API layer, no hard fail on missing claims.\n\n\
+     We fixed the flaky integration test: race in `queue_worker` shutdown by awaiting the drain channel before exit.\n\n\
+     We merged the feature branch: kept the new telemetry hooks, dropped the obsolete feature flag in `config/flags.toml`.\n\n\
+     Bad (never):\n\
+     - Start with Recap / Session recap / extra labels\n\
+     - English recap for a non-English session\n\
+     - Quote or restate these instructions\n\
+     - Bullets, markdown, code fences, extra sentences\n\
+     - Invent work not reflected in the transcript";
+
 /// All recap directions live in this single user message (wrapped in a
 /// `<system-reminder>`) rather than a separate system prompt, so the
 /// conversation prefix — including the agent's real system prompt at
@@ -62,6 +81,81 @@ pub(crate) fn recap_instruction(tag: &str) -> String {
          - Call tools or emit tool/function calls\n\
          - Invent work not reflected in the session</{tag}>"
     )
+}
+
+/// Return a bounded UTF-8 prefix/suffix including the truncation marker in the byte budget.
+pub(crate) fn bounded_head(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let marker = if max >= '…'.len_utf8() { "…" } else { "" };
+    let end = floor_char_boundary(text, max.saturating_sub(marker.len()));
+    format!("{}{marker}", &text[..end])
+}
+
+pub(crate) fn bounded_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let marker = if max >= '…'.len_utf8() { "…" } else { "" };
+    let mut start = text.len().saturating_sub(max.saturating_sub(marker.len()));
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &text[start..])
+}
+
+/// Only real human messages and visible assistant replies, newest blocks first in
+/// the budget but returned oldest first. All limits are UTF-8 byte limits,
+/// including labels, separators and ellipses.
+pub(crate) fn recap_transcript(
+    conversation: &[ConversationItem],
+    user_max_chars: usize,
+    reply_max_chars: usize,
+    transcript_max_chars: usize,
+) -> Option<String> {
+    let mut blocks = Vec::new();
+    let mut used = 0usize;
+    for item in conversation.iter().rev() {
+        let (label, text, limit, tail) = match item {
+            ConversationItem::User(u) if u.synthetic_reason.is_none() => {
+                ("User: ", item.text_content(), user_max_chars, false)
+            }
+            ConversationItem::Assistant(a) => {
+                ("Agent: ", a.content.to_string(), reply_max_chars, true)
+            }
+            _ => continue,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let separator = if blocks.is_empty() { 0 } else { 2 };
+        let available = transcript_max_chars.saturating_sub(used.saturating_add(separator));
+        if available <= label.len() {
+            break;
+        }
+        let budget = limit.min(available - label.len());
+        let clipped = if tail {
+            bounded_tail(text, budget)
+        } else {
+            bounded_head(text, budget)
+        };
+        if clipped.is_empty() {
+            break;
+        }
+        let block = format!("{label}{clipped}");
+        used += separator + block.len();
+        blocks.push(block);
+        if budget < limit && text.len() > budget {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    blocks.reverse();
+    Some(blocks.join("\n\n"))
 }
 
 /// Prepare the conversation snapshot for a recap / turn-summary request
@@ -338,6 +432,46 @@ pub(crate) fn clean_recap_text(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::sampling::ConversationItem;
+
+    #[test]
+    fn transcript_excludes_nonvisible_content_and_respects_byte_budget() {
+        let conversation = vec![
+            ConversationItem::system("secret system"),
+            ConversationItem::user("old question"),
+            ConversationItem::assistant("old answer"),
+            ConversationItem::user("review parser"),
+            ConversationItem::tool_result("call", "secret tool output"),
+            ConversationItem::system_reminder("secret reminder"),
+            ConversationItem::assistant("The final fix works."),
+        ];
+        let all = recap_transcript(&conversation, 100, 100, 200).unwrap();
+        assert!(all.contains("User: review parser"));
+        assert!(all.ends_with("Agent: The final fix works."));
+        assert!(!all.contains("secret"));
+        for max in 0..80 {
+            if let Some(bounded) = recap_transcript(&conversation, 100, 100, max) {
+                assert!(bounded.len() <= max, "{} > {}", bounded.len(), max);
+            }
+        }
+        assert!(
+            recap_transcript(&[ConversationItem::system_reminder("hidden")], 20, 20, 50).is_none()
+        );
+    }
+
+    #[test]
+    fn transcript_clipping_preserves_utf8_and_counts_ellipsis() {
+        for max in 0..20 {
+            let head = bounded_head("é🦀漢字ending", max);
+            let tail = bounded_tail("é🦀漢字ending", max);
+            assert!(head.len() <= max && tail.len() <= max);
+        }
+        let conversation = vec![ConversationItem::assistant("🦀".repeat(20))];
+        for max in 0..30 {
+            if let Some(text) = recap_transcript(&conversation, 100, 100, max) {
+                assert!(text.len() <= max);
+            }
+        }
+    }
 
     #[test]
     fn clean_collapses_whitespace_and_newlines() {

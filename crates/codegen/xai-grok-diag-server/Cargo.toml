@@ -13,10 +13,13 @@ axum = { workspace = true }
 serde = { workspace = true }
 # `net` for the TCP/Unix listeners, `rt` for the server task and the blocking
 # log tail.
-tokio = { workspace = true, features = ["net", "rt"] }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
 tracing = { workspace = true }
 # Build version reported on `/statusz`.
 xai-grok-version = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 # HTTP client for the endpoint contract tests.

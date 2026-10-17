@@ -11,6 +11,7 @@ use xai_grok_telemetry::region::Parent;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AuxiliaryModelPurpose {
     Recap,
+    TurnSummary,
     Memory,
     TitleRefresh,
 }
@@ -28,6 +29,7 @@ fn auxiliary_model_selection(
         .map(str::to_owned)
         .or_else(|| match purpose {
             AuxiliaryModelPurpose::Recap => recap,
+            AuxiliaryModelPurpose::TurnSummary => None,
             AuxiliaryModelPurpose::Memory => memory,
             AuxiliaryModelPurpose::TitleRefresh => title,
         })
@@ -56,6 +58,15 @@ fn automatic_auxiliary_model(
     provider: xai_grok_sampling_types::ModelProvider,
 ) -> Option<&'static str> {
     (provider == xai_grok_sampling_types::ModelProvider::Codex).then_some(AUTOMATIC_CODEX_AUX_MODEL)
+}
+
+fn auxiliary_route_allowed(
+    configured: bool,
+    allow_cross_provider: bool,
+    selected: xai_grok_sampling_types::ModelProvider,
+    active: xai_grok_sampling_types::ModelProvider,
+) -> bool {
+    selected == active || (configured && allow_cross_provider)
 }
 
 fn auxiliary_reasoning_effort(
@@ -1433,6 +1444,19 @@ impl SessionActor {
         purpose: AuxiliaryModelPurpose,
         call_override: Option<&str>,
     ) -> Result<PreparedAuxiliarySampling, acp::Error> {
+        self.prepare_auxiliary_sampling_with_effort(purpose, call_override, None, true)
+            .await
+    }
+
+    /// A remote model preference may select only a route in the active
+    /// provider. A local user-selected model can opt into a different route.
+    pub(super) async fn prepare_auxiliary_sampling_with_effort(
+        &self,
+        purpose: AuxiliaryModelPurpose,
+        call_override: Option<&str>,
+        effort_override: Option<xai_grok_sampling_types::ReasoningEffort>,
+        allow_cross_provider: bool,
+    ) -> Result<PreparedAuxiliarySampling, acp::Error> {
         let active = self.reconstruct_full_config().await;
         let title_model = if purpose == AuxiliaryModelPurpose::TitleRefresh {
             crate::util::config::load_config()
@@ -1471,7 +1495,12 @@ impl SessionActor {
                         // An automatic helper choice is provider-local by
                         // contract. Explicit choices are the only opt-in to
                         // sending recap/memory content to another provider.
-                        if configured.is_some() || cfg.provider == active.provider {
+                        if auxiliary_route_allowed(
+                            configured.is_some(),
+                            allow_cross_provider,
+                            cfg.provider,
+                            active.provider,
+                        ) {
                             selected = Some(cfg);
                         }
                     }
@@ -1504,12 +1533,24 @@ impl SessionActor {
         let model_default = self
             .models_manager
             .model_default_reasoning_effort(&config.model);
-        let reasoning_effort =
-            auxiliary_reasoning_effort(config.provider, supports_reasoning_effort, model_default)
-                .filter(|effort| {
-                    self.models_manager
+        let reasoning_effort = effort_override
+            .filter(|effort| {
+                supports_reasoning_effort
+                    && self
+                        .models_manager
                         .model_accepts_reasoning_effort(&config.model, *effort)
-                });
+            })
+            .or_else(|| {
+                auxiliary_reasoning_effort(
+                    config.provider,
+                    supports_reasoning_effort,
+                    model_default,
+                )
+            })
+            .filter(|effort| {
+                self.models_manager
+                    .model_accepts_reasoning_effort(&config.model, *effort)
+            });
         config.reasoning_effort = reasoning_effort;
 
         let model = config.model.clone();
@@ -1881,7 +1922,7 @@ impl SessionActor {
                     && let Some(new_cw) = std::num::NonZeroU64::new(cw)
                     && self.compaction.context_window_override.is_none()
                 {
-                    cfg.context_window = new_cw;
+                    cfg.context_window = self.context_window_after_overflow(&cfg, new_cw);
                     self.chat_state_handle.update_sampling_config(cfg);
                 }
                 let trigger_info = compaction::AutoCompactTriggerInfo {
@@ -2378,6 +2419,56 @@ impl SessionActor {
                 error.kind,
             )),
         )
+    }
+
+    fn context_window_after_overflow(
+        &self,
+        cfg: &xai_grok_sampling_types::SamplingConfig,
+        server_window: std::num::NonZeroU64,
+    ) -> std::num::NonZeroU64 {
+        let selected = std::num::NonZeroU64::new(
+            self.compaction
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let Some(selected) = selected.filter(|selected| *selected == cfg.context_window) else {
+            return server_window;
+        };
+        if selected <= server_window {
+            return selected;
+        }
+        self.compaction
+            .context_window_selection
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Restrict catalog resolution to the active provider, so a shared slug
+        // never borrows another provider's identity.
+        let models = self.models_manager.models();
+        let model_id = models
+            .iter()
+            .find(|(_, entry)| {
+                entry.info.provider == cfg.provider && entry.info.has_model_id(&cfg.model)
+            })
+            .map(|(key, _)| acp::ModelId::new(key.clone()))
+            .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::CurrentModel {
+                model_id: model_id.clone(),
+                provider: cfg.provider,
+                agent: crate::session::persistence::PersistedAgent::Named(
+                    self.agent.borrow().definition().name.clone(),
+                ),
+                reasoning_effort: None,
+                context_window: Some(None),
+                resolved_tool_policy: None,
+            });
+        self.send_xai_notification_transient(XaiSessionUpdate::model_changed(
+            model_id.0.to_string(),
+            cfg.reasoning_effort.map(|effort| effort.to_string()),
+            None,
+        ));
+        server_window
     }
 
     async fn wait_for_stream_drain(
@@ -3142,6 +3233,58 @@ mod auxiliary_model_policy_tests {
             Some("gpt-5.6-terra")
         );
         assert_eq!(automatic_auxiliary_model(ModelProvider::Xai), None);
+    }
+
+    #[test]
+    fn turn_summary_does_not_inherit_other_auxiliary_overrides() {
+        assert_eq!(
+            auxiliary_model_selection(
+                AuxiliaryModelPurpose::TurnSummary,
+                None,
+                Some("recap-model".into()),
+                Some("memory-model".into()),
+                Some("title-model".into()),
+            ),
+            None
+        );
+        assert_eq!(
+            auxiliary_model_selection(
+                AuxiliaryModelPurpose::TurnSummary,
+                Some("summary-model"),
+                None,
+                None,
+                None,
+            ),
+            Some("summary-model".into())
+        );
+    }
+
+    #[test]
+    fn auxiliary_remote_model_cannot_cross_provider() {
+        assert!(!auxiliary_route_allowed(
+            true,
+            false,
+            ModelProvider::Xai,
+            ModelProvider::Codex
+        ));
+        assert!(auxiliary_route_allowed(
+            true,
+            false,
+            ModelProvider::Codex,
+            ModelProvider::Codex
+        ));
+        assert!(auxiliary_route_allowed(
+            true,
+            true,
+            ModelProvider::Xai,
+            ModelProvider::Codex
+        ));
+        assert!(!auxiliary_route_allowed(
+            false,
+            true,
+            ModelProvider::Xai,
+            ModelProvider::Codex
+        ));
     }
 
     #[test]

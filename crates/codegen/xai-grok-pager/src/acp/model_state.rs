@@ -3,10 +3,12 @@
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use xai_grok_shell::sampling::types::{
-    ModelServiceTier, ReasoningEffort, ReasoningEffortOption, SERVICE_TIER_DEFAULT_REQUEST_VALUE,
-    SERVICE_TIER_FAST_REQUEST_VALUE, parse_canonical_effort_token, parse_reasoning_effort_meta,
-    parse_reasoning_efforts_meta, parse_service_tier_meta, parse_service_tiers_meta,
-    supports_fast_service_tier_meta, supports_reasoning_effort_meta,
+    ModelNotice, ModelServiceTier, ReasoningEffort, ReasoningEffortOption,
+    SERVICE_TIER_DEFAULT_REQUEST_VALUE, SERVICE_TIER_FAST_REQUEST_VALUE,
+    parse_canonical_effort_token, parse_context_window_meta, parse_context_windows_meta,
+    parse_model_notice_meta, parse_reasoning_effort_meta, parse_reasoning_efforts_meta,
+    parse_service_tier_meta, parse_service_tiers_meta, supports_fast_service_tier_meta,
+    supports_reasoning_effort_meta,
 };
 
 use crate::slash::commands::effort_levels::legacy_effort_options;
@@ -81,6 +83,8 @@ pub struct ModelState {
     /// reading from the current model's metadata. Used for subagent
     /// views where SubagentProgress reports the actual window size.
     context_window_override: Option<u64>,
+    pub(crate) context_window_selection: Option<u64>,
+    served_model_name: Option<String>,
 }
 
 impl ModelState {
@@ -96,6 +100,23 @@ impl ModelState {
         } else {
             Some(current.0.to_string())
         }
+    }
+
+    /// Display the model that served this turn when the backend routed it elsewhere.
+    pub fn footer_model_name(&self) -> Option<String> {
+        self.served_model_name
+            .clone()
+            .or_else(|| self.current_model_name())
+    }
+
+    pub fn set_served_model_name(&mut self, name: Option<String>) {
+        self.served_model_name = name;
+    }
+
+    /// The notice attached to the current model, when advertised by its metadata.
+    pub fn current_notice(&self) -> Option<ModelNotice> {
+        let info = self.available.get(self.current.as_ref()?)?;
+        parse_model_notice_meta(info.meta.as_ref())
     }
 
     /// Total context window tokens for the current model (if available).
@@ -141,8 +162,44 @@ impl ModelState {
     /// metadata. The override is set by `override_context_window()` when an
     /// external source (e.g., SubagentProgress) reports the actual window size.
     pub fn get_context_window(&self) -> Option<u64> {
-        self.context_window_override
-            .or_else(|| self.current_context_window_tokens())
+        self.context_window_override.or_else(|| {
+            let default = self.current_context_window_tokens();
+            self.context_window_selection
+                .filter(|selection| {
+                    Some(*selection) == default || self.context_window_options().contains(selection)
+                })
+                .or(default)
+        })
+    }
+
+    pub fn context_window_options(&self) -> Vec<u64> {
+        self.current
+            .as_ref()
+            .map(|id| self.context_window_options_for(id))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn context_window_options_for(&self, id: &acp::ModelId) -> Vec<u64> {
+        self.available
+            .get(id)
+            .and_then(|info| parse_context_windows_meta(info.meta.as_ref()))
+            .map(|windows| windows.into_iter().map(|window| window.get()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Effective window for a target model if the current selection is retained.
+    pub(crate) fn window_after_switch_to(&self, id: &acp::ModelId) -> Option<u64> {
+        self.context_window_selection
+            .filter(|selection| self.context_window_options_for(id).contains(selection))
+            .or_else(|| self.model_default_window(id))
+    }
+
+    pub(crate) fn model_default_window(&self, id: &acp::ModelId) -> Option<u64> {
+        self.available
+            .get(id)
+            .and_then(|info| info.meta.as_ref())
+            .and_then(|meta| meta.get("totalContextTokens"))
+            .and_then(serde_json::Value::as_u64)
     }
 
     /// Override the context window size.
@@ -200,6 +257,7 @@ impl ModelState {
         effort_override: Option<ReasoningEffort>,
     ) {
         self.current = Some(model_id.clone());
+        self.served_model_name = None;
         self.reasoning_effort =
             reasoning_effort_for_model(self.available.get(&model_id), effort_override);
         if let Some(tier) = self.service_tier.clone()
@@ -451,12 +509,19 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                     current_model.as_ref().and_then(|id| models.get(id)),
                     None,
                 );
+                let context_window_selection = current_model
+                    .as_ref()
+                    .and_then(|id| models.get(id))
+                    .and_then(|info| parse_context_window_meta(info.meta.as_ref()))
+                    .map(|value| value.get());
                 Self {
                     available: models,
                     current: current_model,
                     reasoning_effort,
                     service_tier: None,
                     context_window_override: None,
+                    context_window_selection,
+                    served_model_name: None,
                 }
             })
             .unwrap_or_default()
@@ -667,6 +732,33 @@ mod tests {
         );
         state.current = Some(id);
         state
+    }
+
+    #[test]
+    fn selected_context_window_applies_only_when_supported() {
+        let mut state = state_with_meta(Some(serde_json::json!({
+            "totalContextTokens": 256_000,
+            "contextWindows": [256_000, 500_000],
+        })));
+        state.context_window_selection = Some(500_000);
+        assert_eq!(state.get_context_window(), Some(500_000));
+        state.context_window_selection = Some(1_000_000);
+        assert_eq!(state.get_context_window(), Some(256_000));
+        state.override_context_window(42_000);
+        assert_eq!(state.get_context_window(), Some(42_000));
+    }
+
+    #[test]
+    fn served_model_is_a_turn_label_not_a_selection() {
+        let mut state = sample_models();
+        let selected = state.current.clone();
+        let selected_name = state.current_model_name();
+        state.set_served_model_name(Some("Routed model".into()));
+        assert_eq!(state.footer_model_name().as_deref(), Some("Routed model"));
+        assert_eq!(state.current, selected);
+        assert_eq!(state.current_model_name(), selected_name);
+        state.set_served_model_name(None);
+        assert_eq!(state.footer_model_name(), selected_name);
     }
 
     #[test]

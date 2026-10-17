@@ -2264,6 +2264,8 @@ fn make_entry_config_with_id(
     name: Option<&str>,
 ) -> config::ModelEntryConfig {
     config::ModelEntryConfig {
+        notice: None,
+        context_windows: Vec::new(),
         id: id.map(|s| s.to_owned()),
         model: model.to_owned(),
         base_url: "https://test.api/v1".to_owned(),

@@ -44,7 +44,7 @@ fn voice_on_welcome_creates_session_and_records() {
     assert_eq!(app.voice_recording_target(), Some(VoiceTarget::Agent(id)));
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 }
 #[test]
@@ -58,7 +58,8 @@ fn voice_final_routes_to_recording_session_not_active_view() {
     app.active_view = ActiveView::Agent(other);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(rec),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -131,7 +132,8 @@ fn voice_auto_stops_when_leaving_recording_session() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.active_view = ActiveView::Agent(id);
     app.enforce_voice_session_bound();
@@ -147,7 +149,7 @@ fn voice_auto_stops_when_leaving_recording_session() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
 }
 #[test]

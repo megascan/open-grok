@@ -104,13 +104,13 @@ fn dispatch_interject_on_inner(
     // session. Preserve the already-consumed payload locally until the
     // automatic rebind finishes instead of letting an explicit interject use
     // the stale credential.
-    if agent.session.provider_rebind_pending {
-        requeue_consumed_prompt(
-            agent,
-            &text,
-            images,
-            "Kimi service update in progress; prompt queued",
-        );
+    if agent.session.provider_rebind_pending || agent.session.pending_context_switch.is_some() {
+        let notice = if agent.session.pending_context_switch.is_some() {
+            "Model change in progress; prompt queued"
+        } else {
+            "Kimi service update in progress; prompt queued"
+        };
+        requeue_consumed_prompt(agent, &text, images, notice);
         return vec![];
     }
 
@@ -197,9 +197,14 @@ pub(super) fn dispatch_send_prompt_now(
     // Mid-outage guard (mirrors the plain prompt path): the producers already
     // consumed the payload (composer text / queue row), so requeue it locally
     // instead of firing into a dead channel and losing the message.
-    if reconnect_pending || agent.session.provider_rebind_pending {
+    if reconnect_pending
+        || agent.session.provider_rebind_pending
+        || agent.session.pending_context_switch.is_some()
+    {
         let toast = if reconnect_pending {
             "Reconnecting, please wait..."
+        } else if agent.session.pending_context_switch.is_some() {
+            "Model change in progress; prompt queued"
         } else {
             "Kimi service update in progress; prompt queued"
         };

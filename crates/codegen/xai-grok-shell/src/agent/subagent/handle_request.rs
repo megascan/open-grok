@@ -180,6 +180,7 @@ pub(crate) async fn run_shell_child(
     run: grok_build::task::coordinator::ChildRunRequest<ShellChildRuntime>,
     mut ctx: SubagentSpawnContext,
     gateway: &GatewaySender,
+    parent_handle: Option<&SessionHandle>,
 ) -> ChildRunOutput<ShellCompletionData> {
     let grok_build::task::coordinator::ChildRunRequest {
         mut request,
@@ -418,17 +419,57 @@ pub(crate) async fn run_shell_child(
             );
         }
     }
+    // The ACP catalog is a separate transport, never a sampler model. A
+    // reserved but unavailable selector must not reach the native fallback.
+    let external_resume_model = match resume_source.as_ref() {
+        Some(source) => match antigravity_acp_runner::resume_model(&ctx, source) {
+            Ok(model) => model,
+            Err(message) => {
+                return child_run_output(failure_result(&request, message), completion_data, None);
+            }
+        },
+        None => None,
+    };
+    let selected_model = if let Some(source) = resume_source.as_ref() {
+        external_resume_model
+            .as_deref()
+            .or(source.model_id.as_deref())
+    } else {
+        effective_runtime
+            .model
+            .as_deref()
+            .or_else(|| {
+                ctx.subagent_model_overrides
+                    .get(&request.subagent_type)
+                    .map(String::as_str)
+            })
+            .or_else(|| match &definition.model {
+                ModelOverride::Override(model) => Some(model.as_str()),
+                ModelOverride::Inherit => None,
+            })
+    };
+    let external_model = match antigravity_acp_runner::resolve_model(selected_model) {
+        Ok(model) => model,
+        Err(message) => {
+            return child_run_output(failure_result(&request, message), completion_data, None);
+        }
+    };
     if let Some((requested, selection)) =
         explicit_tool_model(&request.runtime_overrides, resume_source.is_some())
-        && let Err(error) = admit_explicit_tool_model(
-            &requested,
-            selection,
-            &ctx.available_models,
-            ctx.auth_manager
-                .current_or_expired()
-                .is_some_and(|auth| auth.is_session_auth()),
-            crate::codex_auth::is_logged_in(),
-        )
+        && let Err(error) =
+            if external_model.is_some() && selection == TaskModelSelection::Selectable {
+                Ok(())
+            } else {
+                admit_explicit_tool_model(
+                    &requested,
+                    selection,
+                    &ctx.available_models,
+                    ctx.auth_manager
+                        .current_or_expired()
+                        .is_some_and(|auth| auth.is_session_auth()),
+                    crate::codex_auth::is_logged_in(),
+                )
+            }
     {
         let message = match error {
             TaskModelAdmissionError::HiddenSelection => {
@@ -606,6 +647,25 @@ pub(crate) async fn run_shell_child(
         effective_runtime.capability_mode,
         definition.capability_mode,
     );
+    if let Some((alias, model)) = external_model {
+        return antigravity_acp_runner::run_external_child(
+            &request,
+            &ctx,
+            gateway,
+            parent_handle,
+            reporter,
+            &cancel_token,
+            &definition,
+            &effective_runtime,
+            resume_source.as_ref(),
+            worktree_path.as_deref(),
+            &alias,
+            &model,
+            completion_data,
+            start,
+        )
+        .await;
+    }
     let child_depth = request
         .runtime_overrides
         .spawn_depth
@@ -1333,6 +1393,7 @@ pub(crate) async fn run_shell_child(
             provider: effective_sampling_config.provider,
             agent: crate::session::persistence::PersistedAgent::from(&definition),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
+            context_window: None,
             resolved_tool_policy: None,
         });
     let parent_surface_snapshot = (verbatim_mirror_fork && !request.owner.is_workflow())
@@ -1596,7 +1657,7 @@ pub(crate) async fn run_shell_child(
                         .map(|path| path.to_string_lossy().into_owned()),
                     effective_model_id: tracker_model_id.clone(),
                     definition_background,
-                    control: ShellChildRuntime {
+                    control: ShellChildRuntime::Native(NativeChildRuntime {
                         child_handle: child_handle.clone(),
                         _child_thread: None,
                         provider: tracker_provider,
@@ -1604,7 +1665,7 @@ pub(crate) async fn run_shell_child(
                         native_agent_protocol,
                         receipt_sink,
                         active_message_telemetry: ctx.active_message_telemetry.clone(),
-                    },
+                    }),
                 })
                 .await
         }

@@ -526,6 +526,7 @@ async fn acp_clients_are_not_liveness_watched() {
     let http = McpClient::new_http(
         "http".to_string(),
         HttpConfig {
+            bearer_token_file: None,
             url: "http://localhost/api/mcp".to_string(),
             headers: vec![],
         },
@@ -819,6 +820,7 @@ fn test_tool_timeout_for_returns_per_tool_override() {
     let client = McpClient::new_http(
         "github".to_string(),
         HttpConfig {
+            bearer_token_file: None,
             url: String::new(),
             headers: vec![],
         },
@@ -844,6 +846,7 @@ fn test_tool_timeout_for_empty_map_returns_default() {
     let client = McpClient::new_http(
         "test".to_string(),
         HttpConfig {
+            bearer_token_file: None,
             url: String::new(),
             headers: vec![],
         },
@@ -1685,6 +1688,7 @@ fn should_recover_service_error_other_non_transport_not_recovered() {
 #[tokio::test]
 async fn recover_and_retry_surfaces_original_error_when_recover_fails() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -1717,10 +1721,12 @@ async fn recover_and_retry_surfaces_original_error_when_recover_fails() {
     let mut reconnect_attempted = false;
     let mut is_timeout = false;
     let ew = xai_grok_session_events::EventWriter::noop();
+    let call = client.request_tracker.begin_request();
 
     let err = tool
         .recover_and_retry(
             &client,
+            &call,
             params,
             std::time::Duration::from_secs(1),
             1,
@@ -1795,6 +1801,7 @@ struct FakeMcpHandles {
     init_capabilities: Arc<parking_lot::Mutex<Option<serde_json::Value>>>,
     call_bodies: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
     discover_override: Arc<parking_lot::Mutex<Option<DiscoverBehavior>>>,
+    authorizations: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 fn header_values(
@@ -1821,6 +1828,11 @@ async fn fake_handle_post(
     axum::Json(req): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    state
+        .handles
+        .authorizations
+        .lock()
+        .extend(header_values(&headers, axum::http::header::AUTHORIZATION));
     let id = req["id"].clone();
     let ok = || {
         serde_json::json!({
@@ -2085,6 +2097,7 @@ async fn spawn_fake_mcp_with(
         init_capabilities: Arc::new(parking_lot::Mutex::new(None)),
         call_bodies: Arc::new(parking_lot::Mutex::new(Vec::new())),
         discover_override: Arc::new(parking_lot::Mutex::new(None)),
+        authorizations: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
     let app = axum::Router::new()
         .route(
@@ -2136,6 +2149,7 @@ fn fake_http_client_with_overrides(
     Arc::new(McpClient::new_http(
         "fake".to_string(),
         HttpConfig {
+            bearer_token_file: None,
             url: url.to_string(),
             headers: vec![],
         },
@@ -2206,6 +2220,87 @@ fn event_types(jsonl: &str) -> Vec<serde_json::Value> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .collect()
+}
+
+/// A token rotated on disk between calls reaches the server without a reconnect and replaces a
+/// static `Authorization` header; once the file is gone, the call fails naming it.
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_token_file_is_reread_on_every_request() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 0 }).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let token_path = dir.path().join("token");
+    std::fs::write(&token_path, "tok-1\n").expect("write token");
+    let overrides = McpClientTimeoutOverrides {
+        startup_timeout_sec: Some(5),
+        tool_timeout_sec: Some(5),
+        ..Default::default()
+    };
+    let client = Arc::new(McpClient::new_http(
+        "fake".to_owned(),
+        HttpConfig {
+            url,
+            headers: vec![("Authorization".to_owned(), "Bearer static".to_owned())],
+            bearer_token_file: Some(BearerTokenFile::new(
+                BearerTokenPath::try_from(token_path.clone()).expect("absolute path"),
+            )),
+        },
+        Some(&overrides),
+        None,
+    ));
+    client.ensure_initialized().await.expect("handshake");
+
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let call = || async {
+        let mut reconnect = false;
+        let mut is_timeout = false;
+        let result = tool
+            .try_call_tool(
+                &client,
+                &serde_json::json!({}),
+                &mut reconnect,
+                &mut is_timeout,
+                &ew,
+            )
+            .await;
+        (result, reconnect)
+    };
+    let (first, reconnect) = call().await;
+    first.expect("tools/call succeeds");
+    std::fs::write(&token_path, "tok-2").expect("rotate token");
+    let (second, reconnect_after_rotation) = call().await;
+    second.expect("tools/call succeeds after rotation");
+    assert!(
+        !reconnect && !reconnect_after_rotation,
+        "rotation must not need a reconnect"
+    );
+
+    let authorizations = handles.authorizations.lock().clone();
+    assert_eq!(
+        Some("Bearer tok-2"),
+        authorizations.last().map(String::as_str),
+        "{authorizations:?}"
+    );
+    assert!(
+        authorizations
+            .iter()
+            .all(|value| value == "Bearer tok-1" || value == "Bearer tok-2"),
+        "every request carries exactly the file token: {authorizations:?}"
+    );
+    assert!(
+        authorizations.iter().any(|value| value == "Bearer tok-1"),
+        "{authorizations:?}"
+    );
+
+    std::fs::remove_file(&token_path).expect("remove token");
+    let (removed, _) = call().await;
+    let error = removed.expect_err("tools/call fails without its token file");
+    assert!(
+        error
+            .to_string()
+            .contains(&token_path.display().to_string()),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2477,6 +2572,7 @@ async fn probe_connect_failure_surfaces_instead_of_legacy_fallback() {
 
     let client = fake_http_client_probing(&url, 5);
     let config = HttpConfig {
+        bearer_token_file: None,
         url: url.clone(),
         headers: vec![],
     };
@@ -2501,6 +2597,33 @@ async fn probe_connect_failure_surfaces_instead_of_legacy_fallback() {
     assert!(
         err.is_connect_failure(),
         "the surfaced error must classify as a connect failure: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_call_drives_mrtr_through_the_elicitation_inbox() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::FormElicitThenOk).await;
+    let client = fake_http_client(&url, 5);
+    let inbox = crate::elicitation::ElicitationInbox::new();
+    client.set_elicitation_tx(Some(inbox.clone()));
+    let answer = tokio::spawn(async move {
+        let job = inbox.recv().await.expect("elicitation reaches the inbox");
+        let _ = job.response_tx.send(crate::elicitation::accept_result(Some(
+            serde_json::json!({"email": "user@example.com"}),
+        )));
+    });
+    let result = client
+        .call_tool("echo", serde_json::json!({"q": 1}))
+        .await
+        .expect("direct call completes after MRTR");
+    answer.await.unwrap();
+    assert!(!result.is_error.unwrap_or(false));
+    let bodies = handles.call_bodies.lock();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1]["params"]["requestState"], "sealed-round-1");
+    assert_eq!(
+        bodies[1]["params"]["inputResponses"]["user_email"]["action"],
+        "accept"
     );
 }
 
@@ -2828,6 +2951,7 @@ async fn try_call_tool_http_retry_timeout_surfaces_timeout() {
 #[test]
 fn test_new_http_stores_http_config() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://localhost:5000/api/mcp".to_string(),
         headers: vec![("x-token".to_string(), "abc".to_string())],
     };
@@ -2853,6 +2977,7 @@ fn test_new_stdio_has_no_http_config() {
 #[test]
 fn http_headers_match_compares_full_set_order_insensitively() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://localhost:5000/api/mcp".to_string(),
         headers: vec![
             ("authorization".to_string(), "Bearer t".to_string()),
@@ -2889,6 +3014,7 @@ fn http_headers_match_handles_duplicate_stored_keys() {
     // Duplicate stored key must not mask a missing fresh key by inflating
     // the stored length to match.
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://localhost:5000/api/mcp".to_string(),
         headers: vec![
             ("authorization".to_string(), "Bearer t".to_string()),
@@ -2973,6 +3099,7 @@ fn refresh_managed_clients_evicts_only_named_client_when_headers_differ() {
 #[tokio::test]
 async fn test_reset_transport_succeeds_for_http_client() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://127.0.0.1:9/api/mcp".to_string(),
         headers: vec![],
     };
@@ -2990,6 +3117,7 @@ async fn test_reset_transport_fails_for_stub() {
 #[tokio::test]
 async fn test_reset_transport_is_idempotent() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://127.0.0.1:9/api/mcp".to_string(),
         headers: vec![],
     };
@@ -3006,6 +3134,7 @@ async fn test_reset_transport_makes_ensure_initialized_retry_handshake() {
     // Port 1 on loopback refuses immediately (ECONNREFUSED -> HandshakeFailed),
     // so each handshake fails fast instead of waiting out the connect timeout.
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://127.0.0.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3191,6 +3320,8 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             server_name: "dead".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+            request_tracker: Arc::default(),
+            service_id: crate::elicitation::RequestTracker::default().next_service_id(),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
             client_read,
@@ -3306,6 +3437,8 @@ async fn watched_live_client(name: &str) -> Arc<McpClient> {
         server_name: name.to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+        request_tracker: Arc::default(),
+        service_id: crate::elicitation::RequestTracker::default().next_service_id(),
     };
     let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
         client_read,
@@ -3321,6 +3454,7 @@ async fn watched_live_client(name: &str) -> Arc<McpClient> {
     let client = Arc::new(McpClient::new_http(
         name.to_string(),
         HttpConfig {
+            bearer_token_file: None,
             url: "http://127.0.0.1:0/".to_string(),
             headers: Vec::new(),
         },
@@ -3556,6 +3690,7 @@ fn load_expose_image_base64_meta_falls_through_when_none() {
 #[test]
 fn new_http_propagates_expose_image_base64_override_to_getter() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://localhost/api/mcp".to_string(),
         headers: vec![],
     };
@@ -3618,6 +3753,7 @@ async fn ensure_initialized_on_empty_client_returns_no_transport_error() {
 #[tokio::test]
 async fn ensure_initialized_concurrent_callers_never_see_legacy_fast_fail() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3669,6 +3805,7 @@ async fn ensure_initialized_concurrent_callers_never_see_legacy_fast_fail() {
 #[tokio::test]
 async fn ensure_initialized_parked_caller_retries_after_notify() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3739,6 +3876,7 @@ async fn ensure_initialized_parked_caller_retries_after_notify() {
 #[tokio::test]
 async fn ensure_initialized_inflight_wait_times_out_when_holder_silent() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3770,6 +3908,7 @@ async fn ensure_initialized_inflight_wait_times_out_when_holder_silent() {
 #[tokio::test]
 async fn ensure_initialized_drop_guard_restores_state_after_holder_aborted() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3963,6 +4102,7 @@ async fn is_healthy_empty_returns_false() {
 #[tokio::test]
 async fn is_healthy_pending_returns_false() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -3992,6 +4132,7 @@ async fn is_healthy_initializing_returns_false() {
 #[tokio::test]
 async fn is_healthy_pending_does_not_block_on_handshake() {
     let config = HttpConfig {
+        bearer_token_file: None,
         url: "http://192.0.2.1:1/unreachable".to_string(),
         headers: vec![],
     };
@@ -4131,6 +4272,8 @@ async fn client_handler_routes_tools_changed() {
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+        request_tracker: Arc::default(),
+        service_id: crate::elicitation::RequestTracker::default().next_service_id(),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: handler.server_name.clone(),
@@ -4152,6 +4295,8 @@ async fn client_handler_no_dispatcher_is_silent() {
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+        request_tracker: Arc::default(),
+        service_id: crate::elicitation::RequestTracker::default().next_service_id(),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: "test".to_string(),
@@ -4168,6 +4313,8 @@ async fn client_handler_get_info_round_trips() {
         server_name: "test-srv".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+        request_tracker: Arc::default(),
+        service_id: crate::elicitation::RequestTracker::default().next_service_id(),
     };
     let got = handler.get_info();
     // ClientInfo doesn't derive PartialEq; check the visible

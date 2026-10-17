@@ -59,6 +59,7 @@ fn initial_model_persistence_message(
         provider,
         agent: crate::session::persistence::PersistedAgent::Named(agent_name),
         reasoning_effort: Some(reasoning_effort),
+        context_window: None,
         resolved_tool_policy: Some(resolved_tool_policy),
     })
 }
@@ -732,6 +733,7 @@ pub(crate) async fn spawn_session_actor(
         },
         |mc| mc.pruning.clone(),
     );
+    let context_window_selection = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let context_window_override = std::env::var("GROK_DEBUG_CONTEXT_WINDOW")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -861,11 +863,12 @@ pub(crate) async fn spawn_session_actor(
     let prompt_index_for_bridge = tool_context.prompt_index.clone();
     let plan_mode = {
         let session_dir = crate::session::persistence::session_dir(&session_info);
-        let tracker = if let Some(snapshot) = persisted_plan_mode {
+        let mut tracker = if let Some(snapshot) = persisted_plan_mode {
             crate::session::plan_mode::PlanModeTracker::from_snapshot(session_dir, snapshot)
         } else {
             crate::session::plan_mode::PlanModeTracker::new(session_dir)
         };
+        tracker.set_permission_handle(permissions.clone());
         Arc::new(parking_lot::Mutex::new(tracker))
     };
     let goal_was_restored = persisted_goal_mode.is_some();
@@ -939,33 +942,49 @@ pub(crate) async fn spawn_session_actor(
         }
     };
     let resolve_policy = || crate::util::config::resolve_shell_env_policy(effective_cfg.as_ref());
+    // The workspace owns the mutable policy; retain its hook for both the
+    // terminal and static-shell tools, including across harness rebuilds.
+    let sandbox_launch = workspace_ops
+        .sandbox_launch(remote_settings.as_ref())
+        .await
+        .map_err(|error| {
+            xai_grok_agent::AgentBuildError::ToolError(format!(
+                "Could not prepare workspace sandbox: {error}"
+            ))
+        })?;
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
         match terminal_backend_kind {
             TerminalBackendKind::ReuseParent => parent_terminal_backend
                 .expect("ReuseParent is only selected when a parent backend is present"),
-            TerminalBackendKind::AcpClient => {
-                std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
+            TerminalBackendKind::AcpClient => std::sync::Arc::new(
+                crate::terminal::AcpTerminalAdapter::new(
                     tool_context.gateway.clone().unwrap(),
                     tool_context.session_id.clone().unwrap(),
-                ))
-                    as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
-            }
+                )
+                .with_workspace_sandbox(workspace_ops.clone()),
+            )
+                as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
             TerminalBackendKind::LocalPersistent => {
-                std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
+                std::sync::Arc::new(LocalTerminalBackend::new_local_with_sandbox_launch(
                     resolve_search_shadows(),
+                    true,
+                    false,
                     resolve_policy(),
                     tool_context.process_scope.clone(),
+                    sandbox_launch.clone(),
                 ))
             }
             TerminalBackendKind::LocalNonPersistent => {
                 let login_shell_capture = crate::util::config::resolve_login_shell_capture(
                     remote_settings.as_ref().and_then(|r| r.login_shell_capture),
                 );
-                std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
+                std::sync::Arc::new(LocalTerminalBackend::new_local_with_sandbox_launch(
                     resolve_search_shadows(),
+                    false,
                     login_shell_capture,
                     resolve_policy(),
                     tool_context.process_scope.clone(),
+                    sandbox_launch.clone(),
                 ))
             }
         };
@@ -1078,6 +1097,13 @@ pub(crate) async fn spawn_session_actor(
         )
     });
     let mut memory_storage_for_session = None;
+    if let Some(config) = memory_config.as_ref() {
+        xai_grok_memory::set_configured_manifest_budget(if config.v2.compact_index_enabled {
+            xai_grok_memory::V2ManifestBudget::compact()
+        } else {
+            xai_grok_memory::V2ManifestBudget::default()
+        });
+    }
     match select_memory_storage(configured_memory_storage.as_ref(), memory_config.as_ref()) {
         MemoryStorageSelection::Enabled => {
             memory_storage_for_session = configured_memory_storage.clone();
@@ -1362,6 +1388,7 @@ pub(crate) async fn spawn_session_actor(
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         session_bus_client,
         terminal_backend: terminal_backend.clone(),
+        sandbox_launch: sandbox_launch.clone(),
         fs_backend: fs_backend.clone(),
         tools_notification_handle: tools_notification_handle.clone(),
         bridge_state_path: bridge_state_path.clone(),
@@ -1732,9 +1759,25 @@ pub(crate) async fn spawn_session_actor(
                 Some(Arc::new(registry))
             }
         };
+    // Root sessions read active plugin hook files anew. Children inherit the
+    // parent's snapshot so a spawn cannot silently change its hook policy.
+    let plugin_hook_source = if is_subagent_spawn {
+        xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Parent
+    } else {
+        xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Registry(
+            plugin_registry.as_deref(),
+        )
+    };
+    let built_hook_registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
+        built_hook_registry,
+        plugin_hook_source,
+    );
     drop(hooks_discovery);
     let hook_registry_for_handle = built_hook_registry.clone();
     let workspace_ops_for_handle = workspace_ops.clone();
+    let sandbox_mode_lease_registration = workspace_ops_for_handle
+        .register_sandbox_mode_lease_fence(permissions_for_handle.clone())
+        .map(Arc::new);
     #[allow(clippy::arc_with_non_send_sync)]
     let mut _hook_load_errors: Vec<String> = hook_discovery_errors
         .iter()
@@ -2143,6 +2186,7 @@ pub(crate) async fn spawn_session_actor(
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
             force_compact: force_compact.clone(),
             context_window_override,
+            context_window_selection: context_window_selection.clone(),
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(previous_turn_model),
@@ -2756,6 +2800,7 @@ pub(crate) async fn spawn_session_actor(
             upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tool_context: tool_context_for_handle,
             model_id: session_model_id,
+            context_window_selection,
             scheduler_background_loops,
             reasoning_effort: sampling_config.reasoning_effort,
             yolo_mode: session_yolo_mode,
@@ -2766,6 +2811,7 @@ pub(crate) async fn spawn_session_actor(
             plan_mode: plan_mode.clone(),
             force_compact,
             permission_handle: permissions_for_handle,
+            sandbox_mode_lease_registration,
             attribution_callback: attribution_callback_for_handle,
             agent_name: agent_name_for_handle,
             managed_mcp_proxy_base_url,

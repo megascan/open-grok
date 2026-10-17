@@ -257,6 +257,57 @@
     }
 
     #[test]
+    fn superseded_elicitation_is_cancelled_and_leaves_a_notice() {
+        let open = |app: &mut AppView, tool_call_id: &str| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let raw = serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": "sess-A",
+                "toolCallId": tool_call_id,
+                "serverName": "airlock",
+                "message": "Create ticket?",
+                "mode": "form",
+                "requestedSchema": { "type": "object", "properties": { "title": { "type": "string" } } }
+            }))
+            .unwrap();
+            handle(
+                AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                    request: acp::ExtRequest::new("x.ai/mcp/elicit", raw.into()),
+                    response_tx: tx,
+                }),
+                app,
+            );
+            rx
+        };
+        let mut app = make_app_with_agent("sess-A");
+        let mut first = open(&mut app, "mcp-elicit-1");
+        let _second = open(&mut app, "mcp-elicit-2");
+
+        let answer = first
+            .try_recv()
+            .expect("the superseded request is answered")
+            .expect("not an error");
+        assert_eq!(
+            serde_json::json!({ "outcome": "cancel" }),
+            serde_json::from_str::<serde_json::Value>(answer.0.get()).unwrap()
+        );
+        let agent = test_agent(&app, AgentId(0));
+        assert_eq!(
+            Some("mcp-elicit-2"),
+            agent.elicitation_view.as_ref().map(|ev| ev.tool_call_id.as_str())
+        );
+        let notes: Vec<String> = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.get(i))
+            .filter_map(|entry| entry.block.searchable_text())
+            .collect();
+        assert_eq!(
+            vec![
+                "Cancelled MCP “airlock” request for input to show a newer one.".to_owned()
+            ],
+            notes
+        );
+    }
+
+    #[test]
     fn mcp_elicit_does_not_replace_url_waiting() {
         let mut app = make_app_with_agent("sess-A");
         let (tx1, mut rx1) = tokio::sync::oneshot::channel();
@@ -986,3 +1037,17 @@
             "session draft must retain its own image payload"
         );
     }
+
+#[test]
+fn sandbox_request_is_not_auto_approved_for_yolo_agent() {
+    let mut app = make_app_with_agent("sess-A");
+    app.agents.get_mut(&AgentId(0)).unwrap().session.yolo_mode = true;
+    let mut request = crate::app::sandbox_permission::tests::request();
+    request.session_id = acp::SessionId::new("sess-A");
+    let (response_tx, mut rx) = tokio::sync::oneshot::channel();
+    let msg = AcpClientMessage::RequestPermission(xai_acp_lib::AcpArgs { request, response_tx });
+    handle(msg, &mut app);
+    let perm = app.agents[&AgentId(0)].permission_queue.front().unwrap();
+    assert_eq!(perm.options[0].option_id.0.as_ref(), "sandbox:deny");
+    assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+}

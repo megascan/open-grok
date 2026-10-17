@@ -398,6 +398,26 @@ impl StopDispatchResult {
             && (!self.blocks.is_empty() || !self.additional_context.is_empty())
     }
 
+    pub fn feedback(&self) -> String {
+        use std::fmt::Write as _;
+        let clip =
+            |text: &str| crate::event::clip_text(text, crate::event::MAX_HOOK_FEEDBACK_CHARS);
+        let mut feedback = String::new();
+        if !self.blocks.is_empty() {
+            feedback.push_str("Stop hook feedback:\n");
+            for block in &self.blocks {
+                let _ = writeln!(feedback, "- {}", clip(&block.reason));
+            }
+        }
+        for context in &self.additional_context {
+            if !feedback.is_empty() {
+                feedback.push('\n');
+            }
+            feedback.push_str(&clip(context));
+        }
+        feedback
+    }
+
     /// The first force-stop wins (later ones are dropped); blocks and context
     /// accumulate in call order.
     pub fn absorb(&mut self, hook_name: &str, signals: StopSignals) {
@@ -598,6 +618,19 @@ pub struct SelectedReplacement {
     pub run_index: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedReplacement {
+    pub hook_name: String,
+    pub run_index: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReplacementChoice {
+    pub chosen: Option<SelectedReplacement>,
+    pub rejected: Option<RejectedReplacement>,
+}
+
 #[derive(Debug, Default)]
 pub struct PostToolUseResult {
     pub blocks: Vec<PostToolUseBlock>,
@@ -608,6 +641,37 @@ pub struct PostToolUseResult {
 }
 
 impl PostToolUseResult {
+    /// MCP accepts either replacement kind; the last hook wins. A built-in
+    /// tool rejects an MCP-only replacement.
+    #[must_use]
+    pub fn take_replacement(&mut self, tool_kind: ReplacementKind) -> ReplacementChoice {
+        let builtin = self.builtin_replacement.take();
+        let mcp = self.mcp_replacement.take();
+        match tool_kind {
+            ReplacementKind::Mcp => ReplacementChoice {
+                chosen: match (builtin, mcp) {
+                    (Some(builtin), Some(mcp)) => Some(if mcp.run_index > builtin.run_index {
+                        mcp
+                    } else {
+                        builtin
+                    }),
+                    (builtin, mcp) => builtin.or(mcp),
+                },
+                rejected: None,
+            },
+            ReplacementKind::Builtin => ReplacementChoice {
+                chosen: builtin,
+                rejected: mcp.map(|mcp| RejectedReplacement {
+                    reason: format!(
+                        "{} does not match the tool's kind",
+                        mcp.replacement.wire_field()
+                    ),
+                    hook_name: mcp.replacement.hook_name,
+                    run_index: mcp.run_index,
+                }),
+            },
+        }
+    }
     fn absorb(
         &mut self,
         hook_name: &str,
@@ -1107,6 +1171,101 @@ mod tests {
         let (mut registry, _) = crate::discovery::load_hooks(None, None);
         registry.append_specs(specs);
         registry
+    }
+
+    #[test]
+    fn tool_kind_decides_which_replacement_its_output_takes() {
+        let replacement = |kind: ReplacementKind, run_index: usize| SelectedReplacement {
+            replacement: OutputReplacement {
+                kind,
+                hook_name: format!("{kind:?}"),
+                value: serde_json::json!("replaced"),
+            },
+            run_index,
+        };
+        let rejected = RejectedReplacement {
+            hook_name: "Mcp".to_owned(),
+            run_index: 1,
+            reason: "updatedMCPToolOutput does not match the tool's kind".to_owned(),
+        };
+        let cases = [
+            (
+                ReplacementKind::Mcp,
+                0,
+                ReplacementChoice {
+                    chosen: Some(replacement(ReplacementKind::Mcp, 1)),
+                    rejected: None,
+                },
+            ),
+            (
+                ReplacementKind::Mcp,
+                2,
+                ReplacementChoice {
+                    chosen: Some(replacement(ReplacementKind::Builtin, 2)),
+                    rejected: None,
+                },
+            ),
+            (
+                ReplacementKind::Builtin,
+                0,
+                ReplacementChoice {
+                    chosen: Some(replacement(ReplacementKind::Builtin, 0)),
+                    rejected: Some(rejected),
+                },
+            ),
+        ];
+
+        for (tool_kind, builtin_run, expected) in cases {
+            let mut result = PostToolUseResult {
+                builtin_replacement: Some(replacement(ReplacementKind::Builtin, builtin_run)),
+                mcp_replacement: Some(replacement(ReplacementKind::Mcp, 1)),
+                ..PostToolUseResult::default()
+            };
+            assert_eq!(
+                expected,
+                result.take_replacement(tool_kind),
+                "{tool_kind:?} with the built-in replacement from run {builtin_run}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_feedback_lists_blocks_then_appends_context() {
+        let cases: [(&[&str], &[&str], &str); 3] = [
+            (
+                &["first", "second"],
+                &[],
+                "Stop hook feedback:\n- first\n- second\n",
+            ),
+            (
+                &["fix tests"],
+                &["note"],
+                "Stop hook feedback:\n- fix tests\n\nnote",
+            ),
+            (&[], &["only context"], "only context"),
+        ];
+
+        for (reasons, additional_context, expected) in cases {
+            let result = StopDispatchResult {
+                blocks: reasons
+                    .iter()
+                    .map(|reason| StopBlock {
+                        hook_name: "h".into(),
+                        reason: (*reason).into(),
+                    })
+                    .collect(),
+                additional_context: additional_context
+                    .iter()
+                    .map(|text| (*text).into())
+                    .collect(),
+                ..StopDispatchResult::default()
+            };
+            assert_eq!(
+                expected,
+                result.feedback(),
+                "{reasons:?} {additional_context:?}"
+            );
+        }
     }
 
     #[test]

@@ -157,6 +157,13 @@ pub(crate) struct MinimalState {
     /// because each revision is a fresh ExitPlanMode with a new id, still commits
     /// every revised plan as its own block.
     pub(crate) committed_plan_tool_call_id: Option<String>,
+    pub(crate) reprint: crate::minimal_reprint::ReprintState,
+}
+
+impl MinimalState {
+    pub(crate) fn needs_frames(&self) -> bool {
+        self.transcript.is_some() || self.reprint.is_waiting()
+    }
 }
 
 /// `AppView::minimal_state.show_todos`.

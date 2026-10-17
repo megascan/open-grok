@@ -100,6 +100,11 @@ pub struct MemoryV2Settings {
     pub capture_enabled: Option<bool>,
     pub automatic_dream_enabled: Option<bool>,
     pub manual_dream_enabled: Option<bool>,
+    pub batch_dream_enabled: Option<bool>,
+    pub batch_dream_max_run_secs: Option<u64>,
+    pub batch_dream_max_calls_per_batch: Option<usize>,
+    pub batch_dream_max_batch_note_bytes: Option<usize>,
+    pub compact_index_enabled: Option<bool>,
     pub file_writes_enabled: Option<bool>,
     pub archived_retention_days: Option<u64>,
     pub job_retention_days: Option<u64>,
@@ -114,6 +119,11 @@ pub struct MemoryV2Config {
     pub capture_enabled: bool,
     pub automatic_dream_enabled: bool,
     pub manual_dream_enabled: bool,
+    pub batch_dream_enabled: bool,
+    pub batch_dream_max_run_secs: u64,
+    pub batch_dream_max_calls_per_batch: usize,
+    pub batch_dream_max_batch_note_bytes: usize,
+    pub compact_index_enabled: bool,
     pub file_writes_enabled: bool,
     pub archived_retention_days: u64,
     pub job_retention_days: u64,
@@ -127,6 +137,11 @@ impl Default for MemoryV2Config {
             capture_enabled: true,
             automatic_dream_enabled: true,
             manual_dream_enabled: true,
+            batch_dream_enabled: false,
+            batch_dream_max_run_secs: 1_800,
+            batch_dream_max_calls_per_batch: 6,
+            batch_dream_max_batch_note_bytes: 96 * 1024,
+            compact_index_enabled: false,
             file_writes_enabled: true,
             archived_retention_days: 30,
             job_retention_days: 14,
@@ -961,6 +976,35 @@ impl MemoryConfig {
                         remote_v2.and_then(|settings| settings.manual_dream_enabled),
                         defaults.v2.manual_dream_enabled,
                     ),
+                    batch_dream_enabled: memory_v2
+                        .batch_dream_enabled
+                        .or_else(|| remote_v2.and_then(|settings| settings.batch_dream_enabled))
+                        .unwrap_or(defaults.v2.batch_dream_enabled),
+                    batch_dream_max_run_secs: memory_v2
+                        .batch_dream_max_run_secs
+                        .or_else(|| {
+                            remote_v2.and_then(|settings| settings.batch_dream_max_run_secs)
+                        })
+                        .unwrap_or(defaults.v2.batch_dream_max_run_secs)
+                        .clamp(60, 3_600),
+                    batch_dream_max_calls_per_batch: memory_v2
+                        .batch_dream_max_calls_per_batch
+                        .or_else(|| {
+                            remote_v2.and_then(|settings| settings.batch_dream_max_calls_per_batch)
+                        })
+                        .unwrap_or(defaults.v2.batch_dream_max_calls_per_batch)
+                        .clamp(2, 16),
+                    batch_dream_max_batch_note_bytes: memory_v2
+                        .batch_dream_max_batch_note_bytes
+                        .or_else(|| {
+                            remote_v2.and_then(|settings| settings.batch_dream_max_batch_note_bytes)
+                        })
+                        .unwrap_or(defaults.v2.batch_dream_max_batch_note_bytes)
+                        .clamp(16 * 1024, 256 * 1024),
+                    compact_index_enabled: memory_v2
+                        .compact_index_enabled
+                        .or_else(|| remote_v2.and_then(|settings| settings.compact_index_enabled))
+                        .unwrap_or(defaults.v2.compact_index_enabled),
                     file_writes_enabled: restrict_flag(
                         memory_v2.file_writes_enabled,
                         remote_v2.and_then(|settings| settings.file_writes_enabled),
@@ -1051,6 +1095,32 @@ impl MemoryConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batch_dream_settings_default_off_apply_precedence_and_clamp_limits() {
+        let config: toml::Value = toml::from_str("[memory_v2]\nenabled = true\nbatch_dream_enabled = false\ncompact_index_enabled = true\nbatch_dream_max_run_secs = 1\nbatch_dream_max_calls_per_batch = 99\nbatch_dream_max_batch_note_bytes = 1").unwrap();
+        let remote = crate::RemoteSettings {
+            memory_v2: Some(MemoryV2Settings {
+                batch_dream_enabled: Some(true),
+                compact_index_enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v2 = MemoryConfig::resolve(false, false, &config, Some(&remote)).v2;
+        assert!(!v2.batch_dream_enabled);
+        assert!(v2.compact_index_enabled);
+        assert_eq!(
+            (
+                v2.batch_dream_max_run_secs,
+                v2.batch_dream_max_calls_per_batch,
+                v2.batch_dream_max_batch_note_bytes
+            ),
+            (60, 16, 16 * 1024)
+        );
+        let defaults = MemoryV2Config::default();
+        assert!(!defaults.batch_dream_enabled && !defaults.compact_index_enabled);
+    }
+
     #[test]
     fn typed_memory_resolver_preserves_explicit_disabled_embeddings_and_zero_timers() {
         let memory = MemorySettings {

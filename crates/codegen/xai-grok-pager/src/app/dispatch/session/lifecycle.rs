@@ -408,6 +408,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,
@@ -629,6 +630,7 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
         cancel_subagents: true,
         trigger: None,
         rewind_if_no_output: false,
+        rewind_prompt_id: None,
     }];
     effects.extend(
         running_bg_tasks
@@ -940,6 +942,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,

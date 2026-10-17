@@ -239,6 +239,7 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
         team_blocked_reasons: vec![],
         coding_data_retention_opt_out: false,
         has_grok_code_access: None,
+        can_administer_team: None,
         refresh_token: None,
         expires_at: None,
         oidc_issuer: None,
@@ -1407,6 +1408,7 @@ fn make_test_handle(
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
+        context_window_selection: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: yolo,
@@ -1422,6 +1424,7 @@ fn make_test_handle(
         )),
         force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         permission_handle: xai_grok_workspace::permission::PermissionHandle::allow_all(),
+        sandbox_mode_lease_registration: None,
         attribution_callback: None,
         agent_name: "grok-build".to_string(),
         managed_mcp_proxy_base_url: String::new(),
@@ -2867,6 +2870,8 @@ mod eligibility_gates {
 fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
     let entry = |model: &str| ModelEntry {
         info: config::ModelInfo {
+            notice: None,
+            context_windows: Vec::new(),
             max_request_bytes: None,
             reasoning_effort_server_default: false,
             variants: Vec::new(),

@@ -244,6 +244,8 @@ impl HookEventName {
 
 /// Max characters for `StopBackgroundTask`/`StopSessionCron` entries, `StopFailure`'s
 /// `errorDetails`, and `StopCancelled`'s `reasonDetails`.
+pub const END_TURN_STOP_REASON: &str = "end_turn";
+
 pub const MAX_STOP_ENTRY_TEXT_CHARS: usize = 1000;
 
 /// Cancel triggers are short tokens.

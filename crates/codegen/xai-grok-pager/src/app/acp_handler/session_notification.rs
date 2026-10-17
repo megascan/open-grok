@@ -635,6 +635,7 @@ pub(super) fn handle_session_notification_with_origin(
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                pending_context_switch: None,
                 provider_rebind_pending: false,
                 hook_block_hold: false,
                 blocked_prompt: None,
@@ -1218,10 +1219,8 @@ pub(super) fn handle_session_notification_with_origin(
                 modal.seed_plugin_groups_once(&plugins);
                 modal.plugins_data =
                     TabDataState::Loaded(xai_hooks_plugins_types::PluginsListResponse { plugins });
-                if !matches!(modal.skills_data, TabDataState::Loading) {
-                    modal.skills_data = TabDataState::Loading;
-                    plugins_changed_needs_skills_refetch = true;
-                }
+                modal.skills_data = TabDataState::Loading;
+                plugins_changed_needs_skills_refetch = true;
                 true
             } else {
                 false
@@ -1347,9 +1346,17 @@ pub(super) fn handle_session_notification_with_origin(
             ));
             true
         }
+        XaiSessionUpdate::ServedModel { display_name } => {
+            agent
+                .session
+                .models
+                .set_served_model_name(Some(display_name));
+            true
+        }
         XaiSessionUpdate::ModelChanged {
             model_id,
             reasoning_effort,
+            context_window_selection,
         } => {
             let new_model_id = acp::ModelId::new(model_id.clone());
             let target_provider = crate::app::app_view::PrimaryProvider::for_model(
@@ -1389,10 +1396,12 @@ pub(super) fn handle_session_notification_with_origin(
                 .and_then(|s| s.parse::<ReasoningEffort>().ok());
             let prev_model = agent.session.models.current.clone();
             let prev_effort = agent.session.models.reasoning_effort;
+            let prev_selection = agent.session.models.context_window_selection;
             agent
                 .session
                 .models
                 .set_current(new_model_id.clone(), effort);
+            agent.session.models.context_window_selection = context_window_selection;
             agent.session.user_model_preference = Some(new_model_id.clone());
             if agent.session.provider_rebind_pending
                 && pending_rebind_provider.is_some_and(|provider| target_provider != Some(provider))
@@ -1404,9 +1413,11 @@ pub(super) fn handle_session_notification_with_origin(
                 agent.pending_effects.extend(drain.effects);
             }
             let resolved_effort = agent.session.models.reasoning_effort;
-            let actually_changed =
-                prev_model.as_ref() != Some(&new_model_id) || prev_effort != resolved_effort;
+            let actually_changed = prev_model.as_ref() != Some(&new_model_id)
+                || prev_effort != resolved_effort
+                || prev_selection != context_window_selection;
             if actually_changed {
+                agent.refresh_context_total();
                 tracing::info!(
                     session_id = session_notif.session_id.0.as_ref(),
                     model_id = %model_id,
@@ -1590,20 +1601,20 @@ pub(super) fn handle_session_notification_with_origin(
         changed |= app.status_line.take_changed();
     }
     if plugins_changed_needs_skills_refetch {
-        if let Some(agent) = app.agents.get(&parent_id)
-            && let Some(session_id) = agent.session.session_id.clone()
-        {
-            app.pending_effects.push(Effect::FetchSkillsList {
-                agent_id: parent_id,
-                session_id,
-            });
-        } else if let Some(agent) = app.agents.get_mut(&parent_id)
+        if let Some(agent) = app.agents.get_mut(&parent_id)
             && let Some(ref mut modal) = agent.extensions_modal
         {
-            modal.skills_data =
-                crate::views::extensions_modal::TabDataState::Error("No active session".into());
-        } else {
-            tracing::warn!("PluginsChanged: agent or modal disappeared before skills re-fetch");
+            if let Some(session_id) = agent.session.session_id.clone() {
+                app.pending_effects.push(Effect::FetchSkillsList {
+                    agent_id: parent_id,
+                    session_id,
+                    refresh: false,
+                    fetch: modal.next_skills_fetch(),
+                });
+            } else {
+                modal.skills_data =
+                    crate::views::extensions_modal::TabDataState::Error("No active session".into());
+            }
         }
     }
     match cancel_pending_provider_rebind {
@@ -1767,7 +1778,8 @@ pub(super) fn handle_child_session_notification(
         | XaiSessionUpdate::RetryState(_)
         | XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
-        | XaiSessionUpdate::MemorySessionSaved { .. } => {
+        | XaiSessionUpdate::MemorySessionSaved { .. }
+        | XaiSessionUpdate::HookAnnotation { .. } => {
             let compact_tokens = match &update {
                 XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } => Some(*tokens_after),
                 _ => None,
@@ -1885,6 +1897,17 @@ pub(crate) fn apply_child_view_session_event(
     update: &XaiSessionUpdate,
     is_api_key_auth: bool,
 ) -> bool {
+    if let XaiSessionUpdate::HookAnnotation { message } = update {
+        if child_view.scrollback.appearance().disable_plugins {
+            return false;
+        }
+        child_view.scrollback.push_block(RenderBlock::session_event(
+            SessionEvent::HookAnnotation {
+                message: message.clone(),
+            },
+        ));
+        return true;
+    }
     apply_compaction_or_retry_update(child_view, update, is_api_key_auth)
 }
 fn apply_compaction_or_retry_update(

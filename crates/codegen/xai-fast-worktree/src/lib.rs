@@ -43,6 +43,8 @@ pub use api::cleanup_orphaned_overlay_snapshots;
 pub use api::gc::effective_max_age;
 #[cfg(feature = "metadata")]
 pub use api::gc::{GcOptions, GcReport, gc_worktrees, gc_worktrees_with_delegate};
+#[cfg(feature = "metadata")]
+pub use api::remove_worktree_in;
 pub use api::{
     BtrfsDelegate, BtrfsMode, CleanupReport, CopyReport, CreationMode, DelegateSnapshotResult,
     DirtyFilesReport, ENOSPC_OS_MESSAGE, IgnoredFilesMode, OUT_OF_DISK_CONTEXT, RemoveReport,

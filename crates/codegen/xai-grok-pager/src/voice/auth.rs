@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use xai_grok_tools::types::SharedApiKeyProvider;
 use xai_grok_tools::types::api_key_provider::SideCallBearerError;
-use xai_grok_voice::{SharedVoiceAuth, VoiceAuthError, VoiceAuthProvider};
+use xai_grok_voice::{SharedVoiceAuth, SttRoutes, VoiceAuthError, VoiceAuthProvider};
 
 /// Adapts the shell's `ApiKeyProvider` onto [`VoiceAuthProvider`].
 ///
@@ -49,6 +49,14 @@ pub fn build_voice_auth(auth_manager: Arc<xai_grok_shell::auth::AuthManager>) ->
     Arc::new(AuthManagerVoiceAuth(
         xai_grok_shell::auth::shared_api_key_provider(auth_manager),
     ))
+}
+
+/// Clip transcription is opt-in: no foreign credential is forwarded to xAI.
+pub fn build_stt_routes(auth_manager: Arc<xai_grok_shell::auth::AuthManager>) -> SttRoutes {
+    SttRoutes {
+        auth: build_voice_auth(auth_manager),
+        clip_transcriber: None,
+    }
 }
 
 #[cfg(test)]

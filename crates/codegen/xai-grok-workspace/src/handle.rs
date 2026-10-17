@@ -664,6 +664,11 @@ impl WorkspaceHandle {
             require_explicit_toolset: config.require_explicit_toolset,
             confine_fs_to_workspace_root: config.confine_fs_to_workspace_root,
             root_cwd: config.root_cwd.clone(),
+            sandbox: tokio::sync::OnceCell::new(),
+            #[cfg(test)]
+            test_hub_approval_gate: std::sync::atomic::AtomicU8::new(2),
+            #[cfg(test)]
+            test_after_hub_approval: parking_lot::Mutex::new(None),
             sessions: parking_lot::RwLock::new(sessions),
             session_factory: config.session_factory,
             mcp_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
@@ -3314,6 +3319,7 @@ impl WorkspaceHandle {
                     let session = match created {
                         Ok(session) => {
                             session.set_yolo_mode(yolo_mode);
+                            session.approval.set_policy(bind_config.tool_approval_policy);
                             session
                                 .set_bind_tool_config_fingerprint_if_unset(
                                     bind_fingerprint.clone(),
@@ -4193,7 +4199,13 @@ pub async fn connect_local_workspace(
         .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
     let data_collection_disabled =
         std::env::var("GROK_WORKSPACE_DATA_COLLECTION_DISABLED").as_deref() != Ok("false");
-    let mut factory = WorkspaceSessionContextFactory::with_auth(auth.clone(), api_base_url.clone());
+    let sandbox = crate::sandbox::WorkspaceSandbox::serve(
+        crate::sandbox::WorkspaceSandboxConfig::for_root(cwd.clone(), workspace_home.clone()),
+    )
+    .await;
+    let hook = xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(sandbox.clone());
+    let mut factory = WorkspaceSessionContextFactory::with_auth(auth.clone(), api_base_url.clone())
+        .with_sandbox_launch(hook);
     if crate::session::tool_config::tool_state_enabled() {
         factory = factory.with_tool_state_home(workspace_home.clone());
     }
@@ -4285,6 +4297,10 @@ pub async fn connect_local_workspace(
         identity,
     )
     .map_err(|e| WorkspaceError::HubError(format!("failed to create workspace: {e}")))?;
+    // Install the same instance used by the factory before accepting any sessions.
+    ws_handle.shared.sandbox.set(sandbox).map_err(|_| {
+        WorkspaceError::HubError("workspace sandbox was already initialized".to_owned())
+    })?;
     let _maintenance = crate::file_system::client_fs::spawn_staged_upload_maintenance(&ws_handle);
     let connect_result = Box::pin(ws_handle.connect_hub()).await;
     observe_startup_stage(
@@ -4882,6 +4898,29 @@ impl WorkspaceHandle {
         let factory = std::sync::Arc::new(TestSessionContextFactory::new());
         Self::new(Self::test_config(root.to_path_buf(), factory))
             .expect("test workspace handle construction must succeed")
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test_in_with_sandbox(
+        root: &std::path::Path,
+        sandbox: Arc<crate::sandbox::WorkspaceSandbox>,
+        gate: crate::permission::ToolApprovalGate,
+    ) -> Self {
+        use crate::session::tool_config::test_support::TestSessionContextFactory;
+        let hook = xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(sandbox.clone());
+        let factory = Arc::new(TestSessionContextFactory::new().with_sandbox_launch(hook));
+        let handle = Self::new(Self::test_config(root.to_path_buf(), factory))
+            .expect("test workspace handle construction must succeed");
+        handle
+            .shared
+            .sandbox
+            .set(sandbox)
+            .ok()
+            .expect("sandbox installed once");
+        handle.shared.test_hub_approval_gate.store(
+            u8::from(gate == crate::permission::ToolApprovalGate::Enforced),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        handle
     }
 }
 #[cfg(test)]

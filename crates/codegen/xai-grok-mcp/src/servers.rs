@@ -1,5 +1,8 @@
 //! MCP server integration using the official rmcp SDK.
 
+use crate::bearer_token_file::BearerTokenFile;
+use xai_grok_config::BearerTokenPath;
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
@@ -493,7 +496,7 @@ pub struct McpState {
     /// Monotonic source for [`UnreachableRetry::InFlight`] attempt tokens.
     unreachable_attempt_counter: u64,
     /// Per-server set of unqualified tool names that the user has disabled.
-    /// Persisted to `~/.grok/config.toml` under `[mcp_servers.<name>].disabled_tools`.
+    /// Persisted to `$OPENGROK_HOME/config.toml` under `[mcp_servers.<name>].disabled_tools`.
     pub disabled_tools: HashMap<McpServerName, std::collections::HashSet<ToolName>>,
     /// Stashed registrations for disabled tools so they can be re-enabled
     /// without a full MCP re-init (no need to call `list_tools` again).
@@ -1280,6 +1283,8 @@ const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How long a stdio server gets to exit after its transport closes before
 /// its process group is killed.
 const STDIO_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Bound a dropped call's cancellation notification when the server is not reading.
+const CANCEL_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Timeout for OAuth metadata discovery when building an HTTP transport.
 /// Bounds transport setup for servers without OAuth support.
@@ -1761,6 +1766,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
                     success: reauth_ok,
                 });
                 if reauth_ok {
+                    is_timeout = false;
                     self.try_call_tool_with_meta(
                         &client,
                         &raw,
@@ -1953,6 +1959,7 @@ impl McpErasedTool {
             .cloned()
             .map(rmcp::model::RequestMetaObject::from);
 
+        let call = client.request_tracker.begin_request();
         let mut input_rounds = 0usize;
         let mut pending_polls = 0u32;
         let mut pending_since: Option<std::time::Instant> = None;
@@ -1960,6 +1967,7 @@ impl McpErasedTool {
             let response = self
                 .call_tool_round(
                     client,
+                    &call,
                     params.clone(),
                     timeout_duration,
                     tool_timeout,
@@ -1969,8 +1977,15 @@ impl McpErasedTool {
                 )
                 .await?;
             let input_required = match response {
-                rmcp::model::CallToolResponse::Complete(call_result) => return Ok(call_result),
-                rmcp::model::CallToolResponse::InputRequired(input_required) => input_required,
+                rmcp::model::CallToolResponse::Complete(mut call_result) => {
+                    call.annotate(&self.tool.server_name, &mut call_result)
+                        .await;
+                    return Ok(call_result);
+                }
+                rmcp::model::CallToolResponse::InputRequired(input_required) => {
+                    call.note_input_required();
+                    input_required
+                }
                 // SEP-2663 tasks are never advertised by this client, so a
                 // conforming server cannot return one; `CallToolResponse` is
                 // also non_exhaustive.
@@ -2019,8 +2034,9 @@ impl McpErasedTool {
                 pending_polls = pending_polls.saturating_add(1);
             }
 
-            let (input_responses, request_state) =
-                self.gather_input_responses(client, input_required).await?;
+            let (input_responses, request_state) = self
+                .gather_input_responses(client, &call, input_required)
+                .await?;
             params.input_responses = input_responses;
             params.request_state = request_state;
         }
@@ -2035,6 +2051,7 @@ impl McpErasedTool {
     async fn call_tool_round(
         &self,
         client: &Arc<McpClient>,
+        call: &crate::elicitation::RunningRequest,
         params: CallToolRequestParams,
         timeout_duration: std::time::Duration,
         tool_timeout: u64,
@@ -2046,7 +2063,18 @@ impl McpErasedTool {
             .ensure_initialized()
             .await
             .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
-        match call_tool_cancel_aware(&mcp_service, params.clone(), timeout_duration).await {
+        let service_id = mcp_service.service().service_id;
+        call.begin_send();
+        match send_tool_call(
+            &mcp_service,
+            params.clone(),
+            Some(timeout_duration),
+            |request_id| {
+                call.bind_send(service_id, request_id);
+            },
+        )
+        .await
+        {
             Ok(response) => Ok(response),
             Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
@@ -2071,6 +2099,7 @@ impl McpErasedTool {
             {
                 self.recover_and_retry(
                     client,
+                    call,
                     params,
                     timeout_duration,
                     tool_timeout,
@@ -2090,6 +2119,7 @@ impl McpErasedTool {
     async fn gather_input_responses(
         &self,
         client: &Arc<McpClient>,
+        call: &crate::elicitation::RunningRequest,
         result: rmcp::model::InputRequiredResult,
     ) -> Result<(Option<rmcp::model::InputResponses>, Option<String>), xai_tool_runtime::ToolError>
     {
@@ -2113,7 +2143,9 @@ impl McpErasedTool {
                         tool = %self.tool.name,
                         "MCP elicitation received in input_required round"
                     );
-                    let elicit_result = client.bridge_elicit(elicit.params).await;
+                    let elicit_result = client
+                        .bridge_elicit(elicit.params, call.begin_answer_ask())
+                        .await;
                     let value = serde_json::to_value(elicit_result).map_err(|e| {
                         xai_tool_runtime::ToolError::custom(
                             "process_manager",
@@ -2149,6 +2181,7 @@ impl McpErasedTool {
     async fn recover_and_retry(
         &self,
         client: &Arc<McpClient>,
+        call: &crate::elicitation::RunningRequest,
         params: CallToolRequestParams,
         timeout_duration: std::time::Duration,
         tool_timeout: u64,
@@ -2187,7 +2220,13 @@ impl McpErasedTool {
                 return Err(tool_error_for_service_error(&original_err));
             }
         };
-        match call_tool_cancel_aware(&mcp_service, params, timeout_duration).await {
+        let service_id = mcp_service.service().service_id;
+        call.begin_send();
+        match send_tool_call(&mcp_service, params, Some(timeout_duration), |request_id| {
+            call.bind_send(service_id, request_id);
+        })
+        .await
+        {
             Ok(response) => Ok(response),
             Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
@@ -2211,10 +2250,19 @@ impl McpErasedTool {
 /// [`ServiceError::Timeout`]), and [`CancelOnDrop`] sends it when the future
 /// is dropped before a reply, which is how a cancelled turn reaches the
 /// server.
-async fn call_tool_cancel_aware(
+pub async fn call_tool_cancel_aware(
     service: &McpService,
     params: CallToolRequestParams,
-    timeout: std::time::Duration,
+    timeout: Option<std::time::Duration>,
+) -> Result<rmcp::model::CallToolResponse, ServiceError> {
+    send_tool_call(service, params, timeout, |_| {}).await
+}
+
+async fn send_tool_call(
+    service: &McpService,
+    params: CallToolRequestParams,
+    timeout: Option<std::time::Duration>,
+    on_sent: impl FnOnce(&rmcp::model::RequestId),
 ) -> Result<rmcp::model::CallToolResponse, ServiceError> {
     use rmcp::model::{CallToolRequest, CallToolResponse, ClientRequest, ServerResult};
     use rmcp::service::PeerRequestOptions;
@@ -2223,11 +2271,15 @@ async fn call_tool_cancel_aware(
         .peer()
         .send_cancellable_request(
             ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-            PeerRequestOptions::with_timeout(timeout),
+            timeout.map_or_else(
+                PeerRequestOptions::no_options,
+                PeerRequestOptions::with_timeout,
+            ),
         )
         .await?;
+    on_sent(&handle.id);
     let mut guard = CancelOnDrop {
-        peer: service.peer().clone(),
+        service: service.clone(),
         request_id: Some(handle.id.clone()),
     };
     let response = handle.await_response().await;
@@ -2244,7 +2296,7 @@ async fn call_tool_cancel_aware(
 /// is dropped before the reply arrived. Disarmed (`request_id = None`) once
 /// the request settles.
 struct CancelOnDrop {
-    peer: rmcp::service::Peer<RoleClient>,
+    service: McpService,
     request_id: Option<rmcp::model::RequestId>,
 }
 
@@ -2260,14 +2312,16 @@ impl Drop for CancelOnDrop {
             );
             return;
         };
-        let peer = self.peer.clone();
+        let service = self.service.clone();
         runtime.spawn(async move {
             let params = rmcp::model::CancelledNotificationParam::new(
                 Some(request_id.clone()),
                 Some("client cancelled".to_owned()),
             );
-            if let Err(e) = peer.notify_cancelled(params).await {
-                tracing::debug!(?request_id, error = %e, "notifications/cancelled not delivered");
+            let sent =
+                tokio::time::timeout(CANCEL_NOTIFY_TIMEOUT, service.notify_cancelled(params)).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                tracing::debug!(?request_id, ?sent, "notifications/cancelled not delivered");
             }
         });
     }
@@ -2579,13 +2633,16 @@ async fn decide_http_auth_over_network(
 pub struct HttpConfig {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    pub bearer_token_file: Option<BearerTokenFile>,
 }
 
 impl HttpConfig {
     fn has_authorization_header(&self) -> bool {
-        self.headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        self.bearer_token_file.is_some()
+            || self
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
     }
 }
 
@@ -3393,6 +3450,7 @@ pub struct McpClient {
     /// allocation-free.
     notify_tx: SharedEventTx,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
+    request_tracker: Arc<crate::elicitation::RequestTracker>,
     /// RAII handle for the per-client transport-liveness poller.
     ///
     /// `Some` after [`Self::arm_liveness_watcher`] succeeds; `None`
@@ -3531,6 +3589,7 @@ impl McpClient {
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+            request_tracker: Arc::default(),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -4542,6 +4601,8 @@ impl McpClient {
             server_name: self.server_name.clone(),
             notify_tx: Arc::clone(&self.notify_tx),
             elicitation_tx: Arc::clone(&self.elicitation_tx),
+            request_tracker: Arc::clone(&self.request_tracker),
+            service_id: self.request_tracker.next_service_id(),
         }
     }
 
@@ -4560,6 +4621,11 @@ impl McpClient {
         *self.elicitation_tx.lock() = tx;
     }
 
+    /// Guard a non-agent request while it is in flight, so untagged server input is not attributed to another call.
+    pub fn begin_outbound_request(&self) -> crate::elicitation::OutboundRequest {
+        crate::elicitation::OutboundRequest::new(&self.request_tracker)
+    }
+
     /// Bridge one elicitation request from an MRTR `input_required` round to
     /// the HITL UI. Same inbox path as the server-initiated
     /// `elicitation/create` handler, so both protocol generations share the
@@ -4567,8 +4633,15 @@ impl McpClient {
     pub(crate) async fn bridge_elicit(
         &self,
         params: rmcp::model::ElicitRequestParams,
+        ask: crate::elicitation::AskGuard,
     ) -> rmcp::model::ElicitResult {
-        crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, params).await
+        crate::elicitation::bridge_elicit_tracked(
+            &self.elicitation_tx,
+            &self.server_name,
+            params,
+            ask,
+        )
+        .await
     }
 
     /// Snapshot the current event sender, if any.
@@ -4663,6 +4736,9 @@ impl McpClient {
             config
                 .headers
                 .iter()
+                .filter(|(key, _)| {
+                    config.bearer_token_file.is_none() || !key.eq_ignore_ascii_case("authorization")
+                })
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
         apply_user_agent_policy(&mut headers, server_name, &config.url);
@@ -4675,11 +4751,10 @@ impl McpClient {
         )
         .build()
         .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
-        Ok(crate::mcp_http_client::McpHttpClient::new(
-            client,
-            server_name,
-            warn_budget,
-        ))
+        Ok(
+            crate::mcp_http_client::McpHttpClient::new(client, server_name, warn_budget)
+                .with_bearer_token_file(config.bearer_token_file.clone()),
+        )
     }
 
     /// Cheap, non-blocking liveness predicate.
@@ -4772,6 +4847,7 @@ impl McpClient {
         &self,
         server_dir: &std::path::Path,
     ) -> Result<usize, McpError> {
+        let request = self.begin_outbound_request();
         let mcp_service = self.ensure_initialized().await?;
 
         // Collect descriptors via the async MCP API, then defer all filesystem
@@ -4808,6 +4884,8 @@ impl McpClient {
                 None => break,
             }
         }
+
+        drop(request);
 
         // Write each descriptor atomically (temp file + rename) so a concurrent
         // reader never sees a half-written JSON and overlapping writers converge
@@ -4875,6 +4953,7 @@ impl McpClient {
         &self,
         mcp_state: Arc<Mutex<McpState>>,
     ) -> Result<Vec<McpToolRegistration>, McpError> {
+        let request = self.begin_outbound_request();
         let _ensure_init_timer =
             xai_grok_telemetry::instrumentation::timer("mcp_ensure_initialized");
         let mcp_service = self.ensure_initialized().await?;
@@ -4898,6 +4977,7 @@ impl McpClient {
             }
         }
 
+        drop(request);
         let event_writer = mcp_state.lock().await.event_writer().clone();
         let registrations: Vec<_> = all_tools
             .into_iter()
@@ -4986,16 +5066,105 @@ impl McpClient {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        let _request = self.begin_outbound_request();
         let mcp_service = self.ensure_initialized().await?;
-        let result = mcp_service
-            .call_tool({
-                let mut params = CallToolRequestParams::new(tool_name.to_string());
-                params.arguments = arguments.as_object().cloned();
-                params
-            })
-            .await?;
-        Ok(result)
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        params.arguments = arguments.as_object().cloned();
+        let mut state_only_rounds = 0usize;
+        for _ in 0..rmcp::model::DEFAULT_MRTR_MAX_ROUNDS {
+            match call_tool_cancel_aware(&mcp_service, params.clone(), None).await? {
+                rmcp::model::CallToolResponse::Complete(result) => return Ok(result),
+                rmcp::model::CallToolResponse::InputRequired(result) => {
+                    let requests = result.input_requests.unwrap_or_default();
+                    if requests.is_empty() && result.request_state.is_none() {
+                        return Err(ServiceError::UnexpectedResponse.into());
+                    }
+                    let had_requests = !requests.is_empty();
+                    let responses = futures::future::try_join_all(requests.into_iter().map(
+                        |(key, request)| fulfill_direct_input_request(&mcp_service, key, request),
+                    ))
+                    .await?;
+                    if had_requests {
+                        state_only_rounds = 0;
+                    } else {
+                        let delay_ms =
+                            (50u64.saturating_mul(1u64 << state_only_rounds.min(3))).min(250);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        state_only_rounds += 1;
+                    }
+                    params.input_responses =
+                        (!responses.is_empty()).then(|| responses.into_iter().collect());
+                    params.request_state = result.request_state;
+                }
+                _ => return Err(ServiceError::UnexpectedResponse.into()),
+            }
+        }
+        Err(ServiceError::InputRequiredRoundsExceeded {
+            max_rounds: rmcp::model::DEFAULT_MRTR_MAX_ROUNDS,
+        }
+        .into())
     }
+}
+
+/// Fulfil a direct call's MRTR input through the same handler as rmcp's high-level call helper.
+/// Keeping this round handling here lets each outgoing round use `CancelOnDrop`.
+async fn fulfill_direct_input_request(
+    service: &McpService,
+    key: String,
+    request: rmcp::model::InputRequest,
+) -> Result<(String, serde_json::Value), ServiceError> {
+    use rmcp::model::{ClientResult, GetExtensions, GetMeta, ServerRequest};
+    use rmcp::service::Service;
+    enum ExpectedResult {
+        CreateMessage,
+        Elicitation,
+        ListRoots,
+    }
+    let (mut request, expected_result) = match request {
+        rmcp::model::InputRequest::CreateMessage(request) => (
+            ServerRequest::CreateMessageRequest(request),
+            ExpectedResult::CreateMessage,
+        ),
+        rmcp::model::InputRequest::Elicitation(request) => (
+            ServerRequest::ElicitRequest(request),
+            ExpectedResult::Elicitation,
+        ),
+        rmcp::model::InputRequest::ListRoots(request) => (
+            ServerRequest::ListRootsRequest(request),
+            ExpectedResult::ListRoots,
+        ),
+        _ => return Err(ServiceError::UnexpectedResponse),
+    };
+    let mut context = RequestContext::new(
+        rmcp::model::RequestId::String(Arc::from(key.as_str())),
+        service.peer().clone(),
+    );
+    std::mem::swap(&mut context.meta, request.get_meta_mut());
+    std::mem::swap(&mut context.extensions, request.extensions_mut());
+    let result = service
+        .service()
+        .handle_request(request, context)
+        .await
+        .map_err(ServiceError::McpError)?;
+    let value = match (expected_result, result) {
+        (ExpectedResult::CreateMessage, ClientResult::CreateMessageResult(result)) => {
+            serde_json::to_value(result)
+        }
+        (ExpectedResult::Elicitation, ClientResult::ElicitResult(result)) => {
+            serde_json::to_value(result)
+        }
+        (ExpectedResult::ListRoots, ClientResult::ListRootsResult(result)) => {
+            serde_json::to_value(result)
+        }
+        _ => return Err(ServiceError::UnexpectedResponse),
+    }
+    .map_err(|error| {
+        ServiceError::McpError(rmcp::ErrorData::internal_error(
+            format!("failed to serialize MRTR input response: {error}"),
+            None,
+        ))
+    })?;
+    Ok((key, value))
 }
 
 fn contains_session_placeholder(value: &str) -> bool {
@@ -5020,7 +5189,7 @@ fn sanitize_mcp_log_filename(name: &str) -> String {
     }
 }
 
-/// Copy an MCP server's stderr to `~/.grok/logs/mcp/<server>.stderr.log`
+/// Copy an MCP server's stderr to `$OPENGROK_HOME/logs/mcp/<server>.stderr.log`
 /// in a background task. Truncated per spawn.
 fn drain_mcp_stderr_to_log(server_name: &str, mut stderr: tokio::process::ChildStderr) {
     let log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
@@ -5327,19 +5496,31 @@ pub async fn start_mcp_server(
             ))
         }
         acp::McpServer::Http(acp::McpServerHttp {
-            name, url, headers, ..
+            name,
+            url,
+            headers,
+            meta,
+            ..
         })
         | acp::McpServer::Sse(acp::McpServerSse {
-            name, url, headers, ..
+            name,
+            url,
+            headers,
+            meta,
+            ..
         }) => {
             if let Some(mc) = meta_config {
                 tracing::info!(server = %name, %url, ?mc, "MCP http: meta config override");
             }
 
             let headers = expand_session_id_headers(headers, ctx.session_id);
+            let bearer_token_file = BearerTokenPath::from_meta(meta.as_ref())
+                .map_err(|e| McpError::ClientError(format!("MCP server '{name}': {e}")))?
+                .map(BearerTokenFile::new);
             let http_config = HttpConfig {
                 url: url.clone(),
                 headers,
+                bearer_token_file,
             };
 
             let auth_decision = if http_config.has_authorization_header() {
@@ -5483,6 +5664,7 @@ impl McpClient {
             PendingTransport::Http(HttpConfig {
                 url: String::new(),
                 headers: Vec::new(),
+                bearer_token_file: None,
             }),
             Some(&overrides),
             None,
@@ -5543,6 +5725,8 @@ pub struct GrokClientHandler {
     /// service loop.
     notify_tx: SharedEventTx,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
+    request_tracker: Arc<crate::elicitation::RequestTracker>,
+    service_id: crate::elicitation::ServiceId,
 }
 
 impl GrokClientHandler {
@@ -5590,8 +5774,17 @@ impl ClientHandler for GrokClientHandler {
             "MCP elicitation/create received"
         );
 
-        let bridged =
-            crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, request);
+        let bridged = crate::elicitation::bridge_elicit_tracked(
+            &self.elicitation_tx,
+            &self.server_name,
+            request,
+            self.request_tracker.begin_server_ask(
+                self.service_id,
+                context
+                    .extensions
+                    .get::<rmcp::service::InboundStreamOrigin>(),
+            ),
+        );
         tokio::select! {
             result = bridged => Ok(result),
             _ = context.ct.cancelled() => {

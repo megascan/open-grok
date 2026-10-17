@@ -16,6 +16,7 @@
 //!   RPCs.
 use crate::computer::types::{AsyncFileSystem, TerminalBackend};
 use crate::notification::types::ToolNotificationHandle;
+pub use crate::sandbox_launch::SandboxLaunchHook;
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;

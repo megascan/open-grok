@@ -43,6 +43,7 @@ impl AgentView {
         self.session_starting_since = None;
         self.session_new_phase = None;
         self.pending_session_id = None;
+        self.load_failed = false;
     }
     /// Advance the reconnect cursor forward-only. Stores the raw id and its parsed sequence together so later compares need not re-parse the string.
     ///
@@ -391,6 +392,7 @@ impl AgentView {
             minimal_cancel_hint_turn: None,
             pending_first_prompt: None,
             pending_fork_banner: None,
+            load_failed: false,
             loading_placeholder_id: None,
             pending_recap_entry: None,
             display_name: None,
@@ -597,6 +599,7 @@ impl AgentView {
             self.scrollback.remove_entry(rid);
         }
         self.session.model_switch_pending = false;
+        self.session.pending_context_switch = None;
         // A reconnect rebuilds the shell-side sampler from the current
         // persisted provider configuration, so any pager-local rebind hold is
         // obsolete and must not leave queued prompts jammed.
@@ -1192,6 +1195,14 @@ impl AgentView {
                     used, total,
                 ));
             }
+        }
+    }
+    /// Rescale the context meter when the selected model window changes.
+    pub(crate) fn refresh_context_total(&mut self) {
+        if let Some(used) = self.context_state.as_ref().map(|context| context.used)
+            && let Some(window) = self.session.models.get_context_window()
+        {
+            self.apply_context_used(used, window);
         }
     }
     /// Apply Build coding-credit balance only for non-chat agents.

@@ -422,6 +422,31 @@ impl SessionRoutedToolHandler {
         crate::permission::access_kind_for_hub_tool(self.semantic_kind, self.name(), args)
     }
 }
+pub(crate) fn hub_grant_store_access(
+    mode: Option<crate::sandbox::SandboxMode>,
+) -> crate::permission::StateFileAccess {
+    if mode.is_some_and(|mode| mode != crate::sandbox::SandboxMode::Off) {
+        crate::permission::StateFileAccess::DaemonOwned {
+            grok_home: xai_grok_config::grok_home(),
+        }
+    } else {
+        crate::permission::StateFileAccess::Plain
+    }
+}
+
+fn hub_approval_enabled(workspace: &WorkspaceHandle) -> bool {
+    #[cfg(test)]
+    match workspace
+        .shared
+        .test_hub_approval_gate
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    crate::permission::hitl_permission_live_enabled()
+}
 /// RAII guard that brackets a tool call's activity-tracker accounting.
 ///
 /// [`SessionRoutedToolHandler::handle_call`] calls
@@ -503,10 +528,32 @@ impl ToolServerHandler for SessionRoutedToolHandler {
             }
         };
         let call_id = ctx.call_id.to_string();
-        if crate::permission::hitl_permission_live_enabled()
-            && !session.yolo_mode()
-            && let Some(access) = self.permission_access(&args)
-        {
+        let virt = session.path_virtualization().cloned();
+        let args = match &virt {
+            Some(v) => v.rewrite_json_inbound(args),
+            None => args,
+        };
+        let (sandbox, mode) = match self.workspace.shared.sandbox() {
+            Some(sandbox) => {
+                let mode = sandbox.engage_unless_off().await;
+                (Some(sandbox), Some(mode))
+            }
+            None => (None, None),
+        };
+        let approval_enabled = hub_approval_enabled(&self.workspace);
+        let gate = if approval_enabled {
+            crate::permission::ToolApprovalGate::Enforced
+        } else {
+            crate::permission::ToolApprovalGate::Off
+        };
+        let tool = session
+            .toolset()
+            .get_tool_metadata(self.name())
+            .map(|tool| (tool.kind(), tool.tool_namespace()));
+        let path = crate::permission::SandboxPath::for_tool(tool, mode)
+            .for_call(gate, &session, self.name(), &args)
+            .await;
+        if approval_enabled && let Some(access) = self.permission_access(&args) {
             let transport = self
                 .workspace
                 .hub_server_blocking()
@@ -516,45 +563,98 @@ impl ToolServerHandler for SessionRoutedToolHandler {
                         server, session_id,
                     )
                 });
-            match transport {
-                Some(transport) => {
-                    let outcome = crate::permission::request_permission_via_hub(
-                        &transport, &access, &call_id, None,
-                    )
-                    .await;
-                    if !crate::permission::prompt_outcome_allows(&outcome) {
-                        use crate::permission::PromptOutcome;
-                        let deny_msg = match &outcome {
-                            PromptOutcome::FollowupMessage(msg) => {
-                                format!("tool permission redirected: {msg}")
-                            }
-                            _ => format!("tool permission denied for {}", self.name()),
-                        };
-                        tracing::info!(
-                            tool = %self.name(),
-                            session = %session_id,
-                            call_id = %call_id,
-                            ?outcome,
-                            "tool-permission denied via hub; rejecting tool call"
-                        );
-                        return terminal_only(Err(ToolError::new(
-                            ToolErrorKind::PermissionDenied,
-                            deny_msg,
-                        )));
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        tool = %self.name(),
-                        session = %session_id,
-                        "GROK_HITL_PERMISSION_LIVE set but no hub ToolServer; rejecting guarded tool"
-                    );
+            let access_state = hub_grant_store_access(mode);
+            let policy = session.approval.policy();
+            let mut accesses = vec![access];
+            if self.name().rsplit(':').next() == Some("apply_patch") {
+                use xai_grok_tools::implementations::codex::apply_patch::{Hunk, parse_patch};
+                use xai_grok_tools::types::ToolInput;
+                let parsed = session.toolset().try_parse(self.name(), &args).await;
+                let Ok(ToolInput::ApplyPatch(patch)) = parsed else {
                     return terminal_only(Err(ToolError::new(
-                        ToolErrorKind::PermissionDenied,
-                        "tool permission unavailable (no hub transport)",
+                        ToolErrorKind::InvalidArguments,
+                        "invalid apply_patch input",
                     )));
+                };
+                let Ok(patch) = parse_patch(&patch.patch) else {
+                    return terminal_only(Err(ToolError::new(
+                        ToolErrorKind::InvalidArguments,
+                        "invalid patch",
+                    )));
+                };
+                accesses = patch
+                    .hunks
+                    .into_iter()
+                    .flat_map(|hunk| match hunk {
+                        Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path],
+                        Hunk::UpdateFile {
+                            path, move_path, ..
+                        } => std::iter::once(path).chain(move_path).collect(),
+                    })
+                    .map(|path| {
+                        crate::permission::AccessKind::Edit(path.to_string_lossy().into_owned())
+                    })
+                    .collect();
+            }
+            for access in accesses {
+                let owner = transport
+                    .as_ref()
+                    .map(|t| t as &dyn crate::permission::PermissionHookTransport);
+                if let Err(error) = session
+                    .approval
+                    .settle(
+                        session.cwd(),
+                        self.workspace.shared.root_cwd(),
+                        &access,
+                        &call_id,
+                        owner,
+                        path.prompt_gate(),
+                        access_state.clone(),
+                        session.yolo_mode(),
+                    )
+                    .await
+                {
+                    return terminal_only(Err(error));
                 }
             }
+            if session.approval.policy() != policy {
+                return terminal_only(Err(ToolError::new(
+                    ToolErrorKind::PermissionDenied,
+                    "tool approval policy changed; retry the call",
+                )));
+            }
+        }
+        // Approval can wait on a person. Recheck the mode after it resolves so
+        // a decision made for one sandbox policy cannot dispatch under another.
+        #[cfg(test)]
+        if let Some(hook) = self.workspace.shared.test_after_hub_approval.lock().take() {
+            hook();
+        }
+        if let (Some(sandbox), Some(mode)) = (&sandbox, mode)
+            && sandbox.engage_unless_off().await != mode
+        {
+            return terminal_only(Err(ToolError::new(
+                ToolErrorKind::PermissionDenied,
+                "sandbox mode changed while approving the tool call; retry",
+            )));
+        }
+        if path.follows_result_path()
+            && let (Some(sandbox), Some(mode)) = (&sandbox, mode)
+            && let Err(error) =
+                sandbox.pin_new_dispatch(&xai_grok_sandbox::command::CallId::tool(&call_id), mode)
+        {
+            return terminal_only(Err(ToolError::new(
+                ToolErrorKind::ConcurrencyLimit,
+                error.to_string(),
+            )));
+        }
+        if path == crate::permission::SandboxPath::None
+            && let Some(sandbox) = &sandbox
+            && let Err(error) =
+                crate::permission::refuse_mode_layer_write(sandbox, &session, self.name(), &args)
+                    .await
+        {
+            return terminal_only(Err(error));
         }
         let toolset = session.toolset();
         tracing::debug!(
@@ -564,12 +664,24 @@ impl ToolServerHandler for SessionRoutedToolHandler {
             "dispatching tool call"
         );
         tracker.tool_call_started(&call_id, self.name(), hub_session.as_deref());
-        let virt = session.path_virtualization().cloned();
-        let args = match &virt {
-            Some(v) => v.rewrite_json_inbound(args),
-            None => args,
+        let inner = if path.follows_result_path() && sandbox.is_some() {
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let name = self.name().to_owned();
+            let dispatch_id = call_id.clone();
+            crate::sandbox::result_path::run_shell_call_with_replay(
+                self.workspace.clone(),
+                session.clone(),
+                call_id.clone(),
+                command,
+                true,
+                move || toolset.call_streaming(&name, args.clone(), &dispatch_id, None),
+            )
+        } else {
+            toolset.call_streaming(self.name(), args, &call_id, None)
         };
-        let inner = toolset.call_streaming(self.name(), args, &call_id, None);
         let tracker = self.workspace.shared.activity_tracker.clone();
         let name = self.name().to_owned();
         let session_label = session_id.to_owned();

@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
 
-use super::layout::{MIN_DASHBOARD_WIDTH, compute_layout};
+use super::layout::MIN_DASHBOARD_WIDTH;
 use super::row::{DashboardRow, RowBadge, build_rows_with_roster, build_rows_with_workspace};
 use super::state::{
     DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RenameDraft,

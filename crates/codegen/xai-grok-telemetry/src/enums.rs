@@ -59,6 +59,15 @@ impl PermissionMode {
     }
 
     pub fn from_yolo(yolo: bool) -> Self {
-        if yolo { Self::AlwaysApprove } else { Self::Ask }
+        Self::from_flags(yolo, false)
+    }
+
+    /// Always-approve wins over Auto. Pass `auto` after the auto gate, not the value the user asked for.
+    pub fn from_flags(yolo: bool, auto: bool) -> Self {
+        match (yolo, auto) {
+            (true, _) => Self::AlwaysApprove,
+            (false, true) => Self::Auto,
+            (false, false) => Self::Ask,
+        }
     }
 }

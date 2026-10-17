@@ -272,88 +272,7 @@ fn reconnect_success_hides_mismatch(current: Option<&str>, incoming: &str) -> bo
     current.is_some_and(crate::acp::is_version_mismatch_banner)
         && (incoming.starts_with("Reconnected.") || incoming.starts_with("Session restored."))
 }
-/// Which prompt box in-flight voice dictation appends its finalized text to.
-/// Captured when recording **starts** so a trailing STT final still lands where
-/// the user was dictating, even if they navigate away — or toggle a dashboard
-/// row's peek panel — mid-utterance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceTarget {
-    /// A live agent session's prompt box.
-    Agent(AgentId),
-    /// The dashboard's new-agent dispatch input (no row peek was open at start).
-    DashboardDispatch,
-    /// The dashboard's peek reply input, bound to the agent whose peek was open
-    /// at start. The id pins the row: selecting a different row mid-utterance
-    /// stops capture (the reply widget is shared and clears on row change), so a
-    /// final can't land on the wrong agent's reply.
-    DashboardPeekReply(AgentId),
-}
-/// The voice-dictation lifecycle. Exactly one state holds at a time, so the
-/// "is the mic live / is a start queued / does a Ctrl+Space hold own it / which
-/// box receives finals" facts can never disagree (they once lived as separate
-/// booleans and repeatedly drifted apart). All transitions go through the
-/// `AppView::voice_*` methods.
-///
-/// `hold` marks a session begun by a Ctrl+Space hold-press: its matching
-/// Ctrl+Space release ends it (and only it), while `/voice` / toggle sessions
-/// leave `hold` false so a Ctrl+Space release can't touch them. `target` is the
-/// prompt box bound at
-/// **start**, so a trailing final lands where the user was dictating. `interim`
-/// (the live partial transcript) lives inside the recording states so it can't
-/// linger as a stale overlay once dictation ends.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum VoiceState {
-    /// No dictation in flight.
-    #[default]
-    Idle,
-    /// A start was requested before the lazy pipeline existed; the event loop
-    /// spawns it once and then opens the mic.
-    ColdStart { hold: bool, target: VoiceTarget },
-    /// Mic is open and streaming audio to STT.
-    Recording {
-        hold: bool,
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-    /// Capture was explicitly stopped (Esc / Ctrl+Space / [stop] / Ctrl+Space
-    /// release), but the target — and the last interim — are kept so a trailing
-    /// STT final still lands without the overlay flickering in the meantime.
-    Stopping {
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-}
-impl VoiceState {
-    /// Mic is live (the `Recording` state).
-    pub fn listening(&self) -> bool {
-        matches!(self, Self::Recording { .. })
-    }
-    /// A start is queued for the lazy pipeline (the `ColdStart` state).
-    pub fn pending_cold_start(&self) -> bool {
-        matches!(self, Self::ColdStart { .. })
-    }
-    /// The prompt box that owns this session's dictation, if any.
-    pub fn target(&self) -> Option<VoiceTarget> {
-        match self {
-            Self::ColdStart { target, .. }
-            | Self::Recording { target, .. }
-            | Self::Stopping { target, .. } => Some(*target),
-            Self::Idle => None,
-        }
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn interim(&self) -> Option<&str> {
-        match self {
-            Self::Recording { interim, .. } | Self::Stopping { interim, .. } => interim.as_deref(),
-            _ => None,
-        }
-    }
-    /// Whether a hold-press owns the current session (so its key release ends
-    /// it). `/voice` and toggle-style starts leave this false.
-    pub(crate) fn hold(&self) -> bool {
-        matches!(self, Self::ColdStart { hold, .. } | Self::Recording { hold, .. } if *hold)
-    }
-}
+pub use crate::app::voice_state::{Partial, VoiceState, VoiceTarget};
 /// Entry from the session list wire: welcome/resume pickers and non-leader
 /// dashboard roster fallback (`session_picker_entry_to_roster`).
 #[derive(Debug, Clone)]
@@ -1495,6 +1414,9 @@ pub struct AppView {
     /// combinations are unrepresentable; production mutates it only through the
     /// `AppView::voice_*` transition methods.
     pub voice_state: VoiceState,
+    pub voice_session: xai_grok_voice::VoiceSessionId,
+    pub voice_trailing_final: Option<(xai_grok_voice::VoiceSessionId, VoiceTarget)>,
+    pub voice_clip_deadline: Option<Instant>,
 }
 /// Reshow window elapsed? None/0 = never. Unparseable ack fails open (show).
 fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bool {
@@ -1986,6 +1908,7 @@ impl AppView {
         if let Some(show) = meta.show_resolved_model {
             self.show_resolved_model = show;
         }
+        crate::app::dispatch::refresh_open_settings_modals(self);
     }
     /// Mirror the provider-neutral `/usage` command gate onto every slash
     /// surface that can run `/usage` (agents, welcome, dashboard dispatch /
@@ -2316,6 +2239,9 @@ impl AppView {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            voice_session: xai_grok_voice::VoiceSessionId::default(),
+            voice_trailing_final: None,
+            voice_clip_deadline: None,
         }
     }
     /// Seed `deferred_model_switch` from CLI `-m`. The CLI effort token is
@@ -2476,96 +2402,6 @@ impl AppView {
             }
         }
     }
-    /// Mic is live (the [`VoiceState::Recording`] state).
-    pub fn voice_listening(&self) -> bool {
-        self.voice_state.listening()
-    }
-    /// Whether the in-flight session is owned by a hold-press (so its key
-    /// release ends it). `/voice` and toggle-style starts leave this false.
-    pub fn voice_hold_owned(&self) -> bool {
-        self.voice_state.hold()
-    }
-    /// The prompt box that owns in-flight dictation, if any.
-    pub fn voice_recording_target(&self) -> Option<VoiceTarget> {
-        self.voice_state.target()
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn voice_interim(&self) -> Option<&str> {
-        self.voice_state.interim()
-    }
-    /// Best-effort one-shot command into the voice pipeline (no-op if it isn't up).
-    fn voice_send(&self, cmd: xai_grok_voice::VoiceCommand) {
-        if let Some(tx) = &self.voice_cmd_tx
-            && tx.try_send(cmd).is_err()
-        {
-            tracing::trace!("voice command dropped: pipeline channel full or closed");
-        }
-    }
-    /// Open the mic now (pipeline already up) and enter [`VoiceState::Recording`]
-    /// bound to `target`. `hold` marks a Ctrl+Space hold-press start.
-    pub(crate) fn voice_begin_recording(&mut self, target: VoiceTarget, hold: bool) {
-        self.voice_send(xai_grok_voice::VoiceCommand::PttPress);
-        self.voice_state = VoiceState::Recording {
-            hold,
-            target,
-            interim: None,
-        };
-    }
-    /// Set the live interim transcript. No-op unless recording, so a late event
-    /// after a stop can't repopulate the overlay.
-    pub(crate) fn voice_set_interim(&mut self, text: String) -> bool {
-        if let VoiceState::Recording { interim, .. } = &mut self.voice_state {
-            *interim = Some(text);
-            true
-        } else {
-            false
-        }
-    }
-    /// Clear the interim in place, keeping the current state. Called when a final
-    /// commits (or yields empty) so the overlay drops the partial without a
-    /// teardown.
-    pub(crate) fn voice_clear_interim(&mut self) {
-        match &mut self.voice_state {
-            VoiceState::Recording { interim, .. } | VoiceState::Stopping { interim, .. } => {
-                *interim = None;
-            }
-            VoiceState::Idle | VoiceState::ColdStart { .. } => {}
-        }
-    }
-    /// Explicit stop (Esc / Ctrl+Space / `[stop]`): release the mic but keep
-    /// the target and last interim so a trailing STT final still lands. Always
-    /// allowed — never leaves a hot mic. No-op unless recording.
-    pub(crate) fn voice_stop_keeping_final(&mut self) {
-        let VoiceState::Recording {
-            target, interim, ..
-        } = &mut self.voice_state
-        else {
-            return;
-        };
-        let target = *target;
-        let interim = interim.take();
-        self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        self.voice_state = VoiceState::Stopping { target, interim };
-    }
-    /// Hard teardown (submit / error / kill-switch / navigate-away): release the
-    /// mic and forget the session — no trailing final, no queued start.
-    pub(crate) fn voice_reset(&mut self) {
-        if self.voice_state.listening() {
-            self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        }
-        self.voice_state = VoiceState::Idle;
-    }
-    /// Ctrl+Space hold release: end only a session a Ctrl+Space hold started —
-    /// cancel a queued hold cold-start, or stop a live hold recording (keeping
-    /// its trailing final). A `/voice` / toggle session (`hold` false) is left
-    /// untouched, so a Ctrl+Space release can neither cancel nor stop it.
-    pub(crate) fn voice_hold_release(&mut self) {
-        match self.voice_state {
-            VoiceState::ColdStart { hold: true, .. } => self.voice_reset(),
-            VoiceState::Recording { hold: true, .. } => self.voice_stop_keeping_final(),
-            _ => {}
-        }
-    }
     /// Whether the active view still owns the bound dictation `target` — i.e. the
     /// box dictation started in is the one currently on screen and selected. The
     /// target is bound at capture start; on the dashboard that means dispatch
@@ -2608,7 +2444,9 @@ impl AppView {
     /// stop controls and the recording session aligned. Event-loop each tick;
     /// no-op unless recording.
     pub fn enforce_voice_session_bound(&mut self) {
-        if !self.voice_state.listening() || self.voice_target_on_active_surface() {
+        if !(self.voice_state.is_listening() || self.voice_state.blocks_new_capture())
+            || self.voice_target_on_active_surface()
+        {
             return;
         }
         self.voice_reset();
@@ -2630,6 +2468,10 @@ impl AppView {
             Some(InputOutcome::Action(Action::VoiceToggle))
         } else if self.voice_state.pending_cold_start() {
             self.voice_reset();
+            Some(InputOutcome::Changed)
+        } else if self.voice_state.blocks_new_capture() {
+            self.voice_reset();
+            self.show_toast(crate::voice::RECORDING_DISCARDED_TOAST);
             Some(InputOutcome::Changed)
         } else {
             None
@@ -2653,7 +2495,7 @@ impl AppView {
     /// tracing pane (step 1a consumes all non-global keys), the cloud modal
     /// (step 1d), the import-Claude modal (agent-arm intercept),
     /// [`Self::voice_esc_outcome`] — listening OR pending cold-start, the
-    /// handler's actual condition, not the render-only recording flag — and
+    /// handler's actual condition, plus an outstanding clip, not the render-only recording flag — and
     /// the dashboard's attached-agent popup (dashboard-arm intercept). Keep
     /// this list in lockstep with those intercepts when adding a top-level
     /// Esc owner.
@@ -2671,6 +2513,7 @@ impl AppView {
             || self.import_claude_modal.is_some()
             || self.voice_listening()
             || self.voice_state.pending_cold_start()
+            || self.voice_state.blocks_new_capture()
     }
     /// Commit interim on real send keys only (not multiline bare Enter).
     fn maybe_commit_voice_interim_before_submit_key(&mut self, key: &crossterm::event::KeyEvent) {
@@ -6099,8 +5942,9 @@ impl AppView {
     /// when a pending action expires (to clear the "press again" hint),
     /// or when new tracing entries arrive via the channel.
     pub fn tick(&mut self) -> bool {
+        self.fps_hud.note_tick();
         let mut needs_redraw = false;
-        needs_redraw |= self.minimal_state.transcript.is_some();
+        needs_redraw |= self.minimal_state.needs_frames();
         needs_redraw |= self.poll_clipboard_focus_tip();
         if matches!(self.active_view, ActiveView::Welcome) {
             self.welcome_tick = self.welcome_tick.wrapping_add(1);
@@ -6382,7 +6226,7 @@ impl AppView {
         if self.gboom_active() {
             return Some(std::time::Duration::from_millis(33));
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return Some(std::time::Duration::from_millis(16));
         }
         None
@@ -6459,7 +6303,7 @@ impl AppView {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return TickDemand::Fast;
         }
         if self
@@ -7086,6 +6930,9 @@ pub(crate) mod tests {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            voice_session: xai_grok_voice::VoiceSessionId::default(),
+            voice_trailing_final: None,
+            voice_clip_deadline: None,
         }
     }
     pub(crate) fn test_app_with_agent() -> AppView {
@@ -7118,6 +6965,7 @@ pub(crate) mod tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                pending_context_switch: None,
                 hook_block_hold: false,
                 blocked_prompt: None,
                 provider_rebind_pending: false,
@@ -7392,6 +7240,7 @@ pub(crate) mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,
@@ -9825,7 +9674,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::DashboardDispatch,
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         assert!(app.esc_owned_before_agent(), "listening owns Esc");
         app.voice_state = VoiceState::ColdStart {
@@ -11792,7 +11642,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::DashboardDispatch,
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
@@ -11848,7 +11699,8 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.voice_state = VoiceState::Stopping {
             target: VoiceTarget::Agent(id),
-            interim: Some("partial".into()),
+            partial: crate::app::app_view::Partial::Shown("partial".into()),
+            route: None,
         };
         app.active_view = ActiveView::Agent(id);
         assert!(
@@ -11874,7 +11726,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::Agent(id),
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         app.active_view = ActiveView::Agent(id);
         app.dashboard = Some(crate::views::dashboard::DashboardState::new());

@@ -1219,6 +1219,7 @@ pub(crate) async fn read_mcp_resource(
         )
     };
 
+    let _request = client.begin_outbound_request();
     let mcp_service = client
         .ensure_initialized()
         .await
@@ -1318,6 +1319,7 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
 
         let mut resources = Vec::new();
         for (server_name, client) in clients {
+            let _request = client.begin_outbound_request();
             let mcp_service = match client.ensure_initialized().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1373,6 +1375,7 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
             )
         };
 
+        let _request = client.begin_outbound_request();
         let mcp_service = client
             .ensure_initialized()
             .await

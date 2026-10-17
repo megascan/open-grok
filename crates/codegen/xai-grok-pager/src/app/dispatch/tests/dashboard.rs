@@ -276,7 +276,8 @@ fn voice_final_appends_to_dashboard_dispatch() {
     app.dashboard.as_mut().unwrap().dispatch.set_text("fix");
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::DashboardDispatch,
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -314,7 +315,8 @@ fn voice_final_appends_to_peek_reply_when_peek_open() {
     dash.peek_reply.set_text("reply");
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::DashboardPeekReply(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -358,7 +360,8 @@ fn voice_final_discarded_when_peek_row_changed_after_stop() {
     ensure_dashboard_state(&mut app);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::DashboardPeekReply(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.dashboard.as_mut().unwrap().peek = Some(peek_for(DashboardRowId::TopLevel(AgentId(1))));
     crate::voice::handle_voice_event(
@@ -384,7 +387,8 @@ fn voice_dashboard_dispatch_submit_tears_down_voice() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardDispatch,
-        interim: Some("the build".into()),
+        partial: crate::app::app_view::Partial::Shown("the build".into()),
+        route: None,
     };
     let _ = dispatch_dashboard_dispatch(&mut app, "fix the build".into(), false);
     assert!(!app.voice_listening(), "submit stops capture");
@@ -395,7 +399,7 @@ fn voice_dashboard_dispatch_submit_tears_down_voice() {
     assert!(app.voice_interim().is_none());
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
     crate::voice::handle_voice_event(
         &mut app,
@@ -442,7 +446,8 @@ fn voice_dashboard_peek_reply_submit_tears_down_voice() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardPeekReply(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     let _ = dispatch_dashboard_peek_reply(
         &mut app,
@@ -457,7 +462,7 @@ fn voice_dashboard_peek_reply_submit_tears_down_voice() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
 }
 #[test]
@@ -529,7 +534,8 @@ fn voice_auto_stops_when_peek_row_changes() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardPeekReply(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.dashboard.as_mut().unwrap().peek = Some(peek_for(DashboardRowId::TopLevel(AgentId(0))));
     app.enforce_voice_session_bound();
@@ -559,7 +565,8 @@ fn voice_suppressed_while_dashboard_popup_open() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardDispatch,
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.enforce_voice_session_bound();
     assert!(

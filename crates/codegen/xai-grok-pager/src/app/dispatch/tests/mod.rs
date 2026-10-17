@@ -372,6 +372,9 @@ fn test_app() -> AppView {
         voice_auth: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
+        voice_session: xai_grok_voice::VoiceSessionId::default(),
+        voice_trailing_final: None,
+        voice_clip_deadline: None,
     }
 }
 /// Build a default `AgentSession` for
@@ -407,6 +410,7 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
         hook_block_hold: false,
         blocked_prompt: None,
         provider_rebind_pending: false,
@@ -700,6 +704,7 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,
@@ -848,6 +853,7 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,
@@ -1032,6 +1038,7 @@ fn enqueue_permission_with_enable_always_approve(
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });
@@ -1171,6 +1178,7 @@ fn push_synthetic_permission(
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     };

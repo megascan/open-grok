@@ -484,6 +484,7 @@ mod tests {
             team_blocked_reasons: vec![],
             coding_data_retention_opt_out: false,
             has_grok_code_access: None,
+            can_administer_team: None,
             refresh_token: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             oidc_issuer: None,

@@ -413,6 +413,8 @@ pub(super) fn extensions_modal_tab_fetches(
         Effect::FetchSkillsList {
             agent_id,
             session_id: session_id.clone(),
+            refresh: false,
+            fetch: modal.next_skills_fetch(),
         },
         Effect::FetchWorkflowsList {
             agent_id,
@@ -821,26 +823,40 @@ pub(super) fn handle_marketplace_list_loaded(
 pub(super) fn handle_skills_toggle_done(
     app: &mut AppView,
     agent_id: AgentId,
-    result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+    session_id: acp::SessionId,
+    fetch: u64,
+    result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
 ) -> Vec<Effect> {
-    use crate::views::extensions_modal::TabDataState;
-    if let Some(agent) = app.agents.get_mut(&agent_id)
-        && let Some(ref mut modal) = agent.extensions_modal
-    {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        return vec![];
+    }
+    let Some(modal) = agent.extensions_modal.as_mut() else {
+        return vec![];
+    };
+    let latest = fetch == modal.skills_fetch;
+    if latest {
         modal.pending_action = None;
         modal.pending_entry_index = None;
-        match result {
-            Ok(skills) => {
-                modal.seed_skills_groups_once(&skills);
-                modal.skills_data = TabDataState::Loaded(skills);
-            }
-            Err(e) => {
-                modal.modal_message = Some(crate::views::extensions_modal::ModalMessage::Error(e));
-            }
-        }
     }
-    // The toggle effect already called x.ai/skills/refresh-baseline
-    // which triggers the session to reload skills and push an
-    // AvailableCommandsUpdate notification with the updated list.
+    match result {
+        Ok(listing) if latest => modal.apply_skills_listing(listing),
+        Ok(_) => {
+            // A newer read may have raced the mutation. Read again after the toggle commits.
+            let fetch = modal.next_skills_fetch();
+            return vec![Effect::FetchSkillsList {
+                agent_id,
+                session_id,
+                refresh: true,
+                fetch,
+            }];
+        }
+        Err(error) if latest => {
+            modal.modal_message = Some(crate::views::extensions_modal::ModalMessage::Error(error));
+        }
+        Err(_) => {}
+    }
     vec![]
 }

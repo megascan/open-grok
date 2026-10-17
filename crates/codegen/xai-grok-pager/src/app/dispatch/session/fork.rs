@@ -306,6 +306,7 @@ fn build_fork_placeholder(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,

@@ -85,6 +85,19 @@ impl HookRegistry {
         out
     }
 
+    pub fn has_layer(&self, layer: config::HookProvenance) -> bool {
+        self.hooks
+            .values()
+            .flatten()
+            .any(|spec| spec.layer == layer)
+    }
+
+    pub fn remove_layer(&mut self, layer: config::HookProvenance) {
+        for specs in self.hooks.values_mut() {
+            specs.retain(|spec| spec.layer != layer);
+        }
+    }
+
     pub fn remove_by_prefix(&mut self, prefix: &str) {
         for specs in self.hooks.values_mut() {
             specs.retain(|s| !s.name.starts_with(prefix));

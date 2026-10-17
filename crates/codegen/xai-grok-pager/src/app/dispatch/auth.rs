@@ -130,6 +130,24 @@ pub(super) fn dispatch_login_codex(app: &mut AppView) -> Vec<Effect> {
     }]
 }
 
+/// External account operations are initiated only by an explicit UI action.
+pub(super) fn dispatch_antigravity_auth(app: &mut AppView, logout: bool) -> Vec<Effect> {
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    };
+    app.show_toast(if logout {
+        "Signing out of Antigravity…"
+    } else {
+        "Starting Antigravity sign-in…"
+    });
+    if logout {
+        vec![Effect::LogoutAntigravity { agent_id }]
+    } else {
+        vec![Effect::LoginAntigravity { agent_id }]
+    }
+}
+
 /// Select and persist a visible model paired with a first-run provider.
 ///
 /// The ACP catalog is already filtered for authentication, hidden models, and

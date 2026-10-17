@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::output::{MCPOutput, ToolOutput};
 use crate::types::tool::{ToolKind, ToolNamespace};
-use crate::util::mcp_structured_content::render_structured_content;
 use crate::util::mcp_truncate::{McpTruncateContext, truncate_tool_output};
+use xai_tool_runtime::render_structured_content;
 
 /// Wire name of the MCP dispatch tool. UIs special-case it: while its
 /// arguments stream, the target tool's name is still inside them, so the

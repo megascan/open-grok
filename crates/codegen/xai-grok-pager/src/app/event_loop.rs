@@ -632,6 +632,9 @@ impl Presenter {
             |force| {
                 if force {
                     let _ = terminal.clear();
+                    for agent in app.agents.values_mut() {
+                        agent.forget_transmitted_inline_media();
+                    }
                 }
                 app.draw(terminal);
             },
@@ -1971,7 +1974,7 @@ pub(crate) async fn run(
     // capture is compiled in: true for production CLI builds on macOS/Windows
     // (cpal) and Linux (subprocess recorder), false for Bazel builds (no
     // capture in the test sandbox).
-    let mut voice_rx = None::<tokio::sync::mpsc::Receiver<xai_grok_voice::VoiceEvent>>;
+    let mut voice_rx = None::<tokio::sync::mpsc::Receiver<xai_grok_voice::TaggedVoiceEvent>>;
     let voice_auth_factory = connection.auth_manager.clone();
 
     // Animation tick: only scheduled when there are running entries.
@@ -2381,17 +2384,17 @@ pub(crate) async fn run(
         // bound target forward into the live recording it spawns.
         if let VoiceState::ColdStart { hold, target } = app.voice_state {
             if app.voice_cmd_tx.is_none() && app.voice_can_start_pipeline() {
-                let voice_auth = crate::voice::build_voice_auth(voice_auth_factory.clone());
+                let stt_routes = crate::voice::build_stt_routes(voice_auth_factory.clone());
+                app.voice_auth = Some(stt_routes.auth.clone());
                 let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
                 let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
                 let voice_config = app.voice_config.clone();
                 tokio::spawn(xai_grok_voice::run_voice_pipeline(
                     voice_config,
-                    voice_auth.clone(),
+                    stt_routes,
                     cmd_rx,
                     event_tx,
                 ));
-                app.voice_auth = Some(voice_auth);
                 app.voice_cmd_tx = Some(cmd_tx);
                 voice_rx = Some(event_rx);
                 tracing::info!("voice pipeline started (/voice or Ctrl+Space)");
@@ -2429,6 +2432,7 @@ pub(crate) async fn run(
 
         // Stop voice if the user has left the recording session (see method).
         app.enforce_voice_session_bound();
+        app.voice_expire_outstanding_clip(std::time::Instant::now());
 
         // Keep the /gboom keyboard layer in sync with whether the game is
         // open, so WASD emit releases while it runs and the layer is popped
@@ -2622,8 +2626,82 @@ pub(crate) async fn run(
                 presenter.acknowledge(sequence);
             }
 
-            // Biased order: cancellation/quit, writer acks/failures, ACP,
-            // task/progress results, updates, input, and render/poll timers all
+            // Self-limiting draw and animation timers must run during sustained ACP traffic.
+            // Scroll clock: flush residual wheel/trackpad lines and detect
+            // the 80ms stream gap on the 16ms redraw cadence, not the slower
+            // animation fps. The next deadline is re-derived at loop top
+            // from the post-tick scroll state.
+            _ = scroll_tick, if input_rx.is_empty() => {
+                if app.tick_scroll() {
+                    presenter.request(false);
+                }
+                // Scroll dispatch can start work that animates (e.g. viewport
+                // state), so keep the animation arm in sync too.
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+            }
+
+            // Deferred draw: fires when an ACP-triggered draw was throttled.
+            _ = deferred_draw => {
+                presenter.draw_scheduled_at = None;
+                presenter.request(false);
+            }
+
+            _ = animation_tick => {
+                animation_tick_at = None;
+                // Lost-cancel recovery: re-send cancels for panes still
+                // cancelling past the grace (`dispatch::reconcile_overdue_cancels`).
+                // `needs_animation()` keeps ticks alive while either recovery
+                // is armed, so these checks cannot be starved.
+                if let Some(resends) = dispatch::reconcile_overdue_cancels(&mut app)
+                    && process_effects(resends, &mut tasks, &mut app, &progress_tx)
+                {
+                    break;
+                }
+                // Lost-response recovery: finish any turn whose
+                // `prompt_complete` broadcast outlived the grace window
+                // without its `session/prompt` RPC response arriving
+                // (see `dispatch::reconcile_overdue_turn_ends`).
+                let reconciled = dispatch::reconcile_overdue_turn_ends(&mut app);
+                // The reconcile drains queues outside any dispatched action; its image notices show now.
+                let notice_shown = app.flush_image_notices_if_root();
+                if let Some(effs) = reconciled {
+                    if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                        break;
+                    }
+                    presenter.request(false);
+                } else {
+                    let ticked = app.tick();
+                    if ticked || notice_shown {
+                        presenter.request(false);
+                    }
+                }
+                // Keep ticking as long as there are running animations
+                // or pending actions waiting to expire.
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+            }
+
+            // Avoid painting an intermediate size while input still contains resize events.
+            _ = resize_debounce, if input_rx.is_empty() => {
+                resize_debounce_at = None;
+                presenter.request(false);
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+            }
+
+            // Refresh without waiting for an ACP stream to become idle.
+            _ = status_line_refresh => {
+                status_line_refresh_at = None;
+                app.note_status_line_refresh_due();
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+                if app.status_line.take_changed() {
+                    presenter.request(false);
+                }
+                if let Some(interval) = status_line_refresh_interval {
+                    status_line_refresh_at = Some(Instant::now() + interval);
+                }
+            }
+
+            // Biased order: cancellation/quit, writer acks, timers, ACP,
+            // task/progress results, updates, input, and polling timers all
             // precede the deliberately-last voice STT arm (see its note below).
 
             // Gated on empty terminal input: a token firehose keeps this arm
@@ -2837,82 +2915,10 @@ pub(crate) async fn run(
                 sync_appearance_watcher(&mut appearance_watcher);
             }
 
-            // Debounced resize: draw once the terminal size has stabilized.
-            _ = status_line_refresh => {
-                status_line_refresh_at = None;
-                app.note_status_line_refresh_due();
-                schedule_tick(&mut animation_tick_at, &app, tick_interval);
-                if app.status_line.take_changed() {
-                    presenter.request(false);
-                }
-                if let Some(interval) = status_line_refresh_interval {
-                    status_line_refresh_at = Some(Instant::now() + interval);
-                }
-            }
-
-            _ = resize_debounce => {
-                resize_debounce_at = None;
-                presenter.request(false);
-                schedule_tick(&mut animation_tick_at, &app, tick_interval);
-            }
-
-            // Deferred draw: fires when an ACP-triggered draw was throttled.
-            _ = deferred_draw => {
-                presenter.draw_scheduled_at = None;
-                presenter.request(false);
-            }
-
             // Only opens the gate; the next loop-top attempt owns the blocking
             // handoff so no select arm performs it inline.
             _ = suspend_retry => {
                 suspend_retry_after = None;
-            }
-
-            // Scroll clock: flush residual wheel/trackpad lines and detect
-            // the 80ms stream gap on the 16ms redraw cadence, not the slower
-            // animation fps. The next deadline is re-derived at loop top
-            // from the post-tick scroll state.
-            _ = scroll_tick => {
-                if app.tick_scroll() {
-                    presenter.request(false);
-                }
-                // Scroll dispatch can start work that animates (e.g. viewport
-                // state), so keep the animation arm in sync too.
-                schedule_tick(&mut animation_tick_at, &app, tick_interval);
-            }
-
-            _ = animation_tick => {
-                animation_tick_at = None;
-                // Lost-cancel recovery: re-send cancels for panes still
-                // cancelling past the grace (`dispatch::reconcile_overdue_cancels`).
-                // `needs_animation()` keeps ticks alive while either recovery
-                // is armed, so these checks cannot be starved.
-                if let Some(resends) = dispatch::reconcile_overdue_cancels(&mut app)
-                    && process_effects(resends, &mut tasks, &mut app, &progress_tx)
-                {
-                    break;
-                }
-                // Lost-response recovery: finish any turn whose
-                // `prompt_complete` broadcast outlived the grace window
-                // without its `session/prompt` RPC response arriving
-                // (see `dispatch::reconcile_overdue_turn_ends`).
-                let reconciled = dispatch::reconcile_overdue_turn_ends(&mut app);
-                // The reconcile drains queues outside any dispatched action; its image notices show now.
-                let notice_shown = app.flush_image_notices_if_root();
-                if let Some(effs) = reconciled {
-                    if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-                        break;
-                    }
-                    presenter.request(false);
-                } else {
-                    let ticked = app.tick();
-                    if ticked || notice_shown {
-                        presenter.request(false);
-                    }
-                }
-                // Keep ticking as long as there are running animations
-                // or pending actions waiting to expire.
-                schedule_tick(&mut animation_tick_at, &app, tick_interval);
             }
 
             _ = billing_poll => {
@@ -3391,7 +3397,7 @@ pub(crate) async fn run(
             } => {
                 match ev {
                     Some(ev) => {
-                        let needs_draw = crate::voice::handle_voice_event(&mut app, ev);
+                        let needs_draw = crate::voice::handle_tagged_voice_event(&mut app, ev);
                         if needs_draw {
                             schedule_tick(&mut animation_tick_at, &app, tick_interval);
                             let now = Instant::now();

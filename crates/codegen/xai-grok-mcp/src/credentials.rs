@@ -1,6 +1,6 @@
 //! Persistent credential storage for MCP server OAuth tokens.
 //!
-//! Credentials are stored in `$GROK_HOME/mcp_credentials.json`, keyed by a
+//! Credentials are stored in `$OPENGROK_HOME/mcp_credentials.json`, keyed by a
 //! composite key derived from the server name and URL. This keeps MCP OAuth
 //! tokens isolated from the user's xAI auth (`auth.json`).
 //!
@@ -58,10 +58,10 @@ pub enum McpCredentialError {
     Other(String),
 }
 
-/// File name for the credential store inside `$GROK_HOME`.
+/// File name for the credential store inside `$OPENGROK_HOME`.
 const CREDENTIALS_FILENAME: &str = "mcp_credentials.json";
 
-/// On-disk credential store: `$GROK_HOME/mcp_credentials.json`.
+/// On-disk credential store: `$OPENGROK_HOME/mcp_credentials.json`.
 ///
 /// Stores rmcp `StoredCredentials` per MCP server, keyed by
 /// `"{server_name}:{server_url}"`.
@@ -85,7 +85,7 @@ impl McpCredentialStore {
         format!("{}:{}", server_name, server_url)
     }
 
-    /// Load the credential store from the default path (`$GROK_HOME/mcp_credentials.json`).
+    /// Load the credential store from the default path (`$OPENGROK_HOME/mcp_credentials.json`).
     ///
     /// Returns an empty store if the file does not exist.
     pub fn load_default() -> Result<Self> {
@@ -117,7 +117,7 @@ impl McpCredentialStore {
     /// Save the credential store to the default path.
     pub fn save_default(&self) -> Result<()> {
         let path = Self::default_path().ok_or_else(|| {
-            McpCredentialError::Other("no user grok home (set $GROK_HOME or $HOME)".into())
+            McpCredentialError::Other("no user Open Grok home (set $OPENGROK_HOME)".into())
         })?;
         self.save_to(&path)
     }
@@ -129,7 +129,7 @@ impl McpCredentialStore {
     /// back to mutating `self` and saving best-effort — the pre-lock behavior.
     fn locked_mutate_and_save(&mut self, mutate: &dyn Fn(&mut Self)) -> Result<()> {
         let path = Self::default_path().ok_or_else(|| {
-            McpCredentialError::Other("no user grok home (set $GROK_HOME or $HOME)".into())
+            McpCredentialError::Other("no user Open Grok home (set $OPENGROK_HOME)".into())
         })?;
         match acquire_store_lock(&path) {
             Some(_lock) => {
@@ -237,7 +237,7 @@ impl McpCredentialStore {
         self.entries.is_empty()
     }
 
-    /// Default path: `$GROK_HOME/mcp_credentials.json`.
+    /// Default path: `$OPENGROK_HOME/mcp_credentials.json`.
     fn default_path() -> Option<PathBuf> {
         Some(xai_grok_config::user_grok_home()?.join(CREDENTIALS_FILENAME))
     }
@@ -290,24 +290,12 @@ fn acquire_store_lock(store_path: &Path) -> Option<std::fs::File> {
 
 /// Config URLs can embed secrets.
 fn write_owner_only_atomic(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write;
-
     let parent = match path.parent() {
         Some(value_p) if !value_p.as_os_str().is_empty() => value_p,
         _ => Path::new("."),
     };
     std::fs::create_dir_all(parent)?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    tmp.write_all(content.as_bytes())?;
-    tmp.flush()?;
-    tmp.persist(path).map_err(|value_e| value_e.error)?;
+    xai_grok_config::fs_atomic::write_user_file_atomically(path, content, Some(0o600))?;
     Ok(())
 }
 
@@ -461,7 +449,7 @@ mod tests {
     }
 
     /// Raw JSON fixture in the exact shape rmcp 0.17 persisted to
-    /// `$GROK_HOME/mcp_credentials.json`. Existing credential files must keep
+    /// `$OPENGROK_HOME/mcp_credentials.json`. Existing credential files must keep
     /// loading across rmcp upgrades (2.1's `OAuthTokenResponse` gained vendor
     /// extra token fields), so this must be a string literal — never JSON
     /// serialized by the current code.
@@ -521,9 +509,8 @@ mod tests {
 
     #[test]
     fn save_and_load_from_file() {
-        let dir = std::env::temp_dir().join("grok-mcp-credentials-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test_creds.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_creds.json");
 
         let mut store = McpCredentialStore::default();
         let url = Url::parse("https://test.example.com/mcp").unwrap();
@@ -532,9 +519,6 @@ mod tests {
 
         let loaded = McpCredentialStore::load_from(&path).unwrap();
         assert!(loaded.get("test", &url).is_some());
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[cfg(unix)]

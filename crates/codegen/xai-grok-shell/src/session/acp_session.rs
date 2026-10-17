@@ -245,6 +245,8 @@ use notification_drain::*;
 #[path = "acp_session_impl/extensions.rs"]
 mod extensions;
 use extensions::*;
+#[path = "acp_session_impl/batch_memory_dream.rs"]
+mod batch_memory_dream;
 #[path = "acp_session_impl/memory_dream.rs"]
 mod memory_dream;
 use memory_dream::*;
@@ -731,6 +733,8 @@ pub(crate) struct PreparedToolCall {
     dispatch_target_name: Option<String>,
     /// Read-only per `ToolKind`; decides whether the call takes the per-file lock.
     is_read_only: bool,
+    /// Pathless edits (such as multi-file patches) exclude all file dispatches.
+    is_edit: bool,
     rewriting_hook: Option<String>,
     additional_context: Vec<xai_grok_hooks::dispatcher::AdditionalContext>,
 }
@@ -2144,6 +2148,9 @@ mod tool_meta_stamp_tests {
                     deny_read_globs: Arc::new(vec![]),
                     in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     user_prompt_notify: Arc::new(parking_lot::Mutex::new(None)),
+                    lease_registry: Arc::new(
+                        xai_grok_workspace::permission::PermissionLeaseRegistry::default(),
+                    ),
                 };
                 let captured: Arc<tokio::sync::Mutex<Option<acp::ToolCallUpdate>>> =
                     Arc::new(tokio::sync::Mutex::new(None));

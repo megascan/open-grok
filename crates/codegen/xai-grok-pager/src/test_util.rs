@@ -33,6 +33,7 @@ pub fn make_agent_view(session_id: Option<&str>, cwd: &str) -> crate::app::agent
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
         hook_block_hold: false,
         blocked_prompt: None,
         provider_rebind_pending: false,

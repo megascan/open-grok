@@ -33,6 +33,8 @@ async fn assert_switch_rejected_without_mutation(actor: &SessionActor) {
             42,
             None,
             None,
+            None,
+            Vec::new(),
         )
         .await
         .expect_err("an active turn must reject model mutation");
@@ -161,6 +163,8 @@ async fn idle_incompatible_model_transition_replaces_the_runtime_generation() {
                     42,
                     None,
                     None,
+                    None,
+                    Vec::new(),
                 )
                 .await
                 .expect("an idle compatible route must switch successfully");
@@ -253,6 +257,50 @@ async fn fork_snapshot_preserves_codex_model_requirement_source() {
 
             assert_eq!(policy.resolved.mode, ToolMode::CodeModeOnly);
             assert_eq!(policy.resolved.source, ToolModeSource::ModelRequirement);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn context_selection_is_applied_and_preserved_across_model_switches() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            let chosen = std::num::NonZeroU64::new(500_000).unwrap();
+            let default = std::num::NonZeroU64::new(128_000).unwrap();
+            for (requested, supported, expected) in [
+                // A persisted selection is retained when the first catalog is
+                // incomplete, without applying it to an unsupported route.
+                (Some(Some(chosen)), vec![default], 128_000),
+                (None, vec![default, chosen], 500_000),
+                (None, vec![default], 128_000),
+                (None, vec![default, chosen], 500_000),
+            ] {
+                actor
+                    .handle_set_session_model(
+                        acp::ModelId::new("replacement-model"),
+                        replacement_config("replacement-model"),
+                        false,
+                        false,
+                        true,
+                        85,
+                        None,
+                        None,
+                        requested,
+                        supported,
+                    )
+                    .await
+                    .expect("idle model switch succeeds");
+                let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                assert_eq!(cfg.context_window.get(), expected);
+                assert_eq!(
+                    actor
+                        .compaction
+                        .context_window_selection
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    500_000
+                );
+            }
         })
         .await;
 }

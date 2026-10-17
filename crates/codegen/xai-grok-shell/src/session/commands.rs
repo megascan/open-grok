@@ -472,6 +472,8 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
+        context_window_selection: Option<Option<std::num::NonZeroU64>>,
+        supported_context_windows: Vec<std::num::NonZeroU64>,
         /// Catalog key selected by the user. This remains distinct from
         /// `sampling_config.model`, which is the provider routing slug and may
         /// be shared by multiple catalog entries with different metadata.

@@ -117,6 +117,8 @@ pub struct WorkspaceBindConfig {
     /// Initial auto-approve (YOLO) state. `None` on legacy payloads →
     /// fail-closed (false).
     pub yolo_mode: Option<bool>,
+    /// Owner's ceiling on remembered grants and unattended calls.
+    pub tool_approval_policy: xai_tool_runtime::ToolApprovalPolicy,
     /// Plane-configured toolset in the gRPC wire shape. An empty list is
     /// treated as unset (proto3 repeated default).
     pub tools: Option<Vec<xai_grok_tools_api::ToolConfigEntry>>,
@@ -179,6 +181,11 @@ impl WorkspaceBindConfig {
                 .and_then(|v| parse_field("tool_config", v)),
             viewer_ctx: wire.viewer_ctx,
             yolo_mode: wire.yolo_mode,
+            tool_approval_policy: match wire.tool_approval_policy {
+                Some(Ok(policy)) => policy,
+                Some(Err(_)) => xai_tool_runtime::ToolApprovalPolicy::AlwaysPrompt,
+                None => xai_tool_runtime::ToolApprovalPolicy::GrantsAllowed,
+            },
             tools: Some(wire.tools).filter(|tools| !tools.is_empty()),
             manifest_version: wire.manifest_version,
             manifest_hash: wire.manifest_hash,
@@ -374,6 +381,24 @@ mod bind_config_tests {
         let v = serde_json::json!({"preset": "explore", "yolo_mode": true});
         let cfg = WorkspaceBindConfig::from_metadata(&v);
         assert_eq!(cfg.yolo_mode, Some(true));
+    }
+
+    #[test]
+    fn workspace_bind_approval_policy_fails_closed_on_invalid_values() {
+        use xai_tool_runtime::ToolApprovalPolicy;
+        let parse = |value| WorkspaceBindConfig::from_metadata(&value).tool_approval_policy;
+        assert_eq!(
+            parse(serde_json::json!({})),
+            ToolApprovalPolicy::GrantsAllowed
+        );
+        assert_eq!(
+            parse(serde_json::json!({"tool_approval_policy": "unattended_allowed"})),
+            ToolApprovalPolicy::UnattendedAllowed
+        );
+        assert_eq!(
+            parse(serde_json::json!({"tool_approval_policy": "unattended"})),
+            ToolApprovalPolicy::AlwaysPrompt
+        );
     }
     #[test]
     fn workspace_bind_config_yolo_mode_omitted_or_malformed_fails_closed() {

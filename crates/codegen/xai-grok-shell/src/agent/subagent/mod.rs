@@ -46,6 +46,7 @@ use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
+mod antigravity_acp_runner;
 mod attempt_runner;
 mod child_runtime;
 mod handle_request;
@@ -483,7 +484,12 @@ impl SubagentSpawnContext {
     }
 }
 /// Shell runtime handle retained while a child is active.
-pub(crate) struct ShellChildRuntime {
+pub(crate) enum ShellChildRuntime {
+    Native(NativeChildRuntime),
+    Antigravity(CancellationToken),
+}
+
+pub(crate) struct NativeChildRuntime {
     pub child_handle: SessionHandle,
     pub _child_thread: Option<SessionThread>,
     pub provider: xai_grok_sampling_types::ModelProvider,
@@ -492,7 +498,7 @@ pub(crate) struct ShellChildRuntime {
     pub receipt_sink: mpsc::Sender<PromptTurnReceipt>,
     pub active_message_telemetry: crate::session::telemetry::ActiveAgentMessageTelemetrySource,
 }
-impl ChildControl for ShellChildRuntime {
+impl ChildControl for NativeChildRuntime {
     type ProgressFuture = LocalBoxFuture<SubagentProgress>;
     fn send_active_message(
         &self,
@@ -603,6 +609,69 @@ impl ChildControl for ShellChildRuntime {
                 ..Default::default()
             }))
             .is_ok()
+    }
+}
+
+impl ChildControl for ShellChildRuntime {
+    type ProgressFuture = LocalBoxFuture<SubagentProgress>;
+
+    fn send_active_message(
+        &self,
+        delivery: ActiveAgentMessageDelivery,
+    ) -> grok_build::task::coordinator::SendBoxFuture<
+        grok_build::task::coordinator::ActiveMessageAdmission,
+    > {
+        match self {
+            Self::Native(native) => native.send_active_message(delivery),
+            Self::Antigravity(_) => Box::pin(std::future::ready(
+                grok_build::task::coordinator::ActiveMessageAdmission::Unsupported,
+            )),
+        }
+    }
+
+    fn progress(&self) -> Self::ProgressFuture {
+        match self {
+            Self::Native(native) => native.progress(),
+            Self::Antigravity(_) => Box::pin(std::future::ready(SubagentProgress::default())),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Native(native) => native.cancel(),
+            Self::Antigravity(cancel) => cancel.cancel(),
+        }
+    }
+
+    fn interrupt(&self) -> bool {
+        match self {
+            Self::Native(native) => native.interrupt(),
+            Self::Antigravity(cancel) => {
+                cancel.cancel();
+                true
+            }
+        }
+    }
+
+    fn accepts_native_message(&self, message: &AgentMailboxMessage) -> bool {
+        match self {
+            Self::Native(native) => native.accepts_native_message(message),
+            Self::Antigravity(_) => false,
+        }
+    }
+
+    fn deliver_initial_message(&self, message: &AgentMailboxMessage) -> bool {
+        match self {
+            Self::Native(native) => native.deliver_initial_message(message),
+            Self::Antigravity(_) => false,
+        }
+    }
+
+    fn deliver_followup(&self, message: &AgentMailboxMessage) -> bool {
+        match self {
+            Self::Native(native) => native.deliver_followup(message),
+            Self::Antigravity(_) => false,
+        }
     }
 }
 #[derive(Default)]

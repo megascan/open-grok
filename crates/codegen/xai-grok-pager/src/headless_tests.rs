@@ -735,3 +735,10 @@ fn handler_answers_ext_method_instead_of_dropping() {
         serde_json::from_str(resp.0.get()).expect("typed wire reply");
     assert!(matches!(parsed, AskUserQuestionExtResponse::Cancelled));
 }
+
+#[tokio::test(start_paused = true)]
+async fn signalled_exit_bounds_a_log_flush_that_never_answers() {
+    let started = tokio::time::Instant::now();
+    super::flush_unified_log_at_exit(std::future::pending(), Some(129)).await;
+    assert_eq!(super::SIGNAL_FLUSH_TIMEOUT, started.elapsed());
+}

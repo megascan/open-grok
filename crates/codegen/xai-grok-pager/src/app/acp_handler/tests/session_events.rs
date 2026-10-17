@@ -1266,6 +1266,24 @@
     // ── handle_child_session_notification ──────────────────────────────
 
     #[test]
+    fn child_hook_annotation_is_rendered_in_live_and_replayed_views() {
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-sess-1";
+        agent.subagent_sessions.insert(child_sid.into(), make_subagent_info(child_sid));
+        agent.subagent_views.insert(child_sid.into(), Box::new(make_agent(Some(child_sid))));
+        let update = XaiSessionUpdate::HookAnnotation { message: "Child note".into() };
+        assert!(handle_child_session_notification(update.clone(), child_sid, &mut agent, false, None));
+        assert_eq!(agent.scrollback.len(), 0);
+        let child = agent.subagent_views.get_mut(child_sid).unwrap();
+        assert_eq!(child.scrollback.len(), 1);
+        let mut replayed = make_agent(Some(child_sid));
+        replayed.session.loading_replay = true;
+        assert!(apply_child_view_session_event(&mut replayed, &update, false));
+        assert_eq!(replayed.scrollback.len(), 1);
+    }
+
+
+    #[test]
     fn child_compact_completed_updates_subagent_info() {
         let mut agent = make_agent(Some("root-sess"));
         let child_sid = "child-sess-1";

@@ -29,7 +29,7 @@ use tracing::debug;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 use xai_grok_tools::types::output::{ReadFileOutput, SearchToolOutput, WebFetchOutput};
 use xai_grok_tools::util::strip_redundant_session_cd;
-use xai_tool_types::ReadLineCounts;
+use xai_tool_types::{ReadLineCounts, parse_lenient_u64_value};
 /// Convert a UTC millisecond timestamp to local time.
 fn utc_ms_to_local(ms: i64) -> DateTime<Local> {
     chrono::Utc
@@ -1632,6 +1632,16 @@ impl AcpUpdateTracker {
         scrollback: &mut ScrollbackState,
     ) -> bool {
         let text = extract_text_from_content(&chunk.content);
+        if self.skip_next_user_echo
+            && chunk
+                .meta
+                .as_ref()
+                .and_then(|m| m.get(user_message_chunk_meta::HIDE_FROM_SCROLLBACK))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        {
+            return false;
+        }
         if self.skip_next_skill_body {
             self.skip_next_skill_body = false;
             return false;
@@ -2654,13 +2664,27 @@ fn task_ids_from_raw_input(raw: &serde_json::Value) -> Vec<String> {
 fn is_bg_tool(tc: &acp::ToolCall) -> bool {
     let looks_like_execute =
         tc.kind == acp::ToolKind::Execute || is_execute_tool_function_name(&tc.title);
-    looks_like_execute
-        && tc
-            .raw_input
-            .as_ref()
-            .and_then(|v| v.get("is_background").or_else(|| v.get("background")))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+    if !looks_like_execute {
+        return false;
+    }
+    let Some(input) = tc.raw_input.as_ref() else {
+        return false;
+    };
+    raw_input_requests_background(input)
+}
+/// Uses the same precedence as `BashTool::resolve_block_until_ms`.
+/// An explicit `block_until_ms` wins over the legacy flags and `timeout: 0`.
+fn raw_input_requests_background(input: &serde_json::Value) -> bool {
+    let ms = |key: &str| input.get(key).and_then(|v| parse_lenient_u64_value(v).ok());
+    if let Some(block) = ms("block_until_ms") {
+        return block == 0;
+    }
+    let legacy_flag = input
+        .get("is_background")
+        .or_else(|| input.get("background"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    legacy_flag || ms("timeout") == Some(0)
 }
 /// Check if an Edit-kind tool call is a whole-file write (write) rather than a targeted replacement (search_replace / edit).
 ///

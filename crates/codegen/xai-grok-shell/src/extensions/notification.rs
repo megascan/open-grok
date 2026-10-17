@@ -985,6 +985,13 @@ pub enum SessionUpdate {
         /// does not support reasoning effort or no effort override was applied.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// Explicit session context window, or none for the model default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window_selection: Option<u64>,
+    },
+    /// Display-only model reported by a routing backend for this turn.
+    ServedModel {
+        display_name: String,
     },
     /// Streaming chunk of a tool call's arguments.
     ///
@@ -1272,11 +1279,29 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_sequence: Option<String>,
     },
+    /// Usage summed across the model calls in a turn.
+    TurnUsage {
+        usage: ResponseUsage,
+    },
     /// Catch-all for unrecognized session update types.
     /// Allows forward/backward compatibility when variants are added or removed.
     /// All fields from the unrecognized variant are discarded during deserialization.
     #[serde(other)]
     Unknown,
+}
+
+impl SessionUpdate {
+    pub fn model_changed(
+        model_id: impl Into<String>,
+        reasoning_effort: Option<String>,
+        context_window_selection: Option<u64>,
+    ) -> Self {
+        Self::ModelChanged {
+            model_id: model_id.into(),
+            reasoning_effort,
+            context_window_selection,
+        }
+    }
 }
 
 fn memory_files_default_true() -> bool {
@@ -2536,15 +2561,18 @@ mod tests {
         let with_effort = SessionUpdate::ModelChanged {
             model_id: "grok-4".into(),
             reasoning_effort: Some("high".into()),
+            context_window_selection: Some(500_000),
         };
         let json = serde_json::to_value(&with_effort).unwrap();
         assert_eq!(json["sessionUpdate"], "model_changed");
         assert_eq!(json["model_id"], "grok-4");
         assert_eq!(json["reasoning_effort"], "high");
+        assert_eq!(json["context_window_selection"], 500_000);
 
         let without_effort = SessionUpdate::ModelChanged {
             model_id: "grok-3".into(),
             reasoning_effort: None,
+            context_window_selection: None,
         };
         let json = serde_json::to_value(&without_effort).unwrap();
         assert_eq!(json["sessionUpdate"], "model_changed");
@@ -2566,6 +2594,7 @@ mod tests {
         let original = SessionUpdate::ModelChanged {
             model_id: "grok-4".into(),
             reasoning_effort: Some("medium".into()),
+            context_window_selection: Some(256_000),
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let parsed: SessionUpdate = serde_json::from_str(&json_str).unwrap();
@@ -2587,6 +2616,7 @@ mod tests {
             update: SessionUpdate::ModelChanged {
                 model_id: "grok-4".into(),
                 reasoning_effort: None,
+                context_window_selection: None,
             },
             meta: None,
         };

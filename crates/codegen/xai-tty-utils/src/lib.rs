@@ -40,6 +40,9 @@ use std::io;
 mod child_wait;
 pub use child_wait::{is_child_wait_identity_uncertain, spawn_child_reaper, wait_child_bounded};
 
+mod display_char;
+pub use display_char::is_unsafe_display_char;
+
 mod process_resources;
 pub use process_resources::{
     ProcessCpu, ProcessResources, process_memory_limit, process_start_time, sample_process_cpu,
@@ -710,6 +713,40 @@ impl ProcessGroup {
         }
     }
 
+    /// Whether process `pid` runs in this job: the attached child or anything it started, which
+    /// stays in the job unless it broke away. A child spawned through a launcher shim (Windows has
+    /// no `exec`) is in the job, as is the real process the shim starts, provided the shim was
+    /// attached before it started it. [`attach`](Self::attach) runs once the child is already
+    /// running, so a shim that starts its child in that window leaves the child outside the job,
+    /// and this answers `false` for it, unless the child was created suspended and resumed only
+    /// after `attach`. Treat `false` as "not known to be ours", never as proof that a process is
+    /// foreign.
+    #[cfg(windows)]
+    pub fn contains_pid(&self, pid: u32) -> io::Result<bool> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        // SAFETY: plain FFI; the handle is owned (and closed) below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .map_err(|e| io::Error::other(format!("OpenProcess({pid}): {e}")))?;
+        // SAFETY: `process` is a valid handle this function exclusively owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+        let mut in_job = windows::core::BOOL::default();
+        // SAFETY: both handles are valid for the call; `in_job` is a valid out-param.
+        unsafe {
+            IsProcessInJob(
+                windows::Win32::Foundation::HANDLE(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&process),
+                ),
+                Some(self.job),
+                &mut in_job,
+            )
+        }
+        .map_err(|e| io::Error::other(format!("IsProcessInJob({pid}): {e}")))?;
+        Ok(in_job.as_bool())
+    }
+
     pub fn terminate(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -836,10 +873,6 @@ impl Drop for ProcessGroup {
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.job) };
     }
 }
-
-// ---------------------------------------------------------------------------
-// Environment variable helpers
-// ---------------------------------------------------------------------------
 
 /// Returns environment variables that prevent CLI tools from launching any
 /// interactive program that would block waiting for user input — pagers,

@@ -534,6 +534,9 @@ fn fork_summary(
     let resolved_tool_policy = (target_model_id == source_model_id)
         .then_some(source.resolved_tool_policy)
         .flatten();
+    let context_window_selection = (target_model_id == source_model_id)
+        .then_some(source.context_window_selection)
+        .flatten();
     // Compute before moving `source` fields that do not implement Copy.
     let cache_affinity_id = Some(source.prompt_cache_affinity_id());
     let target_worktree_identity =
@@ -550,6 +553,7 @@ fn fork_summary(
         num_messages: counters.num_messages,
         num_chat_messages: counters.num_chat_messages,
         current_model_id: target_model_id,
+        context_window_selection,
         resolved_tool_policy,
         previous_turn_model: source.previous_turn_model,
         ever_used_codex: source.ever_used_codex,

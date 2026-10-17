@@ -169,6 +169,7 @@ impl AgentView {
                 }
                 if let Some(opt) = perm.options.get(perm.active_idx)
                     && opt.kind == agent_client_protocol::PermissionOptionKind::RejectOnce
+                    && opt.option_id.0.as_ref() != "sandbox:deny"
                     && crate::input::key::is_text_input_key(key)
                     && matches!(key.code, KeyCode::Char(c) if !c.is_ascii_digit())
                 {
@@ -1104,7 +1105,9 @@ impl AgentView {
             if ev.is_url_waiting() {
                 return false;
             }
-            if let Some(mut ev) = self.elicitation_view.take() {
+            if let Some(mut ev) = self.take_unanswered_elicitation(
+                crate::app::agent_view::UnansweredElicitation::ClosedElsewhere,
+            ) {
                 let _ = ev.take_response_tx();
                 self.restore_elicitation_prompt(ev.stashed_prompt);
             }
@@ -1416,6 +1419,7 @@ mod cancel_turn_mouse_tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                pending_context_switch: None,
                 hook_block_hold: false,
                 blocked_prompt: None,
                 provider_rebind_pending: false,

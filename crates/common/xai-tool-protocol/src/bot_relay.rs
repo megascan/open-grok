@@ -16,6 +16,9 @@ pub const BOT_RELAY_CAPABILITIES: &[&str] = &[
     Method::BotEvent.as_wire_str(),
 ];
 pub const BOT_EVENT_ENVELOPE_V: u32 = 1;
+
+/// Reserved client-nonce prefix for hub-originated chat prompts.
+pub const GROK_CHAT_CLIENT_NONCE_PREFIX: &str = "grok-chat.";
 pub const COMMAND_REJECTED_NOT_YET_ENABLED: &str = "not_yet_enabled";
 pub const COMMAND_REJECTED_AGENT_ID_MISMATCH: &str = "agent_id_mismatch";
 pub const COMMAND_REJECTED_ARGS_TOO_LARGE: &str = "args_too_large";

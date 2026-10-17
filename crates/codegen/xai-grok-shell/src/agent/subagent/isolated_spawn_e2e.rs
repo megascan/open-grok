@@ -169,7 +169,7 @@ impl ChildRunner for Runner {
     ) -> Self::RunFuture {
         let ctx = self.ctx.lock().take().expect("run context");
         let gateway = self.gateway.clone();
-        Box::pin(async move { run_shell_child(run, ctx, &gateway).await })
+        Box::pin(async move { run_shell_child(run, ctx, &gateway, None).await })
     }
     fn validate_type(
         &self,

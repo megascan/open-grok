@@ -130,7 +130,9 @@ impl AgentView {
         if self.active_subagent.as_deref() != Some(child_sid.as_str()) {
             self.close_subagent_fullscreen();
         }
-        crate::app::subagent::ensure_subagent_child_replayed(self, &child_sid);
+        // A failed or empty disk read remains retryable; the existing live view
+        // is still useful, so opening it does not depend on replay succeeding.
+        let _ = crate::app::subagent::ensure_subagent_child_replayed(self, &child_sid);
         self.active_subagent = Some(child_sid);
     }
 
@@ -1032,7 +1034,7 @@ impl AgentView {
         let model_id = self
             .session
             .models
-            .current_model_name()
+            .footer_model_name()
             .unwrap_or_else(|| "unknown".to_string());
         let effective_plan = self.plan_mode_pending.unwrap_or(self.plan_mode_active);
         let casual_commenting = self.is_casual_commenting();
@@ -1434,6 +1436,12 @@ impl AgentView {
             1
         };
         let voice_recording_height = if voice_listening { 1 } else { 0 };
+        let model_notice = self.session.models.current_notice();
+        let model_notice_height = model_notice.as_ref().map_or(0, |notice| {
+            let text_width =
+                inner_width.saturating_sub(layout_cfg.block_pad_left + layout_cfg.block_pad_right);
+            crate::views::model_notice_banner::height(notice, text_width)
+        });
         let _tool_usage_height = 0u16;
         let btw_height =
             crate::views::btw_overlay::btw_panel_height(self.btw_state.as_ref(), inner_width);
@@ -1483,6 +1491,7 @@ impl AgentView {
                 follow_ups_height,
                 0,
                 prompt_gap,
+                model_notice_height,
                 voice_recording_height,
                 1,
                 dock_height,
@@ -2599,6 +2608,17 @@ impl AgentView {
             }
         }
         self.draw_plugin_cta(buf, layout.plugin_cta, &theme);
+        if let Some(notice) = &model_notice {
+            let row = layout.model_notice;
+            let inset = Rect {
+                x: row.x.saturating_add(layout_cfg.block_pad_left),
+                width: row
+                    .width
+                    .saturating_sub(layout_cfg.block_pad_left + layout_cfg.block_pad_right),
+                ..row
+            };
+            crate::views::model_notice_banner::render(inset, buf, notice);
+        }
         if voice_listening && layout.voice_recording.height > 0 && layout.voice_recording.width > 0
         {
             let rec_area = layout.voice_recording;
@@ -2775,6 +2795,12 @@ impl AgentView {
                     &theme,
                     prompt_focused,
                 );
+                if let Some(perm) = self.permission_queue.front_mut() {
+                    perm.sandbox_visible_area = (prompt_focused
+                        && crate::app::sandbox_permission::is_sandbox(&perm.request.request)
+                        && crate::views::permission_view::sandbox_card_fits(perm, perm_area))
+                    .then_some(perm_area);
+                }
                 if let Some(ref iarea) = render_result.inline_prompt {
                     let row_bg = theme.bg_visual;
                     let remaining_h = (perm_area.y + perm_area.height).saturating_sub(iarea.y);
@@ -3663,6 +3689,8 @@ impl AgentView {
                 .is_some_and(|p| p.focus != PlanApprovalFocus::Preview);
             let overlay_bottom = if layout.turn_status.height > 0 {
                 layout.turn_status.y
+            } else if layout.model_notice.height > 0 {
+                layout.model_notice.y
             } else if layout.voice_recording.height > 0 {
                 layout.voice_recording.y
             } else {

@@ -60,6 +60,7 @@ pub(super) fn make_session(session_id: Option<&str>) -> AgentSession {
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
         hook_block_hold: false,
         blocked_prompt: None,
         provider_rebind_pending: false,
@@ -1989,6 +1990,7 @@ pub(super) fn model_changed_ext(
         update: XaiSessionUpdate::ModelChanged {
             model_id: model_id.to_string(),
             reasoning_effort: reasoning_effort.map(String::from),
+            context_window_selection: None,
         },
         meta: None,
     };
@@ -2005,6 +2007,7 @@ pub(super) fn model_changed_ext_with_event(
         update: XaiSessionUpdate::ModelChanged {
             model_id: model_id.to_string(),
             reasoning_effort: None,
+            context_window_selection: None,
         },
         meta: Some(serde_json::json!({ "eventId": event_id })),
     };

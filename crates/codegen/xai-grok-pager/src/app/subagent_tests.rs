@@ -39,6 +39,7 @@ fn make_min_child_view() -> AgentView {
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
         provider_rebind_pending: false,
         hook_block_hold: false,
         blocked_prompt: None,

@@ -1,5 +1,6 @@
 pub mod acp_types;
 pub mod announcement_state;
+pub(crate) mod batch_dream;
 pub mod cache_tracker;
 pub mod commands;
 pub(crate) mod compaction_config;
@@ -13,6 +14,7 @@ pub(crate) mod native_agents;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
+pub(crate) mod sandbox_permission;
 pub(crate) mod swarm_mode;
 pub mod two_pass;
 pub mod usage_file;

@@ -141,6 +141,38 @@ fn background_request(output_file: PathBuf) -> TerminalRunRequest {
     }
 }
 
+#[tokio::test]
+async fn client_terminal_refuses_foreground_and_background_after_sandbox_tightens() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Guard(AtomicBool);
+    #[async_trait::async_trait]
+    impl AcpTerminalSandboxGuard for Guard {
+        async fn requires_local_enforcement(&self) -> Result<bool, ComputerError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let guard = Arc::new(Guard(AtomicBool::new(false)));
+    let mut adapter = AcpTerminalAdapter::new(GatewaySender::new(tx), acp::SessionId::new("s"));
+    adapter.sandbox_guard = Some(guard.clone());
+    guard.0.store(true, Ordering::SeqCst);
+    let foreground = adapter
+        .run(background_request(PathBuf::from("/tmp/not-created.log")))
+        .await
+        .err()
+        .expect("foreground must be refused");
+    let background = adapter
+        .run_background(background_request(PathBuf::from("/tmp/not-created.log")))
+        .await
+        .err()
+        .expect("background must be refused");
+    assert!(foreground.to_string().contains("sandbox enforcement"));
+    assert!(background.to_string().contains("sandbox enforcement"));
+    assert!(rx.try_recv().is_err(), "no terminal request may escape");
+}
+
 #[tokio::test(start_paused = true)]
 async fn run_background_records_snapshots_and_threads_task_kind() {
     use xai_grok_tools::notification::types::ToolNotification;

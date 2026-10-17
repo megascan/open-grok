@@ -375,7 +375,12 @@ pub(super) fn set_yolo_mode_inner(app: &mut AppView, new: bool) {
         // even on idempotent re-dispatch. Prefers `AllowOnce`; falls
         // back to `Cancelled` (never `AllowAlways`).
         agent.last_permission_click = None;
+        let mut sandbox_pending = std::collections::VecDeque::new();
         for perm in agent.permission_queue.drain(..) {
+            if crate::app::sandbox_permission::is_sandbox(&perm.request.request) {
+                sandbox_pending.push_back(perm);
+                continue;
+            }
             if let Some(allow) = perm
                 .options
                 .iter()
@@ -398,7 +403,12 @@ pub(super) fn set_yolo_mode_inner(app: &mut AppView, new: bool) {
                     .ok();
             }
         }
-        super::permissions::restore_permission_stashes(agent);
+        agent.permission_queue = sandbox_pending;
+        if agent.permission_queue.is_empty() {
+            super::permissions::restore_permission_stashes(agent);
+        } else {
+            super::permissions::resolve_permission_queue_transition(agent);
+        }
     }
 
     // Telemetry + tracing guarded on real state change only.

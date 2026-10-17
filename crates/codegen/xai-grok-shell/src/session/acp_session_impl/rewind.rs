@@ -47,22 +47,10 @@ impl SessionActor {
         // Generate a rewind point for every prompt 0..current_prompt_index.
         let rewind_points = (0..current_prompt_index)
             .map(|idx| {
-                let prompt_preview = prompts.get(idx).and_then(|text| {
-                    let clean_text = extract_user_query(text);
-                    let first_line = clean_text
-                        .lines()
-                        .map(|l| l.trim())
-                        .find(|l| !l.is_empty())
-                        .unwrap_or("");
-
-                    if first_line.is_empty() {
-                        None
-                    } else if first_line.chars().count() > 60 {
-                        Some(format!("{}...", crate::util::truncate(first_line, 57)))
-                    } else {
-                        Some(first_line.to_string())
-                    }
-                });
+                let prompt_preview = prompts
+                    .get(idx)
+                    .map(String::as_str)
+                    .and_then(crate::session::helpers::rewind_preview::rewind_prompt_preview);
 
                 let file_meta = file_meta_map.get(&idx);
                 let num_file_snapshots = file_meta.map_or(0, |m| m.num_file_snapshots);

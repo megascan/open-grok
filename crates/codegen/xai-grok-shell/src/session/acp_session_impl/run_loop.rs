@@ -524,19 +524,11 @@ pub(super) async fn run_session(
                             ..
                         })
                     );
-                    let v2_capture_eligible = super::memory_capture::is_successful_query_loop(
+                    let v2_capture_eligible = super::memory_capture::is_capturable_turn_result(
                         &result,
                     ) && {
                         let state = session.state.lock().await;
-                        state.pending_inputs.front().is_some_and(|input| {
-                            input.prompt_id == prompt_id
-                                && input.queue_meta.is_some()
-                                && !input.origin.is_synthetic()
-                                && crate::session::slash_authority::parse_slash_prefix(
-                                    &input.prompt_blocks,
-                                )
-                                .is_none()
-                        })
+                        SessionActor::is_capturable_front(&state, &prompt_id)
                     };
                     let v2_capture_source_prompt_index = if v2_capture_eligible {
                         Some(*session.tool_context.prompt_index.lock().await)
@@ -551,6 +543,9 @@ pub(super) async fn run_session(
                         session
                             .enqueue_v2_completed_turn(source_prompt_index)
                             .await;
+                    }
+                    if owned_completion {
+                        session.schedule_v2_dream_check_after_turn();
                     }
                     #[cfg(test)]
                     if let Some(processed) = processed { let _ = processed.send(()); }
@@ -785,8 +780,13 @@ pub(super) async fn run_session(
                                     traceparent,
                                 })
                                 .await;
-                            if cancel_for_send_now && !session.cancel_turn_for_send_now(&mut replay_buffer).await.settled {
-                                continue;
+                            if cancel_for_send_now {
+                                let cancel = session.cancel_turn_for_send_now(&mut replay_buffer).await;
+                                if !cancel.settled { continue; }
+                                if cancel.capture_queued {
+                                    session.start_v2_capture_worker().await;
+                                    session.schedule_v2_dream_check_after_turn();
+                                }
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
@@ -794,8 +794,8 @@ pub(super) async fn run_session(
                             session.handle_session_mode(session_mode).await;
                             let _ = responds_to.send(());
                         }
-                        SessionCommand::SetSessionModel { model_id, sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, agent_rebuild, resolved_tool_policy_override, responds_to } => {
-                            let updated_model_id = session.handle_set_session_model(model_id, sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, agent_rebuild, resolved_tool_policy_override).await;
+                        SessionCommand::SetSessionModel { model_id, sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, agent_rebuild, resolved_tool_policy_override, context_window_selection, supported_context_windows, responds_to } => {
+                            let updated_model_id = session.handle_set_session_model(model_id, sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, agent_rebuild, resolved_tool_policy_override, context_window_selection, supported_context_windows).await;
                             let _ = responds_to.send(updated_model_id);
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                             SessionActor::maybe_drain_notifications(session.clone(), completion_tx.clone()).await;
@@ -1090,8 +1090,13 @@ pub(super) async fn run_session(
                         SessionCommand::InterjectQueuedPrompt { id, expected_version, owner, new_text } => {
                             // Send-now: the handler promoted the row; cancel the running turn and start it.
                             let cancel_for_send_now = session.handle_interject_queued_prompt(&id, expected_version, owner.as_deref(), new_text.as_deref()).await;
-                            if cancel_for_send_now && !session.cancel_turn_for_send_now(&mut replay_buffer).await.settled {
-                                continue;
+                            if cancel_for_send_now {
+                                let cancel = session.cancel_turn_for_send_now(&mut replay_buffer).await;
+                                if !cancel.settled { continue; }
+                                if cancel.capture_queued {
+                                    session.start_v2_capture_worker().await;
+                                    session.schedule_v2_dream_check_after_turn();
+                                }
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
@@ -1118,6 +1123,10 @@ pub(super) async fn run_session(
                             // finish. New real prompts and rewind abort separately.
                             let cancel = session.cancel_running_task(options).await;
                             if !cancel.settled { continue; }
+                            if cancel.capture_queued {
+                                session.start_v2_capture_worker().await;
+                                session.schedule_v2_dream_check_after_turn();
+                            }
 
                             // Auto-pause the active goal on any cancel so timers stop
                             // and the pager shows "paused" instead of "active".

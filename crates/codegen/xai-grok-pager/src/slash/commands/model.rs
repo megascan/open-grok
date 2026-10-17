@@ -1,6 +1,4 @@
-//! `/model` (alias `/m`) — switch model + (optionally) reasoning effort.
-//! Chained autocomplete: pick a reasoning-supported model → trailing space
-//! re-opens the dropdown into a `low|medium|high|xhigh` sub-menu.
+//! `/model` selects a model, optional context window and reasoning effort.
 
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::{ReasoningEffortOption, supports_reasoning_effort_meta};
@@ -8,6 +6,9 @@ use xai_grok_shell::sampling::types::{ReasoningEffortOption, supports_reasoning_
 use crate::acp::model_state::ModelState;
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
+use crate::slash::commands::context_window::{
+    format_window, parse_window_token, supported_window, unknown_window_error, window_arg_items,
+};
 use crate::slash::commands::effort_levels::build_effort_arg_items;
 
 /// Switch the active model (and optionally its reasoning effort).
@@ -37,7 +38,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn usage(&self) -> &str {
-        "/model <name> [effort]"
+        "/model <name> [window] [effort]"
     }
 
     fn takes_args(&self) -> bool {
@@ -49,7 +50,7 @@ impl SlashCommand for ModelCommand {
     }
 
     fn arg_placeholder(&self) -> Option<&str> {
-        Some("<model> [effort]")
+        Some("<model> [window] [effort]")
     }
 
     fn suggest_args(&self, ctx: &AppCtx, args_query: &str) -> Option<Vec<ArgItem>> {
@@ -57,27 +58,37 @@ impl SlashCommand for ModelCommand {
             return None;
         }
 
-        // Effort phase if input is "<reasoning-model> ", else model phase.
-        if let Some((model_id, prefix)) = matched_reasoning_prefix(ctx.models, args_query) {
-            return Some(build_effort_items(ctx.models, &model_id, &prefix));
+        match chained_phase(ctx.models, args_query) {
+            Some(ChainedPhase::Window { model_id, prefix }) => {
+                Some(build_window_items(ctx.models, &model_id, &prefix))
+            }
+            Some(ChainedPhase::Effort { model_id, prefix }) => {
+                Some(build_effort_items(ctx.models, &model_id, &prefix))
+            }
+            Some(ChainedPhase::Done) => None,
+            None => Some(build_model_items(ctx.models)),
         }
-        Some(build_model_items(ctx.models))
     }
 
     fn preselected_arg(&self, ctx: &AppCtx, args_query: &str) -> Option<String> {
-        let (model_id, prefix) = matched_reasoning_prefix(ctx.models, args_query)?;
-        // A typed effort filter hands the opening row to the match ranking.
-        if !args_query.trim_end().eq_ignore_ascii_case(&prefix) {
-            return None;
+        let fresh = |prefix: &str| args_query.trim_end().eq_ignore_ascii_case(prefix);
+        match chained_phase(ctx.models, args_query)? {
+            ChainedPhase::Window { model_id, prefix } if fresh(&prefix) => {
+                let window = ctx.models.window_after_switch_to(&model_id)?;
+                Some(window_insert_text(ctx.models, &model_id, &prefix, window))
+            }
+            ChainedPhase::Effort { model_id, prefix } if fresh(&prefix) => {
+                let option = ctx.models.preselected_effort_option_for(&model_id)?;
+                Some(effort_insert_text(&prefix, &option))
+            }
+            _ => None,
         }
-        let option = ctx.models.preselected_effort_option_for(&model_id)?;
-        Some(effort_insert_text(&prefix, &option))
     }
 
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return CommandResult::Error("Usage: /model <name> [effort]".into());
+            return CommandResult::Error("Usage: /model <name> [window] [effort]".into());
         }
 
         // Prefer an exact full-string catalog match first. Model display names
@@ -88,16 +99,39 @@ impl SlashCommand for ModelCommand {
             return CommandResult::Action(Action::SetDefaultModel(id));
         }
 
-        // Trailing effort on a reasoning model is a session switch. The token keeps its spaces.
-        if let Some((id, token)) = split_model_effort(ctx.models, trimmed) {
-            return match ctx.models.resolve_effort_for_model(&id, token) {
-                Ok(effort) => CommandResult::Action(Action::SwitchModel {
-                    model_id: id,
-                    effort: Some(effort),
-                    service_tier: None,
-                }),
-                Err(err) => CommandResult::Error(err.message()),
+        if let Some((id, rest)) = split_model_effort(ctx.models, trimmed) {
+            let windows = ctx.models.context_window_options_for(&id);
+            let (window, effort_token) = match split_window_effort(rest, &windows) {
+                Ok(split) => split,
+                Err(message) => return CommandResult::Error(message),
             };
+            let effort = if effort_token.is_empty() && window.is_some() {
+                ctx.models
+                    .reasoning_effort
+                    .filter(|_| ctx.models.current.as_ref() == Some(&id))
+            } else {
+                match ctx.models.resolve_effort_for_model(&id, effort_token) {
+                    Ok(effort) => Some(effort),
+                    Err(err) => return CommandResult::Error(err.message()),
+                }
+            };
+            if let Some(window) = window {
+                if ctx.session_id.is_none() {
+                    return CommandResult::Error(
+                        "No active session yet; retry once it starts".into(),
+                    );
+                }
+                return CommandResult::Action(Action::SwitchModelWithWindow {
+                    model_id: id,
+                    effort,
+                    window,
+                });
+            }
+            return CommandResult::Action(Action::SwitchModel {
+                model_id: id,
+                effort,
+                service_tier: None,
+            });
         }
 
         CommandResult::Error(format!("Unknown model: {trimmed}"))
@@ -223,6 +257,104 @@ fn model_picker_description(id: &acp::ModelId, info: &acp::ModelInfo) -> String 
     parts.join(" · ")
 }
 
+/// The arg picker title for the `/model` sub-menu that `args_query` has reached.
+pub(crate) fn picker_title(models: &ModelState, args_query: &str) -> &'static str {
+    match chained_phase(models, args_query) {
+        Some(ChainedPhase::Window { .. }) => "Pick context window",
+        Some(ChainedPhase::Effort { .. }) => "Pick reasoning effort",
+        Some(ChainedPhase::Done) | None => "Pick model",
+    }
+}
+
+/// Which chained sub-menu the typed args have reached.
+enum ChainedPhase {
+    Window {
+        model_id: acp::ModelId,
+        prefix: String,
+    },
+    Effort {
+        model_id: acp::ModelId,
+        prefix: String,
+    },
+    Done,
+}
+
+/// The sub-menu for `args_query`, or `None` while the user is still picking a model.
+fn chained_phase(models: &ModelState, args_query: &str) -> Option<ChainedPhase> {
+    let (id, key, rest) = longest_reasoning_prefix(models, args_query)?;
+    let model_id = id;
+    let windows = models.context_window_options_for(&model_id);
+    let reasoning = models
+        .available
+        .get(&model_id)
+        .is_some_and(supports_reasoning_effort);
+
+    let phase = match committed_first_token(rest) {
+        // A committed window advances the chain to the effort phase
+        Some(first)
+            if parse_window_token(first).is_some_and(|window| windows.contains(&window)) =>
+        {
+            if reasoning {
+                ChainedPhase::Effort {
+                    model_id,
+                    prefix: format!("{key} {first}"),
+                }
+            } else {
+                ChainedPhase::Done
+            }
+        }
+        // Any other committed token is a typed effort
+        Some(_) if reasoning => ChainedPhase::Effort {
+            model_id,
+            prefix: key.clone(),
+        },
+        // A longer model name may still match ("Foo Bar" after "Foo")
+        Some(_) => return None,
+        None if windows.len() > 1 => {
+            // A partial token that can't start any window row ("Grok 4.7 hi") is a typed effort
+            if starts_a_window(&windows, rest.trim_start()) {
+                ChainedPhase::Window {
+                    model_id,
+                    prefix: key.clone(),
+                }
+            } else if reasoning {
+                ChainedPhase::Effort {
+                    model_id,
+                    prefix: key.clone(),
+                }
+            } else {
+                return None;
+            }
+        }
+        None if reasoning => ChainedPhase::Effort {
+            model_id,
+            prefix: key.clone(),
+        },
+        None => ChainedPhase::Done,
+    };
+    Some(phase)
+}
+
+/// The first token is committed once whitespace follows it.
+fn committed_first_token(rest: &str) -> Option<&str> {
+    let rest_trimmed = rest.trim_start();
+    match rest_trimmed.split_once(char::is_whitespace) {
+        Some((first, _)) => Some(first),
+        None if !rest_trimmed.is_empty() && rest.ends_with(char::is_whitespace) => {
+            Some(rest_trimmed)
+        }
+        None => None,
+    }
+}
+
+/// Whether a partial token can still grow into one of the window rows (an empty partial always can).
+fn starts_a_window(windows: &[u64], partial: &str) -> bool {
+    let partial = partial.to_ascii_lowercase();
+    windows.iter().any(|&window| {
+        format_window(window).starts_with(&partial) || window.to_string().starts_with(&partial)
+    })
+}
+
 fn split_on_model_key<'a>(args: &'a str, key: &str) -> Option<&'a str> {
     let rest = args.get(key.len()..)?;
     if args
@@ -242,24 +374,33 @@ fn longest_reasoning_prefix<'a>(
     args: &'a str,
 ) -> Option<(acp::ModelId, String, &'a str)> {
     let mut best: Option<(acp::ModelId, String, &str)> = None;
+    let mut ambiguous = false;
     for (id, info) in models
         .available
         .iter()
-        .filter(|(_, info)| supports_reasoning_effort(info))
+        .filter(|(id, info)| has_chained_args(models, id, info))
     {
         let selector = model_selector(id, info);
-        let id_str = id.0.as_ref();
-        for key in [selector.as_str(), info.name.as_str(), id_str] {
-            if best
-                .as_ref()
-                .is_some_and(|(_, prev, _)| prev.len() >= key.len())
-            {
+        for key in [selector.as_str(), info.name.as_str(), id.0.as_ref()] {
+            let Some(rest) = split_on_model_key(args, key) else {
                 continue;
-            }
-            if let Some(rest) = split_on_model_key(args, key) {
-                best = Some((id.clone(), key.to_string(), rest));
+            };
+            match best.as_ref() {
+                Some((_, prev, _)) if prev.len() > key.len() => {}
+                Some((prior, prev, _)) if prev.len() == key.len() => {
+                    if prior != id {
+                        ambiguous = true;
+                    }
+                }
+                _ => {
+                    best = Some((id.clone(), key.to_string(), rest));
+                    ambiguous = false;
+                }
             }
         }
+    }
+    if ambiguous {
+        return None;
     }
     best
 }
@@ -277,12 +418,26 @@ fn split_model_effort<'a>(
     }
 }
 
-fn matched_reasoning_prefix(
-    models: &ModelState,
-    args_query: &str,
-) -> Option<(acp::ModelId, String)> {
-    let (id, key, _) = longest_reasoning_prefix(models, args_query)?;
-    Some((id, key))
+fn has_chained_args(models: &ModelState, id: &acp::ModelId, info: &acp::ModelInfo) -> bool {
+    supports_reasoning_effort(info) || models.context_window_options_for(id).len() > 1
+}
+
+/// A window is always the first token, and the remaining words are the effort.
+fn split_window_effort<'a>(
+    rest: &'a str,
+    windows: &[u64],
+) -> Result<(Option<std::num::NonZeroU64>, &'a str), String> {
+    let (first, tail) = match rest.split_once(char::is_whitespace) {
+        Some((first, tail)) => (first, tail.trim()),
+        None => (rest, ""),
+    };
+    if windows.is_empty() || parse_window_token(first).is_none() {
+        return Ok((None, rest));
+    }
+    match supported_window(first, windows) {
+        Some(window) => Ok((Some(window), tail)),
+        None => Err(unknown_window_error(first, windows)),
+    }
 }
 
 /// One row per logical model. Reasoning models get a trailing space in
@@ -310,7 +465,7 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
     let mut items: Vec<ArgItem> = Vec::with_capacity(models.available.len());
     for (id, info) in entries {
         let is_current = current_id == Some(id);
-        let supports = supports_reasoning_effort(info);
+        let supports = has_chained_args(models, id, info);
         let selector = model_selector(id, info);
         let row_label = match model_provider_label(info) {
             Some(provider) => format!("{provider} · {}", info.name),
@@ -345,6 +500,37 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         });
     }
     items
+}
+
+/// One row per selectable window for the `/model` chained window phase.
+fn build_window_items(models: &ModelState, model_id: &acp::ModelId, prefix: &str) -> Vec<ArgItem> {
+    let windows = models.context_window_options_for(model_id);
+    // Only the current model has an active window
+    let active = (models.current.as_ref() == Some(model_id))
+        .then(|| models.get_context_window())
+        .flatten();
+    let default = models.model_default_window(model_id);
+    window_arg_items(&windows, active, default, |_, window| {
+        window_insert_text(models, model_id, prefix, window)
+    })
+}
+
+fn window_insert_text(
+    models: &ModelState,
+    model_id: &acp::ModelId,
+    prefix: &str,
+    window: u64,
+) -> String {
+    let chains_to_effort = models
+        .available
+        .get(model_id)
+        .is_some_and(supports_reasoning_effort);
+    let label = format_window(window);
+    if chains_to_effort {
+        format!("{prefix} {label} ")
+    } else {
+        format!("{prefix} {label}")
+    }
 }
 
 /// One row per effort level for the `/model` chained effort phase.
@@ -411,6 +597,63 @@ mod tests {
                 ),
             ])));
         (id, info)
+    }
+
+    #[test]
+    fn model_picker_chains_window_before_effort_and_preserves_provider_identity() {
+        let mut state = ModelState::default();
+        let (id, mut info) = provider_model("example", "Example", "codex", 256_000);
+        let meta = info.meta.as_mut().unwrap();
+        meta.insert(
+            "contextWindows".into(),
+            serde_json::json!([256_000, 500_000]),
+        );
+        meta.insert("supportsReasoningEffort".into(), serde_json::json!(true));
+        state.available.insert(id.clone(), info);
+        assert_eq!(
+            picker_title(&state, "codex:example "),
+            "Pick context window"
+        );
+        assert_eq!(
+            picker_title(&state, "codex:example 500k "),
+            "Pick reasoning effort"
+        );
+        let windows = build_window_items(&state, &id, "codex:example");
+        assert_eq!(windows[1].insert_text, "codex:example 500k ");
+        let sid = acp::SessionId::new("session");
+        let mut ctx = dummy_exec_ctx(&state);
+        ctx.session_id = Some(&sid);
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "codex:example 500k high"),
+            CommandResult::Action(Action::SwitchModelWithWindow { model_id, effort: Some(ReasoningEffort::High), window })
+                if model_id == id && window.get() == 500_000
+        ));
+        assert!(
+            matches!(ModelCommand.run(&mut ctx, "codex:example 1m high"),
+            CommandResult::Error(message) if message.contains("unknown context window"))
+        );
+    }
+
+    #[test]
+    fn ambiguous_names_cannot_choose_a_provider_for_chained_selection() {
+        let mut state = ModelState::default();
+        for (provider, id) in [("codex", "codex:model"), ("xai", "xai:model")] {
+            let (id, mut info) = provider_model(id, "Same model", provider, 256_000);
+            info.meta.as_mut().unwrap().insert(
+                "contextWindows".into(),
+                serde_json::json!([256_000, 500_000]),
+            );
+            state.available.insert(id, info);
+        }
+        let sid = acp::SessionId::new("session");
+        let mut ctx = dummy_exec_ctx(&state);
+        ctx.session_id = Some(&sid);
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "Same model 500k"),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(ModelCommand.run(&mut ctx, "codex:model 500k"),
+            CommandResult::Action(Action::SwitchModelWithWindow { model_id, .. }) if model_id.0.as_ref() == "codex:model"));
     }
 
     static EMPTY_BUNDLE: crate::app::bundle::BundleState = crate::app::bundle::BundleState {

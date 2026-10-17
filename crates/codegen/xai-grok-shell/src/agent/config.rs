@@ -2,7 +2,7 @@ use crate::agent::auth_method::ModelByok;
 use crate::agent::model_providers::{
     ModelProviderConfig, auth_config_issues, model_provider_auth_name, parse_model_providers,
 };
-use crate::auth::{AuthManager, GrokComConfig, OidcAuthConfig};
+use crate::auth::{AuthManager, GrokComConfig};
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::{config::StorageMode, sampling::ApiBackend, tools::config::ShellToolsetConfig};
 use agent_client_protocol as acp;
@@ -14,9 +14,9 @@ use std::sync::Arc;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
-    CompactionAtTokens, CompactionsRemaining, ModelProvider, REASONING_EFFORT_META_KEY,
-    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ReasoningSummary, ToolMode,
-    reasoning_effort_meta_value, reasoning_efforts_meta_value,
+    CompactionAtTokens, CompactionsRemaining, ModelNotice, ModelProvider,
+    REASONING_EFFORT_META_KEY, REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    ReasoningSummary, ToolMode, reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
 use xai_grok_tools::types::compat::{
     COMPAT_CELLS, CompatConfig, CompatConfigToml, CompatRemoteKey, CompatSurface, CompatVendor,
@@ -2150,6 +2150,8 @@ impl Config {
     }
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
         let raw_config = &Self::expand_auth_alias(raw_config);
+        let auth_config = GrokComConfig::from_effective_config(raw_config)
+            .map_err(|error| format!("invalid auth configuration: {error}"))?;
         let super::config_model_override_parse::ParsedModelOverrides {
             models: config_models,
             warnings: config_warnings,
@@ -2193,12 +2195,22 @@ impl Config {
             t.remove("mcp_servers");
         }
         crate::config::deep_merge_toml(&mut base, &raw_without_model_sections);
+        // The main deserializer needs a complete nested auth section. Seed it
+        // with the resolved defaults while retaining unknown user keys so they
+        // still receive normal config warnings. Install the pinned resolution
+        // after deserialization so an untrusted raw pin cannot override it.
+        let mut normalized_auth = toml::Value::try_from(&auth_config).map_err(|e| e.to_string())?;
+        if let Some(raw_auth) = raw_config.get("grok_com_config") {
+            crate::config::deep_merge_toml(&mut normalized_auth, raw_auth);
+        }
         if let toml::Value::Table(ref mut t) = base {
             t.remove("mcp_servers");
+            t.insert("grok_com_config".to_owned(), normalized_auth);
         }
         let (mut config, mut unrecognized_keys) =
             Self::deserialize_collecting_unrecognized(base, &raw_without_model_sections)?;
         config.mcp_servers = parsed_mcp_servers.into_iter().collect();
+        config.grok_com_config = auth_config;
         config.config_models = config_models;
         config.config_warnings = config_warnings;
         config.auth_providers = auth_providers;
@@ -2279,12 +2291,6 @@ impl Config {
             }
         }
         super::config_model_override_parse::log_config_warnings(&config.config_warnings);
-        if config.grok_com_config.oidc.is_none() {
-            config.grok_com_config.oidc = OidcAuthConfig::from_env();
-        }
-        if config.grok_com_config.oidc.is_none() && config.grok_com_config.oauth2.is_none() {
-            config.grok_com_config.oauth2 = crate::auth::OAuth2ProviderConfig::from_env();
-        }
         if config.client_version.is_none() {
             config.client_version = Self::default().client_version;
         }
@@ -3726,6 +3732,12 @@ pub fn apply_remote_settings_side_effects(settings: Option<&crate::util::config:
         settings.and_then(|s| s.max_mcp_output_bytes),
     );
     crate::util::config::cache_remote_auto_mode(settings.and_then(|s| s.auto_mode.clone()));
+    crate::util::config::cache_remote_session_recap_config(
+        settings.and_then(|s| s.session_recap_config.clone()),
+    );
+    crate::util::config::cache_remote_turn_summary_config(
+        settings.and_then(|s| s.turn_summary_config.clone()),
+    );
     crate::util::config::cache_remote_remember_tool_approvals(
         settings.and_then(|s| s.remember_tool_approvals),
     );
@@ -3783,10 +3795,14 @@ fn merge_remote_provider_partition(
         else {
             continue;
         };
-        if entry.info.context_window.get() == DEFAULT_CONTEXT_WINDOW
-            && donor.info.context_window.get() != DEFAULT_CONTEXT_WINDOW
+        if !has_explicit_context_window(&entry.info, DEFAULT_CONTEXT_WINDOW)
+            && has_explicit_context_window(&donor.info, DEFAULT_CONTEXT_WINDOW)
         {
             entry.info.context_window = donor.info.context_window;
+            entry
+                .info
+                .context_windows
+                .clone_from(&donor.info.context_windows);
         }
         if entry.info.agent_type == DEFAULT_AGENT_TYPE {
             entry.info.agent_type.clone_from(&donor.info.agent_type);
@@ -3960,8 +3976,8 @@ pub fn resolve_model_list_with_provider_catalogs(
                     .get(key)
                     .filter(|donor| donor.info.provider == entry.info.provider);
                 if let Some(donor) = donor {
-                    if entry.info.context_window.get() == default_cw
-                        && donor.info.context_window.get() != default_cw
+                    if !has_explicit_context_window(&entry.info, default_cw)
+                        && has_explicit_context_window(&donor.info, default_cw)
                     {
                         tracing::debug!(
                             model_key = %key,
@@ -3972,6 +3988,10 @@ pub fn resolve_model_list_with_provider_catalogs(
                             "prefetched model missing context_window, inheriting from hardcoded default"
                         );
                         entry.info.context_window = donor.info.context_window;
+                        entry
+                            .info
+                            .context_windows
+                            .clone_from(&donor.info.context_windows);
                     }
                     if entry.info.agent_type == DEFAULT_AGENT_TYPE {
                         entry.info.agent_type.clone_from(&donor.info.agent_type);
@@ -4141,6 +4161,7 @@ pub fn resolve_model_list_with_provider_catalogs(
         let default_cw = DEFAULT_CONTEXT_WINDOW;
         type DonorMetadata = (
             std::num::NonZeroU64,
+            Vec<std::num::NonZeroU64>,
             ApiBackend,
             Option<ToolMode>,
             Option<SubagentContextMode>,
@@ -4151,12 +4172,13 @@ pub fn resolve_model_list_with_provider_catalogs(
         > = std::collections::HashMap::new();
         for entry in resolved
             .values()
-            .filter(|entry| entry.info.context_window.get() != default_cw)
+            .filter(|entry| has_explicit_context_window(&entry.info, default_cw))
         {
             donors.entry(entry.info.provider).or_default().insert(
                 entry.info.model.clone(),
                 (
                     entry.info.context_window,
+                    entry.info.context_windows.clone(),
                     entry.info.api_backend,
                     entry.info.tool_mode,
                     entry.info.subagent_context_default,
@@ -4204,10 +4226,15 @@ pub fn resolve_model_list_with_provider_catalogs(
             let Some(provider_donors) = donors.get(&entry.info.provider) else {
                 continue;
             };
-            if let Some((donor_cw, donor_backend, donor_tool_mode, donor_subagent_context)) =
-                provider_donors.get(&entry.info.model)
+            if let Some((
+                donor_cw,
+                donor_windows,
+                donor_backend,
+                donor_tool_mode,
+                donor_subagent_context,
+            )) = provider_donors.get(&entry.info.model)
             {
-                if entry.info.context_window.get() == default_cw {
+                if !has_explicit_context_window(&entry.info, default_cw) {
                     tracing::debug!(
                         model = %entry.info.model,
                         from = default_cw,
@@ -4215,6 +4242,7 @@ pub fn resolve_model_list_with_provider_catalogs(
                         "slug-match: inheriting context_window from sibling catalog entry"
                     );
                     entry.info.context_window = *donor_cw;
+                    entry.info.context_windows.clone_from(donor_windows);
                 }
                 if entry.info.api_backend == ApiBackend::default()
                     && *donor_backend != ApiBackend::default()
@@ -4366,6 +4394,28 @@ pub struct ModelVariant {
     pub effort: ReasoningEffort,
     pub model_id: String,
 }
+pub(crate) fn context_window_choices(
+    scalar: Option<NonZeroU64>,
+    listed: &[NonZeroU64],
+) -> Option<(NonZeroU64, Vec<NonZeroU64>)> {
+    let default = scalar.or_else(|| listed.first().copied())?;
+    if listed.is_empty() {
+        return Some((default, Vec::new()));
+    }
+    let mut choices = Vec::with_capacity(listed.len() + 1);
+    if !listed.contains(&default) {
+        choices.push(default);
+    }
+    for window in listed {
+        if !choices.contains(window) {
+            choices.push(*window);
+        }
+    }
+    Some((default, choices))
+}
+fn has_explicit_context_window(info: &ModelInfo, fallback: u64) -> bool {
+    info.context_window.get() != fallback || !info.context_windows.is_empty()
+}
 /// JSON-only subset of `ModelEntryConfig`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -4379,6 +4429,8 @@ struct DefaultModelJson {
     name: Option<String>,
     description: Option<String>,
     context_window: Option<NonZeroU64>,
+    context_windows: Option<Vec<NonZeroU64>>,
+    notice: Option<ModelNotice>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_completion_tokens: Option<u32>,
@@ -4506,9 +4558,11 @@ fn default_models(
                 ));
             }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
-            let context_window = m
-                .context_window
-                .unwrap_or_else(|| NonZeroU64::new(200_000).expect("200000 is non-zero"));
+            let (context_window, context_windows) = context_window_choices(
+                m.context_window,
+                m.context_windows.as_deref().unwrap_or_default(),
+            )
+            .unwrap_or_else(|| (NonZeroU64::new(200_000).unwrap(), Vec::new()));
             let (base_url, api_base_url) = match m.provider.profile().session_auth {
                 xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => (
                     m.base_url.clone().unwrap_or_else(|| {
@@ -4541,7 +4595,9 @@ fn default_models(
                 api_base_url,
                 name: m.name,
                 description: m.description,
+                notice: m.notice.and_then(ModelNotice::normalized),
                 context_window,
+                context_windows,
                 max_request_bytes: None,
                 auto_compact_threshold_percent: m.auto_compact_threshold_percent,
                 system_prompt_label: m.system_prompt_label,
@@ -4611,6 +4667,8 @@ pub struct ModelEntryConfig {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<ModelNotice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4684,6 +4742,8 @@ pub struct ModelEntryConfig {
     /// Used for auto-compact threshold calculations.
     /// Required — BYOK users must explicitly set this in config.toml.
     pub context_window: NonZeroU64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_windows: Vec<NonZeroU64>,
     /// Provider request-body cap in bytes; unset resolves to the `api_backend` default (30 MB for `messages`, else 50 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_bytes: Option<NonZeroU64>,
@@ -4779,6 +4839,7 @@ pub struct ConfigModelOverride {
     pub base_url: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub notice: Option<ModelNotice>,
     pub api_key: Option<String>,
     /// Env var name(s) for the provider key — string or array in config.toml.
     pub env_key: Option<EnvKeys>,
@@ -4809,6 +4870,7 @@ pub struct ConfigModelOverride {
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
     pub context_window: Option<u64>,
+    pub context_windows: Option<Vec<NonZeroU64>>,
     pub max_request_bytes: Option<NonZeroU64>,
     /// Explicit raw Codex context budget, allowed above the advertised maximum.
     pub max_context_window: Option<u64>,
@@ -4908,6 +4970,8 @@ impl ConfigModelOverride {
                 entry.info.base_url.clear();
             }
             entry.info.tool_mode = None;
+            entry.info.notice = None;
+            entry.info.context_windows.clear();
             entry.info.subagent_context_default = None;
             entry.info.codex_multi_agent_v2 = false;
             entry.info.codex_model = Default::default();
@@ -4940,6 +5004,9 @@ impl ConfigModelOverride {
             entry.api_key = None;
             entry.env_key = None;
             entry.api_base_url = None;
+        }
+        if let Some(notice) = &self.notice {
+            entry.info.notice = notice.clone().normalized();
         }
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = *v;
@@ -5008,8 +5075,16 @@ impl ConfigModelOverride {
                 entry.info.codex_model.auto_compact_token_limit_override = Some(limit);
             }
         }
-        if let Some(cw) = self.context_window.and_then(NonZeroU64::new) {
+        let scalar = self.context_window.and_then(NonZeroU64::new);
+        let windows = match self.context_windows.as_deref().filter(|w| !w.is_empty()) {
+            Some(listed) => context_window_choices(scalar, listed),
+            None => {
+                scalar.and_then(|cw| context_window_choices(Some(cw), &entry.info.context_windows))
+            }
+        };
+        if let Some((cw, choices)) = windows {
             entry.info.context_window = cw;
+            entry.info.context_windows = choices;
             if entry.info.provider == ModelProvider::Codex {
                 // Preserve the established effective-token meaning of context_window.
                 let percent = entry.info.codex_model.effective_percent();
@@ -5120,6 +5195,8 @@ pub struct ModelInfo {
     /// to users in either consumer.
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<ModelNotice>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -5153,6 +5230,8 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub env_http_headers: IndexMap<String, String>,
     pub context_window: NonZeroU64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_windows: Vec<NonZeroU64>,
     /// Explicit request-body cap only; `sampling_config_for_model` applies the `api_backend` default so the catalog never persists it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_bytes: Option<NonZeroU64>,
@@ -5236,10 +5315,15 @@ impl ModelInfo {
         }
         metadata
     }
+    pub(crate) fn supports_context_window(&self, window: NonZeroU64) -> bool {
+        self.context_window == window || self.context_windows.contains(&window)
+    }
     /// Minimal fallback descriptor for an unknown model slug.
     /// Used when a configured model ID isn't found in presets or remote models.
     pub fn fallback(slug: &str) -> Self {
         ModelInfo {
+            notice: None,
+            context_windows: Vec::new(),
             user_selectable: true,
             id: None,
             model: slug.to_owned(),
@@ -5293,6 +5377,8 @@ impl ModelInfo {
     /// Extract shared model metadata from a flat config entry.
     pub fn from_config(entry: &ModelEntryConfig) -> Self {
         ModelInfo {
+            notice: entry.notice.clone(),
+            context_windows: entry.context_windows.clone(),
             user_selectable: true,
             id: entry.id.clone(),
             model: entry.model.clone(),
@@ -6349,6 +6435,8 @@ pub fn resolve_aux_model_sampling_config(
     if let Some(bearer) = xai_bearer {
         let entry = ModelEntry {
             info: ModelInfo {
+                notice: None,
+                context_windows: Vec::new(),
                 user_selectable: true,
                 id: None,
                 model: catalog_entry
@@ -6781,6 +6869,8 @@ fn resolve_hidden_default_web_search_sampling_config(
 ) -> SamplerConfig {
     let entry = ModelEntry {
         info: ModelInfo {
+            notice: None,
+            context_windows: Vec::new(),
             id: None,
             model: model_id.to_owned(),
             base_url: endpoints.resolve_inference_base_url(),
@@ -6978,6 +7068,18 @@ pub fn to_acp_model_info(
                     map.insert(
                         REASONING_EFFORTS_META_KEY.to_string(),
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
+                    );
+                }
+                if info.context_windows.len() > 1 {
+                    map.insert(
+                        xai_grok_sampling_types::CONTEXT_WINDOWS_META_KEY.to_owned(),
+                        xai_grok_sampling_types::context_windows_meta_value(&info.context_windows),
+                    );
+                }
+                if let Some(notice) = &info.notice {
+                    map.insert(
+                        xai_grok_sampling_types::MODEL_NOTICE_META_KEY.to_owned(),
+                        notice.to_meta_value(),
                     );
                 }
                 if !info.service_tiers.is_empty() {
@@ -8427,6 +8529,8 @@ reasoning_effort = "low"
     ) -> ModelEntry {
         ModelEntry {
             info: ModelInfo {
+                notice: None,
+                context_windows: Vec::new(),
                 variants: Vec::new(),
                 user_selectable: true,
                 id: None,
@@ -9323,6 +9427,36 @@ reasoning_effort = "low"
         assert_eq!(dedup.untracked_exclude_globs, vec!["*.zip", "tmp/**"]);
     }
     #[test]
+    fn model_context_choices_and_notice_flow_to_acp_metadata() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [model.demo]
+            model = "demo"
+            context_windows = [500000, 200000, 500000]
+            notice = { severity = "warning", text = "  Retiring  " }
+        "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        let models = resolve_model_list(&cfg, None);
+        let info = &models["demo"].info;
+        assert_eq!(info.context_window.get(), 500_000);
+        assert_eq!(
+            info.context_windows
+                .iter()
+                .map(|x| x.get())
+                .collect::<Vec<_>>(),
+            vec![500_000, 200_000]
+        );
+        let acp = to_acp_model_info(&models);
+        let meta = acp[&acp::ModelId::new("demo")].meta.as_ref().unwrap();
+        assert_eq!(
+            meta["contextWindows"],
+            serde_json::json!([500_000, 200_000])
+        );
+        assert_eq!(meta["notice"]["text"], "Retiring");
+    }
+    #[test]
     fn parses_model_context_window() {
         let raw_config: toml::Value = toml::from_str(
             r#"
@@ -9905,6 +10039,8 @@ reasoning_effort = "low"
     #[test]
     fn model_info_from_config_propagates_use_concise() {
         let entry = ModelEntryConfig {
+            notice: None,
+            context_windows: Vec::new(),
             variants: Vec::new(),
             id: None,
             model: "test".to_string(),
@@ -10079,6 +10215,8 @@ reasoning_effort = "low"
     #[test]
     fn model_info_from_config_propagates_agent_type() {
         let entry = ModelEntryConfig {
+            notice: None,
+            context_windows: Vec::new(),
             variants: Vec::new(),
             id: None,
             model: "test".to_string(),
@@ -10613,6 +10751,8 @@ reasoning_effort = "low"
     #[test]
     fn inference_idle_timeout_propagates_to_model_info() {
         let entry = ModelEntryConfig {
+            notice: None,
+            context_windows: Vec::new(),
             variants: Vec::new(),
             id: None,
             model: "test".to_string(),
@@ -10752,6 +10892,26 @@ reasoning_effort = "low"
         let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
         let oidc = cfg.grok_com_config.oidc.expect("oidc should be set");
         assert_eq!(oidc.issuer, "https://example.okta.com");
+    }
+    #[test]
+    fn partial_auth_provider_keeps_nested_defaults_and_invalid_values_fail() {
+        let defaults = GrokComConfig::default();
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [auth.oauth2]
+            client_id = "custom-client"
+            "#,
+        )
+        .unwrap();
+        if let Some(default_oauth) = defaults.oauth2 {
+            let cfg = Config::new_from_toml_cfg(&raw).expect("partial auth should resolve");
+            let oauth = cfg.grok_com_config.oauth2.expect("default OAuth provider");
+            assert_eq!(oauth.client_id, "custom-client");
+            assert_eq!(oauth.issuer, default_oauth.issuer);
+        }
+
+        let invalid: toml::Value = toml::from_str("[auth.oauth2]\nclient_id = 123").unwrap();
+        assert!(Config::new_from_toml_cfg(&invalid).is_err());
     }
     /// `disable_api_key_auth` plumbs through the `[auth]` alias, and absent
     /// means None (opt-in knob, zero impact by default).
@@ -14828,6 +14988,8 @@ default = "grok-4.5"
     ) -> ModelEntry {
         ModelEntry {
             info: ModelInfo {
+                notice: None,
+                context_windows: Vec::new(),
                 variants: Vec::new(),
                 user_selectable: true,
                 id: None,

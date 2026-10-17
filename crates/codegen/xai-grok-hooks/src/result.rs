@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::event::{MAX_HOOK_OUTPUT_REPLACEMENT_CHARS, clip_text};
+
 /// The outcome of a blocking (`pre_tool_use`) hook dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookDecision {
@@ -61,6 +63,29 @@ pub struct OutputReplacement {
 impl OutputReplacement {
     pub fn wire_field(&self) -> &'static str {
         self.kind.wire_field()
+    }
+
+    /// Preserve small structured MCP replacements and cap oversized output.
+    pub fn mcp_output(self) -> serde_json::Value {
+        let text = match self.value {
+            serde_json::Value::String(text) => text,
+            structured => {
+                let text = structured.to_string();
+                if text.chars().count() <= MAX_HOOK_OUTPUT_REPLACEMENT_CHARS {
+                    return structured;
+                }
+                text
+            }
+        };
+        serde_json::Value::String(clip_text(&text, MAX_HOOK_OUTPUT_REPLACEMENT_CHARS))
+    }
+
+    pub fn mcp_output_text(self) -> String {
+        let text = match self.value {
+            serde_json::Value::String(text) => text,
+            structured => structured.to_string(),
+        };
+        clip_text(&text, MAX_HOOK_OUTPUT_REPLACEMENT_CHARS)
     }
 }
 
@@ -124,4 +149,27 @@ pub enum HookRunResult {
         http_info: Option<HttpInfo>,
         system_message: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    fn replacement(value: serde_json::Value) -> OutputReplacement {
+        OutputReplacement {
+            kind: ReplacementKind::Mcp,
+            hook_name: "test".into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn mcp_replacements_preserve_small_objects_and_clip_large_output() {
+        let object = serde_json::json!({"id": "example"});
+        assert_eq!(replacement(object.clone()).mcp_output(), object);
+        let large = "x".repeat(MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+        let out = replacement(serde_json::Value::String(large)).mcp_output_text();
+        assert!(out.chars().count() <= MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+        assert!(out.len() < MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+    }
 }

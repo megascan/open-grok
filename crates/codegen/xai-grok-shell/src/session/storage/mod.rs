@@ -1228,7 +1228,7 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Update the current model in summary (delegates to `update_current_model_and_agent` with no agent change).
     async fn update_current_model(&self, info: &Info, model_id: &acp::ModelId) -> io::Result<()> {
-        self.update_current_model_and_agent(info, model_id, None, None, None)
+        self.update_current_model_and_agent(info, model_id, None, None, None, None)
             .await
     }
 
@@ -1244,6 +1244,7 @@ pub trait StorageAdapter: Send + Sync {
         model_id: &acp::ModelId,
         agent: Option<&crate::session::persistence::PersistedAgent>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        context_window: Option<Option<std::num::NonZeroU64>>,
         resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     ) -> io::Result<()>;
 

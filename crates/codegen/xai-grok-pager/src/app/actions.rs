@@ -460,6 +460,16 @@ pub enum Action {
         /// - `Some(Some(id))`: concrete tier id such as `priority` (Fast).
         service_tier: Option<Option<String>>,
     },
+    /// Change model, context window and effort in one request.
+    SwitchModelWithWindow {
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        window: std::num::NonZeroU64,
+    },
+    /// Change the active model's context-window selection.
+    SwitchContextWindow {
+        window: std::num::NonZeroU64,
+    },
     /// Cancel the currently running turn.
     CancelTurn,
     /// User confirmed a cancel-turn choice from the panel.
@@ -855,6 +865,8 @@ pub enum Action {
     Logout,
     /// Disconnect the independent OpenAI Codex OAuth account.
     LogoutCodex,
+    /// Disconnect the separate Antigravity account.
+    LogoutAntigravity,
     /// Log out and immediately start a new login flow.
     SwitchAccount,
     /// Open the provider picker for a bare `/login` command.
@@ -881,6 +893,8 @@ pub enum Action {
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
     LoginCodex,
+    /// Start user-initiated Antigravity OAuth.
+    LoginAntigravity,
     /// Use ChatGPT Codex as the provider for this first-run TUI launch.
     ChooseStartupCodex,
     /// Use xAI Grok as the provider for this first-run TUI launch.
@@ -2130,6 +2144,8 @@ pub enum Effect {
         /// interruption marker, and a later resend pairs the kept copy with the
         /// resend — the send+Ctrl+C double-prompt bug.
         rewind_if_no_output: bool,
+        /// Exact prompt that may be rewound; never infer it from a later turn.
+        rewind_prompt_id: Option<String>,
     },
     /// Run a manual `/compact` command.
     Compact {
@@ -2169,6 +2185,25 @@ pub enum Effect {
         /// (no optimistic update). Threaded through to
         /// `SwitchModelComplete` so `IncompatibleAgent` can roll back.
         prev_model_id: Option<acp::ModelId>,
+    },
+    /// Apply a model, effort and context window together through ACP.
+    SwitchModelWithWindow {
+        agent_id: AgentId,
+        request_id: u64,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        source_model_id: Option<acp::ModelId>,
+        effort: Option<ReasoningEffort>,
+        window: std::num::NonZeroU64,
+    },
+    /// Apply a context window on the current model through ACP.
+    SwitchContextWindow {
+        agent_id: AgentId,
+        request_id: u64,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        window: std::num::NonZeroU64,
     },
     /// Fetch changelog from CDN (both markdown + structured JSON).
     /// Runs off the render path via `spawn_blocking`. Result is cached
@@ -2456,6 +2491,8 @@ pub enum Effect {
     FetchSkillsList {
         agent_id: AgentId,
         session_id: acp::SessionId,
+        refresh: bool,
+        fetch: u64,
     },
     FetchWorkflowsList {
         agent_id: AgentId,
@@ -2465,6 +2502,7 @@ pub enum Effect {
     ToggleSkill {
         agent_id: AgentId,
         session_id: acp::SessionId,
+        fetch: u64,
         skill_name: String,
         enabled: bool,
     },
@@ -2674,6 +2712,12 @@ pub enum Effect {
         targets: Vec<ProviderSessionTarget>,
         primary_was_codex: bool,
     },
+    LoginAntigravity {
+        agent_id: Option<AgentId>,
+    },
+    LogoutAntigravity {
+        agent_id: Option<AgentId>,
+    },
     /// Re-check subscription status via `x.ai/auth/check_subscription`.
     /// `verify` scopes the result to a deferred-gate verification (see
     /// [`crate::app::subscription`]); `None` for generic checks.
@@ -2790,6 +2834,11 @@ pub enum Effect {
         last_turn_summary_gen: u64,
     },
     FetchRewindPoints {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Await cancellation before requesting the rewind points.
+    CancelTurnThenFetchRewindPoints {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
@@ -2991,6 +3040,14 @@ pub struct WorkspaceMemberUpsertFailure {
     pub session_id: String,
     pub error: String,
     pub retryable: bool,
+}
+
+/// OAuth state must never be exposed through derived action/task debug output.
+pub struct SensitiveAuthUrl(pub String);
+impl std::fmt::Debug for SensitiveAuthUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted authorization URL>")
+    }
 }
 
 #[derive(Debug)]
@@ -3531,6 +3588,27 @@ pub enum TaskResult {
         /// rollback on `IncompatibleAgent`.
         prev_model_id: Option<acp::ModelId>,
     },
+    /// A combined model/window request completed for its originating session.
+    ModelWindowSwitchComplete {
+        agent_id: AgentId,
+        request_id: u64,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        source_model_id: Option<acp::ModelId>,
+        effort: Option<ReasoningEffort>,
+        window: std::num::NonZeroU64,
+        result: Result<(), SwitchModelError>,
+    },
+    /// A context-window request completed for its originating session.
+    ContextWindowComplete {
+        agent_id: AgentId,
+        request_id: u64,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        window: std::num::NonZeroU64,
+        result: Result<(), SwitchModelError>,
+    },
     /// Changelog fetched from CDN (both formats).
     ChangelogFetched {
         markdown: Option<String>,
@@ -3649,7 +3727,9 @@ pub enum TaskResult {
     /// Skills list loaded.
     SkillsListLoaded {
         agent_id: AgentId,
-        result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+        session_id: acp::SessionId,
+        fetch: u64,
+        result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
     },
     WorkflowsListLoaded {
         agent_id: AgentId,
@@ -3659,7 +3739,9 @@ pub enum TaskResult {
     /// Skill toggle completed (enable/disable).
     SkillsToggleDone {
         agent_id: AgentId,
-        result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+        session_id: acp::SessionId,
+        fetch: u64,
+        result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
     },
     /// Background marketplace auto-update completed.
     MarketplaceUpdatesAvailable {
@@ -3958,6 +4040,18 @@ pub enum TaskResult {
         agent_id: Option<AgentId>,
         purpose: CodexLoginPurpose,
         authorization_url: Option<String>,
+    },
+    AntigravityLoginUrlReady {
+        agent_id: Option<AgentId>,
+        url: Option<SensitiveAuthUrl>,
+        opened: bool,
+        copied: bool,
+        shown: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    AntigravityAuthComplete {
+        agent_id: Option<AgentId>,
+        logout: bool,
+        result: Result<(), String>,
     },
     /// Independent OpenAI Codex browser OAuth finished.
     CodexLoginComplete {

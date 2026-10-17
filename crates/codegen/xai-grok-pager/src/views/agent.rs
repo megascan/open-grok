@@ -129,6 +129,7 @@ pub struct AgentViewLayout {
     pub follow_ups: Rect,
     /// Single-row record indicator ("◉ Recording") directly above the prompt,
     /// shown only while voice capture is active.
+    pub model_notice: Rect,
     pub voice_recording: Rect,
     pub prompt: Rect,
     pub shortcuts: Rect,
@@ -182,6 +183,7 @@ impl AgentViewLayout {
         follow_ups_height: u16,
         startup_warning_height: u16,
         prompt_gap: u16,
+        model_notice_height: u16,
         voice_recording_height: u16,
         shortcuts_height: u16,
         dock_height: u16,
@@ -264,6 +266,9 @@ impl AgentViewLayout {
         }
         if prompt_gap > 0 {
             constraints.push(Constraint::Length(prompt_gap));
+        }
+        if model_notice_height > 0 {
+            constraints.push(Constraint::Length(model_notice_height));
         }
         if voice_recording_height > 0 {
             constraints.push(Constraint::Length(voice_recording_height));
@@ -384,6 +389,13 @@ impl AgentViewLayout {
         if prompt_gap > 0 {
             i += 1;
         }
+        let model_notice = if model_notice_height > 0 {
+            let r = chunks[i];
+            i += 1;
+            r
+        } else {
+            Rect::default()
+        };
         let voice_recording = if voice_recording_height > 0 {
             let r = chunks[i];
             i += 1;
@@ -439,6 +451,7 @@ impl AgentViewLayout {
             banner,
             plugin_cta,
             follow_ups,
+            model_notice,
             voice_recording,
             prompt,
             shortcuts,
@@ -2258,6 +2271,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             1,
             0,
             0,
@@ -2276,6 +2290,7 @@ mod tests {
             &ScrollbarConfig::default(),
             0,
             2,
+            0,
             0,
             0,
             0,
@@ -2325,6 +2340,7 @@ mod tests {
             scrollbar_cfg,
             timeline_width,
             2,
+            0,
             0,
             0,
             0,

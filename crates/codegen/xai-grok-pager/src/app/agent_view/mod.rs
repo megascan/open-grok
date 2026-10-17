@@ -156,6 +156,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 mod cta;
 mod elicitation;
+pub(crate) use elicitation::UnansweredElicitation;
 mod input;
 pub(crate) use input::ExternalPromptEditorAccess;
 mod interactions;
@@ -179,6 +180,8 @@ mod render;
 pub use render::{AppRenderParams, OverlayHeader};
 #[cfg(test)]
 mod header_tests;
+#[cfg(test)]
+mod model_notice_tests;
 mod rewind;
 mod selection;
 mod session;
@@ -1627,6 +1630,8 @@ pub struct AgentView {
     /// `WorktreeSessionFailed` (non-orphan branch), and
     /// `ForkSessionFailed`.
     pub(crate) pending_fork_banner: Option<PendingForkBanner>,
+    /// The session failed to load; refuse new sends until a session opens.
+    pub(crate) load_failed: bool,
     /// Entry ID of the "Loading session ..." placeholder block pushed
     /// by `dispatch_load_session_inner`. Cleared by the `SessionLoaded`
     /// handler so the placeholder doesn't linger on screen when the
@@ -2412,6 +2417,7 @@ pub(crate) mod test_fixtures {
             args_expanded: false,
             desc_scroll: 0,
             subagent_label: None,
+            sandbox_visible_area: None,
             options_area_height: 0,
             options_scroll_offset: 0,
         }
@@ -2726,6 +2732,7 @@ pub(crate) mod test_fixtures {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,
@@ -2792,6 +2799,7 @@ pub(crate) mod test_fixtures {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                pending_context_switch: None,
                 hook_block_hold: false,
                 blocked_prompt: None,
                 provider_rebind_pending: false,
@@ -3616,6 +3624,7 @@ pub(crate) fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf)
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
             hook_block_hold: false,
             blocked_prompt: None,
             provider_rebind_pending: false,

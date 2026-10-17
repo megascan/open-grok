@@ -102,6 +102,7 @@ windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_UI_Sh
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+xai-grok-env = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = []

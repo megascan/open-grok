@@ -15,7 +15,7 @@ use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::servers::{McpClient, parse_mcp_qualified_name};
 use xai_tool_protocol::ToolId;
-use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput};
+use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput, render_structured_content};
 use xai_tool_types::ToolDescription;
 
 /// Adapts [`McpClient`] to the [`McpTransport`] trait for [`McpBridge`].
@@ -41,8 +41,11 @@ impl McpClientTransportAdapter {
 #[async_trait]
 impl McpTransport for McpClientTransportAdapter {
     async fn initialize(&self) -> Result<McpServerInfo, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client()?
+        let client = self.client()?;
+        // Hub requests have no agent call identity. Account for them while they
+        // are in flight so untagged server requests cannot be misattributed.
+        let _request = client.begin_outbound_request();
+        let service = client
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -61,8 +64,11 @@ impl McpTransport for McpClientTransportAdapter {
     async fn list_tools(
         &self,
     ) -> Result<Vec<McpToolDefinition>, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client()?
+        let client = self.client()?;
+        // Hub requests have no agent call identity. Account for them while they
+        // are in flight so untagged server requests cannot be misattributed.
+        let _request = client.begin_outbound_request();
+        let service = client
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -97,47 +103,24 @@ impl McpTransport for McpClientTransportAdapter {
         name: &str,
         arguments: Value,
     ) -> Result<McpCallResult, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client()?
-            .ensure_initialized()
-            .await
-            .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
+        // `McpClient::call_tool` holds the non-agent request guard across every
+        // MRTR round and sends cancellation if a pending request is dropped.
+        let client = self.client()?;
         // MCP spec requires arguments to be an object; coerce if needed.
-        let args_object = match arguments {
-            Value::Object(map) => Some(map),
-            Value::Null => None,
+        let arguments = match arguments {
+            Value::Object(_) | Value::Null => arguments,
             other => {
                 let mut wrapper = serde_json::Map::new();
                 wrapper.insert("value".to_string(), other);
-                Some(wrapper)
+                Value::Object(wrapper)
             }
         };
-        let result = service
-            .call_tool({
-                let mut params = rmcp::model::CallToolRequestParams::new(name.to_string());
-                params.arguments = args_object;
-                params
-            })
+        let result = client
+            .call_tool(name, arguments)
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
 
-        Ok(McpCallResult {
-            content: result
-                .content
-                .into_iter()
-                .map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
-                    rmcp::model::ContentBlock::Image(img) => McpContent::Image {
-                        mime_type: img.mime_type,
-                        data: img.data,
-                    },
-                    _ => McpContent::Text {
-                        text: "[unsupported content type]".to_string(),
-                    },
-                })
-                .collect(),
-            is_error: result.is_error.unwrap_or(false),
-        })
+        Ok(mcp_call_result_from_rmcp(result))
     }
 
     async fn close(&self) -> Result<(), xai_computer_hub_mcp_adapter::McpError> {
@@ -145,6 +128,35 @@ impl McpTransport for McpClientTransportAdapter {
         // service; a call routed in afterwards fails here.
         self.client.store(None);
         Ok(())
+    }
+}
+
+/// Preserve structured output and MCP metadata on the hub bridge.
+fn mcp_call_result_from_rmcp(result: rmcp::model::CallToolResult) -> McpCallResult {
+    let mut content: Vec<McpContent> = result
+        .content
+        .into_iter()
+        .map(|c| match c {
+            rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
+            rmcp::model::ContentBlock::Image(img) => McpContent::Image {
+                mime_type: img.mime_type,
+                data: img.data,
+            },
+            _ => McpContent::Text {
+                text: "[unsupported content type]".to_string(),
+            },
+        })
+        .collect();
+    let texts = content.iter().filter_map(|c| match c {
+        McpContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    });
+    let structured = render_structured_content(result.structured_content.as_ref(), texts);
+    content.extend(structured.map(|text| McpContent::Text { text }));
+    McpCallResult {
+        content,
+        is_error: result.is_error.unwrap_or(false),
+        meta: result.meta.unwrap_or_default().0,
     }
 }
 
@@ -290,6 +302,30 @@ mod tests {
         async fn close(&self) -> Result<(), McpError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn bridged_result_preserves_meta_and_structured_content_without_duplication() {
+        let data = serde_json::json!({"items": [1, 2]});
+        let meta = serde_json::Map::from_iter([("app_name".into(), "TextEdit".into())]);
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("summary")]);
+        result.structured_content = Some(data.clone());
+        result.meta = Some(rmcp::model::MetaObject(meta.clone()));
+        let bridged = super::mcp_call_result_from_rmcp(result);
+        assert_eq!(bridged.meta, meta);
+        assert!(
+            matches!(&bridged.content[..], [McpContent::Text { text: summary }, McpContent::Text { text: structured }] if summary == "summary" && structured == &data.to_string())
+        );
+
+        let mut inlined =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                data.to_string(),
+            )]);
+        inlined.structured_content = Some(data);
+        let bridged = super::mcp_call_result_from_rmcp(inlined);
+        assert_eq!(bridged.content.len(), 1);
+        assert!(bridged.meta.is_empty());
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
 use crate::kimi_models::KimiApiEndpoint;
@@ -118,8 +117,9 @@ pub(crate) fn backup_corrupt_auth_file(path: &Path) -> Option<PathBuf> {
     if !path.exists() {
         return None;
     }
-    if read_auth_json(path).is_ok() {
-        return None;
+    match read_auth_json(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
+        _ => return None,
     }
 
     let ts = std::time::SystemTime::now()
@@ -250,8 +250,7 @@ fn write_auth_json_with(
 }
 
 /// Serialize `auth_store` to `path` (truncate + rewrite), owner-only (0o600)
-/// and `fsync`'d. Shared core of the atomic path (which targets the temp
-/// file) and the in-place fallback (which targets `auth.json` directly).
+/// and `fsync`'d. Used by the in-place disk-full fallback.
 ///
 /// Uses streaming `to_writer_pretty` through a `BufWriter` to avoid
 /// allocating the entire JSON string in memory — eliminates OOM risk under
@@ -292,8 +291,7 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
 #[cfg(test)]
 pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
-/// Windows `rename` requires removing the target first.
+/// Atomic temp + rename of the referent, preserving a user-created symlink.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     #[cfg(test)]
     if WRITE_FAULT_PATH
@@ -307,34 +305,14 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
             "injected write fault (WRITE_FAULT_PATH)",
         ));
     }
-    // Unique per write (pid + monotonic seq): two concurrent in-process writers
-    // (e.g. background mint + proactive refresher) must not share one tmp path.
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp = auth_file.with_extension(format!(
-        "json.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    // Reclaim the temp file on any early return (write/sync/rename failure); the
-    // unique name otherwise accumulates one orphan per failed write.
-    struct TmpReclaim<'a>(Option<&'a Path>);
-    impl Drop for TmpReclaim<'_> {
-        fn drop(&mut self) {
-            if let Some(p) = self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
+    if let Some(parent) = auth_file.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let mut tmp_reclaim = TmpReclaim(Some(&tmp));
-
-    write_store_to(&tmp, auth_store)?;
-    #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(auth_file);
-    }
-    std::fs::rename(&tmp, auth_file)?;
-    tmp_reclaim.0 = None; // renamed into place; nothing to reclaim
+    let contents = serde_json::to_string_pretty(auth_store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let destination = xai_grok_config::fs_atomic::bind_follow_destination(auth_file)?;
+    xai_grok_config::fs_atomic::require_same_bound_destination(auth_file, &destination)?;
+    xai_grok_config::fs_atomic::write_atomically_bound(&destination, &contents, Some(0o600))?;
     // Re-assert on the final path (covers rename edge cases / FS quirks).
     // Best-effort: rename already published the new tokens.
     if let Err(e) = crate::util::secure_file::ensure_owner_only_permissions(auth_file) {
@@ -1241,6 +1219,38 @@ mod write_fallback_tests {
         let path = dir.path().join("auth.json");
         write_auth_json(&path, &sample_store()).unwrap();
         assert_eq!(read_key(&path).as_deref(), Some("secret-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_symlink_preserves_link_and_owner_only_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real/auth.json");
+        write_auth_json(&target, &AuthStore::new()).unwrap();
+        let link = dir.path().join("auth.json");
+        symlink("real/auth.json", &link).unwrap();
+        write_auth_json(&link, &sample_store()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read_key(&target).as_deref(), Some("secret-key"));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn corrupt_backup_does_not_rename_non_json_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(backup_corrupt_auth_file(&path).is_none());
+        assert!(path.is_dir());
     }
 
     /// On a failed atomic write, the `TmpReclaim` guard must remove the temp

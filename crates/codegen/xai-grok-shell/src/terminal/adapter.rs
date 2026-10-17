@@ -178,6 +178,23 @@ pub struct AcpTerminalAdapter {
     gateway: GatewaySender,
     session_id: acp::SessionId,
     tasks: TaskMap,
+    sandbox_guard: Option<Arc<dyn AcpTerminalSandboxGuard>>,
+}
+
+#[async_trait::async_trait]
+trait AcpTerminalSandboxGuard: Send + Sync {
+    async fn requires_local_enforcement(&self) -> Result<bool, ComputerError>;
+}
+
+#[async_trait::async_trait]
+impl AcpTerminalSandboxGuard for xai_grok_workspace::WorkspaceOps {
+    async fn requires_local_enforcement(&self) -> Result<bool, ComputerError> {
+        self.sandbox_requires_local_enforcement()
+            .await
+            .map_err(|error| {
+                ComputerError::io(format!("Could not verify workspace sandbox: {error}"))
+            })
+    }
 }
 
 impl AcpTerminalAdapter {
@@ -186,7 +203,16 @@ impl AcpTerminalAdapter {
             gateway,
             session_id,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            sandbox_guard: None,
         }
+    }
+
+    pub(crate) fn with_workspace_sandbox(
+        mut self,
+        workspace: xai_grok_workspace::WorkspaceOps,
+    ) -> Self {
+        self.sandbox_guard = Some(Arc::new(workspace));
+        self
     }
 
     async fn create_terminal(
@@ -194,6 +220,13 @@ impl AcpTerminalAdapter {
         command: String,
         request: &TerminalRunRequest,
     ) -> Result<acp::CreateTerminalResponse, ComputerError> {
+        if let Some(guard) = &self.sandbox_guard
+            && guard.requires_local_enforcement().await?
+        {
+            return Err(ComputerError::io(
+                "Workspace sandbox enforcement requires a local terminal; the ACP client terminal cannot enforce it",
+            ));
+        }
         self.gateway
             .send(
                 acp::CreateTerminalRequest::new(self.session_id.clone(), command)

@@ -2703,7 +2703,20 @@ impl SessionActor {
         let codex_model_limit = model_id
             .and_then(|model_id| self.models_manager.codex_compaction_metadata(model_id))
             .and_then(|metadata| metadata.auto_compact_token_limit);
-        let limit = auto_compact_token_limit(provider, cw, configured_percent, codex_model_limit);
+        let mut limit =
+            auto_compact_token_limit(provider, cw, configured_percent, codex_model_limit);
+        // A catalog absolute limit belongs to its default window; a smaller
+        // explicit selection must still compact before it fills.
+        if provider == ModelProvider::Codex
+            && self
+                .compaction
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == cw
+        {
+            let selected_limit = auto_compact_token_limit(provider, cw, configured_percent, None);
+            limit = limit.min(selected_limit);
+        }
         if total_tokens >= limit {
             let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
             Some(AutoCompactTriggerInfo {
@@ -3298,6 +3311,7 @@ mod inline_auto_compact_flow_tests {
                 threshold_percent: std::cell::Cell::new(threshold_percent),
                 force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 context_window_override: None,
+                context_window_selection: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 count: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
                 previous_model: std::cell::Cell::new(None),

@@ -121,14 +121,24 @@ These differ from `/cd`, which only changes where **new** dashboard sessions spa
 
 ## Model and Mode
 
-### `/model <name>`
+### `/context-window <size>`
 
-Switch models. Accepts a model ID or display name (case-insensitive), and for reasoning models you can add an effort level as a second argument. Alias: `/m`.
+Select a context window for the current model when it advertises multiple sizes. Use the short label (such as `500k`) or the full token count. The selection applies after the session accepts the change.
+
+```
+/context-window 500k
+/context-window 256000
+```
+
+### `/model <name> [window] [effort]`
+
+Switch models using an ID, provider-qualified selector, or unambiguous display name (case-insensitive). For models that offer multiple context windows or reasoning effort levels, the picker guides you through those choices. Alias: `/m`.
 
 ```
 /model grok-build
 /model Grok Build
 /model Reasoning X high
+/model codex:example 500k high
 ```
 
 ### `/effort <level>`
@@ -188,6 +198,8 @@ Toggle vim-style scrollback keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, and so on)
 ### `/minimal` and `/fullscreen`
 
 Reopen the current session in the other render mode. `/minimal` (offered while you're in fullscreen) switches to the experimental scrollback-native mode; `/fullscreen` (offered while you're in minimal; alias `/full`) switches back to standard fullscreen mode. Both relaunch the pager on the same conversation for this session only — they don't touch `config.toml`, and the relaunch banner reminds you how to switch back. The `--minimal` / `--fullscreen` CLI flags are session-scoped the same way. To make plain `open-grok` open in a given mode by default, use `/settings` → **Default screen mode** or set `[ui] screen_mode`.
+
+In minimal mode, a terminal resize can reprint the current session at the new width after a short pause. Reprinting clears the terminal screen and scrollback, including output from before Open Grok and previous `/new` sessions. It restores up to the newest 4,000 rows of this session; use `/transcript` for older conversation blocks.
 
 A handful of commands only work in one of the two modes, because the surface they drive doesn't exist in the other: `/find`, `/jump`, `/timeline`, `/theme`, `/tutorial`, `/workflows`, and `/dashboard` are fullscreen-only, while `/expand` and `/edit-prompt` are minimal-only. Those are hidden from the command menu and the palette in the mode they can't run in. If you type one out anyway, Grok says why — and points you at whichever is actually useful. When the other mode is the only way to get it, that's the mode switch: `/theme isn't available in minimal mode (minimal renders with your terminal's own palette). Run /fullscreen to switch this session.` When this mode already does the job another way, it names that instead: `/expand isn't available in fullscreen mode — press Tab to focus the scrollback, then → on the block.` Everything else works in both. Note that `--no-alt-screen` still counts as fullscreen here, so it keeps the fullscreen-only commands.
 

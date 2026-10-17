@@ -421,6 +421,7 @@ pub enum PersistenceMsg {
         /// The active agent, persisted so session resume doesn't depend on the mutable model catalog.
         agent: PersistedAgent,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        context_window: Option<Option<std::num::NonZeroU64>>,
         /// When present, model identity and provider transport are committed
         /// in the same summary patch so cold resume cannot observe a torn pair.
         resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
@@ -433,6 +434,11 @@ pub enum PersistenceMsg {
     /// model. Codex-backed subagents use this to close and persist the parent
     /// tree's cumulative xAI export boundary.
     ObserveProvider(ModelProvider),
+    /// Close the export boundary for an external agent and acknowledge only
+    /// after its marker has been written. Callers must abort on any error.
+    CloseXaiExportAndAck {
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Bind an idle Codex-backed title client's existing OAuth resolver after
     /// a session that started logged out adopts its first identity. This is
     /// runtime-only state; model and endpoint selection stay unchanged.
@@ -1297,6 +1303,13 @@ pub struct Summary {
     pub sandbox_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(
+        default,
+        rename = "context_window",
+        alias = "context_window_selection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window_selection: Option<std::num::NonZeroU64>,
     /// Ultra-short summary of the most recent successful turn, shown as the
     /// dashboard row's secondary line (via the roster for non-attached
     /// clients). Displayed until replaced by the next successful turn (or
@@ -1430,6 +1443,7 @@ impl Summary {
             agent: PersistedAgentSelection::default(),
             sandbox_profile: None,
             reasoning_effort: None,
+            context_window_selection: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,
@@ -1723,6 +1737,17 @@ mod is_hidden_tests {
         assert!(summary.ever_used_codex);
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("ever_used_codex"));
+    }
+
+    #[test]
+    fn external_agent_closes_the_shared_boundary_without_a_sampler_provider() {
+        let boundary = ProviderBoundary::default();
+        let export_guard = boundary.clone();
+        assert!(boundary.close_xai_export());
+        assert!(!export_guard.allows_xai_export());
+        assert!(!boundary.close_xai_export());
+        assert!(!boundary.observe(ModelProvider::Xai));
+        assert!(!export_guard.allows_xai_export());
     }
 
     #[test]
@@ -2184,11 +2209,15 @@ impl ProviderBoundary {
     /// Keeping the decision on the profile avoids growing another
     /// provider-specific boolean as providers are added.
     pub(crate) fn observe(&self, provider: ModelProvider) -> bool {
-        !provider.profile().allows_xai_services()
-            && self
-                .ever_used_codex
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        !provider.profile().allows_xai_services() && self.close_xai_export()
+    }
+
+    /// External agents are not sampler providers, but their content must
+    /// close the same cumulative boundary immediately.
+    pub(crate) fn close_xai_export(&self) -> bool {
+        self.ever_used_codex
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub(crate) fn ever_used_codex(&self) -> bool {
@@ -2989,6 +3018,7 @@ impl SessionPersistence {
                     provider,
                     agent,
                     reasoning_effort,
+                    context_window,
                     resolved_tool_policy,
                 } => {
                     self.current_provider = provider;
@@ -3000,6 +3030,7 @@ impl SessionPersistence {
                             &model_id,
                             Some(&agent),
                             reasoning_effort,
+                            context_window,
                             resolved_tool_policy,
                         )
                         .await
@@ -3023,6 +3054,14 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::ObserveProvider(provider) => {
                     self.observe_provider(provider).await;
+                }
+                PersistenceMsg::CloseXaiExportAndAck { respond_to } => {
+                    self.provider_boundary.close_xai_export();
+                    self.remote_sync.take();
+                    self.relay_sync.take();
+                    self.registry_title_sync.take();
+                    let result = self.storage.mark_ever_used_codex(&self.info).await;
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::RefreshCodexSummaryAuth { bearer_resolver } => {
                     self.summary.refresh_codex_bearer_resolver(bearer_resolver);
@@ -3353,17 +3392,22 @@ impl SessionPersistence {
     }
 }
 
+#[path = "persistence_archive_logs.rs"]
+mod archive_logs;
+
 /// Collect MCP server stderr logs from `~/.opengrok/logs/mcp/` for inclusion in the session archive.
 fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
     let mcp_log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
     let Ok(entries) = std::fs::read_dir(&mcp_log_dir) else {
         return;
     };
+    let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(&mcp_log_dir);
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file()
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
             && path.extension().is_some_and(|ext| ext == "log")
-            && let Ok(data) = std::fs::read(&path)
+            && let Ok(Some(file)) = artifacts.open_non_artifact(&path)
+            && let Ok(data) = archive_logs::read_log_for_archive(file)
             && !data.is_empty()
         {
             let name = format!(
@@ -3402,6 +3446,17 @@ fn backfill_updates_to_sync(
 }
 
 fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<CopiedSessionFile>) {
+    let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(base);
+    collect_session_files_recursive_with_artifacts(base, dir, files, &artifacts);
+    archive_logs::collect_terminal_logs(base, files, &artifacts);
+}
+
+fn collect_session_files_recursive_with_artifacts(
+    base: &Path,
+    dir: &Path,
+    files: &mut Vec<CopiedSessionFile>,
+    artifacts: &xai_grok_feedback::FeedbackDraftArtifactSet,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -3412,8 +3467,14 @@ fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<Copi
     };
 
     for entry in entries.flatten() {
+        if xai_grok_feedback::is_feedback_draft_artifact_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
-        if path.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
             let rel_path = match path.strip_prefix(base) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -3421,19 +3482,20 @@ fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<Copi
             let Some(name) = rel_path.to_str() else {
                 continue;
             };
-            let data = match std::fs::read(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(?e, "Failed to read session file during copy");
-                    continue;
-                }
+            let Ok(Some(mut file)) = artifacts.open_non_artifact(&path) else {
+                continue;
             };
+            let mut data = Vec::new();
+            if let Err(e) = std::io::Read::read_to_end(&mut file, &mut data) {
+                tracing::warn!(?e, "Failed to read session file during copy");
+                continue;
+            }
             files.push(CopiedSessionFile {
                 name: name.to_string(),
                 data,
             });
-        } else if path.is_dir() {
-            collect_session_files_recursive(base, &path, files);
+        } else if file_type.is_dir() && path != base.join(archive_logs::TERMINAL_DIR) {
+            collect_session_files_recursive_with_artifacts(base, &path, files, artifacts);
         }
     }
 }
@@ -4765,6 +4827,107 @@ mod collect_session_files_tests {
         assert_eq!(files[0].data, b"line1\nline2");
         assert_eq!(files[1].name, "summary.json");
         assert_eq!(files[1].data, b"{}");
+    }
+
+    #[test]
+    fn trims_oversized_terminal_logs_to_both_ends_but_never_caps_other_files() {
+        let dir = TempDir::new().unwrap();
+        let cap = archive_logs::MAX_ARCHIVED_LOG_BYTES as usize;
+        fs::create_dir(dir.path().join("terminal")).unwrap();
+        fs::create_dir(dir.path().join("images")).unwrap();
+        let big_log = [vec![b'h'; cap], vec![b't'; cap]].concat();
+        fs::write(dir.path().join("terminal/big.log"), &big_log).unwrap();
+        fs::write(dir.path().join("terminal/small.log"), b"ok").unwrap();
+        for name in ["images/big.png", "chat_history.jsonl"] {
+            fs::File::create(dir.path().join(name))
+                .unwrap()
+                .set_len(cap as u64 + 1)
+                .unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let sizes: Vec<_> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.data.len()))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                ("chat_history.jsonl", cap + 1),
+                ("images/big.png", cap + 1),
+                ("terminal/big.log", cap + archive_logs::TRIM_MARKER.len()),
+                ("terminal/small.log", 2),
+            ]
+        );
+        let trimmed = &files[2].data;
+        assert!(trimmed.starts_with(&vec![b'h'; cap / 2]));
+        assert!(trimmed.ends_with(&vec![b't'; cap / 2]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_a_symlinked_terminal_dir() {
+        let dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        fs::write(elsewhere.path().join("outside.log"), b"not session data").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("terminal")).unwrap();
+        fs::write(dir.path().join("summary.json"), b"{}").unwrap();
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["summary.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excludes_draft_hardlinks_and_symlinked_files_from_archives() {
+        let dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let draft = dir.path().join("feedback_drafts.json");
+        fs::write(&draft, b"private draft").unwrap();
+        fs::hard_link(&draft, dir.path().join("innocent.json")).unwrap();
+        fs::create_dir(dir.path().join("terminal")).unwrap();
+        fs::hard_link(&draft, dir.path().join("terminal/copy.log")).unwrap();
+        fs::write(elsewhere.path().join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("outside"), dir.path().join("link"))
+            .unwrap();
+        fs::write(dir.path().join("summary.json"), b"{}").unwrap();
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "summary.json");
+    }
+
+    #[test]
+    fn admits_newest_terminal_logs_until_the_copy_budget_is_spent() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = TempDir::new().unwrap();
+        let terminal = dir.path().join("terminal");
+        fs::create_dir(&terminal).unwrap();
+        let per_log = archive_logs::MAX_ARCHIVED_LOG_BYTES;
+        let fits = (archive_logs::MAX_ARCHIVED_TERMINAL_BYTES / per_log) as usize;
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for i in 0..=fits {
+            let log = fs::File::create(terminal.join(format!("{i:02}.log"))).unwrap();
+            log.set_len(per_log).unwrap();
+            log.set_modified(t0 + Duration::from_secs(i as u64))
+                .unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+
+        let mut names: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
+        names.sort_unstable();
+        let newest: Vec<_> = (1..=fits).map(|i| format!("terminal/{i:02}.log")).collect();
+        assert_eq!(names, newest, "the oldest log is the one left out");
     }
 
     #[test]

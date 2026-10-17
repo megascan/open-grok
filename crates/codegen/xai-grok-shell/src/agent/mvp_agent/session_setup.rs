@@ -1860,9 +1860,16 @@ impl MvpAgent {
                 });
             let restore_request = acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
                 .meta(restore_meta);
-            if let Some(policy) = restored_tool_policy {
-                crate::agent::handlers::model_switch::apply_restored(self, restore_request, policy)
-                    .await?;
+            if requested_model_id.is_none()
+                && model_selection_origin == acp_agent::LoadModelSelectionOrigin::PersistedIdentity
+            {
+                crate::agent::handlers::model_switch::apply_restored(
+                    self,
+                    restore_request,
+                    restored_tool_policy,
+                    summary.context_window_selection,
+                )
+                .await?;
             } else {
                 crate::agent::handlers::model_switch::apply(self, restore_request).await?;
             }

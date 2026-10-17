@@ -67,6 +67,29 @@ Run `/usage` to view xAI billing and OpenAI Codex quota windows together. If
 Codex is not connected, the OpenAI section says so and points to
 `open-grok login --codex`; xAI usage still loads independently.
 
+### Antigravity subagents
+
+Antigravity runs as a separate ACP agent with its own Google account and Open
+Grok profile. From an Open Grok source checkout on macOS or Linux, install the
+runtime and sign in:
+
+```bash
+./scripts/install-antigravity-acp.sh
+open-grok login --antigravity
+```
+
+Inside Open Grok, use `/login antigravity`; sign out with
+`open-grok logout --antigravity` or `/logout antigravity`. Start a new session
+after sign-in to refresh the task tool's model list. The available models are
+those advertised for your account, named `antigravity-acp:<model-id>` for
+subagent tasks; they are not parent chat models.
+
+Antigravity tasks require an unrestricted general-purpose child and parent:
+always-approve must be enabled, plan mode inactive, and hooks, restrictive
+permission rules, and the local sandbox must be off. Restricted or unverifiable
+configurations cannot launch this external agent. Interaction questions are
+currently cancelled rather than presented in the parent session.
+
 ---
 
 ## API Key

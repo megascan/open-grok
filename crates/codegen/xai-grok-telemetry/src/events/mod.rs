@@ -15,10 +15,14 @@ pub use super::enums::PrCreationSource;
 
 mod active_agent_message;
 mod feedback;
+mod file_acceleration;
 mod permission_analytics;
+mod sandbox;
 pub use active_agent_message::*;
 pub use feedback::*;
+pub use file_acceleration::*;
 pub use permission_analytics::*;
+pub use sandbox::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
 pub trait TelemetryEvent: Serialize + Send + 'static {
@@ -2393,6 +2397,29 @@ pub struct ClipboardImagePaste {
     pub duration_ms: u64,
 }
 
+/// Why a paste-time attachment probe did not attach its result.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardProbeDropReason {
+    PasteboardChangedBeforeRead,
+    PasteboardChangedAfterRead,
+    BracketedPayloadMismatch,
+    BracketedOriginReadFailed,
+    ReadFailed,
+    Timeout,
+    PersistFailed,
+    Panicked,
+}
+
+#[derive(Serialize)]
+pub struct ClipboardPasteProbeDropped {
+    #[serde(flatten)]
+    pub terminal: TerminalTelemetry,
+    pub reason: ClipboardProbeDropReason,
+    pub image_hash: String,
+    pub duration_ms: u64,
+}
+
 /// Emitted when Ctrl/Cmd+V (paste key) is handled but the **host** process
 /// clipboard has no pasteable text/image/file URLs. Diagnoses silent no-ops
 /// on remote/ETX sessions. Does not change paste behavior.
@@ -2835,6 +2862,22 @@ telemetry_event!(
     AuthLockReplacedOutFromUnder,
     "auth_lock_replaced_out_from_under"
 );
+telemetry_event!(SandboxCommandEnded, "sandbox_command_ended");
+telemetry_event!(SandboxViolationSettled, "sandbox_violation_settled");
+telemetry_event!(SandboxGrantRecorded, "sandbox_grant_recorded");
+telemetry_event!(SandboxGrantRevoked, "sandbox_grant_revoked");
+telemetry_event!(
+    FileAccelerationSessionStarted,
+    "file_acceleration_session_started"
+);
+telemetry_event!(
+    FileAccelerationSessionEnded,
+    "file_acceleration_session_ended"
+);
+telemetry_event!(
+    FileAccelerationUnavailableHit,
+    "file_acceleration_unavailable_hit"
+);
 telemetry_event!(CliUpdate, "cli_update");
 telemetry_event!(CloneEnded, "clone_ended");
 
@@ -3047,6 +3090,7 @@ telemetry_event!(TerminalTelemetry, "terminal_context");
 telemetry_event!(DisplayRefreshProbe, "display_refresh_probe");
 telemetry_event!(BackspaceNoEffect, "backspace_no_effect");
 telemetry_event!(ClipboardImagePaste, "clipboard_image_paste");
+telemetry_event!(ClipboardPasteProbeDropped, "clipboard_paste_probe_dropped");
 telemetry_event!(PasteKeyEmptyHostClipboard, "paste_key_empty_host_clipboard");
 telemetry_event!(ClipboardCopy, "clipboard_copy");
 telemetry_event!(NotificationEmitted, "notification_emitted");
@@ -3164,6 +3208,10 @@ telemetry_event!(
     "memory_v2_flush_result"
 );
 telemetry_event!(
+    crate::memory_telemetry::MemoryV2BatchDreamEnded,
+    "memory_v2_batch_dream_ended"
+);
+telemetry_event!(
     crate::memory_telemetry::MemoryV2DreamLifecycle,
     "memory_v2_dream_lifecycle"
 );
@@ -3211,6 +3259,8 @@ mod tests {
             include_str!("mod.rs"),
             include_str!("active_agent_message.rs"),
             include_str!("feedback.rs"),
+            include_str!("file_acceleration.rs"),
+            include_str!("sandbox.rs"),
             include_str!("permission_analytics.rs"),
             include_str!("../session_metrics.rs"),
             include_str!("../memory_telemetry.rs"),
@@ -3302,6 +3352,9 @@ mod tests {
             ("DoomLoopRecovery", "turn_number"),
             ("LongReasoningReminderTurn", "session_id"),
             ("LongReasoningReminderTurn", "turn_number"),
+            ("FileAccelerationSessionEnded", "session_id"),
+            ("FileAccelerationSessionStarted", "session_id"),
+            ("FileAccelerationUnavailableHit", "session_id"),
             ("MemoryFlushComplete", "session_id"),
             ("MemoryFlushStart", "session_id"),
             ("MemoryInjection", "session_id"),

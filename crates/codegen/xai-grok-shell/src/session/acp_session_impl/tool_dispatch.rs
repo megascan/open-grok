@@ -8,6 +8,29 @@ use super::*;
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
 const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// Read the model-facing command parameter, respecting a configured alias.
+/// Ambiguous input is left unnamed rather than associating the wrong command
+/// with a sandbox hold; the tool's own parser remains authoritative.
+fn sandbox_command(
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+    args: &serde_json::Value,
+) -> Option<String> {
+    use xai_grok_tools::types::tool::ToolKind;
+    let names = toolset.template_param_names();
+    let name = names
+        .get(&ToolKind::Execute)
+        .and_then(|params| params.get("command"))
+        .map(String::as_str)
+        .unwrap_or("command");
+    if name != "command" && args.get(name).is_some() && args.get("command").is_some() {
+        return None;
+    }
+    args.get(name)
+        .or_else(|| args.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
 ///
 /// Agent sessions always use local workspace ops (in-process toolset).
@@ -79,6 +102,7 @@ pub(super) async fn dispatch_tool(
         session_id,
         origin,
         xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
+        None,
     )
     .await
 }
@@ -89,6 +113,7 @@ pub(super) async fn dispatch_observed(
     session_id: &str,
     origin: xai_grok_tools::types::tool_call_origin::ToolCallOrigin,
     slot: xai_grok_tools::types::source_summary::SourceSummarySlot,
+    sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
     let mut ctx = xai_tool_runtime::ToolCallContext::new(
         xai_tool_protocol::ToolCallId::new(prepared.tool_call_id.0.as_ref())
@@ -96,6 +121,37 @@ pub(super) async fn dispatch_observed(
     );
     ctx.insert(origin);
     ctx.insert(slot);
+    if let xai_grok_workspace::WorkspaceOps::Local { handle } = workspace_ops {
+        let session = handle.session(session_id).ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom("session_not_found", "workspace session not found")
+        })?;
+        let toolset = session.toolset();
+        if toolset.tool_kind_map().get(&prepared.tool_name)
+            == Some(&xai_grok_tools::types::tool::ToolKind::Execute)
+        {
+            use futures::StreamExt;
+            let name = prepared.tool_name.clone();
+            let args = prepared.execution_arguments().clone();
+            let command = sandbox_command(&toolset, &args);
+            let stream = workspace_ops.run_sandbox_shell_call(
+                session_id,
+                prepared.tool_call_id.0.to_string(),
+                command,
+                sandbox_transport,
+                move || toolset.call_streaming_with_context(&name, args.clone(), ctx.clone()),
+            );
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                if let xai_tool_runtime::ToolStreamItem::Terminal(result) = item {
+                    return result;
+                }
+            }
+            return Err(xai_tool_runtime::ToolError::custom(
+                "stream_no_terminal",
+                "sandbox dispatch ended without a result",
+            ));
+        }
+    }
     workspace_ops
         .call_tool_with_context(
             &prepared.tool_name,
@@ -115,6 +171,7 @@ pub(super) async fn dispatch_code_mode_nested_tool_streaming<F, Fut>(
     session_id: &str,
     cancellation_token: &tokio_util::sync::CancellationToken,
     progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
+    sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
     on_progress: F,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError>
 where
@@ -149,6 +206,7 @@ where
             session_id,
             origin,
             xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
+            sandbox_transport,
         )
         .await;
     };
@@ -166,14 +224,34 @@ where
     if let Some(metadata) = &prepared.mcp_request_meta {
         extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
     }
-    let stream = toolset.call_streaming_with_extensions(
-        &prepared.tool_name,
-        prepared.parsed_args.clone(),
-        &prepared.tool_call_id.0,
-        None,
-        Some(cancellation_token.clone()),
-        extensions,
-    );
+    let execute = toolset.tool_kind_map().get(&prepared.tool_name)
+        == Some(&xai_grok_tools::types::tool::ToolKind::Execute);
+    let name = prepared.tool_name.clone();
+    let args = prepared.parsed_args.clone();
+    let call_id = prepared.tool_call_id.0.to_string();
+    let command = sandbox_command(&toolset, &args);
+    let cancellation = cancellation_token.clone();
+    let dispatch = move || {
+        toolset.call_streaming_with_extensions(
+            &name,
+            args.clone(),
+            &call_id,
+            None,
+            Some(cancellation.clone()),
+            extensions.clone(),
+        )
+    };
+    let stream = if execute {
+        workspace_ops.run_sandbox_shell_call(
+            session_id,
+            prepared.tool_call_id.0.to_string(),
+            command,
+            sandbox_transport,
+            dispatch,
+        )
+    } else {
+        dispatch()
+    };
     drain_code_mode_nested_tool_stream(stream, prepared, progress, on_progress).await
 }
 
@@ -277,37 +355,19 @@ fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 /// `target_directory` is deliberately omitted — a directory listing isn't an
 /// edit and must not bucket into a file lock.
 pub(super) fn lock_path_for_args(args: &serde_json::Value, cwd: &Path) -> Option<String> {
-    let input = Path::new(str_arg(args, &["file_path", "path", "target_file"])?);
-    let absolute = if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        cwd.join(input)
-    };
-    let mut normalized = std::path::PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    let lock_path = canonicalize_existing_ancestor(&normalized).unwrap_or(normalized);
-    Some(lock_path.to_string_lossy().into_owned())
+    xai_grok_tools::util::lock_path::lock_path_for_args(args, cwd)
 }
 
-fn canonicalize_existing_ancestor(path: &Path) -> Option<std::path::PathBuf> {
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    loop {
-        if let Ok(mut canonical) = dunce::canonicalize(ancestor) {
-            suffix.reverse();
-            canonical.extend(suffix);
-            return Some(canonical);
-        }
-        suffix.push(ancestor.file_name()?.to_owned());
-        ancestor = ancestor.parent()?;
+pub(super) fn lock_path_for_prepared(
+    prepared: &PreparedToolCall,
+    cwd: &Path,
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+) -> Option<String> {
+    let args = prepared.authored_arguments();
+    if let Some(param) = toolset.lock_path_client_param(&prepared.tool_name) {
+        xai_grok_tools::util::lock_path::lock_path_for_keys(args, &[param.as_str()], cwd)
+    } else {
+        lock_path_for_args(args, cwd)
     }
 }
 
@@ -518,6 +578,7 @@ impl SessionActor {
         let tool_input = ToolInput::Bash(BashToolInput {
             command: command.clone(),
             timeout: None,
+            block_until_ms: None,
             description: title_command.clone().into_owned(),
             is_background: false,
         });
@@ -750,6 +811,7 @@ mod tests {
             coercion_note: None,
             dispatch_target_name: None,
             is_read_only: true,
+            is_edit: false,
             rewriting_hook: None,
             additional_context: Vec::new(),
         }
@@ -769,6 +831,7 @@ mod tests {
             "no-such-session",
             &tokio_util::sync::CancellationToken::new(),
             &progress_sink,
+            None,
             |_| async {},
         )
         .await
@@ -794,6 +857,7 @@ mod tests {
             "no-such-session",
             &cancellation_token,
             &progress_sink,
+            None,
             |_| async {},
         )
         .await

@@ -36,8 +36,8 @@
 //! On rebuild, we must reuse the **same** senders so the existing coordinator keeps receiving requests.
 //! A fresh channel would orphan the running coordinator.
 use crate::agent::models::task_model_policy::{
-    LatchedTaskModelSelection, TaskModelPolicyInputs, latch_task_model_presentation,
-    presentation_applied_event, rejection_sink,
+    LatchedTaskModelSelection, TaskModelPolicyInputs, TaskModelSelection,
+    latch_task_model_presentation, presentation_applied_event, rejection_sink,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -178,6 +178,9 @@ pub(crate) struct AgentRebuildSpec {
         Option<xai_grok_tools::implementations::codex::context_management::ContextManagementStore>,
     pub working_directory: PathBuf,
     pub terminal_backend: Arc<dyn TerminalBackend>,
+    /// The same workspace launch policy used by the terminal, retained for
+    /// static shell tools across agent rebuilds.
+    pub sandbox_launch: Option<Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
     pub tools_notification_handle: ToolNotificationHandle,
     pub bridge_state_path: PathBuf,
@@ -341,6 +344,7 @@ impl AgentRebuildSpec {
             context_management,
             working_directory,
             terminal_backend,
+            sandbox_launch,
             fs_backend,
             tools_notification_handle,
             bridge_state_path,
@@ -430,7 +434,16 @@ impl AgentRebuildSpec {
             env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
             Arc::new(env)
         };
-        let presentation = latch_task_model_presentation(models_manager, task_model_policy).await;
+        let mut presentation =
+            latch_task_model_presentation(models_manager, task_model_policy).await;
+        // These names refer to a separate child transport; they are never
+        // added to the parent chat-model catalog.
+        if presentation.selection == TaskModelSelection::Selectable
+            && let Some(catalog) =
+                crate::agent::antigravity_acp::cached_catalog(&crate::util::grok_home::grok_home())
+        {
+            presentation.model_slugs.extend(catalog.child_model_names());
+        }
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
@@ -535,6 +548,14 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let mut agent = builder.build().await?;
+        if let Some(launch) = sandbox_launch {
+            agent
+                .tool_bridge()
+                .update_resource(xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(
+                    launch.clone(),
+                ))
+                .await;
+        }
         agent.set_tool_mode(
             crate::agent::config::effective_tool_mode(
                 xai_grok_sampling_types::ModelProvider::Xai,
@@ -549,6 +570,13 @@ impl AgentRebuildSpec {
         agent
             .tool_bridge()
             .update_resource(TaskModelValidator::new(move |requested| {
+                if requested.starts_with("antigravity-acp:") {
+                    return crate::agent::antigravity_acp::cached_catalog(
+                        &crate::util::grok_home::grok_home(),
+                    )
+                    .and_then(|catalog| catalog.resolve_child_model(requested).map(str::to_owned))
+                    .map_or_else(|| Some("Antigravity model is not available in the signed-in account catalog".to_owned()), |_| None);
+                }
                 model_validator.task_model_error(requested)
             }))
             .await;
@@ -713,6 +741,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
                 xai_grok_tools::computer::local::SearchShadowConfig::default(),
             ),
         ),
+        sandbox_launch: None,
         fs_backend: Arc::new(xai_grok_tools::computer::local::LocalFs),
         tools_notification_handle: ToolNotificationHandle::noop(),
         bridge_state_path: std::env::temp_dir().join("test_tool_state.json"),

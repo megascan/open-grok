@@ -20,10 +20,13 @@ pub enum Command {
     /// Sign out and clear cached credentials
     Logout {
         /// Sign out of the separate OpenAI Codex account instead of xAI.
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long, conflicts_with_all = ["all", "antigravity"])]
         codex: bool,
+        /// Sign out of the separate Antigravity ACP account.
+        #[arg(long, conflicts_with_all = ["all", "codex"])]
+        antigravity: bool,
         /// Sign out of both xAI and OpenAI Codex.
-        #[arg(long, conflicts_with = "codex")]
+        #[arg(long, conflicts_with_all = ["codex", "antigravity"])]
         all: bool,
     },
     /// Sign in to Open Grok
@@ -32,16 +35,19 @@ pub enum Command {
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
+        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "antigravity"])]
         oauth: bool,
         /// Sign in to the separate OpenAI Codex account with ChatGPT OAuth.
-        #[arg(long, conflicts_with = "oauth")]
+        #[arg(long, conflicts_with_all = ["oauth", "antigravity"])]
         codex: bool,
+        /// Sign in to the separate Antigravity ACP profile using Google OAuth.
+        #[arg(long, conflicts_with_all = ["oauth", "codex", "device_auth"])]
+        antigravity: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
+            conflicts_with_all = ["oauth", "antigravity"]
         )]
         device_auth: bool,
         /// Authenticate for remote development environments (hidden).
@@ -1713,7 +1719,8 @@ mod tests {
             args.command,
             Some(Command::Logout {
                 codex: false,
-                all: false
+                all: false,
+                antigravity: false,
             })
         ));
         assert!(args.prompt.is_none());
@@ -1737,9 +1744,31 @@ mod tests {
             logout.command,
             Some(Command::Logout {
                 codex: true,
-                all: false
+                all: false,
+                antigravity: false,
             })
         ));
+    }
+    #[test]
+    fn antigravity_account_flags_are_explicit_and_do_not_mix_providers() {
+        let login = PagerArgs::try_parse_from(["grok", "login", "--antigravity"]).unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                antigravity: true,
+                ..
+            })
+        ));
+        let logout = PagerArgs::try_parse_from(["grok", "logout", "--antigravity"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Logout {
+                antigravity: true,
+                ..
+            })
+        ));
+        assert!(PagerArgs::try_parse_from(["grok", "login", "--antigravity", "--codex"]).is_err());
+        assert!(PagerArgs::try_parse_from(["grok", "logout", "--antigravity", "--all"]).is_err());
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

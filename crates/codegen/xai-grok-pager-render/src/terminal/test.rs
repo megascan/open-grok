@@ -2133,3 +2133,49 @@ fn repaints_pane_out_of_band_per_arm() {
     };
     assert!(!plain.repaints_pane_out_of_band());
 }
+
+#[test]
+fn width_shrink_rewraps_only_for_known_reflowing_layers() {
+    let brand = |brand: TerminalName| TerminalContext {
+        brand,
+        env_brand: brand,
+        ..Default::default()
+    };
+    assert_eq!(
+        WidthShrink::Rewraps,
+        brand(TerminalName::Ghostty).width_shrink()
+    );
+    assert_eq!(
+        WidthShrink::Truncates,
+        brand(TerminalName::Unknown).width_shrink()
+    );
+    assert_eq!(
+        WidthShrink::Truncates,
+        brand(TerminalName::JetBrains).width_shrink()
+    );
+
+    // Only `env_brand` counts, never the assumed native-Windows fallback `brand`
+    let assumed = TerminalContext {
+        brand: TerminalName::WindowsTerminal,
+        env_brand: TerminalName::Unknown,
+        ..Default::default()
+    };
+    assert_eq!(WidthShrink::Truncates, assumed.width_shrink());
+
+    // The innermost layer decides
+    let tmux = TerminalContext {
+        multiplexer: MultiplexerKind::Tmux,
+        ..brand(TerminalName::Unknown)
+    };
+    assert_eq!(WidthShrink::Rewraps, tmux.width_shrink());
+    let screen = TerminalContext {
+        multiplexer: MultiplexerKind::Screen,
+        ..brand(TerminalName::Ghostty)
+    };
+    assert_eq!(WidthShrink::Truncates, screen.width_shrink());
+    let editor = TerminalContext {
+        embedded_editor: Some(EmbeddedEditor::Vim),
+        ..brand(TerminalName::Ghostty)
+    };
+    assert_eq!(WidthShrink::Truncates, editor.width_shrink());
+}

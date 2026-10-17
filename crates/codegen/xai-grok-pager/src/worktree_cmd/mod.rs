@@ -1,8 +1,9 @@
 mod display;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use tokio_util::sync::CancellationToken;
 use xai_fast_worktree::WorktreeRecord;
@@ -45,6 +46,14 @@ pub struct WorktreeArgs {
 
 #[derive(Debug, Subcommand, Clone)]
 enum WorktreeCommand {
+    /// Create a worktree without starting a session
+    Create {
+        /// Worktree name; generated when omitted
+        name: Option<String>,
+        /// Branch, tag, or commit to base a clean worktree on
+        #[arg(long = "ref", value_name = "REF")]
+        git_ref: Option<String>,
+    },
     /// List tracked worktrees
     #[command(visible_alias = "ls")]
     List {
@@ -127,6 +136,17 @@ pub async fn run(args: WorktreeArgs, agent_config: &AgentConfig) -> Result<()> {
 
 async fn dispatch(command: WorktreeCommand, tx: &xai_acp_lib::AcpAgentTx) -> Result<()> {
     match command {
+        WorktreeCommand::Create { name, git_ref } => {
+            let cwd = std::env::current_dir().context("couldn't read the current directory")?;
+            cmd_create(
+                tx,
+                &cwd,
+                name.as_deref(),
+                git_ref.as_deref(),
+                &mut std::io::stdout(),
+            )
+            .await
+        }
         WorktreeCommand::List {
             repo,
             r#type,
@@ -181,6 +201,58 @@ async fn ext_call<T: serde::de::DeserializeOwned>(
     envelope
         .result
         .ok_or_else(|| anyhow::anyhow!("ACP response missing result field"))
+}
+
+/// Print only the created directory to stdout so it can be passed to `cd`.
+async fn cmd_create(
+    tx: &xai_acp_lib::AcpAgentTx,
+    cwd: &Path,
+    name: Option<&str>,
+    git_ref: Option<&str>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut params = serde_json::json!({
+        "sourceWorktreePath": cwd.to_string_lossy(),
+        "newSessionId": format!("pager-{}", &id[..12]),
+        "copyMode": if git_ref.is_some() { "clean" } else { "dirty" },
+    });
+    if let Some(name) = name {
+        params["label"] = name.into();
+    }
+    if let Some(git_ref) = git_ref {
+        params["gitRef"] = git_ref.into();
+    }
+    let result: serde_json::Value =
+        ext_call(tx, "x.ai/git/worktree/create_from_worktree_sync", &params)
+            .await
+            .context("couldn't create worktree")?;
+    let root = result
+        .get("worktreePath")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .context("couldn't create worktree: response missing worktreePath")?;
+    let session_cwd = result
+        .get("sourceGitRoot")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|source| cwd.strip_prefix(source).ok())
+        .map(|relative| root.join(relative))
+        .unwrap_or_else(|| root.clone());
+    let target = if session_cwd.is_dir() {
+        &session_cwd
+    } else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{} is not in the new worktree; printing the worktree root",
+            session_cwd.display()
+        );
+        &root
+    };
+    Ok(crate::util::ignore_broken_pipe(writeln!(
+        out,
+        "{}",
+        target.display()
+    ))?)
 }
 
 async fn cmd_list(
@@ -324,6 +396,78 @@ async fn cmd_db(tx: &xai_acp_lib::AcpAgentTx, command: WorktreeDbCommand) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn create_sends_ref_and_prints_the_matching_subdirectory() {
+        let source = tempfile::tempdir().unwrap();
+        let cwd = source.path().join("nested");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let nested = worktree.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let source_root = source.path().to_path_buf();
+        let worktree_root = worktree.path().to_path_buf();
+        tokio::spawn(async move {
+            let xai_acp_lib::AcpAgentMessage::ExtMethod(args) = rx.recv().await.unwrap() else {
+                panic!("expected extension request");
+            };
+            let params: serde_json::Value =
+                serde_json::from_str(args.request.params.get()).unwrap();
+            seen_tx
+                .send((args.request.method.to_string(), params))
+                .unwrap();
+            let reply = serde_json::value::to_raw_value(&serde_json::json!({"result": {
+                "worktreePath": worktree_root, "sourceGitRoot": source_root,
+            }}))
+            .unwrap();
+            args.response_tx
+                .send(Ok(acp::ExtResponse::new(std::sync::Arc::from(reply))))
+                .unwrap();
+        });
+        let mut out = Vec::new();
+        cmd_create(&tx, &cwd, Some("fix"), Some("main"), &mut out)
+            .await
+            .unwrap();
+        let (method, params) = seen_rx.recv().await.unwrap();
+        assert_eq!(method, "x.ai/git/worktree/create_from_worktree_sync");
+        assert_eq!(params["label"], "fix");
+        assert_eq!(params["gitRef"], "main");
+        assert_eq!(params["copyMode"], "clean");
+        assert!(
+            params["newSessionId"]
+                .as_str()
+                .unwrap()
+                .starts_with("pager-")
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", nested.display())
+        );
+    }
+
+    #[test]
+    fn create_parses_optional_name_and_ref() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: WorktreeCommand,
+        }
+        let cli = Cli::parse_from(["test", "create", "fix", "--ref", "main"]);
+        assert!(
+            matches!(cli.command, WorktreeCommand::Create { name: Some(name), git_ref: Some(git_ref) } if name == "fix" && git_ref == "main")
+        );
+        let cli = Cli::parse_from(["test", "create"]);
+        assert!(matches!(
+            cli.command,
+            WorktreeCommand::Create {
+                name: None,
+                git_ref: None
+            }
+        ));
+    }
 
     #[test]
     fn ext_request_builds_list_with_filters() {

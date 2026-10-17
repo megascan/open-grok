@@ -219,9 +219,11 @@ pub fn compute_peek_fields(
                         .map(|highlights| {
                             highlights.highlighted_words[..p.bash_deny_selection_count].join(" ")
                         });
+                    let sandbox = crate::app::sandbox_permission::is_sandbox(&p.request.request);
                     let opts = p
                         .options
                         .iter()
+                        .filter(|o| !sandbox || o.option_id.0.as_ref() == "sandbox:deny")
                         .map(|opt| {
                             let row_words = if opt.option_id.0.as_ref()
                                 == crate::views::permission_view::REJECT_ALWAYS_COMMAND_OPTION_ID
@@ -242,9 +244,13 @@ pub fn compute_peek_fields(
                         })
                         .collect::<Vec<_>>();
                     // The `RejectOnce` option accepts free-text feedback.
-                    let reject = p.options.iter().position(|o| {
-                        o.kind == agent_client_protocol::PermissionOptionKind::RejectOnce
-                    });
+                    let reject = if sandbox {
+                        None
+                    } else {
+                        p.options.iter().position(|o| {
+                            o.kind == agent_client_protocol::PermissionOptionKind::RejectOnce
+                        })
+                    };
                     (Some(q), opts, Some(p.id), reject)
                 } else if let Some((qv, q)) = agent.question_view.as_ref().and_then(|qv| {
                     let ok = qv.local_kind.is_none()

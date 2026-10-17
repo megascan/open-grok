@@ -749,34 +749,19 @@ impl SessionActor {
             self.retry_auth_required_servers().await;
             self.retry_unreachable_servers().await;
         }
-        let write_paths: std::collections::HashSet<String> = approved
-            .iter()
-            .filter(|prepared| !prepared.is_read_only)
-            .filter_map(|prepared| {
-                lock_path_for_args(
-                    prepared.authored_arguments(),
-                    self.tool_context.cwd.as_path(),
-                )
-            })
-            .collect();
-        let file_locks = {
-            let mut map: std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>> =
-                std::collections::HashMap::new();
-            for prepared in &approved {
-                if let Some(path) = lock_path_for_args(
-                    prepared.authored_arguments(),
-                    self.tool_context.cwd.as_path(),
-                ) && write_paths.contains(&path)
-                {
-                    map.entry(path)
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
-                }
-            }
-            map
-        };
+        let path_toolset = self.agent.borrow().tool_bridge().toolset();
+        let file_locks = self.tool_context.file_dispatch_locks.clone();
         let shared_xai_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let shared_codex_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let workspace_ops = self.workspace_ops.clone();
+        let sandbox_transport: Arc<dyn xai_grok_workspace::permission::PermissionHookTransport> =
+            Arc::new(
+                crate::session::sandbox_permission::AcpSandboxPermissionTransport {
+                    gateway: self.notifications.gateway.clone(),
+                    session_id: self.session_info.id.clone(),
+                    pending: self.pending_interactions.clone(),
+                },
+            );
         if should_flush_held_queue_before_wait(
             approved.iter().any(|prepared| {
                 is_interruptible_wait_tool(&prepared.tool_name, prepared.authored_arguments())
@@ -808,6 +793,7 @@ impl SessionActor {
                     ToolAuthRefreshRoute::CodexOAuth => Arc::clone(&shared_codex_recovery),
                 };
                 let workspace_ops = workspace_ops.clone();
+                let sandbox_transport = sandbox_transport.clone();
                 let session_id = session_id.clone();
                 let pending_interjections = pending_interjections.clone();
                 let parent_interject = parent_interject.clone();
@@ -835,9 +821,12 @@ impl SessionActor {
                     }
                     Arc::new(dispatch_prepared)
                 };
-                let lock =
-                    lock_path_for_args(prepared.authored_arguments(), self.tool_context.cwd.as_path())
-                        .and_then(|path| file_locks.get(&path).cloned());
+                let lock_path = lock_path_for_prepared(
+                    &prepared,
+                    self.tool_context.cwd.as_path(),
+                    &path_toolset,
+                );
+                let file_locks = file_locks.clone();
                 let tools_execute_span = tracing::Span::current();
                 async move {
                     let exec_start = std::time::Instant::now();
@@ -865,8 +854,10 @@ impl SessionActor {
                     let run_tool = || {
                         let prepared = Arc::clone(&prepared);
                         let workspace_ops = workspace_ops.clone();
+                        let sandbox_transport = sandbox_transport.clone();
                         let session_id = session_id.clone();
-                        let lock = lock.clone();
+                        let lock_path = lock_path.clone();
+                        let file_locks = file_locks.clone();
                         let latest_slot = std::sync::Arc::clone(&latest_slot);
                         let origin = origin.clone();
                         async move {
@@ -874,17 +865,18 @@ impl SessionActor {
                                 xai_grok_tools::types::source_summary::SourceSummarySlot::new();
                             *latest_slot.lock() = slot.clone();
                             let result = {
-                                let _guard = if let Some(ref l) = lock {
-                                    Some(l.lock().await)
-                                } else {
-                                    None
-                                };
+                                let _guard = file_locks.lock(
+                                    lock_path,
+                                    prepared.is_read_only,
+                                    prepared.is_edit,
+                                ).await;
                                 dispatch_observed(
                                     &workspace_ops,
                                     &prepared,
                                     &session_id,
                                     origin,
                                     slot,
+                                    Some(sandbox_transport),
                                 )
                                 .await
                             };
@@ -1436,15 +1428,33 @@ impl SessionActor {
         let wait_guard = interruptible
             .then(|| BlockingWaitGuard::enter(self.tool_context.blocking_wait_depth.clone()));
         let tool_started_at = std::time::Instant::now();
-        let dispatch = || {
+        let sandbox_transport: Arc<dyn xai_grok_workspace::permission::PermissionHookTransport> =
+            Arc::new(
+                crate::session::sandbox_permission::AcpSandboxPermissionTransport {
+                    gateway: self.notifications.gateway.clone(),
+                    session_id: self.session_info.id.clone(),
+                    pending: self.pending_interactions.clone(),
+                },
+            );
+        let path_toolset = self.agent.borrow().tool_bridge().toolset();
+        let lock_path =
+            lock_path_for_prepared(&prepared, self.tool_context.cwd.as_path(), &path_toolset);
+        let dispatch = || async {
+            let _guard = self
+                .tool_context
+                .file_dispatch_locks
+                .lock(lock_path.clone(), prepared.is_read_only, prepared.is_edit)
+                .await;
             dispatch_code_mode_nested_tool_streaming(
                 &self.workspace_ops,
                 &prepared,
                 self.session_info.id.0.as_ref(),
                 &cancellation_token,
                 &progress,
+                Some(sandbox_transport.clone()),
                 |update| self.send_update(acp::SessionUpdate::ToolCallUpdate(update), None),
             )
+            .await
         };
         let (result, was_cancelled, wait_aborted) = tokio::select! {
             biased;
@@ -2710,6 +2720,7 @@ impl SessionActor {
             coercion_note,
             dispatch_target_name,
             is_read_only,
+            is_edit: matches!(access_kind, AccessKind::Edit(_)),
             rewriting_hook,
             additional_context: hook_additional_context,
         };
@@ -4852,6 +4863,7 @@ mod plan_mode_edit_gate_tests {
                 &ToolInput::Bash(BashToolInput {
                     command: "echo hi > /tmp/f".into(),
                     timeout: None,
+                    block_until_ms: None,
                     description: "write via bash".into(),
                     is_background: false,
                 })

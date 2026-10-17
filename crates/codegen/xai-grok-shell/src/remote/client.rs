@@ -845,12 +845,32 @@ pub(crate) fn parse_remote_model_value(
         .or_else(|| get_string(obj, "base_url"))
         .unwrap_or_else(|| default_base_url.to_owned());
     let name = get_string(obj, "name").or_else(|| Some(model.clone()));
-    let context_window = get_u64(obj, "contextWindow")
+    let listed = obj
+        .get("contextWindows")
+        .or_else(|| obj.get("context_windows"))
+        .or_else(|| meta.and_then(|m| m.get("contextWindows")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().and_then(std::num::NonZeroU64::new))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let scalar = get_u64(obj, "contextWindow")
         .or_else(|| get_u64(obj, "context_window"))
         .or_else(|| meta.and_then(|m| get_u64(m, "contextWindow")))
-        .or_else(|| meta.and_then(|m| get_u64(m, "totalContextTokens")))
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let context_window = std::num::NonZeroU64::new(context_window)?;
+        .or_else(|| meta.and_then(|m| get_u64(m, "totalContextTokens")));
+    let scalar = match scalar {
+        Some(n) => Some(std::num::NonZeroU64::new(n)?),
+        None => None,
+    };
+    let (context_window, context_windows) =
+        crate::agent::config::context_window_choices(scalar, &listed).unwrap_or_else(|| {
+            (
+                std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW).unwrap(),
+                Vec::new(),
+            )
+        });
     let agent_type = get_string(obj, "systemPromptType")
         .or_else(|| get_string(obj, "system_prompt_type"))
         .or_else(|| get_string(obj, "agent_type"))
@@ -920,6 +940,9 @@ pub(crate) fn parse_remote_model_value(
         base_url,
         name,
         description: get_string(obj, "description"),
+        notice: obj.get(xai_grok_sampling_types::MODEL_NOTICE_META_KEY)
+            .or_else(|| meta.and_then(|m| m.get(xai_grok_sampling_types::MODEL_NOTICE_META_KEY)))
+            .and_then(xai_grok_sampling_types::ModelNotice::from_value),
         max_completion_tokens: get_u64(obj, "maxCompletionTokens")
             .or_else(|| get_u64(obj, "max_completion_tokens"))
             .and_then(|v| u32::try_from(v).ok()),
@@ -937,6 +960,7 @@ pub(crate) fn parse_remote_model_value(
         experimental_supported_tools: Vec::new(),
         apply_patch_tool_type: None,
         context_window,
+        context_windows,
         max_request_bytes: get_u64(obj, "maxRequestBytes")
             .or_else(|| get_u64(obj, "max_request_bytes"))
             .and_then(std::num::NonZeroU64::new),
@@ -1502,6 +1526,7 @@ mod tests {
             team_blocked_reasons: vec![],
             coding_data_retention_opt_out: false,
             has_grok_code_access: None,
+            can_administer_team: None,
             refresh_token: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             oidc_issuer: None,
@@ -1880,6 +1905,25 @@ mod tests {
             std::num::NonZeroU64::new(131072).unwrap()
         );
         assert_eq!(result.agent_type, "concise");
+    }
+    #[test]
+    fn remote_context_choices_and_notice_are_normalized() {
+        let value = serde_json::json!({
+            "model": "example",
+            "contextWindows": [500_000, 200_000, 500_000, 0],
+            "notice": { "severity": "warning", "text": "  Moving soon  ", "label": " old " }
+        });
+        let model = parse_remote_model_value(&value, "https://example.invalid").unwrap();
+        assert_eq!(model.context_window.get(), 500_000);
+        assert_eq!(
+            model
+                .context_windows
+                .iter()
+                .map(|x| x.get())
+                .collect::<Vec<_>>(),
+            vec![500_000, 200_000]
+        );
+        assert_eq!(model.notice.unwrap().text, "Moving soon");
     }
     #[test]
     fn parse_remote_model_value_no_laziness_detector_block_yields_default() {

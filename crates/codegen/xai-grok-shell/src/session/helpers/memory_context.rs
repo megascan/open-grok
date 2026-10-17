@@ -74,17 +74,23 @@ pub struct V2InjectedContext {
 /// Regenerate and format both bounded v2 manifests for model context.
 pub fn format_v2_memory_context(
     storage: &crate::session::memory::MemoryStorage,
+    compact_index: bool,
 ) -> Result<V2InjectedContext, String> {
+    let budget = if compact_index {
+        crate::session::memory::V2ManifestBudget::compact()
+    } else {
+        crate::session::memory::V2ManifestBudget::default()
+    };
     let global = crate::session::memory::regenerate_scope_manifest(
         storage.global_dir(),
         crate::session::memory::V2MemoryScope::Global,
-        crate::session::memory::V2ManifestBudget::default(),
+        budget,
     )
     .map_err(|error| error.to_string())?;
     let workspace = crate::session::memory::regenerate_scope_manifest(
         storage.workspace_dir(),
         crate::session::memory::V2MemoryScope::Workspace,
-        crate::session::memory::V2ManifestBudget::default(),
+        budget,
     )
     .map_err(|error| error.to_string())?;
     let content = format!(
@@ -256,6 +262,39 @@ pub fn is_greeting(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_compact_index_omits_observations_and_topic_descriptions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cwd = temp.path().join("workspace");
+        let root = temp.path().join("memory-v2");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let storage = crate::session::memory::MemoryStorage::new_for_mode(
+            &cwd,
+            Some(&root),
+            crate::config::MemoryMode::V2,
+        );
+        storage.ensure_initialized().unwrap();
+        std::fs::write(
+            storage.workspace_dir().join("topics/new.md"),
+            "# New\n\nCurrent.",
+        )
+        .unwrap();
+        std::fs::write(
+            storage.workspace_dir().join("observations/_inbox/note.md"),
+            "# Pending note\n\nEvidence.",
+        )
+        .unwrap();
+        let full = format_v2_memory_context(&storage, false).unwrap();
+        assert!(full.content.contains("Current."));
+        assert!(full.content.contains("observations/_inbox/note.md"));
+        let compact = format_v2_memory_context(&storage, true).unwrap();
+        assert!(compact.content.contains("topics/new.md"));
+        assert!(!compact.content.contains("Current."));
+        assert!(!compact.content.contains("observations/_inbox/note.md"));
+        let disk = std::fs::read_to_string(storage.workspace_dir().join("MEMORY.md")).unwrap();
+        assert!(compact.content.contains(&disk));
+    }
 
     #[test]
     fn test_format_empty() {

@@ -140,6 +140,8 @@ impl SessionActor {
         auto_compact_threshold_percent: u8,
         agent_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)>,
         resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+        context_window_selection: Option<Option<std::num::NonZeroU64>>,
+        supported_context_windows: Vec<std::num::NonZeroU64>,
     ) -> Result<acp::ModelId, acp::Error> {
         if let Err(blocked) = self
             .begin_lifecycle_mutation(LifecycleMutationKind::ModelSwitch)
@@ -167,6 +169,8 @@ impl SessionActor {
                 auto_compact_threshold_percent,
                 agent_rebuild,
                 resolved_tool_policy_override,
+                context_window_selection,
+                supported_context_windows,
             )
             .await;
         self.end_lifecycle_mutation(LifecycleMutationKind::ModelSwitch)
@@ -184,7 +188,23 @@ impl SessionActor {
         auto_compact_threshold_percent: u8,
         agent_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)>,
         resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+        context_window_selection: Option<Option<std::num::NonZeroU64>>,
+        supported_context_windows: Vec<std::num::NonZeroU64>,
     ) -> Result<acp::ModelId, acp::Error> {
+        let selected = match context_window_selection {
+            // User requests are validated before reaching the actor. A saved
+            // selection may arrive before its catalog and must remain dormant.
+            Some(selection) => selection,
+            None => std::num::NonZeroU64::new(
+                self.compaction
+                    .context_window_selection
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        };
+        let mut sampling_config = sampling_config;
+        if let Some(window) = selected.filter(|window| supported_context_windows.contains(window)) {
+            sampling_config.context_window = window.get();
+        }
         let previous_provider = self
             .chat_state_handle
             .get_sampling_config()
@@ -264,6 +284,10 @@ impl SessionActor {
         }
         self.install_rebuilt_agent(prepared_agent_rebuild.0, prepared_agent_rebuild.1)
             .await;
+        self.compaction.context_window_selection.store(
+            selected.map_or(0, std::num::NonZeroU64::get),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -379,6 +403,7 @@ impl SessionActor {
                 provider: sampling_config.provider,
                 agent: crate::session::persistence::PersistedAgent::Named(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
+                context_window: Some(selected),
                 resolved_tool_policy: Some(resolved_tool_policy),
             });
         self.emit_status_snapshot_detached();
@@ -416,6 +441,7 @@ impl SessionActor {
                 provider,
                 agent: crate::session::persistence::PersistedAgent::Named(agent_name),
                 reasoning_effort: Some(Some(effort)),
+                context_window: None,
                 resolved_tool_policy: None,
             });
         self.emit_status_snapshot_detached();

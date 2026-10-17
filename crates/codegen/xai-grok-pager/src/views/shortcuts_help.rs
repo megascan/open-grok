@@ -1,10 +1,8 @@
 //! All-shortcuts cheatsheet modal (Ctrl+. / Ctrl+X).
 //!
-//! Registry-driven: `build_entries(registry)` pulls every `ActionDef` from
-//! `ActionRegistry`, groups them by `Category` in onboarding-friendly order
-//! (Essentials → Panes → Scrollback Navigation → View → Prompt → Agent),
-//! and includes alt-key bindings inline. Search filters against key display,
-//! description, and label.
+//! Registry-driven: `build_entries(registry)` pulls every `ActionDef` from `ActionRegistry` and groups them by `Category`.
+//! The order is onboarding-friendly (Essentials, Panes, Scrollback Navigation, View, Prompt, Agent), with alt-key bindings inline.
+//! Search matches every query word against key display, description, label, and long help.
 //!
 //! Two ways to read a binding's help: pattern A expands an inline help line under
 //! the selected hint (e/Space/l/h/arrows); pattern B opens an in-modal man-style
@@ -408,6 +406,7 @@ pub fn filter_entries(
         return (0..entries.len()).collect();
     }
     let q = query.to_lowercase();
+    let tokens: Vec<&str> = q.split_whitespace().collect();
     let mut result: Vec<usize> = Vec::new();
     let mut pending_header: Option<usize> = None;
     let mut section_has_match = false;
@@ -425,7 +424,10 @@ pub fn filter_entries(
                 current_section_collapsed = !searching && collapsed.contains(category_idx);
             }
             ShortcutsHelpEntry::Hint {
-                item: h, dimmed, ..
+                item: h,
+                dimmed,
+                long_help,
+                ..
             } => {
                 if current_section_collapsed {
                     continue;
@@ -433,15 +435,7 @@ pub fn filter_entries(
                 if hide_dimmed && *dimmed {
                     continue;
                 }
-                let key_text = hint_key_display(h);
-                let key_pretty = hint_key_pretty(h);
-                let desc = hint_description(h);
-                let q_matches = q.is_empty()
-                    || h.label.to_lowercase().contains(&q)
-                    || key_text.to_lowercase().contains(&q)
-                    || key_pretty.to_lowercase().contains(&q)
-                    || desc.to_lowercase().contains(&q);
-                if q_matches {
+                if hint_matches_query(h, *long_help, &tokens) {
                     if let Some(idx) = pending_header.take() {
                         result.push(idx);
                     }
@@ -457,6 +451,22 @@ pub fn filter_entries(
         result.push(h);
     }
     result
+}
+
+/// Every query token must appear in the hint's label, key display, description, or long help.
+fn hint_matches_query(h: &HintItem, long_help: Option<&str>, tokens: &[&str]) -> bool {
+    tokens.is_empty() || {
+        let haystack = format!(
+            "{} {} {} {} {}",
+            h.label,
+            hint_key_display(h),
+            hint_key_pretty(h),
+            hint_description(h),
+            long_help.unwrap_or_default(),
+        )
+        .to_lowercase();
+        tokens.iter().all(|t| haystack.contains(t))
+    }
 }
 
 fn hint_key_display(h: &HintItem) -> String {

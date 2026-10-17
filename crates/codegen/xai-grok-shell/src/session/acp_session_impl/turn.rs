@@ -458,6 +458,9 @@ impl SessionActor {
         } = request;
         let prompt_id = prompt_id.as_str();
         let handle_prompt_start = std::time::Instant::now();
+        self.chat_state_handle
+            .record_turn_start(chrono::Utc::now().timestamp_millis());
+        self.apply_supported_context_window_selection().await;
         // Allocate Codex's sticky-routing cell at the outer prompt boundary,
         // including manual `/compact` prompts that return before inference.
         // Auxiliary clients remain detached from this state; pre-turn compact
@@ -2194,6 +2197,7 @@ impl SessionActor {
             return None;
         }
         if self.memory.can_expose_v2() {
+            let compact_index = self.memory.v2_config.compact_index_enabled;
             let conversation = self.chat_state_handle.get_conversation().await;
             if crate::session::helpers::memory_context::conversation_has_memory_context(
                 &conversation,
@@ -2202,11 +2206,24 @@ impl SessionActor {
                     target: xai_grok_telemetry::memory_log::TARGET,
                     "MEMORY_INJECT: persisted v2 manifests reused to preserve prompt cache"
                 );
+                crate::session::memory_observation::log_memory_injection(
+                    self.session_info.id.to_string(),
+                    xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Results,
+                    crate::session::memory_observation::MemoryInjectionMetrics {
+                        compact_index,
+                        was_reused: true,
+                        ..Default::default()
+                    },
+                );
                 return None;
             }
             let storage = self.memory.storage()?;
+            let inject_start = std::time::Instant::now();
             let context = tokio::task::spawn_blocking(move || {
-                crate::session::helpers::memory_context::format_v2_memory_context(&storage)
+                crate::session::helpers::memory_context::format_v2_memory_context(
+                    &storage,
+                    compact_index,
+                )
             })
             .await
             .map_err(|error| error.to_string())
@@ -2218,6 +2235,17 @@ impl SessionActor {
                     self.memory
                         .injection_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::session::memory_observation::log_memory_injection(
+                        self.session_info.id.to_string(),
+                        xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Results,
+                        crate::session::memory_observation::MemoryInjectionMetrics {
+                            compact_index,
+                            duration_ms: inject_start.elapsed().as_millis() as u64,
+                            result_count: context.global_entry_count
+                                + context.workspace_entry_count,
+                            ..Default::default()
+                        },
+                    );
                     Some(context.content)
                 }
                 Err(error) => {
@@ -2225,6 +2253,15 @@ impl SessionActor {
                         target: xai_grok_telemetry::memory_log::TARGET,
                         %error,
                         "MEMORY_INJECT: v2 manifest injection failed"
+                    );
+                    crate::session::memory_observation::log_memory_injection(
+                        self.session_info.id.to_string(),
+                        xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
+                        crate::session::memory_observation::MemoryInjectionMetrics {
+                            compact_index,
+                            duration_ms: inject_start.elapsed().as_millis() as u64,
+                            ..Default::default()
+                        },
                     );
                     None
                 }
@@ -2291,6 +2328,7 @@ impl SessionActor {
                 top_score,
                 configured_min_score,
                 injection_duration_ms: inject_start.elapsed().as_millis() as u64,
+                compact_index: false,
             },
         );
         let experience_briefing =

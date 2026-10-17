@@ -192,7 +192,115 @@ pub fn is_xai_oauth2_issuer(issuer: &str) -> bool {
 /// auth.json scope key used by the pre-OIDC `open-grok login --legacy` flow.
 /// Matches the key format produced by the original `accounts.x.ai` relay auth.
 pub(crate) const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
+
+// Parse nested provider tables as partial overlays, so a configured field does
+// not erase the remaining defaults of an already-selected provider.
+#[derive(Deserialize)]
+struct GrokComConfigSection {
+    grok_ws_origin: Option<String>,
+    grok_ws_url: Option<String>,
+    token_header: Option<String>,
+    oidc: Option<toml::Value>,
+    oauth2: Option<toml::Value>,
+    auth_provider_command: Option<String>,
+    auth_provider_label: Option<String>,
+    auth_token_ttl: Option<u64>,
+    disable_api_key_auth: Option<bool>,
+    force_login_team_uuid: Option<ForceLoginTeam>,
+    preferred_method: Option<PreferredAuthMethod>,
+}
+
+#[derive(Deserialize)]
+struct OidcAuthSection {
+    issuer: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<Vec<String>>,
+    audience: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuth2ProviderSection {
+    issuer: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<Vec<String>>,
+    principal_type: Option<String>,
+    principal_id: Option<String>,
+    referrer: Option<String>,
+}
+
+impl GrokComConfigSection {
+    fn merge_over(self, base: GrokComConfig) -> Result<GrokComConfig, toml::de::Error> {
+        let oidc = match (self.oidc, base.oidc) {
+            (None, base) => base,
+            (Some(value), None) => Some(value.try_into()?),
+            (Some(value), Some(base)) => {
+                let section: OidcAuthSection = value.try_into()?;
+                Some(OidcAuthConfig {
+                    issuer: section.issuer.unwrap_or(base.issuer),
+                    client_id: section.client_id.unwrap_or(base.client_id),
+                    scopes: section.scopes.unwrap_or(base.scopes),
+                    audience: section.audience.or(base.audience),
+                })
+            }
+        };
+        let oauth2 = match (self.oauth2, base.oauth2) {
+            (None, base) => base,
+            (Some(value), None) => Some(value.try_into()?),
+            (Some(value), Some(base)) => {
+                let section: OAuth2ProviderSection = value.try_into()?;
+                Some(OAuth2ProviderConfig {
+                    issuer: section.issuer.unwrap_or(base.issuer),
+                    client_id: section.client_id.unwrap_or(base.client_id),
+                    scopes: section.scopes.unwrap_or(base.scopes),
+                    principal_type: section.principal_type.or(base.principal_type),
+                    principal_id: section.principal_id.or(base.principal_id),
+                    referrer: section.referrer.or(base.referrer),
+                })
+            }
+        };
+        Ok(GrokComConfig {
+            grok_ws_origin: self.grok_ws_origin.unwrap_or(base.grok_ws_origin),
+            grok_ws_url: self.grok_ws_url.unwrap_or(base.grok_ws_url),
+            token_header: self.token_header.unwrap_or(base.token_header),
+            oidc,
+            oauth2,
+            auth_provider_command: self.auth_provider_command.or(base.auth_provider_command),
+            auth_provider_label: self.auth_provider_label.or(base.auth_provider_label),
+            auth_token_ttl: self.auth_token_ttl.or(base.auth_token_ttl),
+            disable_api_key_auth: self.disable_api_key_auth.or(base.disable_api_key_auth),
+            force_login_team_uuid: self.force_login_team_uuid.or(base.force_login_team_uuid),
+            preferred_method: self.preferred_method.or(base.preferred_method),
+        })
+    }
+}
+
 impl GrokComConfig {
+    /// Resolve the auth section of an effective config, retaining nested defaults.
+    pub fn from_effective_config(config: &toml::Value) -> Result<Self, toml::de::Error> {
+        let config = expand_auth_alias(config);
+        let mut resolved = match config.get("grok_com_config") {
+            Some(section) => {
+                GrokComConfigSection::deserialize(section.clone())?.merge_over(Self::default())?
+            }
+            None => Self::default(),
+        };
+        resolved.pin_login_team();
+        Ok(resolved)
+    }
+
+    /// Apply the non-overridable requirements, environment, then config pin.
+    pub fn pin_login_team(&mut self) {
+        let requirements = xai_grok_config::requirements_layers();
+        self.force_login_team_uuid = resolve_force_login_team(
+            force_login_team_from_requirements_layers(
+                requirements.iter().map(|layer| &layer.value),
+            ),
+            std::env::var("OPENGROK_FORCE_LOGIN_TEAM_ID")
+                .ok()
+                .and_then(|value| parse_force_login_team(&value)),
+            self.force_login_team_uuid.take(),
+        );
+    }
     /// Whether `xai.api_key` auth is disabled. Pinning a team
     /// (`force_login_team_uuid`) implies this — team membership can't be verified
     /// from a bare API key, so it must go through IdP login. The
@@ -324,6 +432,82 @@ fn env_lockdown_forced() -> bool {
         .ok()
         .is_some_and(|v| env_flag_enabled(&v))
 }
+
+/// Read a team restriction from a requirements layer. A malformed configured
+/// value is a deny-all restriction, never an absent policy.
+pub fn force_login_team_from_requirements_value(value: &toml::Value) -> Option<ForceLoginTeam> {
+    let pin = value
+        .get("grok_com_config")
+        .and_then(|section| section.get("force_login_team_uuid"))
+        .or_else(|| {
+            value
+                .get("auth")
+                .and_then(|section| section.get("force_login_team_uuid"))
+        })?;
+    Some(pin.clone().try_into().unwrap_or_else(|_| {
+        tracing::warn!("malformed requirements team pin; failing closed");
+        ForceLoginTeam::AnyOf(Vec::new())
+    }))
+}
+
+fn force_login_team_from_requirements_layers<'a>(
+    layers: impl Iterator<Item = &'a toml::Value>,
+) -> Option<ForceLoginTeam> {
+    layers
+        .filter_map(force_login_team_from_requirements_value)
+        .last()
+}
+
+/// Fold the short `[auth]` alias into `[grok_com_config]`; explicit fields win.
+pub fn expand_auth_alias(config: &toml::Value) -> toml::Value {
+    let mut config = config.clone();
+    if let toml::Value::Table(ref mut table) = config
+        && let Some(auth) = table.remove("auth")
+    {
+        if let Some(explicit) = table.get_mut("grok_com_config") {
+            if let (toml::Value::Table(explicit), toml::Value::Table(auth)) = (explicit, &auth) {
+                for (key, value) in auth {
+                    explicit.entry(key.clone()).or_insert(value.clone());
+                }
+            }
+        } else {
+            table.insert("grok_com_config".to_owned(), auth);
+        }
+    }
+    config
+}
+
+pub fn resolve_force_login_team(
+    requirements: Option<ForceLoginTeam>,
+    env: Option<ForceLoginTeam>,
+    config: Option<ForceLoginTeam>,
+) -> Option<ForceLoginTeam> {
+    requirements.or(env).or(config)
+}
+
+fn parse_force_login_team(raw: &str) -> Option<ForceLoginTeam> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('[') {
+        match serde_json::from_str::<Vec<String>>(raw) {
+            Ok(teams) => Some(ForceLoginTeam::AnyOf(
+                teams
+                    .into_iter()
+                    .map(|team| team.trim().to_owned())
+                    .collect(),
+            )),
+            Err(_) => {
+                tracing::warn!("malformed OPENGROK_FORCE_LOGIN_TEAM_ID; failing closed");
+                Some(ForceLoginTeam::AnyOf(Vec::new()))
+            }
+        }
+    } else {
+        Some(ForceLoginTeam::Single(raw.to_owned()))
+    }
+}
+
 impl OidcAuthConfig {
     pub fn from_env() -> Option<Self> {
         let issuer = std::env::var("GROK_OIDC_ISSUER").ok()?;
@@ -341,6 +525,65 @@ impl OidcAuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_provider_overlay_preserves_unspecified_defaults() {
+        let mut base = GrokComConfig::default();
+        base.oidc = None;
+        base.oauth2 = Some(OAuth2ProviderConfig {
+            issuer: "https://example.test".into(),
+            client_id: "client".into(),
+            scopes: vec!["openid".into()],
+            principal_type: None,
+            principal_id: None,
+            referrer: None,
+        });
+        let original = base.oauth2.clone().unwrap();
+        let section: GrokComConfigSection =
+            toml::from_str("[oauth2]\nprincipal_type = 'Team'\nprincipal_id = 'team-a'\n").unwrap();
+        let merged = section.merge_over(base).unwrap().oauth2.unwrap();
+        assert_eq!(merged.issuer, original.issuer);
+        assert_eq!(merged.client_id, original.client_id);
+        assert_eq!(merged.scopes, original.scopes);
+        assert_eq!(merged.principal_id.as_deref(), Some("team-a"));
+    }
+
+    #[test]
+    fn team_pin_precedence_and_malformed_values_fail_closed() {
+        let req: toml::Value = toml::from_str("[auth]\nforce_login_team_uuid = 42\n").unwrap();
+        let requirements = force_login_team_from_requirements_value(&req);
+        assert_eq!(requirements, Some(ForceLoginTeam::AnyOf(vec![])));
+        let env = parse_force_login_team("[\"team-b\", \" team-c \" ]");
+        assert_eq!(
+            env,
+            Some(ForceLoginTeam::AnyOf(vec![
+                "team-b".into(),
+                "team-c".into()
+            ]))
+        );
+        let config = Some(ForceLoginTeam::Single("team-a".into()));
+        assert_eq!(
+            resolve_force_login_team(requirements.clone(), env.clone(), config.clone()),
+            requirements
+        );
+        assert_eq!(
+            resolve_force_login_team(None, env.clone(), config.clone()),
+            env
+        );
+        assert_eq!(resolve_force_login_team(None, None, config.clone()), config);
+        assert_eq!(
+            parse_force_login_team("[broken"),
+            Some(ForceLoginTeam::AnyOf(vec![]))
+        );
+        let user: toml::Value =
+            toml::from_str("[grok_com_config]\nforce_login_team_uuid = 'user-team'\n").unwrap();
+        let system: toml::Value =
+            toml::from_str("[auth]\nforce_login_team_uuid = 'system-team'\n").unwrap();
+        assert_eq!(
+            force_login_team_from_requirements_layers([&user, &system].into_iter()),
+            Some(ForceLoginTeam::Single("system-team".into()))
+        );
+    }
     #[test]
     fn team_auth_scope_is_base_scope() {
         let cfg = OAuth2ProviderConfig {

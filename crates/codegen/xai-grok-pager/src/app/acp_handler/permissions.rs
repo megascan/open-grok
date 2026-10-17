@@ -47,6 +47,7 @@ pub(super) fn handle_permission_request(
     //    `enqueue_permission` even in YOLO mode (won't pick
     //    `AllowAlways` by default).
     if agent.session.is_yolo()
+        && !crate::app::sandbox_permission::is_sandbox(&perm.request)
         && let Some(allow) = perm
             .request
             .options
@@ -155,7 +156,7 @@ fn enqueue_permission(
     let subagent_label = resolve_subagent_label(agent, &perm.request.session_id);
 
     // 3. Build title and description from the tool call.
-    let (title, description, bash_command_raw) = build_permission_display(
+    let (mut title, mut description, mut bash_command_raw) = build_permission_display(
         &perm.request,
         bash_highlights.as_ref(),
         #[cfg(feature = "local-workspace")]
@@ -166,6 +167,12 @@ fn enqueue_permission(
         #[cfg(not(feature = "local-workspace"))]
         false,
     );
+
+    let sandbox = crate::app::sandbox_permission::is_sandbox(&perm.request);
+    if sandbox {
+        (title, description) = crate::app::sandbox_permission::display(&perm.request);
+        bash_command_raw = None;
+    }
 
     // 4. Assign a monotonic ID.
     let perm_id = agent.next_perm_req_id;
@@ -190,11 +197,19 @@ fn enqueue_permission(
     }
 
     // 6. Clone options before moving perm into the struct.
-    let options = perm.request.options.clone();
+    let options = if sandbox {
+        crate::app::sandbox_permission::options(&perm.request)
+    } else {
+        perm.request.options.clone()
+    };
 
     // 7. Cursor preselection (sticky last-used → configured default → the
     //    enable-always-approve row → index 0). See `permission_cursor`.
-    let active_idx = crate::appearance::permission_cursor::resolve_initial_cursor(&options);
+    let active_idx = if sandbox {
+        0
+    } else {
+        crate::appearance::permission_cursor::resolve_initial_cursor(&options)
+    };
 
     // 8. Queue the request FIFO (do NOT replace/cancel existing requests).
     agent.permission_queue.push_back(PermissionViewState {
@@ -203,16 +218,17 @@ fn enqueue_permission(
         focus: PermissionFocus::Options,
         options,
         active_idx,
-        bash_highlights,
+        bash_highlights: if sandbox { None } else { bash_highlights },
         bash_selection_count,
         bash_deny_selection_count,
         bash_command_raw,
-        mcp_scope,
+        mcp_scope: if sandbox { None } else { mcp_scope },
         title,
         description,
-        args_expanded: false,
+        args_expanded: sandbox,
         desc_scroll: 0,
         subagent_label,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });

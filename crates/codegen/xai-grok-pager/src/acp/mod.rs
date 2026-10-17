@@ -6,6 +6,7 @@
 pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
+pub(crate) mod skills_listing;
 pub mod spawn;
 pub(crate) mod subagent_message;
 pub mod tracker;

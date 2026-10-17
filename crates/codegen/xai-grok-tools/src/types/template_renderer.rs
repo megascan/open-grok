@@ -756,6 +756,18 @@ Usage notes:
         assert!(rendered.contains("Omit timeout_ms") || rendered.contains("positive timeout_ms"));
     }
 
+    #[test]
+    fn render_task_output_current_block_parameter() {
+        let renderer = make_renderer(
+            &[(ToolKind::Execute, "run_terminal_command")],
+            &[(ToolKind::Execute, &[("block_until_ms", "wait_ms")])],
+        );
+        let rendered = renderer
+            .render("Use ${{ params.execute.block_until_ms }}=0 for background commands")
+            .unwrap();
+        assert_eq!(rendered, "Use wait_ms=0 for background commands");
+    }
+
     #[tokio::test]
     async fn resolve_returns_canonical_names() {
         let mut resources = crate::types::resources::Resources::new();

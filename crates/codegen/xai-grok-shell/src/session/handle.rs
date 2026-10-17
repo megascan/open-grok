@@ -123,6 +123,7 @@ pub struct SessionHandle {
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
+    pub(crate) context_window_selection: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether this session's scheduled fires run as detached background
     /// subagents. Copied from the value the spawn resolved for the session's
     /// [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec), so
@@ -163,6 +164,11 @@ pub struct SessionHandle {
     /// Set via `x.ai/debug/arm_auto_compact`.
     pub force_compact: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub permission_handle: xai_grok_workspace::permission::PermissionHandle,
+    /// Keeps the workspace mode-change fence registered for external children.
+    /// A proxy cannot prove its remote mode and has no local registration.
+    pub(crate) sandbox_mode_lease_registration: Option<
+        std::sync::Arc<xai_grok_workspace::sandbox_mode_fence::SandboxModeLeaseRegistration>,
+    >,
     /// The parent SessionActor's live `Auth401AttributionCallback`
     /// (if any). Exposed on the handle so
     /// `MvpAgent::build_subagent_spawn_context` can copy it into the
@@ -375,23 +381,23 @@ impl SessionHandle {
     /// Snapshot the session's client-registered hooks for subagent inheritance. A dead actor
     /// or dropped reply fails open to no hooks, warned since it drops the inherited deny gate.
     pub(crate) async fn snapshot_client_hooks(&self) -> crate::extensions::hooks::ClientHooks {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(SessionCommand::SnapshotClientHooks { respond_to: tx })
-            .is_err()
-        {
+        self.try_snapshot_client_hooks().await.unwrap_or_else(|| {
             tracing::warn!(
                 "snapshot_client_hooks: session actor gone; subagent inherits no client hooks"
             );
-            return Default::default();
-        }
-        rx.await.unwrap_or_else(|_| {
-            tracing::warn!(
-                "snapshot_client_hooks: reply dropped; subagent inherits no client hooks"
-            );
             Default::default()
         })
+    }
+    /// A missing actor or reply is not sufficient evidence to authorize an
+    /// external child that cannot enforce client hooks.
+    pub(crate) async fn try_snapshot_client_hooks(
+        &self,
+    ) -> Option<crate::extensions::hooks::ClientHooks> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::SnapshotClientHooks { respond_to: tx })
+            .ok()?;
+        rx.await.ok()
     }
     /// Snapshot the session's resolved ordinary-tool inputs for verbatim-fork
     /// inheritance. The child applies the shared provider/mode surface policy.
@@ -445,6 +451,8 @@ impl SessionHandle {
     }
     /// Replace the live session's client-registered hooks (see `SessionCommand::SetClientHooks`).
     pub(crate) fn set_client_hooks(&self, hooks: crate::extensions::hooks::ClientHooks) {
+        let mut tracker = self.plan_mode.lock();
+        tracker.client_hooks_will_change();
         let _ = self.cmd_tx.send(SessionCommand::SetClientHooks { hooks });
     }
     pub(crate) async fn get_mcp_status(&self) -> crate::extensions::mcp::McpStatusSnapshot {

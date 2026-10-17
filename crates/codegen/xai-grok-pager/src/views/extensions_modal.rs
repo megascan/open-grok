@@ -18,6 +18,7 @@ use crate::views::modal_window::{
 use crate::views::picker;
 use xai_grok_tools::implementations::skills::types::SkillInfo;
 
+mod skills_tab;
 mod workflows_picker_rows;
 use workflows_picker_rows::build_workflows_picker_rows;
 
@@ -1684,6 +1685,7 @@ fn parse_mcp_add_fields(name: &str, url_or_cmd: &str) -> Option<ButtonAction> {
             url: command_or_url.to_string(),
             transport_type: None,
             bearer_token_env_var: None,
+            bearer_token_file: None,
             headers: None,
             oauth_client_id: None,
             oauth_client_secret_env_var: None,
@@ -1798,6 +1800,8 @@ pub struct ExtensionsModalState {
     pub marketplace_scroll: usize,
     /// Skills tab state.
     pub skills_data: TabDataState<Vec<SkillInfo>>,
+    pub skills_scan_errors: Vec<xai_grok_shell::extensions::skills::SkillScanError>,
+    pub skills_fetch: u64,
     pub skills_selected: usize,
     pub skills_scroll: usize,
     pub workflows_data: TabDataState<Vec<WorkflowInfo>>,
@@ -1890,6 +1894,8 @@ impl ExtensionsModalState {
             marketplace_selected: 0,
             marketplace_scroll: 0,
             skills_data: TabDataState::Loading,
+            skills_scan_errors: Vec::new(),
+            skills_fetch: 0,
             skills_selected: 0,
             skills_scroll: 0,
             workflows_data: TabDataState::Loading,
@@ -2810,6 +2816,23 @@ pub fn render_extensions_modal(
                                 entry_badge_color.push(None);
                             }
                         }
+                    }
+                    for label in skills_tab::scan_error_rows(
+                        &state.skills_scan_errors,
+                        state.picker_state.query(),
+                    ) {
+                        entry_labels.push(label);
+                        entry_right_labels.push(String::new());
+                        entry_desc_lines.push(vec![]);
+                        entry_summary_lines.push(vec![]);
+                        entry_fields.push(vec![]);
+                        entry_is_header.push(true);
+                        entry_dimmed.push(false);
+                        entry_indent.push(0);
+                        entry_data_indices.push(None);
+                        entry_group_keys.push(None);
+                        entry_badge_text.push(String::new());
+                        entry_badge_color.push(None);
                     }
                 } else if let TabDataState::Error(ref msg) = state.skills_data {
                     entry_labels.push(format!("Error: {}", msg));

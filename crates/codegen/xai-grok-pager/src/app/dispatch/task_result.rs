@@ -3662,6 +3662,116 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             MemoryCommandKind::Dream,
             result.map(|r| (r.summary(), r.succeeded())),
         ),
+        TaskResult::ModelWindowSwitchComplete {
+            agent_id,
+            request_id,
+            session_id,
+            model_id,
+            source_model_id,
+            effort,
+            window,
+            result,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            if agent.session.session_id.as_ref() != Some(&session_id)
+                || agent.session.pending_context_switch.as_ref()
+                    != Some(&(session_id.clone(), model_id.clone(), window, request_id))
+                || !agent.session.model_switch_pending
+            {
+                return vec![];
+            }
+            agent.session.pending_context_switch = None;
+            if agent.session.models.current != source_model_id {
+                agent.session.model_switch_pending = false;
+                return crate::app::dispatch::maybe_drain_queue(
+                    agent,
+                    &mut app.pending_image_notices,
+                )
+                .effects;
+            }
+            let success = result.is_ok();
+            if success {
+                agent.session.models.context_window_selection = Some(window.get());
+            }
+            let effects = dispatch_task_result(
+                TaskResult::SwitchModelComplete {
+                    agent_id,
+                    model_id: model_id.clone(),
+                    effort,
+                    service_tier: None,
+                    result,
+                    prev_model_id: None,
+                },
+                app,
+            );
+            if success
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && agent.session.session_id.as_ref() == Some(&session_id)
+                && agent.session.models.current.as_ref() == Some(&model_id)
+            {
+                agent.refresh_context_total();
+                agent.scrollback.push_block(RenderBlock::system(format!(
+                    "Context window set to {}",
+                    crate::slash::commands::context_window::format_window(window.get())
+                )));
+            }
+            effects
+        }
+        TaskResult::ContextWindowComplete {
+            agent_id,
+            request_id,
+            session_id,
+            model_id,
+            effort,
+            window,
+            result,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            if agent.session.session_id.as_ref() != Some(&session_id)
+                || agent.session.pending_context_switch.as_ref()
+                    != Some(&(session_id.clone(), model_id.clone(), window, request_id))
+                || !agent.session.model_switch_pending
+            {
+                return vec![];
+            }
+            agent.session.pending_context_switch = None;
+            if agent.session.models.current.as_ref() != Some(&model_id) {
+                // A remote provider switch became authoritative while the request was in flight.
+                // Never overwrite that selection; release only this request's hold.
+                agent.session.model_switch_pending = false;
+                return crate::app::dispatch::maybe_drain_queue(
+                    agent,
+                    &mut app.pending_image_notices,
+                )
+                .effects;
+            }
+            if result.is_ok() {
+                let changed = agent.session.models.get_context_window() != Some(window.get());
+                agent.session.models.context_window_selection = Some(window.get());
+                agent.refresh_context_total();
+                if changed {
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Context window set to {}",
+                        crate::slash::commands::context_window::format_window(window.get())
+                    )));
+                }
+            }
+            dispatch_task_result(
+                TaskResult::SwitchModelComplete {
+                    agent_id,
+                    model_id,
+                    effort,
+                    service_tier: None,
+                    result,
+                    prev_model_id: None,
+                },
+                app,
+            )
+        }
         TaskResult::SwitchModelComplete {
             agent_id,
             model_id,
@@ -5089,18 +5199,17 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::PluginCtaCatalogLoaded { agent_id, result } => {
             handle_plugin_cta_catalog_loaded(app, agent_id, result)
         }
-        TaskResult::SkillsListLoaded { agent_id, result } => {
-            use crate::views::extensions_modal::TabDataState;
+        TaskResult::SkillsListLoaded {
+            agent_id,
+            session_id,
+            fetch,
+            result,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id)
+                && agent.session.session_id.as_ref() == Some(&session_id)
                 && let Some(ref mut modal) = agent.extensions_modal
+                && modal.show_skills_listing(fetch, result)
             {
-                modal.skills_data = match result {
-                    Ok(skills) => {
-                        modal.seed_skills_groups_once(&skills);
-                        TabDataState::Loaded(skills)
-                    }
-                    Err(e) => TabDataState::Error(e),
-                };
                 modal.pending_action = None;
                 modal.pending_entry_index = None;
             }
@@ -5123,9 +5232,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::SkillsToggleDone { agent_id, result } => {
-            handle_skills_toggle_done(app, agent_id, result)
-        }
+        TaskResult::SkillsToggleDone {
+            agent_id,
+            session_id,
+            fetch,
+            result,
+        } => handle_skills_toggle_done(app, agent_id, session_id, fetch, result),
         TaskResult::ShareSessionComplete {
             agent_id,
             share_url,
@@ -5996,6 +6108,59 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.welcome_menu_index = Some(0);
             app.welcome_prompt_focused = false;
             effects
+        }
+        TaskResult::AntigravityLoginUrlReady {
+            agent_id,
+            url,
+            opened,
+            copied,
+            shown,
+        } => {
+            if opened {
+                app.show_toast("Complete Antigravity sign-in in your browser.");
+            } else if let Some(url) = url {
+                if let Some(agent_id) = agent_id
+                    && let Some(agent) = app.agents.get_mut(&agent_id)
+                {
+                    agent.active_modal = Some(crate::views::modal::ActiveModal::DocViewer {
+                        title: "Antigravity sign-in".to_owned(),
+                        content: format!("Complete Google sign-in using this link:\n\n{}", url.0),
+                        scroll: 0,
+                        window: crate::views::modal_window::ModalWindowState::new(),
+                        cached_lines: None,
+                        previous_palette: None,
+                        standalone: true,
+                    });
+                } else if copied {
+                    app.show_toast("Antigravity sign-in link copied to clipboard.");
+                } else {
+                    app.show_toast("Could not open Antigravity sign-in. Use open-grok login --antigravity in a terminal.");
+                }
+            }
+            if let Some(shown) = shown {
+                let _ = shown.send(());
+            }
+            vec![]
+        }
+        TaskResult::AntigravityAuthComplete {
+            agent_id,
+            logout,
+            result,
+        } => {
+            if let Some(agent_id) = agent_id
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && matches!(&agent.active_modal, Some(crate::views::modal::ActiveModal::DocViewer { title, .. }) if title == "Antigravity sign-in")
+            {
+                agent.active_modal = None;
+            }
+            let message = match (logout, result) {
+                (false, Ok(())) => "Antigravity connected.".to_owned(),
+                (true, Ok(())) => "Antigravity disconnected.".to_owned(),
+                (false, Err(error)) => format!("Antigravity login failed: {error}"),
+                (true, Err(error)) => format!("Antigravity logout failed: {error}"),
+            };
+            push_codex_auth_result(app, agent_id, message);
+            vec![]
         }
         TaskResult::CodexLoginUrlReady {
             agent_id,

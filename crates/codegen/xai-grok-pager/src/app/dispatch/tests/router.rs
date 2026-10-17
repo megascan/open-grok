@@ -190,11 +190,13 @@ fn external_prompt_editor_refuses_voice_and_pending_paste_with_visible_messages(
         VoiceState::Recording {
             hold: false,
             target: VoiceTarget::Agent(AgentId(0)),
-            interim: Some("partial".to_owned()),
+            partial: crate::app::app_view::Partial::Shown("partial".to_owned()),
+            route: None,
         },
         VoiceState::Stopping {
             target: VoiceTarget::Agent(AgentId(0)),
-            interim: Some("partial".to_owned()),
+            partial: crate::app::app_view::Partial::Shown("partial".to_owned()),
+            route: None,
         },
     ] {
         let mut app = test_app_with_agent();
@@ -2783,5 +2785,395 @@ fn toggle_scroll_log_flips_recorder_and_reports_path() {
     assert!(
         texts.iter().any(|t| t == "scroll log: off"),
         "disable must be confirmed, got {texts:?}"
+    );
+}
+
+#[test]
+fn context_window_change_holds_sends_and_applies_only_after_its_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("context-model");
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let mut meta = acp::Meta::new();
+    meta.insert("totalContextTokens".into(), serde_json::json!(256_000));
+    meta.insert(
+        "contextWindows".into(),
+        serde_json::json!([256_000, 500_000]),
+    );
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.available.insert(
+        model.clone(),
+        acp::ModelInfo::new(model.clone(), "Context model").meta(Some(meta)),
+    );
+    agent.session.models.current = Some(model.clone());
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let effects = dispatch(Action::SwitchContextWindow { window }, &mut app);
+    assert!(
+        matches!(effects.as_slice(), [Effect::SwitchContextWindow { window: selected, .. }] if *selected == window)
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    assert_eq!(
+        app.agents[&id].session.models.get_context_window(),
+        Some(256_000)
+    );
+    let blocked = dispatch(
+        Action::SwitchModel {
+            model_id: model.clone(),
+            effort: None,
+            service_tier: None,
+        },
+        &mut app,
+    );
+    assert!(blocked.is_empty());
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(!app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.get_context_window(),
+        Some(500_000)
+    );
+}
+
+#[test]
+fn stale_context_completion_does_not_clear_a_new_session_hold() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("old-model");
+    let old_session = acp::SessionId::new("old-session");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((old_session.clone(), model.clone(), window, 1));
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id: old_session,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.context_window_selection,
+        None
+    );
+}
+
+#[test]
+fn combined_model_window_switch_holds_sends_until_atomic_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let source = app.agents[&id].session.models.current.clone();
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let model = acp::ModelId::new("target-model");
+    let meta = serde_json::json!({"totalContextTokens": 256_000, "contextWindows": [256_000, 500_000], "supportsReasoningEffort": true});
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .models
+        .available
+        .insert(
+            model.clone(),
+            acp::ModelInfo::new(model.clone(), "Target").meta(meta.as_object().cloned()),
+        );
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let effort = Some(xai_grok_shell::sampling::types::ReasoningEffort::High);
+    let effects = dispatch(
+        Action::SwitchModelWithWindow {
+            model_id: model.clone(),
+            effort,
+            window,
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(effects.as_slice(), [Effect::SwitchModelWithWindow { model_id, effort: actual_effort, window: actual_window, .. }] if model_id == &model && *actual_effort == effort && *actual_window == window)
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    assert_eq!(app.agents[&id].session.models.current, source);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    dispatch(
+        Action::TaskComplete(TaskResult::ModelWindowSwitchComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model.clone(),
+            source_model_id: source,
+            effort,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(!agent.session.model_switch_pending);
+    assert_eq!(agent.session.models.current.as_ref(), Some(&model));
+    assert_eq!(agent.session.models.get_context_window(), Some(500_000));
+    assert_eq!(agent.session.models.reasoning_effort, effort);
+}
+
+#[test]
+fn failed_combined_model_window_switch_keeps_previous_state() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let source = app.agents[&id].session.models.current.clone();
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let target = acp::ModelId::new("target");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((session_id.clone(), target.clone(), window, 1));
+    dispatch(
+        Action::TaskComplete(TaskResult::ModelWindowSwitchComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id,
+            model_id: target,
+            source_model_id: source.clone(),
+            effort: None,
+            window,
+            result: Err(SwitchModelError::Other("failure".into())),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.agents[&id].session.models.current, source);
+    assert!(!app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.context_window_selection,
+        None
+    );
+}
+
+#[test]
+fn stale_same_session_context_completion_cannot_finish_new_request() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let model = acp::ModelId::new("context-model");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.current = Some(model.clone());
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((session_id.clone(), model.clone(), window, 2));
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.session.model_switch_pending);
+    assert_eq!(agent.session.pending_context_switch.as_ref().unwrap().3, 2);
+    assert_eq!(agent.session.models.context_window_selection, None);
+}
+
+#[test]
+fn context_switch_holds_normal_send_until_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("context-model");
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.current = Some(model.clone());
+    agent.session.models.available.insert(model.clone(), acp::ModelInfo::new(model.clone(), "Context")
+        .meta(serde_json::json!({"totalContextTokens": 256_000, "contextWindows": [256_000, 500_000]}).as_object().cloned()));
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    dispatch(Action::SwitchContextWindow { window }, &mut app);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    let effects = dispatch(Action::SendPrompt("hello".into()), &mut app);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPrompt { .. }))
+    );
+    assert_eq!(app.agents[&id].session.queue_len(), 1);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text == "hello"))
+    );
+}
+
+#[test]
+fn context_switch_holds_interject_and_both_send_now_paths() {
+    for action in [
+        Action::Interject {
+            text: "held".into(),
+            images: vec![],
+        },
+        Action::SendPromptNow {
+            text: "held".into(),
+            images: vec![],
+            image_notice: None,
+        },
+        Action::QueueInterjectShared {
+            id: "p1".into(),
+            expected_version: 1,
+            new_text: None,
+        },
+    ] {
+        let shared = matches!(&action, Action::QueueInterjectShared { .. });
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let sid = app.agents[&id].session.session_id.clone().unwrap();
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.model_switch_pending = true;
+        agent.session.pending_context_switch = Some((
+            sid,
+            acp::ModelId::new("model"),
+            std::num::NonZeroU64::new(500_000).unwrap(),
+            1,
+        ));
+        let effects = dispatch(action, &mut app);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendInterject { .. }
+                | Effect::SendPrompt { .. }
+                | Effect::QueueInterject { .. }
+        )));
+        assert_eq!(
+            app.agents[&id].session.queue_len(),
+            if shared { 0 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn skills_list_ignores_stale_session_and_fetch_and_shows_scan_errors() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
+    use xai_grok_shell::extensions::skills::{SkillScanError, SkillsListResponse};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = app.agents[&id].session.session_id.clone().unwrap();
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
+    let old = modal.next_skills_fetch();
+    let current = modal.next_skills_fetch();
+    app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
+    for (session_id, fetch) in [(sid.clone(), old), (acp::SessionId::new("old"), current)] {
+        dispatch(
+            Action::TaskComplete(TaskResult::SkillsListLoaded {
+                agent_id: id,
+                session_id,
+                fetch,
+                result: Err("stale".into()),
+            }),
+            &mut app,
+        );
+        assert!(matches!(
+            app.agents[&id]
+                .extensions_modal
+                .as_ref()
+                .unwrap()
+                .skills_data,
+            TabDataState::Loading
+        ));
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::SkillsListLoaded {
+            agent_id: id,
+            session_id: sid,
+            fetch: current,
+            result: Ok(SkillsListResponse {
+                skills: vec![],
+                scan_errors: vec![SkillScanError {
+                    path: "/locked".into(),
+                    message: "denied".into(),
+                }],
+            }),
+        }),
+        &mut app,
+    );
+    let modal = app.agents[&id].extensions_modal.as_ref().unwrap();
+    assert!(matches!(modal.skills_data, TabDataState::Loaded(_)));
+    assert_eq!(modal.skills_scan_errors[0].path, "/locked");
+}
+
+#[test]
+fn skills_toggle_finishing_after_reload_refetches_committed_state() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = app.agents[&id].session.session_id.clone().unwrap();
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
+    let toggle = modal.next_skills_fetch();
+    let newer_read = modal.next_skills_fetch();
+    app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SkillsToggleDone {
+            agent_id: id,
+            session_id: sid.clone(),
+            fetch: toggle,
+            result: Ok(Default::default()),
+        }),
+        &mut app,
+    );
+    let fetch = match effects.as_slice() {
+        [
+            Effect::FetchSkillsList {
+                session_id,
+                refresh: true,
+                fetch,
+                ..
+            },
+        ] if session_id == &sid => *fetch,
+        other => panic!("expected post-toggle refresh, got {other:?}"),
+    };
+    assert_ne!(fetch, newer_read);
+    assert_eq!(
+        app.agents[&id]
+            .extensions_modal
+            .as_ref()
+            .unwrap()
+            .skills_fetch,
+        fetch
     );
 }

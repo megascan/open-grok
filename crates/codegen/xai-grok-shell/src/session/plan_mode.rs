@@ -52,6 +52,10 @@ pub enum PlanModeState {
 pub struct PlanModeTracker {
     /// Current state in the lifecycle.
     state: PlanModeState,
+    /// Invalidates unrestricted external children when shell restrictions change.
+    permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
+    /// Changes synchronously when a client-hook replacement is enqueued.
+    hook_generation: u64,
     /// Whether plan mode was previously active in this session.
     /// Used for reentry detection — if true and we enter Active again,
     /// inject the reentry reminder instead of the standard one.
@@ -110,6 +114,8 @@ impl PlanModeTracker {
     pub fn new(session_dir: PathBuf) -> Self {
         Self {
             state: PlanModeState::Inactive,
+            permission_handle: None,
+            hook_generation: 0,
             was_previously_active: false,
             reminder_count: 0,
             pending_exit_reminder: false,
@@ -138,6 +144,8 @@ impl PlanModeTracker {
         }
         Self {
             state: snapshot.state,
+            permission_handle: None,
+            hook_generation: 0,
             was_previously_active: snapshot.was_previously_active,
             reminder_count: snapshot.reminder_count,
             pending_exit_reminder: snapshot.pending_exit_reminder,
@@ -145,6 +153,30 @@ impl PlanModeTracker {
             pending_activation: None,
             plan_file_path: session_dir.join("plan.md"),
         }
+    }
+    pub(crate) fn set_permission_handle(
+        &mut self,
+        handle: xai_grok_workspace::permission::PermissionHandle,
+    ) {
+        self.permission_handle = Some(handle);
+    }
+
+    fn revoke_external_children(&self) {
+        if let Some(handle) = &self.permission_handle {
+            handle.revoke_unrestricted_leases();
+        }
+    }
+
+    /// Captured before requesting the actor's client-hook snapshot and checked
+    /// again after acquiring a permission lease, under this tracker's lock.
+    pub(crate) fn hook_generation(&self) -> u64 {
+        self.hook_generation
+    }
+
+    /// Called while holding the tracker lock, before queuing hook replacement.
+    pub(crate) fn client_hooks_will_change(&mut self) {
+        self.revoke_external_children();
+        self.hook_generation = self.hook_generation.wrapping_add(1);
     }
     /// Mark that the client is waiting on plan approval (`exit_plan_mode` parked).
     pub(crate) fn set_awaiting_plan_approval(&mut self, awaiting: bool) {
@@ -216,11 +248,13 @@ impl PlanModeTracker {
     pub(crate) fn enter_pending(&mut self) -> bool {
         match self.state {
             PlanModeState::Inactive => {
+                self.revoke_external_children();
                 self.state = PlanModeState::Pending;
                 self.pending_exit_reminder = false;
                 true
             }
             PlanModeState::ExitPending => {
+                self.revoke_external_children();
                 self.state = PlanModeState::Active;
                 self.pending_exit_reminder = false;
                 true
@@ -234,6 +268,7 @@ impl PlanModeTracker {
         if self.state != PlanModeState::Pending {
             return false;
         }
+        self.revoke_external_children();
         self.state = PlanModeState::Active;
         self.was_previously_active = true;
         self.reminder_count = 0;
@@ -252,6 +287,7 @@ impl PlanModeTracker {
             return false;
         }
         let prior_was_previously_active = self.was_previously_active;
+        self.revoke_external_children();
         self.state = PlanModeState::Active;
         self.was_previously_active = true;
         self.reminder_count = 0;
@@ -277,6 +313,7 @@ impl PlanModeTracker {
         if self.state != PlanModeState::Inactive {
             return false;
         }
+        self.revoke_external_children();
         self.state = PlanModeState::Active;
         self.was_previously_active = true;
         self.reminder_count = 0;

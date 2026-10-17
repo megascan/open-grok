@@ -13,6 +13,7 @@ pub mod compact;
 pub mod compact_mode;
 pub mod config_agents;
 pub mod context;
+pub mod context_window;
 pub mod copy;
 pub mod dashboard;
 pub mod debug;
@@ -103,6 +104,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(model::ModelCommand),
         Arc::new(fast::FastCommand),
         Arc::new(context::ContextCommand),
+        Arc::new(context_window::ContextWindowCommand),
         Arc::new(compact::CompactCommand),
         Arc::new(fork::ForkCommand),
         Arc::new(resume::ResumeCommand),

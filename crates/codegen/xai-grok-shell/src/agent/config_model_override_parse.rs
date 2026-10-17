@@ -686,6 +686,11 @@ mod tests {
             base_url: Some("https://example.com".into()),
             name: Some("Model M".into()),
             description: Some("desc".into()),
+            notice: Some(xai_grok_sampling_types::ModelNotice {
+                severity: xai_grok_sampling_types::ModelNoticeSeverity::Warning,
+                text: "Model notice".into(),
+                label: Some("notice".into()),
+            }),
             api_key: Some("key".into()),
             env_key: Some(crate::agent::config::EnvKeys::single("ENV_KEY")),
             auth_provider: Some("corp-gateway".into()),
@@ -707,6 +712,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             context_window: Some(200_000),
+            context_windows: Some(vec![std::num::NonZeroU64::new(200_000).unwrap()]),
             max_request_bytes: None,
             max_context_window: Some(1_000_000),
             auto_compact_token_limit: Some(850_000),

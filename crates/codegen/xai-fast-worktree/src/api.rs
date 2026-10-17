@@ -250,6 +250,8 @@ pub struct WorktreeBuilder {
     worktree_id: Option<String>,
     #[cfg(feature = "metadata")]
     metadata: Option<serde_json::Value>,
+    #[cfg(feature = "metadata")]
+    registry_home: Option<PathBuf>,
     nfs: Option<NfsWorktreeOpts>,
 }
 
@@ -288,6 +290,8 @@ impl WorktreeBuilder {
             worktree_id: None,
             #[cfg(feature = "metadata")]
             metadata: None,
+            #[cfg(feature = "metadata")]
+            registry_home: None,
             nfs: None,
         }
     }
@@ -371,6 +375,13 @@ impl WorktreeBuilder {
         self
     }
 
+    /// Store this worktree's metadata under an explicitly selected Open Grok home.
+    #[cfg(feature = "metadata")]
+    pub fn registry_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.registry_home = Some(home.into());
+        self
+    }
+
     /// Shorthand for `.creation_mode(CreationMode::Standalone)`.
     pub fn standalone(mut self, standalone: bool) -> Self {
         if standalone {
@@ -447,6 +458,7 @@ impl WorktreeBuilder {
             self.source.clone(),
             self.git_ref.clone(),
             self.metadata,
+            self.registry_home,
         );
 
         let plan = crate::worktree::WorktreePlan {
@@ -469,12 +481,14 @@ impl WorktreeBuilder {
 
         #[cfg(feature = "metadata")]
         {
-            let (kind, session_id, wt_id, source, git_ref, mut metadata) = meta_fields;
+            let (kind, session_id, wt_id, source, git_ref, mut metadata, registry_home) =
+                meta_fields;
             if let Some(kind) = kind {
                 if let Some(sm) = result.strategy_metadata.clone() {
                     metadata = Some(merge_strategy_metadata(metadata, sm));
                 }
                 register_worktree(
+                    registry_home.as_deref(),
                     &result.worktree_path,
                     &source,
                     kind,
@@ -654,7 +668,7 @@ pub struct RemoveReport {
 /// This is a **blocking** operation. Callers should use `spawn_blocking`
 /// when calling from async contexts.
 pub fn remove_worktree(worktree_path: &std::path::Path) -> Result<RemoveReport> {
-    remove_worktree_inner(worktree_path, None)
+    remove_worktree_inner(worktree_path, None, None)
 }
 
 /// Remove a worktree with an optional delegate for privileged btrfs operations.
@@ -666,20 +680,43 @@ pub fn remove_worktree_with_delegate(
     worktree_path: &std::path::Path,
     delegate: Option<Arc<dyn BtrfsDelegate>>,
 ) -> Result<RemoveReport> {
-    remove_worktree_inner(worktree_path, delegate.as_ref())
+    remove_worktree_inner(worktree_path, delegate.as_ref(), None)
+}
+
+/// Remove a worktree and unregister it from the explicitly selected metadata home.
+#[cfg(feature = "metadata")]
+pub fn remove_worktree_in(
+    worktree_path: &std::path::Path,
+    registry_home: &std::path::Path,
+) -> Result<RemoveReport> {
+    remove_worktree_inner(worktree_path, None, Some(registry_home))
 }
 
 fn remove_worktree_inner(
     worktree_path: &std::path::Path,
     delegate: Option<&Arc<dyn BtrfsDelegate>>,
+    registry_home: Option<&std::path::Path>,
 ) -> Result<RemoveReport> {
+    #[cfg(not(feature = "metadata"))]
+    let _ = registry_home;
+    // Capture the registered path before removing it: canonicalization after
+    // deletion cannot resolve parent aliases such as /var on macOS. Preserve
+    // a symlink's own name because grove registrations use that spelling.
+    #[cfg(feature = "metadata")]
+    let registry_path = match std::fs::symlink_metadata(worktree_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            crate::worktree::plan::canonicalize_for_id(worktree_path)
+        }
+        _ => dunce::canonicalize(worktree_path)
+            .unwrap_or_else(|_| crate::worktree::plan::canonicalize_for_id(worktree_path)),
+    };
     let report = remove_worktree_from_disk(worktree_path, delegate)?;
 
     // Unregister only AFTER a successful on-disk removal: a failed removal (e.g.
     // EPERM on btrfs delete) must keep the record so the worktree stays tracked
     // by list/gc instead of leaking untracked on disk.
     #[cfg(feature = "metadata")]
-    unregister_worktree(worktree_path);
+    unregister_worktree(registry_home, &registry_path);
 
     Ok(report)
 }
@@ -879,7 +916,7 @@ fn cleanup_single_worktree(
     delegate: Option<&Arc<dyn BtrfsDelegate>>,
     report: &mut CleanupReport,
 ) {
-    match remove_worktree_inner(path, delegate) {
+    match remove_worktree_inner(path, delegate, None) {
         Ok(r) => {
             report.removed += 1;
             if r.unmounted_overlay {
@@ -1489,6 +1526,7 @@ fn cleanup_orphaned_btrfs_snapshots_inner(
 
 #[cfg(feature = "metadata")]
 pub(crate) fn register_worktree(
+    registry_home: Option<&std::path::Path>,
     worktree_path: &std::path::Path,
     source: &std::path::Path,
     kind: crate::db::WorktreeKind,
@@ -1501,7 +1539,11 @@ pub(crate) fn register_worktree(
 ) {
     use crate::db;
 
-    let db = match db::WorktreeDb::open_default() {
+    let opened = match registry_home {
+        Some(home) => db::WorktreeDb::open(home),
+        None => db::WorktreeDb::open_default(),
+    };
+    let db = match opened {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "failed to open worktree DB for registration");
@@ -1538,8 +1580,12 @@ pub(crate) fn register_worktree(
 }
 
 #[cfg(feature = "metadata")]
-fn unregister_worktree(worktree_path: &std::path::Path) {
-    if let Ok(db) = crate::db::WorktreeDb::open_default() {
+fn unregister_worktree(registry_home: Option<&std::path::Path>, worktree_path: &std::path::Path) {
+    let opened = match registry_home {
+        Some(home) => crate::db::WorktreeDb::open(home),
+        None => crate::db::WorktreeDb::open_default(),
+    };
+    if let Ok(db) = opened {
         let path =
             dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
         let _ = db.unregister_by_path(&path);
@@ -3452,6 +3498,7 @@ mod tests {
             let wt_canon = dunce::canonicalize(&wt_path).unwrap_or_else(|_| wt_path.clone());
 
             super::super::register_worktree(
+                None,
                 &wt_path,
                 std::path::Path::new("/src/repo"),
                 WorktreeKind::Session,
@@ -3478,6 +3525,34 @@ mod tests {
             assert_eq!(mine[0].creation_mode, "linked");
             assert_eq!(mine[0].head_commit.as_deref(), Some("abc123"));
             assert!(mine[0].creator_pid.is_some());
+        }
+
+        #[test]
+        fn explicit_registry_home_is_used_for_registration_and_removal() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let home = tmp.path().join("private-home");
+            let other_home = tmp.path().join("other-home");
+            let wt = tmp.path().join("worktree");
+            std::fs::create_dir_all(&wt).unwrap();
+            super::super::register_worktree(
+                Some(&home),
+                &wt,
+                tmp.path(),
+                WorktreeKind::Session,
+                "linked",
+                "HEAD",
+                "fixture",
+                None,
+                None,
+                None,
+            );
+            let db = WorktreeDb::open(&home).unwrap();
+            let other = WorktreeDb::open(&other_home).unwrap();
+            assert_eq!(db.list(&ListFilter::default()).unwrap().len(), 1);
+            assert!(other.list(&ListFilter::default()).unwrap().is_empty());
+            super::super::remove_worktree_in(&wt, &home).unwrap();
+            assert!(db.list(&ListFilter::default()).unwrap().is_empty());
+            assert!(!wt.exists());
         }
 
         #[test]
@@ -4066,6 +4141,7 @@ mod tests {
 
             // Register via the production registration path (uses open_default).
             super::super::register_worktree(
+                None,
                 &wt_path,
                 std::path::Path::new("/src/repo"),
                 WorktreeKind::Session,
@@ -4115,6 +4191,7 @@ mod tests {
                 .unwrap();
 
             super::super::register_worktree(
+                None,
                 &wt_path,
                 &repo,
                 WorktreeKind::Session,

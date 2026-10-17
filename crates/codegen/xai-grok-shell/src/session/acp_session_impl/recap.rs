@@ -192,7 +192,7 @@ impl SessionActor {
     /// [`SessionUpdate::SessionRecap`](crate::extensions::notification::SessionUpdate::SessionRecap).
     ///
     /// Snapshots the conversation, appends a single recap instruction turn
-    /// (reusing the prompt prefix verbatim so the provider cache stays warm),
+    /// using bounded visible conversation text,
     /// makes one tool-free model call, and emits the cleaned one-line summary
     /// for display only. It never mutates the conversation.
     ///
@@ -200,8 +200,7 @@ impl SessionActor {
     /// A missing recap must never disrupt the session.
     ///
     /// Recap routes through [`Self::prepare_auxiliary_sampling`] so provider /
-    /// credential isolation and export boundaries stay intact (shared request
-    /// skeleton lives in [`Self::parent_cached_request`]).
+    /// credential isolation and export boundaries stay intact.
     pub(super) async fn handle_recap(&self, auto: bool) {
         use crate::session::helpers::session_recap;
 
@@ -260,8 +259,29 @@ impl SessionActor {
         // (not on failure/empty/cancel) so auto can retry later for this turn if needed.
         let clear_in_flight = || self.recap_in_flight.set(false);
 
+        let settings = crate::util::config::resolve_session_recap_settings_from_disk();
+        let Some(transcript) = session_recap::recap_transcript(
+            &conversation,
+            settings.user_message_max_chars,
+            settings.agent_reply_max_chars,
+            settings.transcript_max_chars,
+        ) else {
+            clear_in_flight();
+            if !auto {
+                self.emit_recap_unavailable().await;
+            }
+            return;
+        };
+
+        let effective_legacy_model = self.models_manager.recap_model();
+        let trusted_model = settings.trusted_model_override(effective_legacy_model.as_deref());
         let auxiliary = match self
-            .prepare_auxiliary_sampling(AuxiliaryModelPurpose::Recap, None)
+            .prepare_auxiliary_sampling_with_effort(
+                AuxiliaryModelPurpose::Recap,
+                trusted_model,
+                settings.reasoning_effort,
+                trusted_model.is_some(),
+            )
             .await
         {
             Ok(route) => route,
@@ -283,44 +303,30 @@ impl SessionActor {
             provider,
         } = auxiliary;
 
-        let tag = self.reminder_wrapper_tag();
-        let strip_reasoning = sampling_client.api_backend().requires_reasoning_strip();
-
-        // Budget against the independently selected recap model, not the
-        // primary chat model. This matters when a 353K Codex session delegates
-        // recap to a helper with a different context window (or vice versa).
-        let context_window = context_window.max(1);
-        let items =
-            session_recap::budget_recap_items(conversation, tag, strip_reasoning, context_window);
-
-        // Leave BOTH temperature and max_output_tokens unset: the cli-chat-proxy
-        // layer may inject a `thinking` budget for thinking-enabled models
-        // (which also forces temperature == 1), and a small max_output_tokens
-        // below that budget makes the call error or return empty — silently
-        // dropping the recap. The recap instruction keeps the body to
-        // ~25–40 words, and `clean_recap_text` caps it at a generous
-        // RECAP_MAX_CHARS safety net, so an explicit token cap isn't needed.
+        // No original tool calls, hidden reasoning, hosted tools, or parent
+        // cache identity cross this projection boundary.
+        let tag = "";
+        let strip_reasoning = false;
+        let items = vec![
+            ConversationItem::system(session_recap::RECAP_SYSTEM),
+            ConversationItem::user(transcript),
+        ];
         let started_at = chrono::Utc::now().to_rfc3339();
         let x_grok_conv_id = format!("recap-{}", uuid::Uuid::new_v4());
         let x_grok_req_id = format!("xai-recap-{}", uuid::Uuid::new_v4());
-        // Clone the exact request items for the on-disk artifact (recap never
-        // mutates conversation state, so this file is the only durable record).
         let chat_history_for_artifact = items.clone();
-        // Main-turn tool specs: tools serialize into the cached token prefix.
-        let tool_defs = self.prepare_tool_definitions().await;
-        let tools = self.turn_base_tool_specs(&tool_defs, provider);
-        // Mirror the main turn's hosted tools so a recap can't search past the active cutoff.
-        let hosted_tools = self.hosted_tools_for_turn();
-        let request = self.parent_cached_request(AuxCall {
+        let request = ConversationRequest {
             items,
-            tools,
-            hosted_tools,
-            model: model.clone(),
+            model: Some(model.clone()),
             reasoning_effort,
-            backend: sampling_client.api_backend(),
-            conv_id: x_grok_conv_id.clone(),
-            req_id: x_grok_req_id.clone(),
-        });
+            x_grok_conv_id: Some(x_grok_conv_id.clone()),
+            x_grok_cache_affinity_id: Some(x_grok_conv_id.clone()),
+            x_grok_req_id: Some(x_grok_req_id.clone()),
+            x_grok_session_id: Some(self.session_info.id.to_string()),
+            x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+            length_policy: xai_grok_sampling_types::LengthPolicy::Fail,
+            ..Default::default()
+        };
 
         tracing::debug!(
             recap_model = %model,
@@ -330,10 +336,20 @@ impl SessionActor {
             "recap: dispatching auxiliary model call"
         );
 
-        let response = match sampling_client.conversation_collect(request).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "recap: model call failed");
+        let response = match tokio::time::timeout(
+            settings.timeout,
+            sampling_client.conversation_collect(request),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            result => {
+                let error = match result {
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "recap model call timed out".to_owned(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                tracing::warn!(%error, "recap: model call failed");
                 self.persist_recap_request_artifact(
                     chat_history_for_artifact,
                     &model,
@@ -345,7 +361,7 @@ impl SessionActor {
                     started_at,
                     None,
                     None,
-                    Some(&e.to_string()),
+                    Some(&error),
                 );
                 clear_in_flight();
                 // A manual `/recap` shows a loading spinner; clear it on failure.

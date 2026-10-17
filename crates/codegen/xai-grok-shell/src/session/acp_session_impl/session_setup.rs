@@ -533,7 +533,7 @@ impl SessionActor {
         let mut config_changed = false;
         let mut updated_config = current_config.clone();
         if current_config.context_window != new_context_window
-            && self.compaction.context_window_override.is_none()
+            && !self.is_context_window_fixed(current_config.context_window)
         {
             tracing::info!(
                 old_context_window = current_config.context_window.get(),
@@ -576,7 +576,7 @@ impl SessionActor {
         let mut new_max_completion_tokens = current_config.max_completion_tokens;
         if let Some(new_cw) = metadata.context_window.and_then(std::num::NonZeroU64::new)
             && current_config.context_window != new_cw
-            && self.compaction.context_window_override.is_none()
+            && !self.is_context_window_fixed(current_config.context_window)
         {
             if new_cw < current_config.context_window {
                 tracing::warn!(
@@ -619,6 +619,44 @@ impl SessionActor {
     /// Inject the actor's managed Read-deny globs into the current ToolBridge so
     /// the Grep tool excludes policy-forbidden paths. No-op when empty. Called on
     /// session setup and re-called after an agent rebuild (the rebuilt bridge
+    fn is_context_window_fixed(&self, current: std::num::NonZeroU64) -> bool {
+        self.compaction.context_window_override.is_some()
+            || std::num::NonZeroU64::new(
+                self.compaction
+                    .context_window_selection
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) == Some(current)
+    }
+
+    pub(super) async fn apply_supported_context_window_selection(&self) {
+        let Some(selection) = std::num::NonZeroU64::new(
+            self.compaction
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) else {
+            return;
+        };
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return;
+        };
+        if cfg.context_window == selection || self.compaction.context_window_override.is_some() {
+            return;
+        }
+        let supported = self.models_manager.models().values().any(|entry| {
+            entry.info.provider == cfg.provider
+                && entry.info.has_model_id(&cfg.model)
+                && entry.info.supports_context_window(selection)
+        });
+        if supported {
+            self.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    context_window: selection,
+                    ..cfg
+                },
+            );
+        }
+    }
+
     pub(super) async fn inject_deny_read_globs(&self) {
         if self.deny_read_globs.is_empty() {
             return;

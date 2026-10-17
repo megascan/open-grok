@@ -382,11 +382,20 @@ impl AgentView {
         (!clear_esc.is_empty()).then_some(clear_esc)
     }
 
-    /// Stop inline video playback, dropping the pre-extracted frame set
-    /// (~50–300 MB), and request a post-draw purge for it. Returns whether a
-    /// video was actually playing — callers on the draw path rely on the
-    /// deferred request (never a synchronous purge mid-frame), and image-only
-    /// paths (`None` here) must not purge at all.
+    /// Forget which Kitty images the terminal holds, so the next frame re-transmits them instead of placing ids that no longer exist.
+    /// Call after a full screen clear: Ghostty drops image data on `ESC[2J`, and a place-only frame with `q=2` then fails silently and draws nothing.
+    pub(crate) fn forget_transmitted_inline_media(&mut self) {
+        self.inline_media_ids.clear();
+        self.inline_media_iterm_emitted.clear();
+        self.last_placed_ids.clear();
+        for child in self.subagent_views.values_mut() {
+            child.forget_transmitted_inline_media();
+        }
+    }
+
+    /// Stop inline video playback, dropping the pre-extracted frame set (~50-300 MB), and request a post-draw purge for it.
+    /// Returns whether a video was actually playing.
+    /// Draw-path callers rely on the deferred request (never a synchronous mid-frame purge); image-only paths must not purge at all.
     pub(super) fn stop_inline_playback(&mut self) -> bool {
         let had_video = self.inline_video.take().is_some();
         if had_video {
