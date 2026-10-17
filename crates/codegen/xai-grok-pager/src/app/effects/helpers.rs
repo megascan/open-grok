@@ -690,10 +690,13 @@ pub(crate) struct EffectMeta {
 pub(super) fn extract_first_user_prompt(
     info: &xai_grok_shell::session::info::Info,
 ) -> Option<String> {
-    use std::io::BufRead;
     let history_path = xai_grok_shell::session::persistence::session_dir(info)
         .join("chat_history.jsonl");
-    let file = std::fs::File::open(history_path).ok()?;
+    extract_first_user_prompt_from_path(&history_path)
+}
+fn extract_first_user_prompt_from_path(history_path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = xai_file_utils::session_file::open(history_path).ok()?;
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.ok()?;
@@ -734,7 +737,7 @@ pub(super) fn count_chat_history_stats(history_path: &Path) -> (usize, usize) {
     use xai_grok_shell::sampling::{AssistantItem, ConversationItem, UserItem};
     let mut turn_count = 0usize;
     let mut tool_call_count = 0usize;
-    let Ok(file) = std::fs::File::open(history_path) else {
+    let Ok(file) = xai_file_utils::session_file::open(history_path) else {
         return (0, 0);
     };
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
@@ -1996,5 +1999,32 @@ pub(super) fn unregister_active_session_best_effort_in(
         )
         }
         Err(e) => tracing::warn!(?e, "Failed to unregister active session"),
+    }
+}
+
+#[cfg(test)]
+mod gzip_history_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn gzip_history_preserves_card_preview_and_stats() {
+        use xai_grok_shell::sampling::ConversationItem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_history.jsonl");
+        let item: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": "<user_query>Implement compression</user_query>"}],
+        })).unwrap();
+        let history = format!("{}\n", serde_json::to_string(&item).unwrap());
+        std::fs::write(&path, history.as_bytes()).unwrap();
+        assert_eq!(extract_first_user_prompt_from_path(&path).as_deref(), Some("Implement compression"));
+        assert_eq!(count_chat_history_stats(&path), (1, 0));
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(history.as_bytes()).unwrap();
+        std::fs::write(&path, gzip.finish().unwrap()).unwrap();
+        assert_eq!(extract_first_user_prompt_from_path(&path).as_deref(), Some("Implement compression"));
+        assert_eq!(count_chat_history_stats(&path), (1, 0));
     }
 }

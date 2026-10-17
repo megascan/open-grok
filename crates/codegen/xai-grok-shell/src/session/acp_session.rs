@@ -1659,9 +1659,8 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// agent-rebuild: `chat_state_handle.replace_conversation` persists the same
 /// content, but only after two async actor hops, so a reload that races the
 /// first prompt could otherwise read the bare pre-enrichment template. A
-/// distinct temp suffix (`.sync.tmp`) avoids clobbering the persistence actor's
-/// own `chat_history.jsonl.tmp`; whichever atomic `rename` lands last wins and
-/// the content is identical, so the two writers can never produce a torn file.
+/// shared history lock serializes snapshot publication with appends and gzip
+/// transforms. Unique staging names keep concurrent writers separate.
 fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
     let dir = match crate::session::persistence::ensure_owner_only_session_dir(session_info) {
         Ok(dir) => dir,
@@ -1672,23 +1671,9 @@ fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[C
         }
     };
     let final_path = dir.join("chat_history.jsonl");
-    let tmp_path = dir.join("chat_history.jsonl.sync.tmp");
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        for item in conversation {
-            serde_json::to_writer(&mut buf, item)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push(b'\n');
-        }
-        std::fs::File::create(&tmp_path)?.write_all(&buf)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
+    if let Err(e) = crate::session::storage::write_jsonl_atomic(&final_path, conversation) {
         tracing::warn!(session_id = %session_info.id.0, ?e,
             "persist_chat_history_jsonl_sync: failed to persist chat_history.jsonl");
-        let _ = std::fs::remove_file(&tmp_path);
     }
 }
 /// Persist the exact rendered system prompt to `{session_dir}/system_prompt.txt`.

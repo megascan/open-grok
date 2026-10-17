@@ -87,7 +87,7 @@ impl SessionActor {
     ) -> std::io::Result<Vec<String>> {
         use crate::session::storage::{PromptExtractIterator, collect_prompts_from_events};
 
-        let Some(iter) = PromptExtractIterator::open(updates_path)? else {
+        let Some(mut iter) = PromptExtractIterator::open(updates_path)? else {
             return Ok(vec![]);
         };
 
@@ -96,7 +96,8 @@ impl SessionActor {
             "load_user_prompts_from_updates: starting selective scan"
         );
 
-        let prompts = collect_prompts_from_events(iter);
+        let prompts = collect_prompts_from_events(iter.by_ref());
+        iter.finish()?;
 
         tracing::debug!(
             prompt_count = prompts.len(),

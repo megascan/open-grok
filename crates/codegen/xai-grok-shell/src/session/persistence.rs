@@ -3005,7 +3005,29 @@ impl SessionPersistence {
     async fn run(mut self) {
         // The constructors fire the t=0 touch, so this starts at now().
         let mut last_worktree_touch = std::time::Instant::now();
-        while let Some(msg) = self.rx.recv().await {
+        let mut history_dirty = false;
+        loop {
+            let message = if history_dirty {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), self.rx.recv()).await
+                {
+                    Ok(message) => message,
+                    Err(_) => {
+                        if self.flush_pending().await.is_ok()
+                            && let Err(error) = self.storage.compress_history(&self.info).await
+                        {
+                            tracing::warn!(%error, "failed to gzip idle thread history");
+                        }
+                        history_dirty = false;
+                        continue;
+                    }
+                }
+            } else {
+                self.rx.recv().await
+            };
+            let Some(msg) = message else {
+                break;
+            };
+            history_dirty = true;
             if last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL {
                 last_worktree_touch = std::time::Instant::now();
                 // Detached on purpose: opportunistic refresh, no ordering need.
@@ -3508,8 +3530,12 @@ impl SessionPersistence {
             }
         }
 
-        // Drain the merge buffer on channel close.
-        let _ = self.flush_pending().await;
+        // Drain before compressing; never publish a stale detached snapshot.
+        if self.flush_pending().await.is_ok()
+            && let Err(error) = self.storage.compress_history(&self.info).await
+        {
+            tracing::warn!(%error, "failed to gzip closed thread history");
+        }
     }
 
     async fn copy_session_dir_to_memory(&self) -> anyhow::Result<SessionStateCopy> {
@@ -3521,7 +3547,7 @@ impl SessionPersistence {
                 return Ok(SessionStateCopy { files });
             }
 
-            collect_session_files_recursive(&session_dir, &session_dir, &mut files);
+            collect_session_files_recursive(&session_dir, &session_dir, &mut files)?;
             collect_mcp_stderr_logs(&mut files);
 
             Ok(SessionStateCopy { files })
@@ -3607,10 +3633,15 @@ fn backfill_updates_to_sync(
     backfilled
 }
 
-fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<CopiedSessionFile>) {
+fn collect_session_files_recursive(
+    base: &Path,
+    dir: &Path,
+    files: &mut Vec<CopiedSessionFile>,
+) -> io::Result<()> {
     let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(base);
-    collect_session_files_recursive_with_artifacts(base, dir, files, &artifacts);
+    collect_session_files_recursive_with_artifacts(base, dir, files, &artifacts)?;
     archive_logs::collect_terminal_logs(base, files, &artifacts);
+    Ok(())
 }
 
 fn collect_session_files_recursive_with_artifacts(
@@ -3618,13 +3649,13 @@ fn collect_session_files_recursive_with_artifacts(
     dir: &Path,
     files: &mut Vec<CopiedSessionFile>,
     artifacts: &xai_grok_feedback::FeedbackDraftArtifactSet,
-) {
+) -> io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             tracing::warn!(?dir, ?e, "Failed to read directory during session copy");
-            return;
+            return Err(e);
         }
     };
 
@@ -3644,22 +3675,31 @@ fn collect_session_files_recursive_with_artifacts(
             let Some(name) = rel_path.to_str() else {
                 continue;
             };
-            let Ok(Some(mut file)) = artifacts.open_non_artifact(&path) else {
+            let Ok(Some(file)) = artifacts.open_non_artifact(&path) else {
                 continue;
             };
-            let mut data = Vec::new();
-            if let Err(e) = std::io::Read::read_to_end(&mut file, &mut data) {
-                tracing::warn!(?e, "Failed to read session file during copy");
-                continue;
-            }
+            let data = match archive_logs::read_session_file_for_archive(file, &path) {
+                Ok(data) => data,
+                Err(e) => {
+                    if matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("chat_history.jsonl" | "updates.jsonl")
+                    ) {
+                        return Err(e);
+                    }
+                    tracing::warn!(?e, "Failed to read session file during copy");
+                    continue;
+                }
+            };
             files.push(CopiedSessionFile {
                 name: name.to_string(),
                 data,
             });
         } else if file_type.is_dir() && path != base.join(archive_logs::TERMINAL_DIR) {
-            collect_session_files_recursive_with_artifacts(base, &path, files, artifacts);
+            collect_session_files_recursive_with_artifacts(base, &path, files, artifacts)?;
         }
     }
+    Ok(())
 }
 
 fn init_remote_sync(
@@ -5197,7 +5237,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -5224,7 +5264,7 @@ mod collect_session_files_tests {
         }
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
         files.sort_by(|a, b| a.name.cmp(&b.name));
 
         let sizes: Vec<_> = files
@@ -5255,7 +5295,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["summary.json"]);
@@ -5277,7 +5317,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "summary.json");
     }
@@ -5300,7 +5340,7 @@ mod collect_session_files_tests {
         }
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         let mut names: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
         names.sort_unstable();
@@ -5318,7 +5358,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 3);
@@ -5337,7 +5377,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("top.txt"), b"top").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -5351,7 +5391,7 @@ mod collect_session_files_tests {
         let missing = dir.path().join("does_not_exist");
 
         let mut files = Vec::new();
-        collect_session_files_recursive(&missing, &missing, &mut files);
+        collect_session_files_recursive(&missing, &missing, &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -5361,7 +5401,7 @@ mod collect_session_files_tests {
         let dir = TempDir::new().unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -5373,7 +5413,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("file.txt"), b"data").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "file.txt");

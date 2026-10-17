@@ -249,7 +249,7 @@ fn copy_updates_streaming(
     target_prompt_index: Option<usize>,
 ) -> io::Result<CopiedUpdates> {
     let mut writer = UpdateLineWriter::try_new(target, source, target_session_id)?;
-    let mut file = match std::fs::File::open(source) {
+    let mut file = match xai_file_utils::session_file::open(source) {
         Ok(file) => file,
         // A missing source is an empty transcript; still write the target.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return writer.finish(),
@@ -284,7 +284,7 @@ fn copy_updates_streaming(
 /// A point fork must know whether *any* compaction occurred. Ignoring even
 /// one corrupt line could hide a checkpoint and expose a future summary.
 fn has_compaction_checkpoint(updates: &Path) -> io::Result<bool> {
-    let file = std::fs::File::open(updates)?;
+    let file = xai_file_utils::session_file::open(updates)?;
     let mut reader = BufReader::new(file);
     let mut found = false;
     let mut any = false;
@@ -331,7 +331,7 @@ fn point_fork_checkpoint(
     updates: &Path,
     target: usize,
 ) -> io::Result<Option<crate::extensions::notification::CompactionCheckpointInfo>> {
-    let mut file = std::fs::File::open(updates)?;
+    let mut file = xai_file_utils::session_file::open(updates)?;
     let survivors = surviving_line_indexes(BufReader::new(&mut file), target)?;
     file.seek(io::SeekFrom::Start(0))?;
     let mut survivors = survivors.into_iter().peekable();
@@ -674,7 +674,7 @@ impl JsonlStorageAdapter {
                 None,
             )?;
             if has_checkpoint {
-                let mut file = std::fs::File::open(&updates)?;
+                let mut file = xai_file_utils::session_file::open(&updates)?;
                 let survivors = surviving_line_indexes(BufReader::new(&mut file), target_idx)?;
                 file.seek(io::SeekFrom::Start(0))?;
                 let mut survivors = survivors.into_iter().peekable();
@@ -1246,4 +1246,89 @@ fn copy_referenced_checkpoints(
 
 fn invalid_data(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+
+    fn write_compressed(path: &Path, contents: &[u8]) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(contents).unwrap();
+        std::fs::write(path, encoder.finish().unwrap()).unwrap();
+    }
+
+    fn updates() -> String {
+        let mut contents = String::new();
+        for (kind, text, prompt) in [
+            ("user_message_chunk", "first", 0),
+            ("agent_message_chunk", "reply", 0),
+            ("user_message_chunk", "second", 1),
+            ("agent_message_chunk", "later", 1),
+        ] {
+            contents.push_str(
+                &serde_json::json!({
+                    "timestamp": 1,
+                    "method": "session/update",
+                    "params": {"sessionId": "source", "update": {
+                        "sessionUpdate": kind,
+                        "content": {"type": "text", "text": text},
+                        "_meta": {"promptIndex": prompt}
+                    }}
+                })
+                .to_string(),
+            );
+            contents.push('\n');
+        }
+        contents
+    }
+
+    #[test]
+    fn gzip_fork_stream_and_point_copy_match_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("updates.jsonl");
+        let plain = dir.path().join("plain.jsonl");
+        let compressed = dir.path().join("compressed.jsonl");
+        let contents = updates();
+        let target_id = acp::SessionId::new("target");
+        for target in [None, Some(0), Some(1)] {
+            std::fs::write(&source, &contents).unwrap();
+            let expected = copy_updates_streaming(&source, &plain, &target_id, target).unwrap();
+            assert_eq!(expected.count, if target == Some(0) { 2 } else { 4 });
+            write_compressed(&source, contents.as_bytes());
+            let actual = copy_updates_streaming(&source, &compressed, &target_id, target).unwrap();
+            assert_eq!(actual.count, expected.count);
+            let records = |path: &Path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                        value.as_object_mut().unwrap().remove("timestamp");
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(records(&compressed), records(&plain));
+        }
+    }
+
+    #[test]
+    fn gzip_fork_rejects_corrupt_trailer_even_for_point_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("updates.jsonl");
+        let target = dir.path().join("target.jsonl");
+        write_compressed(&source, updates().as_bytes());
+        let mut bytes = std::fs::read(&source).unwrap();
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        std::fs::write(&source, bytes).unwrap();
+        for prompt in [None, Some(0)] {
+            assert!(
+                copy_updates_streaming(&source, &target, &acp::SessionId::new("target"), prompt)
+                    .is_err()
+            );
+        }
+    }
 }

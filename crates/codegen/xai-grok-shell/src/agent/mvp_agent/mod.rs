@@ -1630,7 +1630,7 @@ impl MvpAgent {
         let Some(updates_path) = updates_file_path else {
             return Vec::new();
         };
-        let contents = match std::fs::read_to_string(updates_path) {
+        let contents = match xai_file_utils::session_file::read_to_string(updates_path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
@@ -1748,39 +1748,60 @@ impl MvpAgent {
         }
         completions
     }
-    /// Extracts initial_total_tokens by scanning only the tail of the updates file.
+    /// Extracts initial_total_tokens from the final 64 KiB of decoded updates.
+    /// Plain files seek directly; gzip files use a bounded streaming tail.
     /// Avoids loading and deserializing all updates when replay is skipped (noReplay).
-    pub(super) fn extract_initial_tokens_from_updates(
-        updates_file_path: &Option<PathBuf>,
-    ) -> u64 {
+    pub(super) fn extract_initial_tokens_from_updates(updates_file_path: &Option<PathBuf>) -> u64 {
         use std::io::{Read, Seek, SeekFrom};
         let Some(updates_path) = updates_file_path else {
             return 0;
         };
-        let mut file = match std::fs::File::open(updates_path) {
+        let mut file = match xai_file_utils::session_file::open(updates_path) {
             Ok(f) => f,
-            Err(_) => return 0u64,
-        };
-        let file_len = match file.metadata() {
-            Ok(m) => m.len(),
             Err(_) => return 0,
         };
-        const TAIL_SIZE: u64 = 64 * 1024;
-        let start_pos = file_len.saturating_sub(TAIL_SIZE);
-        if file.seek(SeekFrom::Start(start_pos)).is_err() {
-            return 0;
-        }
-        let mut buf = String::new();
-        if file.read_to_string(&mut buf).is_err() {
-            return 0;
-        }
+        const TAIL_SIZE: usize = 64 * 1024;
+        let read_tail = (|| -> std::io::Result<Vec<u8>> {
+            if !file.is_compressed() {
+                let len = file.seek(SeekFrom::End(0))?;
+                file.seek(SeekFrom::Start(len.saturating_sub(TAIL_SIZE as u64)))?;
+                let mut tail = Vec::new();
+                file.take(TAIL_SIZE as u64).read_to_end(&mut tail)?;
+                return Ok(tail);
+            }
+            // Gzip offsets are decoded coordinates. Keep a bounded rolling
+            // tail in one pass, consuming EOF to validate the gzip trailer.
+            let mut tail = std::collections::VecDeque::with_capacity(TAIL_SIZE);
+            let mut chunk = [0u8; 8192];
+            loop {
+                let count = file.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                let excess = (tail.len() + count).saturating_sub(TAIL_SIZE);
+                tail.drain(..excess);
+                tail.extend(&chunk[..count]);
+            }
+            Ok(tail.into_iter().collect())
+        })();
+        let bytes = match read_tail {
+            Ok(bytes) => bytes,
+            Err(_) => return 0,
+        };
+        // The first retained byte may land inside a UTF-8 character. That
+        // incomplete first record must not hide valid later token records.
+        let buf = String::from_utf8_lossy(&bytes);
         let result = buf
             .lines()
             .rev()
             .filter(|line| !line.trim().is_empty())
             .find_map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).ok()?;
-                value.get("params")?.get("meta")?.get("totalTokens")?.as_u64()
+                value
+                    .get("params")?
+                    .get("meta")?
+                    .get("totalTokens")?
+                    .as_u64()
             })
             .unwrap_or(0);
         if result == 0 {
@@ -2667,3 +2688,92 @@ mod replay_tests;
 mod tests;
 #[cfg(test)]
 mod prompt_response_meta_tests;
+
+#[cfg(test)]
+mod gzip_history_tests {
+    use super::MvpAgent;
+    use std::io::Write;
+    use std::path::Path;
+
+    fn gzip(path: &Path, text: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        let bytes = encoder.finish().unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn gzip_initial_tokens_use_decoded_tail_and_validate_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let contents = format!(
+            "{}\n{{\"params\":{{\"meta\":{{\"totalTokens\":12345}}}}}}\n",
+            "é".repeat(100_000)
+        );
+        std::fs::write(&path, &contents).unwrap();
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            12345
+        );
+        let mut bytes = gzip(&path, &contents);
+        assert!(bytes.len() < 64 * 1024);
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            12345
+        );
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            0
+        );
+        let old_token = format!(
+            "{{\"params\":{{\"meta\":{{\"totalTokens\":999}}}}}}\n{}\n",
+            "x".repeat(70_000)
+        );
+        gzip(&path, &old_token);
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path)),
+            0
+        );
+    }
+
+    #[test]
+    fn gzip_orphaned_tasks_match_plain_and_reject_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let mut contents = String::new();
+        for (kind, task_id) in [
+            ("task_backgrounded", "done"),
+            ("task_completed", "done"),
+            ("task_backgrounded", "pending"),
+        ] {
+            contents.push_str(
+                &serde_json::json!({"params": {"update": {
+                    "sessionUpdate": kind, "task_id": task_id, "command": "sleep 10", "cwd": "/work",
+                    "task_snapshot": {"task_id": task_id}
+                }}})
+                .to_string(),
+            );
+            contents.push('\n');
+        }
+        for compressed in [false, true] {
+            if compressed {
+                gzip(&path, &contents);
+            } else {
+                std::fs::write(&path, &contents).unwrap();
+            }
+            let tasks = MvpAgent::find_orphaned_background_tasks(&Some(path.clone()));
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].task_id, "pending");
+            assert_eq!(tasks[0].command, "sleep 10");
+            assert_eq!(tasks[0].cwd, "/work");
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(MvpAgent::find_orphaned_background_tasks(&Some(path)).is_empty());
+    }
+}

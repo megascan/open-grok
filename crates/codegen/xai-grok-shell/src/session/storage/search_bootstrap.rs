@@ -13,8 +13,8 @@ use tokio::time::Instant;
 
 use super::StorageAdapter;
 use super::search_content::{
-    UpsertOutcome, build_session_doc, collect_all_indexable_content_single_pass,
-    should_skip_session, upsert_unless_unchanged,
+    UpsertOutcome, build_session_doc, collect_all_indexable_content_bounded, should_skip_session,
+    upsert_unless_unchanged,
 };
 use super::search_db::{
     HealAwareLogCounter, log_bootstrap_timeout, log_session_index_failure, search_db_path,
@@ -612,11 +612,24 @@ async fn reindex_all(
             match tokio::time::timeout(per_session_timeout, async move {
                 let (content, bytes_read) = if let Some(path) = updates_path {
                     match tokio::task::spawn_blocking(move || {
-                        collect_all_indexable_content_single_pass(&path)
+                        collect_all_indexable_content_bounded(&path, max_file_size)
                     })
                     .await
                     {
-                        Ok(Ok(result)) => result,
+                        Ok(Ok(Some(result))) => result,
+                        Ok(Ok(None)) => {
+                            // The gzip transcript exceeded the decoded limit.
+                            // Preserve any fuller existing row, as for the
+                            // cheap on-disk size check above.
+                            let doc = build_session_doc(&summary, String::new());
+                            let db_path = search_db_path(&root);
+                            tokio::task::spawn_blocking(move || {
+                                shared.with(&db_path, |index| index.insert_doc_if_absent(&doc))
+                            })
+                            .await
+                            .map_err(io::Error::other)??;
+                            return Ok(UpsertOutcome::TooLarge);
+                        }
                         Ok(Err(e)) => return Err(e),
                         Err(e) => return Err(io::Error::other(e)),
                     }
@@ -647,6 +660,10 @@ async fn reindex_all(
                     UpsertOutcome::Unchanged { bytes_read } => {
                         progress.unchanged.fetch_add(1, Ordering::Relaxed);
                         progress.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
+                    }
+                    UpsertOutcome::TooLarge => {
+                        progress.skipped.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
                     UpsertOutcome::NoContent => {}
                 },

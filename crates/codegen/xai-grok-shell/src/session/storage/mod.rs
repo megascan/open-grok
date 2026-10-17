@@ -13,6 +13,7 @@ use agent_client_protocol as acp;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_workspace::session::file_state::RewindPoint;
 
+mod compression;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
@@ -222,7 +223,9 @@ fn to_jsonl_bytes<T: serde::Serialize>(items: &[T]) -> io::Result<Vec<u8>> {
 /// Write `items` as newline-delimited JSON to `path`, atomically (see
 /// [`write_bytes_atomic`]).
 pub(crate) fn write_jsonl_atomic<T: serde::Serialize>(path: &Path, items: &[T]) -> io::Result<()> {
-    write_bytes_atomic(path, &to_jsonl_bytes(items)?)
+    let _lock = compression::lock_history(path)?;
+    let bytes = compression::encode_snapshot(path, to_jsonl_bytes(items)?)?;
+    write_bytes_atomic(path, &bytes)
 }
 
 /// Async sibling of [`write_jsonl_atomic`].
@@ -230,7 +233,15 @@ pub(crate) async fn write_jsonl_atomic_async<T: serde::Serialize>(
     path: &Path,
     items: &[T],
 ) -> io::Result<()> {
-    write_bytes_atomic_async(path, to_jsonl_bytes(items)?).await
+    let path = path.to_owned();
+    let bytes = to_jsonl_bytes(items)?;
+    tokio::task::spawn_blocking(move || {
+        let _lock = compression::lock_history(&path)?;
+        let bytes = compression::encode_snapshot(&path, bytes)?;
+        write_bytes_atomic(&path, &bytes)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// A unique sibling temp path, e.g. `summary.json` -> `summary.json.<uuid>.tmp`.
@@ -259,17 +270,18 @@ pub(crate) mod chat_rebuild {
         use std::io::{Seek, Write};
 
         let updates_path = dir.join(UPDATES_FILE);
-        let Some(iter) = UpdatesIterator::open(&updates_path)? else {
+        let Some(mut iter) = UpdatesIterator::open(&updates_path)? else {
             return Ok(0);
         };
 
         let chat_path = dir.join(CHAT_HISTORY_FILE);
+        let _lock = super::compression::lock_history(&chat_path)?;
         let tmp_path = dir.join(format!("{CHAT_HISTORY_FILE}.{}.tmp", uuid::Uuid::now_v7()));
         let file = std::fs::File::create(&tmp_path)?;
         let mut writer = std::io::BufWriter::new(file);
         let mut reducer = ChatReducer::new();
 
-        for result in iter {
+        for result in iter.by_ref() {
             let update = match result {
                 Ok(u) => u,
                 Err(_) => continue,
@@ -290,6 +302,11 @@ pub(crate) mod chat_rebuild {
             }
         }
 
+        if let Err(error) = iter.finish() {
+            drop(writer);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
         for item in reducer.flush() {
             if let Ok(line) = serde_json::to_string(&item) {
                 let _ = writer.write_all(line.as_bytes());
@@ -588,21 +605,33 @@ pub(crate) mod chat_rebuild {
 /// Iterator that streams session updates from a JSONL file without loading all into memory.
 /// Each call to `next()` reads and parses one line.
 pub struct UpdatesIterator {
-    reader: BufReader<std::fs::File>,
-    line_buffer: String,
+    reader: BufReader<xai_file_utils::session_file::DecodedFile>,
+    line_buffer: Vec<u8>,
+    done: bool,
+    read_error: Option<io::Error>,
 }
 
 impl UpdatesIterator {
+    /// Report terminal transport errors after a tolerant line-parsing pass.
+    pub fn finish(mut self) -> io::Result<()> {
+        if let Some(error) = self.read_error {
+            return Err(error);
+        }
+        std::io::copy(&mut self.reader, &mut std::io::sink())?;
+        Ok(())
+    }
     /// Create a new iterator over updates in the given file.
     /// Returns None if the file doesn't exist.
     pub fn open(path: &Path) -> io::Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
-        let file = std::fs::File::open(path)?;
+        let file = xai_file_utils::session_file::open(path)?;
         Ok(Some(Self {
             reader: BufReader::new(file),
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
+            done: false,
+            read_error: None,
         }))
     }
 
@@ -619,21 +648,32 @@ impl Iterator for UpdatesIterator {
     type Item = io::Result<SessionUpdate>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.line_buffer.clear();
-        match self.reader.read_line(&mut self.line_buffer) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let line = self.line_buffer.trim();
-                if line.is_empty() {
-                    return self.next();
+        while !self.done {
+            self.line_buffer.clear();
+            match self.reader.read_until(b'\n', &mut self.line_buffer) {
+                Ok(0) => self.done = true,
+                Ok(_) => {
+                    let line = self.line_buffer.trim_ascii();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    return Some(
+                        std::str::from_utf8(line)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                            .and_then(|line| {
+                                SessionUpdateEnvelope::from_str(line)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                            }),
+                    );
                 }
-                match SessionUpdateEnvelope::from_str(line) {
-                    Ok(update) => Some(Ok(update)),
-                    Err(e) => Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                Err(error) => {
+                    self.done = true;
+                    self.read_error = Some(io::Error::new(error.kind(), error.to_string()));
+                    return Some(Err(error));
                 }
             }
-            Err(e) => Some(Err(e)),
         }
+        None
     }
 }
 
@@ -1345,6 +1385,11 @@ pub trait StorageAdapter: Send + Sync {
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()>;
 
     async fn load_rewind_points(&self, info: &Info) -> io::Result<Vec<RewindPoint>>;
+
+    /// Compress settled local histories; adapters without local files may skip it.
+    async fn compress_history(&self, _info: &Info) -> io::Result<()> {
+        Ok(())
+    }
 
     async fn sync_session_files(&self, info: &Info) -> io::Result<()> {
         self.sync_session_files_selected(info, SessionFileSet::ALL)
@@ -2101,11 +2146,21 @@ impl PromptExtractEvent {
 /// original [`UpdatesIterator`]-based path, but safely terminating any
 /// in-progress user-message accumulation).
 pub struct PromptExtractIterator {
-    reader: std::io::BufReader<std::fs::File>,
-    line_buffer: String,
+    reader: std::io::BufReader<xai_file_utils::session_file::DecodedFile>,
+    line_buffer: Vec<u8>,
+    done: bool,
+    read_error: Option<io::Error>,
 }
 
 impl PromptExtractIterator {
+    /// Report terminal transport errors after collecting prompt events.
+    pub fn finish(mut self) -> io::Result<()> {
+        if let Some(error) = self.read_error {
+            return Err(error);
+        }
+        std::io::copy(&mut self.reader, &mut std::io::sink())?;
+        Ok(())
+    }
     /// Open a `updates.jsonl` file for selective prompt extraction.
     ///
     /// Returns `None` if the file does not exist.
@@ -2113,10 +2168,12 @@ impl PromptExtractIterator {
         if !path.exists() {
             return Ok(None);
         }
-        let file = std::fs::File::open(path)?;
+        let file = xai_file_utils::session_file::open(path)?;
         Ok(Some(Self {
             reader: std::io::BufReader::new(file),
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
+            done: false,
+            read_error: None,
         }))
     }
 }
@@ -2125,21 +2182,33 @@ impl Iterator for PromptExtractIterator {
     type Item = PromptExtractEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
+        while !self.done {
             self.line_buffer.clear();
-            match std::io::BufRead::read_line(&mut self.reader, &mut self.line_buffer) {
-                Ok(0) => return None, // EOF
-                Err(_) => return Some(PromptExtractEvent::NotUserMessage),
+            match std::io::BufRead::read_until(&mut self.reader, b'\n', &mut self.line_buffer) {
+                Ok(0) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(error) => {
+                    self.done = true;
+                    self.read_error = Some(error);
+                    return Some(PromptExtractEvent::NotUserMessage);
+                }
                 Ok(_) => {}
             }
 
-            let line = self.line_buffer.trim();
+            let line = self.line_buffer.trim_ascii();
             if line.is_empty() {
                 continue;
             }
 
-            return Some(parse_prompt_extract_event(line));
+            return Some(
+                std::str::from_utf8(line)
+                    .map(parse_prompt_extract_event)
+                    .unwrap_or(PromptExtractEvent::NotUserMessage),
+            );
         }
+        None
     }
 }
 

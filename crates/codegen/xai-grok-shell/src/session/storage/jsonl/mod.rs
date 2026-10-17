@@ -460,6 +460,7 @@ impl JsonlStorageAdapter {
         debug_assert!(line.ends_with(b"\n"), "JSONL record must end with \\n");
         let lock = Self::lock_append(path).map_err(AppendLineError::NotCommitted)?;
         let result = (|| {
+            super::compression::ensure_plain_locked(path).map_err(AppendLineError::NotCommitted)?;
             let mut file = OpenOptions::new()
                 .read(true)
                 .create(true)
@@ -560,7 +561,7 @@ impl JsonlStorageAdapter {
         path: &Path,
         generation: u64,
     ) -> io::Result<Option<ConversationItem>> {
-        let contents = match std::fs::read(path) {
+        let contents = match xai_file_utils::session_file::read(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -579,6 +580,8 @@ impl JsonlStorageAdapter {
     ) -> Result<StrictAppendAck, super::AppendCwdSwitchError> {
         let lock = Self::lock_append(path).map_err(super::AppendCwdSwitchError::NotCommitted)?;
         let result = (|| {
+            super::compression::ensure_plain_locked(path)
+                .map_err(super::AppendCwdSwitchError::NotCommitted)?;
             if let Some(authoritative) = Self::find_cwd_switch_generation(path, generation)
                 .map_err(super::AppendCwdSwitchError::NotCommitted)?
             {
@@ -626,7 +629,7 @@ impl JsonlStorageAdapter {
         result
     }
     /// Lock tail healing, append, and barriers through `<target>.jsonl.lock`.
-    /// Full-file [`Self::write_jsonl`] atomic-rename rewrites bypass this append-only lock.
+    /// History snapshot rewrites and gzip transforms share this same lock.
     fn lock_append(path: &Path) -> io::Result<std::fs::File> {
         let lock = OpenOptions::new()
             .read(true)
@@ -741,7 +744,7 @@ impl JsonlStorageAdapter {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let contents = std::fs::read(&path)?;
+        let contents = xai_file_utils::session_file::read(&path)?;
         let mut skipped_lines: usize = 0;
         let mut updates = Vec::new();
         for line in contents.split(|b| *b == b'\n') {
@@ -1065,28 +1068,13 @@ impl JsonlStorageAdapter {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file()
-            || metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX)
-        {
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("chat history is not a regular file within the {max_bytes}-byte limit"),
+                "chat history is not a regular file",
             ));
         }
-        let read_limit = u64::try_from(max_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        let mut contents = Vec::with_capacity(metadata.len() as usize);
-        std::fs::File::open(&path)?
-            .take(read_limit)
-            .read_to_end(&mut contents)?;
-        if contents.len() > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("chat history exceeds the {max_bytes}-byte read limit"),
-            ));
-        }
+        let contents = xai_file_utils::session_file::read_bounded(&path, max_bytes)?;
         let mut sibling_btc_ids_seen: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut upgraded_reasoning_count: usize = 0;
@@ -1865,6 +1853,17 @@ impl StorageAdapter for JsonlStorageAdapter {
         self.write_jsonl(self.rewind_points_file(info), &merged)
             .await
     }
+    async fn compress_history(&self, info: &Info) -> io::Result<()> {
+        let paths = [self.chat_file(info), self.updates_file(info)];
+        tokio::task::spawn_blocking(move || {
+            for path in paths {
+                super::compression::compress_history(&path)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     async fn sync_session_files_selected(
         &self,
         info: &Info,
@@ -1961,10 +1960,12 @@ impl StorageAdapter for JsonlStorageAdapter {
             return Ok(Vec::new());
         }
         tokio::task::spawn_blocking(move || {
-            let Some(iter) = super::PromptExtractIterator::open(&updates_path)? else {
+            let Some(mut iter) = super::PromptExtractIterator::open(&updates_path)? else {
                 return Ok(Vec::new());
             };
-            Ok(super::collect_prompts_from_events(iter))
+            let prompts = super::collect_prompts_from_events(iter.by_ref());
+            iter.finish()?;
+            Ok(prompts)
         })
         .await
         .map_err(io::Error::other)?
@@ -1976,10 +1977,12 @@ impl StorageAdapter for JsonlStorageAdapter {
             return Ok(Vec::new());
         }
         tokio::task::spawn_blocking(move || {
-            let Some(iter) = super::UpdatesIterator::open(&updates_path)? else {
+            let Some(mut iter) = super::UpdatesIterator::open(&updates_path)? else {
                 return Ok(Vec::new());
             };
-            Ok(super::collect_assistant_text(iter))
+            let content = super::collect_assistant_text(iter.by_ref());
+            iter.finish()?;
+            Ok(content)
         })
         .await
         .map_err(io::Error::other)?
@@ -1991,10 +1994,12 @@ impl StorageAdapter for JsonlStorageAdapter {
             return Ok(Vec::new());
         }
         tokio::task::spawn_blocking(move || {
-            let Some(iter) = super::UpdatesIterator::open(&updates_path)? else {
+            let Some(mut iter) = super::UpdatesIterator::open(&updates_path)? else {
                 return Ok(Vec::new());
             };
-            Ok(super::collect_tool_metadata(iter))
+            let content = super::collect_tool_metadata(iter.by_ref());
+            iter.finish()?;
+            Ok(content)
         })
         .await
         .map_err(io::Error::other)?
@@ -2189,3 +2194,6 @@ mod durable_tests;
 mod tests;
 #[cfg(test)]
 mod worktree_heal_tests;
+
+#[cfg(test)]
+mod gzip_tests;

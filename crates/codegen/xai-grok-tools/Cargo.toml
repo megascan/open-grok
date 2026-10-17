@@ -111,6 +111,7 @@ libc = { workspace = true }
 windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+flate2 = { workspace = true }
 dirs = { workspace = true }
 pretty_assertions = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

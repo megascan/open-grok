@@ -39,7 +39,7 @@ pub fn find_latest_compaction_checkpoint(
 ) -> io::Result<Option<CompactionCheckpointInfo>> {
     use crate::session::storage::RawLinePeek;
 
-    let raw_contents = match std::fs::read_to_string(updates_path) {
+    let raw_contents = match xai_file_utils::session_file::read_to_string(updates_path) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => return Ok(None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -94,7 +94,7 @@ pub fn replay_to_prompt(
     session_dir: &Path,
     target_prompt_index: usize,
 ) -> io::Result<ReplayResult> {
-    let Some(iter) = UpdatesIterator::open(updates_path)? else {
+    let Some(mut iter) = UpdatesIterator::open(updates_path)? else {
         return Ok(ReplayResult {
             conversation: vec![],
             prompt_index_reached: 0,
@@ -105,7 +105,7 @@ pub fn replay_to_prompt(
 
     let mut state = ReplayState::new(target_prompt_index);
 
-    for update_result in iter {
+    for update_result in iter.by_ref() {
         let update = match update_result {
             Ok(u) => u,
             Err(e) => {
@@ -119,6 +119,8 @@ pub fn replay_to_prompt(
             break;
         }
     }
+
+    iter.finish()?;
 
     // Flush any trailing partial messages.
     state.flush_pending_user();
@@ -1094,6 +1096,43 @@ mod tests {
         assert_eq!(result.conversation[3].text_content(), "P2");
         assert_eq!(result.conversation[4].text_content(), "R2");
         assert_eq!(result.prompt_index_reached, 3);
+    }
+
+    #[test]
+    fn gzip_checkpoint_and_rewind_replay_match_plain() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("updates.jsonl");
+        let updates = [
+            make_user_update_pi("s", "first", 0),
+            make_user_update_pi("s", "second", 1),
+        ];
+        let expected = replay_updates(&updates, tmp.path(), 1);
+        let raw = std::fs::read(&path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let mut bytes = encoder.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let actual = replay_to_prompt(&path, tmp.path(), 1).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual.conversation).unwrap(),
+            serde_json::to_value(expected.conversation).unwrap()
+        );
+        assert_eq!(actual.prompt_index_reached, expected.prompt_index_reached);
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(replay_to_prompt(&path, tmp.path(), 1).is_err());
+
+        let checkpoint = make_checkpoint("compressed-checkpoint", 2, None);
+        let envelope =
+            crate::session::storage::SessionUpdateEnvelope::from_update(&checkpoint).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        serde_json::to_writer(&mut encoder, &envelope).unwrap();
+        encoder.write_all(b"\n").unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let checkpoint = find_latest_compaction_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(checkpoint.checkpoint_id, "compressed-checkpoint");
+        assert_eq!(checkpoint.prompt_index_at_compaction, 2);
     }
 
     #[test]

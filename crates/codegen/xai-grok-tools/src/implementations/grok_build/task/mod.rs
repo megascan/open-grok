@@ -96,7 +96,10 @@ async fn recent_user_asks(resources: &SharedResources) -> Vec<String> {
         return Vec::new();
     };
     let path = folder.join("chat_history.jsonl");
-    let Ok(text) = tokio::fs::read_to_string(path).await else {
+    let Ok(Ok(text)) =
+        tokio::task::spawn_blocking(move || xai_file_utils::session_file::read_to_string(&path))
+            .await
+    else {
         return Vec::new();
     };
     let mut asks = Vec::new();
@@ -1528,6 +1531,35 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         (resources, dir)
+    }
+
+    #[tokio::test]
+    async fn recent_parent_asks_support_gzip_history() {
+        use std::io::Write;
+
+        let (backend, _rx) = make_backend();
+        let (resources, dir) = resources_with_chat_history(
+            backend,
+            &[
+                serde_json::json!({"type": "assistant", "content": "ignored"}),
+                serde_json::json!({"type": "user", "content": "<user_query>continue implementation</user_query>"}),
+                serde_json::json!({"type": "user", "content": "synthetic", "synthetic_reason": "auto_continue"}),
+                serde_json::json!({"type": "user", "content": "keep the tests"}),
+            ],
+        );
+        let resources = resources.into_shared();
+        let plain = recent_user_asks(&resources).await;
+        assert_eq!(plain, vec!["continue implementation", "keep the tests"]);
+        let path = dir.path().join("chat_history.jsonl");
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&std::fs::read(&path).unwrap()).unwrap();
+        let compressed = gzip.finish().unwrap();
+        std::fs::write(&path, &compressed).unwrap();
+        assert_eq!(recent_user_asks(&resources).await, plain);
+
+        // Never interpret a partially decoded gzip snapshot as parent intent.
+        std::fs::write(&path, &compressed[..compressed.len() - 4]).unwrap();
+        assert!(recent_user_asks(&resources).await.is_empty());
     }
 
     #[tokio::test]

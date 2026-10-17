@@ -2585,3 +2585,117 @@ async fn manual_title_renamed_is_noop_without_remote_sync() {
         .expect("ManualTitleRenamed with remote_sync=None must not fail");
     actor.stop().await;
 }
+
+#[tokio::test]
+async fn gzip_actor_close_flushes_and_compresses_thread_history() {
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("gzip-close"),
+        cwd: "/gzip-close".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        root.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor_inner(info.clone(), storage.clone(), None, true);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user(
+            "compress repeated text ".repeat(8_000),
+        )))
+        .unwrap();
+    let ActorGuard { handle, task } = actor;
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        xai_file_utils::session_file::open(&root.path().join("chat_history.jsonl"))
+            .unwrap()
+            .is_compressed()
+    );
+    assert_eq!(
+        storage
+            .load_session(&info)
+            .await
+            .unwrap()
+            .chat_history
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn gzip_actor_idle_compresses_then_accepts_a_new_append() {
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("gzip-idle"),
+        cwd: "/gzip-idle".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        root.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor_inner(info.clone(), storage.clone(), None, true);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user(
+            "compress repeated text ".repeat(8_000),
+        )))
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to: tx })
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    tokio::time::pause();
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to: tx })
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    tokio::time::resume();
+    assert!(
+        xai_file_utils::session_file::open(&root.path().join("chat_history.jsonl"))
+            .unwrap()
+            .is_compressed()
+    );
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("new turn")))
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to: tx })
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    assert_eq!(
+        storage
+            .load_session(&info)
+            .await
+            .unwrap()
+            .chat_history
+            .len(),
+        2
+    );
+    actor.stop().await;
+}

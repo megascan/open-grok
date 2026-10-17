@@ -1598,7 +1598,7 @@ impl MvpAgent {
                     target_client_id.as_ref(),
                     cursor_mark_replay,
                     &code_mode_transport_ids,
-                ),
+                )?,
                 Err(reason) => {
                     tracing::warn!(
                         session_id = %session_id.0,
