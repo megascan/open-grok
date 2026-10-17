@@ -12,6 +12,8 @@
 //! headers (proxy auth, OTel context, etc.)
 //! into [`SamplerConfig::extra_headers`] before constructing the client.
 
+mod sse_prefix;
+
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -20,6 +22,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
+use sse_prefix::strip_utf8_bom;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -2277,20 +2280,7 @@ impl SamplingClient {
             });
         }
 
-        // Strip UTF-8 BOM if present: eventsource-stream 0.2.3 incorrectly slices BOM at byte 1 instead of 3.
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -2679,20 +2669,9 @@ impl SamplingClient {
             });
         }
 
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if first {
-                    first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
-        let mut event_stream = byte_stream.eventsource();
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
+        let event_stream = byte_stream.eventsource();
+        futures_util::pin_mut!(event_stream);
         let mut collector = CodexRemoteCompactionV2Collector::default();
         while let Some(event) = event_stream.next().await {
             let event =
@@ -3162,20 +3141,7 @@ impl SamplingClient {
 
         let model_metadata = extract_model_metadata(response.headers());
 
-        // Strip UTF-8 BOM if present
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -3513,20 +3479,7 @@ impl SamplingClient {
 
         let model_metadata = extract_model_metadata(response.headers());
 
-        // Strip UTF-8 BOM if present
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -3665,19 +3618,7 @@ impl SamplingClient {
 
         let model_metadata = extract_model_metadata(response.headers());
 
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         let event_stream = byte_stream.eventsource();
 
