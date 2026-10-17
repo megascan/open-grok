@@ -119,6 +119,32 @@ Under `$OPENGROK_HOME/sessions/<encoded-cwd>/<session-id>/`:
 | `updates.jsonl` | Authoritative ACP presentation stream and timeline markers. Envelope: `{ timestamp, method, params }` for ACP `session/update` or `_x.ai/session/update`. It does not contain the complete model-facing history. |
 | `chat_history.jsonl` | Model-facing `ConversationItem` lines (format version in summary; `CHAT_FORMAT_VERSION = 1`). Compaction rewrites this file wholesale via `ReplaceChatHistory`. |
 
+### Gzip history storage
+
+`chat_history.jsonl` and `updates.jsonl` retain their canonical names but may
+contain gzip bytes. Use `xai_file_utils::session_file` for reads; it detects the
+encoding from the opened file. Plain histories remain supported. Metadata,
+checkpoints, rewind points, and other logs retain their existing formats.
+
+Whole history snapshots of at least 64 KiB are compressed when gzip saves space.
+The persistence actor also flushes and compresses append histories after 30
+seconds without a persistence message and when its channel closes. Active writes
+may leave plain JSONL, including after an abrupt process exit. Old sessions are
+converted lazily when written; there is no startup migration of all sessions.
+
+Compression, snapshot replacement, and append share each history's `.jsonl.lock`.
+Before appending, gzip is decoded into an atomic plain replacement under that
+lock. Transformations preserve permissions and sync the temporary file before
+rename. A decode failure preserves the original file and rejects the append.
+Readers retain their opened file across replacements; replay offsets and byte
+limits refer to decoded bytes. Full reads validate gzip trailers, and iterator
+consumers must call `finish()` to surface decoder errors, including unread tails.
+
+For manual inspection, check `file /absolute/session/updates.jsonl`; use
+`gzip -dc /absolute/session/updates.jsonl | jq .` for a gzip file and `jq .` on a
+plain file. Older Open Grok binaries without gzip support cannot read compressed
+histories. See [gzip verification](../verification/thread-gzip-2026-10-17.md).
+
 ### Plan / goals / tools
 
 | Path | Role |

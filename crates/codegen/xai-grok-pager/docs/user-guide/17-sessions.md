@@ -358,11 +358,17 @@ To reclaim space, run `open-grok worktree gc --max-age 7d`, which removes tracke
 
 ### Persistence Format
 
-Grok stores the conversation as newline-delimited JSON (JSONL). Each line in `updates.jsonl` is a self-contained ACP session update event. This format supports:
+Open Grok stores the conversation as newline-delimited JSON (JSONL), with automatic gzip compression for large histories. Each decoded line in `updates.jsonl` is a self-contained ACP session update event. This format supports:
 
 - Incremental writes (append-only during a session)
 - Efficient streaming reads (for session restore)
-- Easy debugging (each line is valid JSON)
+- Easy debugging after decompression (each line is valid JSON)
+
+The `updates.jsonl` and `chat_history.jsonl` filenames stay the same whether their contents are plain or gzip-compressed. Open Grok detects the format automatically for resume, search, fork, rewind, previews, and exports. Existing plain sessions remain readable. Older Open Grok versions without gzip support cannot read compressed histories.
+
+Histories of at least 64 KiB are compressed only when it saves space. Full history saves can compress immediately; append histories compress after 30 seconds without a persistence update or when the persistence writer closes. Writing again automatically restores plain JSONL before appending. An abrupt exit can leave a valid plain history. Existing sessions are compressed as they are written, without a bulk conversion at startup.
+
+To inspect a history manually, run `file /path/to/session/updates.jsonl`. For a gzip file, use `gzip -dc /path/to/session/updates.jsonl | jq .`; for a plain file, use `jq . /path/to/session/updates.jsonl`.
 
 The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- are plain JSON rather than JSONL. JSONL is the source of truth for session content; `open-grok sessions search` additionally maintains a local SQLite FTS5 index over session titles and prompts for fast keyword search.
 
@@ -382,7 +388,7 @@ The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- ar
 
 ### Disk Usage
 
-Session history (`updates.jsonl`, `chat_history.jsonl`) dominates disk usage in long sessions. Use `/compact` to reduce history size.
+Session history (`updates.jsonl`, `chat_history.jsonl`) dominates disk usage in long sessions. Automatic gzip compression reduces its disk footprint while preserving the full stored content. `/compact` separately summarizes model context; it does not remove the authoritative update timeline.
 
 ---
 
