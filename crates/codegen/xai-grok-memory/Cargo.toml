@@ -20,6 +20,7 @@ git2 = { version = "0.20", default-features = false, features = [
 ] }
 notify = { workspace = true }
 parking_lot = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 # rusqlite 0.37 + bundled = self-contained SQLite (>= 3.50.2) with FTS5.
