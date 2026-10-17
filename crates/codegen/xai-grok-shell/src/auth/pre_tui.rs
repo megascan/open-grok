@@ -30,7 +30,7 @@ pub async fn maybe_run_pre_tui_external_login(
         return Ok(PreTuiLoginOutcome::Skipped);
     }
     let auth = run_pre_tui_external_login_with(&manager, command, force_login).await?;
-    report_signed_in(&auth);
+    report_signed_in(&auth)?;
     apply_post_login_config(auth.clone()).await?;
     Ok(PreTuiLoginOutcome::SignedIn(Box::new(auth)))
 }

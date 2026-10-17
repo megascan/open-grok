@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
+use xai_tty_utils::cli_eprintln as eprintln;
 
 use anyhow::{Context, Result};
 
@@ -78,8 +79,9 @@ pub fn run(args: ExportArgs) -> Result<()> {
             lines
         );
     } else {
-        std::io::stdout().write_all(md.as_bytes())?;
-        std::io::stdout().write_all(b"\n")?;
+        let mut stdout = std::io::stdout().lock();
+        xai_tty_utils::cli_output::ignore_broken_pipe(stdout.write_all(md.as_bytes()))?;
+        xai_tty_utils::cli_output::ignore_broken_pipe(stdout.write_all(b"\n"))?;
     }
 
     Ok(())

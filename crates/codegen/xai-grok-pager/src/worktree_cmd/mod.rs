@@ -11,6 +11,7 @@ use xai_fast_worktree::WorktreeRecord;
 use agent_client_protocol as acp;
 use xai_acp_lib::acp_send;
 use xai_grok_shell::agent::config::Config as AgentConfig;
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 /// Local response types matching the ACP response shapes.
 #[derive(Debug, serde::Deserialize)]
@@ -241,11 +242,11 @@ async fn cmd_create(
     let target = if session_cwd.is_dir() {
         &session_cwd
     } else {
-        let _ = writeln!(
+        xai_tty_utils::cli_output::ignore_broken_pipe(writeln!(
             std::io::stderr(),
             "{} is not in the new worktree; printing the worktree root",
             session_cwd.display()
-        );
+        ))?;
         &root
     };
     Ok(crate::util::ignore_broken_pipe(writeln!(

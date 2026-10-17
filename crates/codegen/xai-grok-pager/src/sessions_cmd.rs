@@ -4,6 +4,7 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::auth::{AuthManager, try_ensure_fresh_auth};
 use xai_grok_shell::session::merge::MergedSession;
 use xai_grok_shell::util::grok_home::grok_home;
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 #[derive(Debug, clap::Args, Clone)]
 pub struct SessionsArgs {
     #[command(subcommand)]

@@ -267,6 +267,7 @@ mod git_backend {
     use std::process::{Command, Stdio};
 
     use super::*;
+    use xai_tty_utils::cli_println as println;
 
     fn validate_source(source: &str) -> Result<()> {
         if source.contains("://") {
@@ -694,6 +695,7 @@ mod backend {
     use xai_fast_worktree::{NfsWorktreeClient, NfsWorktreeOpts};
 
     use super::*;
+    use xai_tty_utils::cli_println as println;
 
     const RPC_TIMEOUT: Duration = Duration::from_secs(5);
     const CLONE_TIMEOUT: Duration = Duration::from_secs(1800);

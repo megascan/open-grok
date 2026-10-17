@@ -109,9 +109,9 @@ async fn user_auth_guard(
 struct UserHost<F>(F);
 
 #[async_trait]
-impl<F: FnMut(&str) + Send> Host for UserHost<F> {
-    async fn authentication_url(&mut self, url: &str) {
-        (self.0)(url);
+impl<F: FnMut(&str) -> std::io::Result<()> + Send> Host for UserHost<F> {
+    async fn authentication_url(&mut self, url: &str) -> std::io::Result<()> {
+        (self.0)(url)
     }
 }
 
@@ -119,7 +119,7 @@ impl<F: FnMut(&str) + Send> Host for UserHost<F> {
 /// must send it only to the real user, never to model history or logs.
 pub async fn login_user(
     launch: &Launch,
-    on_url: impl FnMut(&str) + Send,
+    on_url: impl FnMut(&str) -> std::io::Result<()> + Send,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let _guard = user_auth_guard(cancel).await?;
@@ -129,7 +129,7 @@ pub async fn login_user(
     let catalog = list_models(
         launch,
         &launch.cwd,
-        &mut UserHost(|_: &str| {}),
+        &mut UserHost(|_: &str| Ok(())),
         cancel,
         |_| Ok(()),
     )
@@ -143,7 +143,7 @@ pub async fn logout_user(launch: &Launch, cancel: &CancellationToken) -> Result<
     let _guard = user_auth_guard(cancel).await?;
     let _auth_change = stop_live_children(cancel).await?;
     super::catalog::clear_catalog(&launch.opengrok_home)?;
-    logout(launch, &mut UserHost(|_: &str| {}), cancel, |_| Ok(())).await
+    logout(launch, &mut UserHost(|_: &str| Ok(())), cancel, |_| Ok(())).await
 }
 
 /// Fetch only the external account's advertised model identifiers.
@@ -154,7 +154,10 @@ pub async fn list_user_models(
 ) -> Result<ModelCatalog> {
     let _guard = user_auth_guard(cancel).await?;
     super::catalog::clear_catalog(&launch.opengrok_home)?;
-    let catalog = list_models(launch, cwd, &mut UserHost(|_: &str| {}), cancel, |_| Ok(())).await?;
+    let catalog = list_models(launch, cwd, &mut UserHost(|_: &str| Ok(())), cancel, |_| {
+        Ok(())
+    })
+    .await?;
     super::catalog::save_catalog(&launch.opengrok_home, &catalog)?;
     Ok(catalog)
 }
@@ -195,7 +198,8 @@ pub async fn login(
     }
     .await;
     client.shutdown().await;
-    result
+    result?;
+    client.finish_oauth_urls(host, cancel).await
 }
 
 /// Called only after the user requests Antigravity logout. The integration must
@@ -340,7 +344,7 @@ impl<H: Host> Host for StreamingHost<'_, H> {
         self.inner.question(params).await
     }
 
-    async fn authentication_url(&mut self, url: &str) {
-        self.inner.authentication_url(url).await;
+    async fn authentication_url(&mut self, url: &str) -> std::io::Result<()> {
+        self.inner.authentication_url(url).await
     }
 }

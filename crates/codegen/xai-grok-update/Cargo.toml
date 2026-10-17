@@ -24,6 +24,7 @@ xai-grok-shell = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-tools = { workspace = true }
 xai-grok-version = { workspace = true }
+xai-tty-utils = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

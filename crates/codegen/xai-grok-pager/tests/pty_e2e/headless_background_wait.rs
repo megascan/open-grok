@@ -129,3 +129,83 @@ async fn headless_background_timeout_exits_nonzero() {
         "stderr: {stderr}"
     );
 }
+
+#[cfg(unix)]
+fn closed_pipe() -> std::process::Stdio {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // Close the reader before the child starts, making even short writes fail.
+    unsafe {
+        libc::close(fds[0]);
+    }
+    std::process::Stdio::from(unsafe { std::fs::File::from_raw_fd(fds[1]) })
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "process e2e; run with the pager binary and --ignored"]
+async fn headless_streaming_closed_stdout_exits_cleanly() {
+    let content = ContentController::start().await.expect("start content");
+    let mut reply = content.expect_agent_turn("closed stdout", "STREAMED_REPLY");
+    let mut command = tokio::process::Command::new(pager_binary().expect("resolve pager binary"));
+    content.sandbox().apply_to_tokio_command(&mut command);
+    let child = command
+        .current_dir(content.home())
+        .args(["--yolo", "--trust", "--no-leader", "-p", "say hello"])
+        .stdout(closed_pipe())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn headless pager");
+    tokio::time::timeout(Duration::from_secs(45), reply.wait_satisfied())
+        .await
+        .expect("mock reply");
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("headless exit timed out")
+        .expect("collect headless output");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    reply.assert_satisfied();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "process e2e; run with the pager binary and --ignored"]
+async fn headless_warning_closed_stderr_exits_cleanly() {
+    let content = ContentController::start().await.expect("start content");
+    let mut reply = content.expect_agent_turn("closed stderr", "STDERR_CLOSED_REPLY");
+    let mut command = tokio::process::Command::new(pager_binary().expect("resolve pager binary"));
+    content.sandbox().apply_to_tokio_command(&mut command);
+    let child = command
+        .current_dir(content.home())
+        .args([
+            "--yolo",
+            "--trust",
+            "--no-leader",
+            // Plain output makes this flag emit a warning before the turn.
+            "--include-partial-messages",
+            "-p",
+            "say hello",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(closed_pipe())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn headless pager");
+    tokio::time::timeout(Duration::from_secs(45), reply.wait_satisfied())
+        .await
+        .expect("mock reply");
+    let output = tokio::time::timeout(Duration::from_secs(40), child.wait_with_output())
+        .await
+        .expect("headless exit timed out")
+        .expect("collect headless output");
+    assert!(output.status.success(), "status: {}", output.status);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("STDERR_CLOSED_REPLY"));
+    reply.assert_satisfied();
+}

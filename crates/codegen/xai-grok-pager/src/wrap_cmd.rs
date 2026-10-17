@@ -19,6 +19,7 @@
 //! The PTY/OSC 52/resize engine lives in [`crate::pty_wrap::run_wrapped_command`].
 
 use anyhow::Result;
+use xai_tty_utils::cli_eprintln as eprintln;
 
 use crate::app::WrapArgs;
 

@@ -14944,6 +14944,7 @@ dependencies = [
  "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",
+ "xai-tty-utils",
  "zstd",
 ]
 

@@ -2659,11 +2659,23 @@ pub(crate) fn execute(
         }
         Effect::LoginAntigravity { agent_id } => {
             let cwd = cwd.to_path_buf();
-            let (url_tx, url_rx) = tokio::sync::oneshot::channel::<(String, bool, bool)>();
+            let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
             let (shown_tx, shown_rx) = tokio::sync::oneshot::channel();
             tasks.spawn(async move {
                 let (url, opened, copied) = match url_rx.await {
-                    Ok((url, opened, copied)) => (Some(actions::SensitiveAuthUrl(url)), opened, copied),
+                    Ok(url) => {
+                        let opened = antigravity::open_authorization_url(&url).await;
+                        let copied = if !opened && agent_id.is_none() {
+                            let clipboard_url = url.clone();
+                            matches!(tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::task::spawn_blocking(move || {
+                                    crate::clipboard::SystemClipboard::try_set(&clipboard_url).reported_success()
+                                }),
+                            ).await, Ok(Ok(true)))
+                        } else { false };
+                        (Some(actions::SensitiveAuthUrl(url)), opened, copied)
+                    }
                     Err(_) => (None, false, false),
                 };
                 TaskResult::AntigravityLoginUrlReady {
@@ -2681,22 +2693,8 @@ pub(crate) fn execute(
                     let login = xai_grok_shell::agent::antigravity_acp::login_user(
                         &launch,
                         move |url| {
-                            if let Some(tx) = url_tx.take() {
-                                let url = url.to_owned();
-                                tokio::spawn(async move {
-                                    let opened = antigravity::open_authorization_url(&url).await;
-                                    let copied = if !opened && agent_id.is_none() {
-                                        let clipboard_url = url.clone();
-                                        matches!(tokio::time::timeout(
-                                            std::time::Duration::from_secs(5),
-                                            tokio::task::spawn_blocking(move || {
-                                                crate::clipboard::SystemClipboard::try_set(&clipboard_url).reported_success()
-                                            }),
-                                        ).await, Ok(Ok(true)))
-                                    } else { false };
-                                    let _ = tx.send((url, opened, copied));
-                                });
-                            }
+                            let tx = url_tx.take().ok_or_else(|| std::io::Error::other("Authorization URL already delivered"))?;
+                            tx.send(url.to_owned()).map_err(|_| std::io::Error::other("Could not deliver authorization URL"))
                         },
                         &cancel,
                     );

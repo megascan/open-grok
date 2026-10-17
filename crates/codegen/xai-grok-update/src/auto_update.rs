@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

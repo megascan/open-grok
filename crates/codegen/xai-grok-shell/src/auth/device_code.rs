@@ -7,6 +7,7 @@
 //! Callers control what happens between the two phases (print to stderr,
 //! show in TUI, display in IDE sidebar, etc.).
 
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -342,6 +343,35 @@ pub(crate) async fn run_device_code_login_channels(
     complete_device_code_login(issuer, client_id, device_code, auth_manager, surface).await
 }
 
+/// Required authentication instructions must reach the user before the flow
+/// can open a browser, poll for approval, or persist credentials.
+pub(crate) fn write_required_login_prompt(
+    writer: &mut impl Write,
+    text: std::fmt::Arguments<'_>,
+) -> io::Result<()> {
+    writer.write_fmt(text)?;
+    writer.flush()
+}
+
+fn write_device_login_prompt(writer: &mut impl Write, code: &DeviceCode) -> io::Result<()> {
+    let url = code
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&code.verification_uri);
+    let code_instruction = if code.verification_uri_complete.is_some() {
+        "Confirm this code in your browser:"
+    } else {
+        "Then enter this code:"
+    };
+    write_required_login_prompt(
+        writer,
+        format_args!(
+            "\nTo sign in, open this URL in your browser:\n\n  {url}\n\n{code_instruction}\n\n  {}\n\n\x1b[90mOnly continue with a code you requested. Don't share it with anyone.\x1b[0m\n\nWaiting for authorization...\n",
+            code.user_code
+        ),
+    )
+}
+
 /// Display the device code to stderr and poll until approved.
 async fn prompt_and_poll(
     issuer: &str,
@@ -355,33 +385,17 @@ async fn prompt_and_poll(
         .as_deref()
         .unwrap_or(&device_code.verification_uri);
 
-    eprintln!();
-    eprintln!("To sign in, open this URL in your browser:");
-    eprintln!();
-    eprintln!("  {}", display_uri);
-    eprintln!();
+    write_device_login_prompt(&mut std::io::stderr().lock(), &device_code)
+        .map_err(|e| anyhow::anyhow!("Could not write sign-in instructions: {e}"))?;
 
     if !open_browser_detached(display_uri).await {
-        eprintln!("  (Could not open browser automatically — open the URL above manually.)");
-        eprintln!();
+        xai_tty_utils::cli_output::write_checked(
+            std::io::stderr().lock(),
+            format_args!(
+                "  (Could not open browser automatically — open the URL above manually.)\n\n"
+            ),
+        )?;
     }
-
-    // Show the code to confirm it matches the browser (anti-phishing): a complete
-    // URL pre-fills it (just confirm), otherwise the user types it.
-    if device_code.verification_uri_complete.is_some() {
-        eprintln!("Confirm this code in your browser:");
-    } else {
-        eprintln!("Then enter this code:");
-    }
-    eprintln!();
-    eprintln!("  {}", device_code.user_code);
-    eprintln!();
-    eprintln!(
-        "\x1b[90mOnly continue with a code you requested. \
-         Don't share it with anyone.\x1b[0m"
-    );
-    eprintln!();
-    eprintln!("Waiting for authorization...");
 
     // The caller prints the `✓ Signed in` confirmation (it also owns the
     // external-provider / devbox early-return paths that never reach here).
@@ -528,10 +542,53 @@ fn validate_verification_uri(uri: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
 
     use super::{AuthManager, build_auth, validate_verification_uri};
     use crate::auth::{AuthMode, GrokComConfig};
+
+    #[test]
+    fn required_device_prompt_fails_closed_on_write_or_flush_errors() {
+        struct Fail(io::ErrorKind, bool);
+        impl Write for Fail {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.1 {
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::from(self.0))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.1 {
+                    Err(io::Error::from(self.0))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let code = super::DeviceCode {
+            verification_uri: "https://auth.example.invalid/verify".into(),
+            verification_uri_complete: None,
+            user_code: "test-code".into(),
+            device_code: "private-device-code".into(),
+            interval: 1,
+            expires_in: 60,
+        };
+        let mut shown = Vec::new();
+        super::write_device_login_prompt(&mut shown, &code).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains(&code.verification_uri));
+        assert!(shown.contains(&code.user_code));
+        assert!(!shown.contains(&code.device_code));
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::PermissionDenied] {
+            for fail_flush in [false, true] {
+                let error = super::write_device_login_prompt(&mut Fail(kind, fail_flush), &code)
+                    .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+        }
+    }
 
     #[test]
     fn validate_verification_uri_rejects_unsupported_scheme() {

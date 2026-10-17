@@ -8,6 +8,14 @@ struct TestHost {
     urls: Vec<String>,
 }
 
+struct FailingUrlHost;
+#[async_trait]
+impl Host for FailingUrlHost {
+    async fn authentication_url(&mut self, url: &str) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, url.to_owned()))
+    }
+}
+
 #[async_trait]
 impl Host for TestHost {
     async fn update(&mut self, _method: &str, params: &Value) {
@@ -21,8 +29,9 @@ impl Host for TestHost {
         self.questions += 1;
         None
     }
-    async fn authentication_url(&mut self, url: &str) {
+    async fn authentication_url(&mut self, url: &str) -> io::Result<()> {
         self.urls.push(url.to_owned());
+        Ok(())
     }
 }
 
@@ -57,7 +66,7 @@ fn user_login_future_can_run_on_pager_task_executor() {
         cwd: PathBuf::from("/tmp"),
     };
     let cancel = CancellationToken::new();
-    assert_send(login_user(&launch, |_| {}, &cancel));
+    assert_send(login_user(&launch, |_| Ok(()), &cancel));
 }
 
 async fn recv<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Value {
@@ -73,6 +82,98 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) {
 }
 fn response(id: &Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "result":result})
+}
+
+#[tokio::test]
+async fn authentication_url_output_error_stops_and_closes_client() {
+    let (client_pipe, server_pipe) = tokio::io::duplex(4096);
+    let (read, write) = tokio::io::split(client_pipe);
+    let (tx, rx) = mpsc::channel(8);
+    let mut client = Client::from_pipes(Box::new(read), Box::new(write), None, rx);
+    client.auth_methods.push(AUTH_METHOD.to_owned());
+    let server = tokio::spawn(async move {
+        let (read, _write) = tokio::io::split(server_pipe);
+        let mut read = BufReader::new(read);
+        let auth = recv(&mut read).await;
+        assert_eq!(auth["method"], "authenticate");
+        tx.send("https://accounts.google.com/o/oauth2/auth?state=secret".to_owned())
+            .await
+            .unwrap();
+        let mut next = String::new();
+        assert_eq!(read.read_line(&mut next).await.unwrap(), 0);
+    });
+
+    let error = client
+        .authenticate(&mut FailingUrlHost, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::Io(error) if error.kind() == io::ErrorKind::BrokenPipe));
+    assert!(!format!("{error:?}").contains("secret"));
+    assert!(client.closed);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_authentication_url_precedes_ready_success_response() {
+    let (client_pipe, mut server_pipe) = tokio::io::duplex(4096);
+    let (read, write) = tokio::io::split(client_pipe);
+    let (tx, rx) = mpsc::channel(8);
+    let mut client = Client::from_pipes(Box::new(read), Box::new(write), None, rx);
+    client.oauth_active = true;
+    tx.send("https://accounts.google.com/o/oauth2/auth?state=secret".to_owned())
+        .await
+        .unwrap();
+    send(&mut server_pipe, response(&json!(1), json!({}))).await;
+
+    let result = client
+        .rpc(
+            &mut FailingUrlHost,
+            "authenticate",
+            json!({}),
+            &CancellationToken::new(),
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe));
+    assert!(client.closed);
+}
+
+#[tokio::test]
+async fn delayed_authentication_url_is_drained_after_success_and_shutdown() {
+    let (client_pipe, server_pipe) = tokio::io::duplex(4096);
+    let (read, write) = tokio::io::split(client_pipe);
+    let (tx, rx) = mpsc::channel(8);
+    let mut client = Client::from_pipes(Box::new(read), Box::new(write), None, rx);
+    client.auth_methods.push(AUTH_METHOD.to_owned());
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server_pipe);
+        let mut read = BufReader::new(read);
+        let auth = recv(&mut read).await;
+        send(&mut write, response(&auth["id"], json!({}))).await;
+        release_rx.await.unwrap();
+        tx.send("https://accounts.google.com/o/oauth2/auth?state=secret".to_owned())
+            .await
+            .unwrap();
+    });
+    let cancel = CancellationToken::new();
+    client
+        .authenticate(&mut FailingUrlHost, &cancel)
+        .await
+        .unwrap();
+    client.shutdown().await;
+    release_tx.send(()).unwrap();
+    let result = client.finish_oauth_urls(&mut FailingUrlHost, &cancel).await;
+    assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe));
+    server.await.unwrap();
+
+    // Cached authentication need not emit a URL at all.
+    let (mut client, _server) = mock_client();
+    client.shutdown().await;
+    client
+        .finish_oauth_urls(&mut FailingUrlHost, &cancel)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -462,12 +563,97 @@ async fn oauth_stderr_only_forwards_valid_google_authorization_urls() {
     let task = tokio::spawn(read_oauth_urls(read, tx));
     write.write_all(b"other output with secrets\nOpen the following link to authenticate the ACP server: https://accounts.google.com.evil.example/x\nOpen the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/auth?state=test\n").await.unwrap();
     drop(write);
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     assert_eq!(
         rx.recv().await.as_deref(),
         Some("https://accounts.google.com/o/oauth2/auth?state=test")
     );
     assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn oauth_stderr_overflow_is_reported() {
+    let (mut write, read) = tokio::io::duplex(4096);
+    let (tx, rx) = mpsc::channel(1);
+    let task = tokio::spawn(read_oauth_urls(read, tx));
+    let line = b"Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/auth?state=test\n";
+    write.write_all(line).await.unwrap();
+    write.write_all(line).await.unwrap();
+    drop(write);
+    let (mut client, _server) = mock_client();
+    client.oauth_urls = rx;
+    client.oauth_reader = Some(task);
+    client.shutdown().await;
+    let mut host = TestHost::new();
+    let result = client
+        .finish_oauth_urls(&mut host, &CancellationToken::new())
+        .await;
+    assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::Other));
+    assert_eq!(host.urls.len(), 1);
+}
+
+#[tokio::test]
+async fn oauth_reader_failure_stops_inflight_login_without_response() {
+    for method in ["initialize", "authenticate"] {
+        let (mut stderr_write, stderr_read) = tokio::io::duplex(4096);
+        let (tx, rx) = mpsc::channel(1);
+        let reader = tokio::spawn(read_oauth_urls(stderr_read, tx));
+        let line = b"Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/auth?state=secret\n";
+        stderr_write.write_all(line).await.unwrap();
+        stderr_write.write_all(line).await.unwrap();
+        drop(stderr_write);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (mut client, _server) = mock_client();
+        client.scope = Scope::Login;
+        client.oauth_urls = rx;
+        client.oauth_reader = Some(reader);
+        client.oauth_active = method == "authenticate";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.rpc(
+                &mut TestHost::new(),
+                method,
+                json!({}),
+                &CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("reader failure must end the request without an ACP response");
+        let error = result.unwrap_err();
+        assert!(matches!(&error, Error::Io(error) if error.kind() == io::ErrorKind::Other));
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(client.closed);
+    }
+}
+
+#[tokio::test]
+async fn clean_oauth_reader_eof_does_not_abort_login_request() {
+    let (client_pipe, mut server_pipe) = tokio::io::duplex(4096);
+    let (read, write) = tokio::io::split(client_pipe);
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let mut client = Client::from_pipes(Box::new(read), Box::new(write), None, rx);
+    client.scope = Scope::Login;
+    client.oauth_reader = Some(tokio::spawn(async { Ok(()) }));
+    send(&mut server_pipe, response(&json!(1), json!({}))).await;
+    client
+        .rpc(
+            &mut TestHost::new(),
+            "initialize",
+            json!({}),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
 }
 
 #[test]

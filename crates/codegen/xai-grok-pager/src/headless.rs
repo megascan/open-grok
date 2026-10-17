@@ -24,6 +24,7 @@ use xai_grok_shell::sampling::types::{
 };
 use xai_grok_shell::util::config as cli_config;
 use xai_grok_telemetry::startup::PendingStartup;
+use xai_tty_utils::cli_eprintln as eprintln;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::{AgentShutdownGuard, SpawnedAgent, spawn_grok_shell};
@@ -1273,8 +1274,7 @@ pub async fn run_single_turn(
             },
         );
         if let Some(warning) = active_registration_warning(registration) {
-            use std::io::Write;
-            let _ = writeln!(std::io::stderr().lock(), "{warning}");
+            eprintln!("{warning}");
         }
     }
 

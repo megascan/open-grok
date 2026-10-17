@@ -868,7 +868,18 @@ impl PagerArgs {
             .filter(|n| *n == "open-grok")
             .unwrap_or("open-grok")
             .to_owned();
-        Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
+        match Self::try_parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1))) {
+            Ok(args) => args,
+            Err(error) => {
+                // Clap normally discards every output error. Preserve its exit
+                // code for help/usage and closed pipes, but fail on other I/O.
+                let code = match xai_tty_utils::cli_output::ignore_broken_pipe(error.print()) {
+                    Ok(()) => error.exit_code(),
+                    Err(_) => 1,
+                };
+                std::process::exit(code);
+            }
+        }
     }
     /// Apply launch-directory path anchoring and `--cwd` after early commands
     /// have been dispatched without filesystem or process initialization.

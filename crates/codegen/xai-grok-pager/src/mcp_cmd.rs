@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};

@@ -16,7 +16,11 @@ pub struct UsageArgs {
 pub fn run(args: UsageArgs) -> Result<()> {
     let payload = load_payload(&args.session_id, args.turn)?;
     let mut output = std::io::stdout().lock();
-    writeln!(output, "{}", serde_json::to_string_pretty(&payload)?)?;
+    xai_tty_utils::cli_output::ignore_broken_pipe(writeln!(
+        output,
+        "{}",
+        serde_json::to_string_pretty(&payload)?
+    ))?;
     Ok(())
 }
 

@@ -49,8 +49,10 @@ use xai_grok_telemetry::process_info::{
     Entrypoint, Interactivity, ProcessIdentity, ReleaseChannel, set_identity, set_release_channel,
 };
 use xai_grok_update::{UpdateConfig, auto_update, enforce_version_policy_or_exit};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 #[cfg(all(feature = "test-seams", debug_assertions))]
 mod test_seam {
+    use xai_tty_utils::cli_eprintln as eprintln;
     const TEST_TRUSTED_PUBKEY_FILE_ENV: &str = "GROK_TEST_TRUSTED_PUBKEY_FILE";
     pub(super) fn install() {
         let Ok(path) = std::env::var(TEST_TRUSTED_PUBKEY_FILE_ENV) else {
@@ -1838,6 +1840,11 @@ fn version_text(channel_label: &str) -> String {
 fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::io::Result<()> {
     writer.write_all(version_text(channel_label).as_bytes())
 }
+
+fn write_antigravity_login_url(writer: &mut impl std::io::Write, url: &str) -> std::io::Result<()> {
+    writeln!(writer, "Open this link to sign in to Antigravity:\n{url}")?;
+    writer.flush()
+}
 /// The leader gets its own crash directory: `install()` opens `last-crash.bin` with `O_TRUNC`, so a pager and a
 /// leader sharing one directory would each wipe the other's pending crash blob on start.
 fn crash_dir_for(args: &PagerArgs) -> std::path::PathBuf {
@@ -1848,15 +1855,28 @@ fn crash_dir_for(args: &PagerArgs) -> std::path::PathBuf {
     );
     if is_leader { base.join("leader") } else { base }
 }
-fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
-    if !args.version {
-        return false;
+fn dispatch_version_if_requested(args: &PagerArgs) -> std::io::Result<bool> {
+    let json = match &args.command {
+        _ if args.version => false,
+        Some(Command::Version { json }) => *json,
+        _ => return Ok(false),
+    };
+    if json {
+        let payload = serde_json::json!({
+            "currentVersion": xai_grok_version::version_with_commit(),
+            "releaseSource": xai_grok_update::RELEASE_SOURCE,
+        });
+        xai_tty_utils::cli_output::write_checked(
+            std::io::stdout().lock(),
+            format_args!("{payload}\n"),
+        )?;
+    } else {
+        xai_tty_utils::cli_output::ignore_broken_pipe(write_version(
+            &mut std::io::stdout().lock(),
+            "",
+        ))?;
     }
-    if let Err(error) = write_version(&mut std::io::stdout().lock(), "") {
-        eprintln!("Error: {error}");
-        std::process::exit(1);
-    }
-    true
+    Ok(true)
 }
 fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     let Some(Command::Doctor(doctor_args)) = &args.command else {
@@ -1881,13 +1901,21 @@ fn main() {
     if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
         std::process::exit(code);
     }
+    let args = PagerArgs::parse_cli();
+    match dispatch_version_if_requested(&args) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
+    if dispatch_doctor_if_requested(&args) {
+        return;
+    }
     set_release_channel(ReleaseChannel::from_label(
         xai_grok_update::channel_name().unwrap_or_default(),
     ));
-    let args = PagerArgs::parse_cli();
-    if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
-        return;
-    }
     xai_grok_pager_minimal::install();
     #[cfg(all(feature = "test-seams", debug_assertions))]
     test_seam::install();
@@ -1994,7 +2022,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         set_if_unset("GROK_HOOKS_LOG", "1");
     }
     if let Some(Command::Completions { shell }) = &args.command {
-        xai_grok_pager::completions_cmd::run(*shell);
+        xai_grok_pager::completions_cmd::run(*shell)?;
         return Ok(());
     }
     if let Some(Command::Wrap(ref wrap_args)) = args.command {
@@ -2081,18 +2109,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
     let update_config = build_update_config();
     if let Some(command) = args.command.take() {
         match command {
-            Command::Version { json } => {
-                if json {
-                    let payload = serde_json::json!({
-                        "currentVersion": xai_grok_version::version_with_commit(),
-                        "releaseSource": xai_grok_update::RELEASE_SOURCE,
-                    });
-                    println!("{}", serde_json::to_string(&payload)?);
-                } else {
-                    write_version(&mut std::io::stdout().lock(), "")?;
-                }
-                return Ok(());
-            }
+            Command::Version { .. } => unreachable!("version was consumed before startup"),
             Command::Agent(agent_args) => {
                 if args.leader || args.no_leader {
                     let flag = if args.leader {
@@ -2244,7 +2261,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     let cancel = CancellationToken::new();
                     let login = xai_grok_shell::agent::antigravity_acp::login_user(
                         &launch,
-                        |url| eprintln!("Open this link to sign in to Antigravity:\n{url}"),
+                        |url| write_antigravity_login_url(&mut std::io::stderr().lock(), url),
                         &cancel,
                     );
                     tokio::pin!(login);
@@ -2867,6 +2884,53 @@ mod tests {
             assert!(output.ends_with(expected_suffix), "{output:?}");
         }
     }
+
+    #[test]
+    fn antigravity_login_url_requires_successful_write_and_flush() {
+        struct Failing {
+            kind: std::io::ErrorKind,
+            fail_on_flush: bool,
+        }
+        impl std::io::Write for Failing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(self.kind.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_on_flush {
+                    Err(self.kind.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            for fail_on_flush in [false, true] {
+                let error = write_antigravity_login_url(
+                    &mut Failing {
+                        kind,
+                        fail_on_flush,
+                    },
+                    "https://example.test/authorization",
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+        }
+        let mut output = Vec::new();
+        write_antigravity_login_url(&mut output, "https://example.test/authorization").unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("https://example.test/authorization")
+        );
+    }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {
         let version = PagerArgs::try_parse_from(["grok", "--version"]).unwrap();
@@ -2916,7 +2980,7 @@ mod tests {
         if jemalloc_prof_available() {
             return true;
         }
-        eprintln!(
+        std::eprintln!(
             "skip jemalloc prof checks: opt.prof false \
              (release-dist static conf, or MALLOC_CONF=prof:true,prof_active:false,lg_prof_sample={})",
             xai_grok_shell::heap_profile::LG_PROF_SAMPLE

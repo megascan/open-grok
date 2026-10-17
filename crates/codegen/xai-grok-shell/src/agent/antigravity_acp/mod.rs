@@ -66,6 +66,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 type ReadPipe = Box<dyn AsyncRead + Unpin + Send>;
 type WritePipe = Box<dyn AsyncWrite + Unpin + Send>;
 
+fn check_oauth_reader(
+    result: std::result::Result<io::Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Error::Io(io::Error::from(error.kind()))),
+        Err(_) => Err(Error::Io(io::Error::other(
+            "authentication output reader failed",
+        ))),
+    }
+}
+
 /// Receives agent updates and handles reverse RPC. The host is responsible for
 /// routing permission requests, fs, terminal, and elicitation with correct
 /// authority. `None` denies a request; no request is approved by default.
@@ -86,7 +98,9 @@ pub trait Host: Send {
     }
     /// Display the short-lived Google authorization URL to the user only.
     /// Do not persist or log it; it contains OAuth state.
-    async fn authentication_url(&mut self, _url: &str) {}
+    async fn authentication_url(&mut self, _url: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Launch input is explicit: never discover or copy another application's
@@ -173,6 +187,7 @@ pub(super) struct Client {
     pub catalog: Option<ModelCatalog>,
     selected_model: Option<String>,
     oauth_urls: mpsc::Receiver<String>,
+    oauth_reader: Option<tokio::task::JoinHandle<io::Result<()>>>,
     oauth_active: bool,
     scope: Scope,
     closed: bool,
@@ -288,8 +303,9 @@ impl Client {
         let output = child.stdin.take().ok_or(Error::Protocol)?;
         let stderr = child.stderr.take().ok_or(Error::Protocol)?;
         let (oauth_tx, oauth_rx) = mpsc::channel(8);
-        tokio::spawn(read_oauth_urls(stderr, oauth_tx));
+        let oauth_reader = tokio::spawn(read_oauth_urls(stderr, oauth_tx));
         let mut client = Self::from_pipes(Box::new(input), Box::new(output), Some(child), oauth_rx);
+        client.oauth_reader = Some(oauth_reader);
         client.process_group = Some(process_group);
         client.scope = scope;
         Ok(client)
@@ -315,6 +331,7 @@ impl Client {
             catalog: None,
             selected_model: None,
             oauth_urls,
+            oauth_reader: None,
             oauth_active: false,
             scope: Scope::Agent,
             closed: false,
@@ -615,7 +632,9 @@ impl Client {
                 cancelled = true;
                 deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
             }
+            let watch_oauth_reader = self.scope == Scope::Login && self.oauth_reader.is_some();
             let message = tokio::select! {
+                biased;
                 _ = cancel.cancelled(), if !cancelled => {
                     if !matches!(tokio::time::timeout(CANCEL_GRACE, self.cancel_request(id, session)).await, Ok(Ok(()))) {
                         self.shutdown().await;
@@ -629,11 +648,25 @@ impl Client {
                     self.shutdown().await;
                     return Err(Error::Cancelled);
                 }
+                result = async { self.oauth_reader.as_mut().expect("reader exists").await }, if watch_oauth_reader => {
+                    self.oauth_reader.take();
+                    if let Err(error) = check_oauth_reader(result) {
+                        self.shutdown().await;
+                        return Err(error);
+                    }
+                    continue;
+                }
                 Some(url) = self.oauth_urls.recv(), if self.oauth_active => {
                     if cancelled { continue; }
-                    tokio::select! {
-                        _ = host.authentication_url(&url) => {},
-                        _ = cancel.cancelled(), if !cancelled => {},
+                    let output = tokio::select! {
+                        result = host.authentication_url(&url) => Some(result),
+                        _ = cancel.cancelled(), if !cancelled => None,
+                    };
+                    if let Some(Err(error)) = output {
+                        // Callbacks can include the ephemeral URL in their error;
+                        // retain only the I/O kind before reporting it.
+                        self.shutdown().await;
+                        return Err(Error::Io(io::Error::from(error.kind())));
                     }
                     continue;
                 }
@@ -729,6 +762,36 @@ impl Client {
         }
     }
 
+    /// After the login process has stopped, consume stderr through EOF before
+    /// accepting its success: the stderr reader can lag behind the ACP reply.
+    async fn finish_oauth_urls(
+        &mut self,
+        host: &mut impl Host,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(Error::Io(io::Error::from(io::ErrorKind::TimedOut))),
+                next = self.oauth_urls.recv() => next,
+            };
+            let Some(url) = next else { break };
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(Error::Io(io::Error::from(io::ErrorKind::TimedOut))),
+                result = host.authentication_url(&url) => result,
+            };
+            result.map_err(|error| Error::Io(io::Error::from(error.kind())))?;
+        }
+        if let Some(reader) = self.oauth_reader.take() {
+            check_oauth_reader(reader.await)?;
+        }
+        Ok(())
+    }
+
     /// Kill the owned process group before reaping its leader.
     pub async fn shutdown(&mut self) {
         if self.closed {
@@ -757,21 +820,20 @@ impl Drop for Client {
 
 /// Only one known diagnostic form is surfaced, and only while authenticating.
 /// All other stderr is discarded. No log contains the URL or source line.
-async fn read_oauth_urls(stderr: impl AsyncRead + Unpin, sender: mpsc::Sender<String>) {
+async fn read_oauth_urls(
+    stderr: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<String>,
+) -> io::Result<()> {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
     let mut discarding = false;
     loop {
         // Bound memory even for malicious or malformed stderr without newline.
         line.clear();
-        let read = match (&mut reader)
+        let read = (&mut reader)
             .take(16 * 1024)
             .read_until(b'\n', &mut line)
-            .await
-        {
-            Ok(read) => read,
-            Err(_) => break,
-        };
+            .await?;
         if read == 0 {
             break;
         }
@@ -802,9 +864,16 @@ async fn read_oauth_urls(stderr: impl AsyncRead + Unpin, sender: mpsc::Sender<St
             && url.port().is_none()
             && url.fragment().is_none()
         {
-            let _ = sender.try_send(candidate.to_owned());
+            match sender.try_send(candidate.to_owned()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return Err(io::Error::other("too many authentication URLs"));
+                }
+            }
         }
     }
+    Ok(())
 }
 
 fn prepare_profile(home: &Path) -> Result<PathBuf> {

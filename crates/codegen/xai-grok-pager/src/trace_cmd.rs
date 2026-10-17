@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::{Context, Result};
 use xai_grok_shell::agent::config::Config as AgentConfig;

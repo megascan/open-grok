@@ -10,6 +10,7 @@
 //! telemetry.
 
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
@@ -1247,7 +1248,7 @@ mod tests {
     #[test]
     fn marketplace_update_force_syncs_fresh_git_cache() {
         if !git_available() {
-            eprintln!("skipping git-dependent test: git binary not available");
+            std::eprintln!("skipping git-dependent test: git binary not available");
             return;
         }
         let remote = tempfile::tempdir().unwrap();

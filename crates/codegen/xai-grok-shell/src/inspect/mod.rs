@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::auth::ForceLoginTeam;
 use xai_grok_tools::types::config_source::ConfigSource;
 use xai_grok_tools::util::truncate::estimate_tokens;
+use xai_tty_utils::{cli_print as print, cli_println as println};
 
 const TREE: &str = "\u{2514}";
 
