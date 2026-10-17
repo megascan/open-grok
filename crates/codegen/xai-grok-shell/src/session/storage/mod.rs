@@ -2161,105 +2161,87 @@ impl Iterator for PromptExtractIterator {
 /// space: `prompt_index == prompts.len()` after load, matching live turn
 /// stamping (not raw user-message count).
 pub fn collect_prompts_from_events(iter: impl Iterator<Item = PromptExtractEvent>) -> Vec<String> {
-    let mut prompts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_user = false;
-    let mut current_run_pi: Option<usize> = None;
-    let mut current_counts = false;
-    let mut seen_marker = false;
+    let mut accumulator = PromptAccumulator::default();
+    for event in iter {
+        accumulator.push(event);
+    }
+    accumulator.finish()
+}
 
-    fn flush(
-        prompts: &mut Vec<String>,
-        current: &mut String,
-        in_user: &mut bool,
-        current_run_pi: &mut Option<usize>,
-        current_counts: &mut bool,
-    ) {
-        if *in_user {
-            if *current_counts {
-                let trimmed = current.trim().to_string();
+/// Reduces prompt events as they are read, retaining only the prompt state
+/// needed to honor later rewinds rather than a copy of every transcript event.
+#[derive(Default)]
+struct PromptAccumulator {
+    prompts: Vec<String>,
+    current: String,
+    in_user: bool,
+    current_run_pi: Option<usize>,
+    current_counts: bool,
+    seen_marker: bool,
+}
+
+impl PromptAccumulator {
+    fn flush(&mut self) {
+        if self.in_user {
+            if self.current_counts {
+                let trimmed = self.current.trim().to_string();
                 if !trimmed.is_empty() {
-                    prompts.push(trimmed);
+                    self.prompts.push(trimmed);
                 }
             }
-            current.clear();
-            *in_user = false;
-            *current_run_pi = None;
-            *current_counts = false;
+            self.current.clear();
+            self.in_user = false;
+            self.current_run_pi = None;
+            self.current_counts = false;
         }
     }
 
-    for event in iter {
+    fn push(&mut self, event: PromptExtractEvent) {
         match event {
             PromptExtractEvent::UserTextChunk { text, prompt_index } => {
                 if prompt_index.is_some() {
-                    seen_marker = true;
+                    self.seen_marker = true;
                 }
-                let counts = if seen_marker {
+                let counts = if self.seen_marker {
                     prompt_index.is_some()
                 } else {
                     true
                 };
-                let new_run = if !in_user {
+                let new_run = if !self.in_user {
                     true
-                } else if seen_marker || prompt_index.is_some() {
-                    prompt_index != current_run_pi
+                } else if self.seen_marker || prompt_index.is_some() {
+                    prompt_index != self.current_run_pi
                 } else {
                     false
                 };
                 if new_run {
-                    flush(
-                        &mut prompts,
-                        &mut current,
-                        &mut in_user,
-                        &mut current_run_pi,
-                        &mut current_counts,
-                    );
-                    in_user = true;
-                    current_run_pi = prompt_index;
-                    current_counts = counts;
-                    current.push_str(&text);
+                    self.flush();
+                    self.in_user = true;
+                    self.current_run_pi = prompt_index;
+                    self.current_counts = counts;
+                    self.current.push_str(&text);
                 } else {
-                    current.push_str(&text);
-                    if current_run_pi.is_none() && prompt_index.is_some() {
-                        current_run_pi = prompt_index;
-                        current_counts = true;
+                    self.current.push_str(&text);
+                    if self.current_run_pi.is_none() && prompt_index.is_some() {
+                        self.current_run_pi = prompt_index;
+                        self.current_counts = true;
                     }
                 }
             }
             PromptExtractEvent::RewindTo(target_index) => {
                 // Flush any in-progress user message before truncating.
                 // Rewinding TO prompt N keeps prompts[0..N].
-                flush(
-                    &mut prompts,
-                    &mut current,
-                    &mut in_user,
-                    &mut current_run_pi,
-                    &mut current_counts,
-                );
-                prompts.truncate(target_index);
+                self.flush();
+                self.prompts.truncate(target_index);
             }
-            PromptExtractEvent::NotUserMessage => {
-                flush(
-                    &mut prompts,
-                    &mut current,
-                    &mut in_user,
-                    &mut current_run_pi,
-                    &mut current_counts,
-                );
-            }
+            PromptExtractEvent::NotUserMessage => self.flush(),
         }
     }
 
-    flush(
-        &mut prompts,
-        &mut current,
-        &mut in_user,
-        &mut current_run_pi,
-        &mut current_counts,
-    );
-
-    prompts
+    fn finish(mut self) -> Vec<String> {
+        self.flush();
+        self.prompts
+    }
 }
 /// Collect assistant text from a stream of [`SessionUpdate`]s.
 ///

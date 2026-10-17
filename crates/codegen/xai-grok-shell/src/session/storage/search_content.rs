@@ -6,8 +6,8 @@ use std::path::Path;
 
 use super::search_fts::{SessionDoc, SessionSearchIndex};
 use super::{
-    ContentPeek, PromptExtractEvent, RawLinePeek, RawParamsPeek, XAI_SESSION_UPDATE_METHOD,
-    collect_prompts_from_events,
+    ContentPeek, PromptAccumulator, PromptExtractEvent, RawLinePeek, RawParamsPeek,
+    XAI_SESSION_UPDATE_METHOD,
 };
 use crate::session::persistence::Summary;
 use crate::session::wire_tags::{REWIND_MARKER, USER_MESSAGE_CHUNK};
@@ -124,7 +124,7 @@ pub(super) fn collect_all_indexable_content_single_pass(
     let bytes_read = file.metadata().map(|m| m.len()).unwrap_or(0);
     let reader = io::BufReader::new(file);
 
-    let mut prompt_events: Vec<PromptExtractEvent> = Vec::new();
+    let mut prompts = PromptAccumulator::default();
     let mut assistant_texts: Vec<String> = Vec::new();
     let mut current_assistant: String = String::new();
     let mut tool_meta: Vec<String> = Vec::new();
@@ -156,7 +156,7 @@ pub(super) fn collect_all_indexable_content_single_pass(
                 // An I/O error is a turn boundary, matching the
                 // iterator-based collectors.
                 flush_assistant(&mut current_assistant, &mut assistant_texts);
-                prompt_events.push(PromptExtractEvent::NotUserMessage);
+                prompts.push(PromptExtractEvent::NotUserMessage);
                 continue;
             }
         };
@@ -200,20 +200,20 @@ pub(super) fn collect_all_indexable_content_single_pass(
                                 .as_ref()
                                 .is_some_and(|m| m.host_turn == Some(true))
                         {
-                            prompt_events.push(PromptExtractEvent::NotUserMessage);
+                            prompts.push(PromptExtractEvent::NotUserMessage);
                         } else {
                             let prompt_index = peek
                                 .update
                                 .meta
                                 .as_ref()
                                 .and_then(|m| m.prompt_index.map(|v| v as usize));
-                            prompt_events.push(PromptExtractEvent::UserTextChunk {
+                            prompts.push(PromptExtractEvent::UserTextChunk {
                                 text: text.into_owned(),
                                 prompt_index,
                             });
                         }
                     } else {
-                        prompt_events.push(PromptExtractEvent::NotUserMessage);
+                        prompts.push(PromptExtractEvent::NotUserMessage);
                     }
                 }
                 Some("agent_message_chunk") => {
@@ -242,11 +242,11 @@ pub(super) fn collect_all_indexable_content_single_pass(
                             assistant_chars += take;
                         }
                     }
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 Some("agent_thought_chunk") => {
                     // Same assistant turn: not indexed, but must not flush.
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 Some("tool_call") => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
@@ -286,11 +286,11 @@ pub(super) fn collect_all_indexable_content_single_pass(
                             }
                         }
                     }
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 _ => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
             }
         } else {
@@ -300,14 +300,14 @@ pub(super) fn collect_all_indexable_content_single_pass(
                     if let Some(ref u) = update_peek
                         && let Some(idx) = u.target_prompt_index
                     {
-                        prompt_events.push(PromptExtractEvent::RewindTo(idx));
+                        prompts.push(PromptExtractEvent::RewindTo(idx));
                     } else {
-                        prompt_events.push(PromptExtractEvent::NotUserMessage);
+                        prompts.push(PromptExtractEvent::NotUserMessage);
                     }
                 }
                 _ => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
             }
         }
@@ -320,7 +320,7 @@ pub(super) fn collect_all_indexable_content_single_pass(
         }
     }
 
-    let prompts = collect_prompts_from_events(prompt_events.into_iter());
+    let prompts = prompts.finish();
 
     let parts = [
         prompts.join("\n\n"),

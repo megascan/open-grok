@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use super::StorageAdapter;
@@ -480,6 +479,39 @@ impl SharedIndex {
     }
 }
 
+/// Limit both running and waiting Tokio tasks, including completed tasks that
+/// have not yet been joined. Session metadata remains in the input iterator.
+struct BoundedIndexTasks {
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl BoundedIndexTasks {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+
+    async fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if self.tasks.len() >= BOOTSTRAP_MAX_CONCURRENT.max(1) {
+            self.join_one().await;
+        }
+        self.tasks.spawn(task);
+    }
+
+    async fn join_one(&mut self) {
+        if let Some(Err(e)) = self.tasks.join_next().await {
+            tracing::warn!(error = %e, "session indexing task panicked");
+        }
+    }
+
+    async fn drain(&mut self) {
+        while !self.tasks.is_empty() {
+            self.join_one().await;
+        }
+    }
+}
+
 async fn reindex_all(
     root_dir: &Path,
     storage: &dyn StorageAdapter,
@@ -525,14 +557,12 @@ async fn reindex_all(
         "session search bootstrap starting"
     );
 
-    let semaphore = Arc::new(Semaphore::new(BOOTSTRAP_MAX_CONCURRENT.max(1)));
     let root = root_dir.to_path_buf();
     let shared = SharedIndex::new();
 
-    let mut join_set = tokio::task::JoinSet::new();
+    let mut tasks = BoundedIndexTasks::new();
 
     for (summary, updates_path) in sessions {
-        let semaphore = semaphore.clone();
         let progress = progress.clone();
         let root = root.clone();
         let shared = shared.clone();
@@ -540,12 +570,7 @@ async fn reindex_all(
         let per_session_timeout = BOOTSTRAP_PER_SESSION_TIMEOUT;
         let max_file_size = BOOTSTRAP_MAX_FILE_SIZE;
 
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore is never closed");
-
+        let task = async move {
             // A successor owns the index. These upserts are idempotent,
             // not fenced; stopping just avoids contending with it.
             if claim_lost.load(Ordering::Acquire) {
@@ -642,14 +667,11 @@ async fn reindex_all(
                 }
             }
             progress.indexed.fetch_add(1, Ordering::Relaxed);
-        });
+        };
+        tasks.spawn(task).await;
     }
 
-    while let Some(result) = join_set.join_next().await {
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "session indexing task panicked");
-        }
-    }
+    tasks.drain().await;
 
     if claim_lost.load(Ordering::Acquire) {
         tracing::warn!("bootstrap claim lost; abandoning reindex without a completion marker");
