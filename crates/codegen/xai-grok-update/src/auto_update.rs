@@ -921,6 +921,7 @@ pub async fn run_install_script(
 
 const OPEN_GROK_MACOS_AARCH64_ASSET: &str = "open-grok-macos-aarch64";
 const OPEN_GROK_LINUX_X86_64_ASSET: &str = "open-grok-linux-x86_64";
+const OPEN_GROK_LINUX_AARCH64_ASSET: &str = "open-grok-linux-aarch64";
 const OPEN_GROK_WINDOWS_X86_64_ASSET: &str = "open-grok-windows-x86_64.exe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -933,9 +934,12 @@ struct OpenGrokReleasePlatform {
 }
 
 fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
-    if cfg!(target_os = "macos")
-        && (cfg!(target_arch = "aarch64") || running_under_rosetta_on_apple_silicon())
-    {
+    let (os, arch) = detect_platform()?;
+    open_grok_release_platform_for(os, arch)
+}
+
+fn open_grok_release_platform_for(os: &str, arch: &str) -> Result<OpenGrokReleasePlatform> {
+    if (os, arch) == ("macos", "aarch64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_MACOS_AARCH64_ASSET,
             versioned_platform: "macos-aarch64",
@@ -943,7 +947,7 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
             display_name: "macOS Apple Silicon",
             managed_command: "open-grok",
         })
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    } else if (os, arch) == ("linux", "x86_64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_LINUX_X86_64_ASSET,
             versioned_platform: "linux-x86_64",
@@ -951,7 +955,15 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
             display_name: "Linux x86_64",
             managed_command: "open-grok",
         })
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+    } else if (os, arch) == ("linux", "aarch64") {
+        Ok(OpenGrokReleasePlatform {
+            asset: OPEN_GROK_LINUX_AARCH64_ASSET,
+            versioned_platform: "linux-aarch64",
+            binary_extension: "",
+            display_name: "Linux arm64",
+            managed_command: "open-grok",
+        })
+    } else if (os, arch) == ("windows", "x86_64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_WINDOWS_X86_64_ASSET,
             versioned_platform: "windows-x86_64",
@@ -961,7 +973,7 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
         })
     } else {
         anyhow::bail!(
-            "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64, and Windows x86_64"
+            "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64 and arm64, and Windows x86_64"
         )
     }
 }
@@ -3891,6 +3903,21 @@ mod tests {
                 managed_command: "open-grok",
             }
         );
+    }
+
+    #[test]
+    fn test_open_grok_release_platform_selects_linux_arm64() {
+        assert_eq!(
+            open_grok_release_platform_for("linux", "aarch64").unwrap(),
+            OpenGrokReleasePlatform {
+                asset: "open-grok-linux-aarch64",
+                versioned_platform: "linux-aarch64",
+                binary_extension: "",
+                display_name: "Linux arm64",
+                managed_command: "open-grok",
+            }
+        );
+        assert!(open_grok_release_platform_for("linux", "arm").is_err());
     }
 
     #[test]
