@@ -1,7 +1,7 @@
 //! Binary resolution, serial env guards, and git sandbox creation.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -12,6 +12,17 @@ static GROK_BINARY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_grok_binary_override(path: PathBuf) {
     let _ = GROK_BINARY_OVERRIDE.set(path);
+}
+
+pub fn resolved_grok_binary_override() -> Option<PathBuf> {
+    GROK_BINARY_OVERRIDE.get().cloned()
+}
+
+pub fn env_binary(key: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(key).filter(|path| !path.is_empty())?;
+    let path = PathBuf::from(path);
+    assert!(path.exists(), "{key} does not exist: {}", path.display());
+    Some(std::path::absolute(&path).unwrap_or(path))
 }
 
 /// Parse env var `key` into `T`, falling back to `default` when it is unset or
@@ -175,15 +186,11 @@ pub fn ensure_cargo_bin_with_features(
 
 /// Resolve the Open Grok binary: `GROK_BINARY` env (CI) or a local `open-grok` build.
 pub fn grok_binary() -> PathBuf {
-    if let Some(path) = GROK_BINARY_OVERRIDE.get() {
-        return path.clone();
+    if let Some(path) = resolved_grok_binary_override() {
+        return path;
     }
-    if let Ok(path) = std::env::var("GROK_BINARY") {
-        let p = PathBuf::from(path);
-        assert!(p.exists(), "GROK_BINARY does not exist: {}", p.display());
-        // Bazel's GROK_BINARY is runfiles-relative; the harness spawns the child
-        // with a different cwd, so absolutize against the (runfiles-root) cwd now.
-        return std::path::absolute(&p).unwrap_or(p);
+    if let Some(path) = env_binary("GROK_BINARY") {
+        return path;
     }
 
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_open-grok") {
@@ -194,6 +201,68 @@ pub fn grok_binary() -> PathBuf {
     }
 
     ensure_cargo_bin("xai-grok-pager-bin", "open-grok")
+}
+
+/// Build a feature-specific test binary separately from the normal developer binary.
+/// Cargo still runs on a cache hit so changes to source cannot be hidden by the stamp.
+pub fn ensure_default_target_with_features(package: &str, bin: &str, features: &[&str]) -> PathBuf {
+    let target = target_dir().join("shipped-pager");
+    let binary = target
+        .join("debug")
+        .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+    let stamp = binary.with_extension("features");
+    let wanted = format!("no-default:{}", features.join(","));
+    if binary.exists() && !stamp_matches(&stamp, &wanted) {
+        std::fs::remove_file(&binary).expect("remove feature-mismatched test binary");
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = Command::new(&cargo);
+    cmd.current_dir(workspace_root())
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            package,
+            "--bin",
+            bin,
+            "--no-default-features",
+            "--features",
+        ])
+        .arg(features.join(","))
+        .env("CARGO_TARGET_DIR", &target)
+        .stdin(std::process::Stdio::null())
+        .envs(xai_tty_utils::pager_env());
+    xai_tty_utils::detach_std_command(&mut cmd);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo}: {e}"));
+    assert!(
+        output.status.success(),
+        "failed to build {bin}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(binary.exists(), "binary missing at {}", binary.display());
+    std::fs::write(&stamp, wanted).expect("write feature stamp");
+    binary
+}
+
+fn stamp_matches(stamp: &Path, wanted: &str) -> bool {
+    std::fs::read_to_string(stamp).is_ok_and(|have| have == wanted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_matches;
+
+    #[test]
+    fn feature_stamp_must_match_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("features");
+        assert!(!stamp_matches(&stamp, "no-default:chat"));
+        std::fs::write(&stamp, "no-default:chat,jemalloc").unwrap();
+        assert!(!stamp_matches(&stamp, "no-default:chat"));
+        assert!(stamp_matches(&stamp, "no-default:chat,jemalloc"));
+    }
 }
 
 /// Create an owned, git-initialized [`TestSandbox`].

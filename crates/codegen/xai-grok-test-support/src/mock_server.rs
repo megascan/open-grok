@@ -13,10 +13,12 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use axum::body::Bytes;
+use axum::http::Uri;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -27,13 +29,22 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::conversation::ReadConversation;
+use crate::conversation_script::{Conversation, ScriptViolation};
+use crate::failure::ObservedFailure;
 use crate::inference_override::{ClassifiedInferenceRequest, InferenceOverrides};
 pub use crate::inference_override::{
     InferenceEndpoint, InferenceExpectation, InferenceRequestMatcher,
 };
+use crate::inference_request::{
+    InferenceRequest, InferenceRequestKind, first_system_message, offered_tools, tool_results,
+};
+pub use crate::managed_gateway_endpoint::ManagedGatewayCall;
+use crate::managed_gateway_endpoint::ManagedGatewayEndpointState;
 use crate::scripted::TerminalWait;
 pub use crate::scripted::{ScriptedBody, ScriptedResponse, SseEvent};
 use crate::sse;
+use crate::startup_stall::StartupStall;
 use crate::telemetry_events::TelemetryEventsState;
 
 #[derive(Debug, Clone)]
@@ -46,6 +57,15 @@ pub struct LogEntry {
     /// Request headers (lowercase names, arrival order), captured on the
     /// inference POST endpoints; the GET endpoints log an empty list.
     pub headers: Vec<(String, String)>,
+    pub query: Option<String>,
+    pub raw_body: Option<String>,
+    pub conversation: Option<usize>,
+    pub endpoint: Option<InferenceEndpoint>,
+    pub scripted_reply: Option<usize>,
+    pub observed_failure: Option<ObservedFailure>,
+    pub finished: bool,
+    pub at: std::time::SystemTime,
+    sequence: u64,
 }
 
 impl LogEntry {
@@ -57,6 +77,21 @@ impl LogEntry {
             .find(|(k, _)| *k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    pub fn first_system_prompt(&self) -> Option<String> {
+        self.body.as_ref().and_then(first_system_message)
+    }
+
+    pub fn offered_tool_names(&self) -> Vec<String> {
+        self.body
+            .as_ref()
+            .map(|body| offered_tools(body).names())
+            .unwrap_or_default()
+    }
+
+    pub fn tool_results(&self) -> std::collections::BTreeMap<String, String> {
+        self.body.as_ref().map(tool_results).unwrap_or_default()
+    }
 }
 
 /// An entry holds a whole conversation, so the log evicts oldest first.
@@ -66,6 +101,9 @@ pub struct RequestLog {
     count: AtomicU32,
     entries: std::sync::Mutex<Vec<LogEntry>>,
     keep_entries: AtomicBool,
+    capture_request_bytes: AtomicBool,
+    observed_through: AtomicU64,
+    inference_arrivals: tokio::sync::watch::Sender<usize>,
 }
 
 impl RequestLog {
@@ -74,6 +112,9 @@ impl RequestLog {
             count: AtomicU32::new(0),
             entries: std::sync::Mutex::new(Vec::new()),
             keep_entries: AtomicBool::new(true),
+            capture_request_bytes: AtomicBool::new(false),
+            observed_through: AtomicU64::new(0),
+            inference_arrivals: tokio::sync::watch::Sender::new(0),
         }
     }
 
@@ -85,11 +126,31 @@ impl RequestLog {
         authorization: Option<&str>,
         headers: Vec<(String, String)>,
     ) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        if !self.keep_entries.load(Ordering::SeqCst) {
-            return;
-        }
+        self.record_entry(method, path, body, authorization, headers, None, None, None);
+    }
+
+    fn record_entry(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        authorization: Option<&str>,
+        headers: Vec<(String, String)>,
+        inference: Option<&InferenceRequest<'_>>,
+        raw: Option<&[u8]>,
+        query: Option<&str>,
+    ) -> u64 {
         let mut entries = self.entries.lock().unwrap();
+        let sequence = u64::from(self.count.fetch_add(1, Ordering::SeqCst)) + 1;
+        let foreground =
+            inference.is_some_and(|request| request.kind() == InferenceRequestKind::Foreground);
+        if !self.keep_entries.load(Ordering::SeqCst) {
+            drop(entries);
+            if foreground {
+                self.inference_arrivals.send_modify(|count| *count += 1);
+            }
+            return sequence;
+        }
         if entries.len() >= MAX_LOGGED_REQUESTS {
             entries.remove(0);
         }
@@ -99,7 +160,78 @@ impl RequestLog {
             body: body.cloned(),
             authorization: authorization.map(String::from),
             headers,
+            query: query.map(str::to_owned),
+            raw_body: raw
+                .filter(|_| self.capture_request_bytes.load(Ordering::SeqCst))
+                .map(|raw| String::from_utf8_lossy(raw).into_owned()),
+            conversation: inference
+                .and_then(|request| request.conversation())
+                .map(|id| id.number()),
+            endpoint: inference.map(|request| request.endpoint()),
+            scripted_reply: None,
+            observed_failure: None,
+            finished: false,
+            at: std::time::SystemTime::now(),
+            sequence,
         });
+        drop(entries);
+        if foreground {
+            self.inference_arrivals.send_modify(|count| *count += 1);
+        }
+        sequence
+    }
+
+    pub(crate) fn note_finished(&self, sequence: u64) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence)
+        {
+            entry.finished = true;
+        }
+    }
+
+    pub(crate) fn note_reply(
+        &self,
+        sequence: u64,
+        reply: Option<usize>,
+        failure: Option<ObservedFailure>,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence)
+        {
+            entry.scripted_reply = reply;
+            entry.observed_failure = failure;
+        }
+    }
+
+    fn take_for_observation(&self) -> Vec<LogEntry> {
+        let entries = self.entries.lock().unwrap();
+        let seen = self.observed_through.load(Ordering::SeqCst);
+        let fresh = entries
+            .iter()
+            .filter(|entry| entry.sequence > seen)
+            .cloned()
+            .collect();
+        if let Some(last) = entries.iter().map(|entry| entry.sequence).max() {
+            self.observed_through.fetch_max(last, Ordering::SeqCst);
+        }
+        fresh
+    }
+
+    pub(crate) fn conversation_requests(&self, conversation: usize) -> usize {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.conversation == Some(conversation))
+            .count()
     }
 }
 
@@ -126,6 +258,7 @@ pub struct MockModelEntry {
     /// raw JSON option (a table `{ "value": ..., "id"?, "label"?, ... }` or a
     /// bare value string), matching what `parse_remote_model_value` reads.
     pub reasoning_efforts: Vec<Value>,
+    pub system_prompt_label: Option<String>,
 }
 
 impl MockModelEntry {
@@ -139,6 +272,7 @@ impl MockModelEntry {
             supports_reasoning_effort: false,
             reasoning_effort: None,
             reasoning_efforts: Vec::new(),
+            system_prompt_label: None,
         }
     }
 
@@ -179,6 +313,11 @@ impl MockModelEntry {
         self
     }
 
+    pub fn with_system_prompt_label(mut self, label: impl Into<String>) -> Self {
+        self.system_prompt_label = Some(label.into());
+        self
+    }
+
     fn to_json(&self) -> Value {
         let mut obj = json!({
             "id": self.id,
@@ -206,6 +345,9 @@ impl MockModelEntry {
         }
         if !self.reasoning_efforts.is_empty() {
             obj["reasoningEfforts"] = json!(self.reasoning_efforts);
+        }
+        if let Some(label) = &self.system_prompt_label {
+            obj["systemPromptLabel"] = json!(label);
         }
         obj
     }
@@ -267,6 +409,25 @@ struct StorageState {
     unauthorized: AtomicBool,
     request_count: AtomicU32,
     uploads: std::sync::Mutex<Vec<StorageUpload>>,
+    observed: AtomicUsize,
+}
+
+impl StorageState {
+    fn take_for_observation(&self) -> Vec<StorageUpload> {
+        let uploads = self.uploads.lock().unwrap();
+        let start = self.observed.load(Ordering::SeqCst);
+        let fresh = uploads.iter().skip(start).cloned().collect();
+        self.observed.store(uploads.len(), Ordering::SeqCst);
+        fresh
+    }
+}
+
+/// Records that arrived since the previous observation.
+pub struct ObservationRecords {
+    pub requests: Vec<LogEntry>,
+    pub telemetry: Vec<Value>,
+    pub storage_uploads: Vec<StorageUpload>,
+    pub gateway_calls: Vec<ManagedGatewayCall>,
 }
 
 /// `teamId`, `teamName`, and `teamRole` on `GET /v1/user`.
@@ -307,6 +468,7 @@ pub struct MockInferenceServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     log: Arc<RequestLog>,
     models: Arc<std::sync::RwLock<Vec<Value>>>,
+    models_installed: AtomicBool,
     settings: Arc<std::sync::RwLock<Option<Value>>>,
     response_mode: Arc<std::sync::RwLock<ResponseMode>>,
     overrides: InferenceOverrides,
@@ -327,7 +489,11 @@ pub struct MockInferenceServer {
     storage: Arc<StorageState>,
     /// When set, `/v1/models` and `/v1/settings` hang forever (never
     /// respond); see [`Self::set_hang`].
-    hang: Arc<std::sync::atomic::AtomicBool>,
+    startup_stall: Arc<StartupStall>,
+    user_opt_out: Arc<std::sync::RwLock<Option<bool>>>,
+    user_info_released: Arc<tokio::sync::watch::Sender<bool>>,
+    user_info_arrivals: Arc<tokio::sync::watch::Sender<usize>>,
+    managed_gateway: Arc<ManagedGatewayEndpointState>,
     /// See [`Self::set_user_subscription_tier`].
     user_tier: Arc<std::sync::RwLock<Option<String>>>,
     /// See [`Self::set_user_team`].
@@ -375,7 +541,11 @@ impl MockInferenceServer {
         let messages_stop_reason = Arc::new(std::sync::RwLock::new("end_turn".to_string()));
         let chunk_delay = Arc::new(std::sync::RwLock::new(None::<Duration>));
         let storage = Arc::new(StorageState::default());
-        let hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let startup_stall = Arc::new(StartupStall::default());
+        let user_opt_out = Arc::new(std::sync::RwLock::new(None));
+        let user_info_released = Arc::new(tokio::sync::watch::Sender::new(true));
+        let user_info_arrivals = Arc::new(tokio::sync::watch::Sender::new(0));
+        let managed_gateway = Arc::new(ManagedGatewayEndpointState::default());
         let user_tier = Arc::new(std::sync::RwLock::new(None::<String>));
         let user_team = Arc::new(std::sync::RwLock::new(None::<MockUserTeam>));
         let user_can_administer_team =
@@ -392,7 +562,11 @@ impl MockInferenceServer {
             messages_stop_reason.clone(),
             chunk_delay.clone(),
             storage.clone(),
-            hang.clone(),
+            startup_stall.clone(),
+            user_opt_out.clone(),
+            user_info_released.clone(),
+            user_info_arrivals.clone(),
+            managed_gateway.clone(),
             user_tier.clone(),
             user_team.clone(),
             user_can_administer_team.clone(),
@@ -428,6 +602,7 @@ impl MockInferenceServer {
             shutdown_tx: Some(shutdown_tx),
             log,
             models: shared_models,
+            models_installed: AtomicBool::new(false),
             settings: shared_settings,
             response_mode,
             overrides,
@@ -436,7 +611,11 @@ impl MockInferenceServer {
             messages_stop_reason,
             chunk_delay,
             storage,
-            hang,
+            startup_stall,
+            user_opt_out,
+            user_info_released,
+            user_info_arrivals,
+            managed_gateway,
             user_tier,
             user_team,
             user_can_administer_team,
@@ -449,6 +628,183 @@ impl MockInferenceServer {
     pub fn set_models(&self, models: Vec<MockModelEntry>) {
         let mut guard = self.models.write().unwrap();
         *guard = models.iter().map(MockModelEntry::to_json).collect();
+        self.models_installed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install_models(&self, leading: &[MockModelEntry], trailing: &[MockModelEntry]) {
+        if leading.is_empty() && trailing.is_empty() {
+            return;
+        }
+        let mut models = self.models.write().unwrap();
+        let named: Vec<&str> = leading
+            .iter()
+            .chain(trailing)
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let kept: Vec<Value> = models
+            .iter()
+            .filter(|_| self.models_installed.load(Ordering::SeqCst))
+            .filter(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !named.contains(&id))
+            })
+            .cloned()
+            .collect();
+        *models = leading
+            .iter()
+            .map(MockModelEntry::to_json)
+            .chain(kept)
+            .chain(trailing.iter().map(MockModelEntry::to_json))
+            .collect();
+        self.models_installed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn set_conversations(&self, conversations: impl IntoIterator<Item = Conversation>) {
+        self.overrides.conversation_scripts().set(conversations);
+    }
+
+    pub fn script_violations(&self) -> Vec<ScriptViolation> {
+        self.overrides.conversation_scripts().violations()
+    }
+
+    #[must_use = "assert on the violations; finishing disarms the drop check"]
+    pub fn finish_scripts(&self) -> Vec<ScriptViolation> {
+        self.overrides.conversation_scripts().finish()
+    }
+
+    #[track_caller]
+    pub fn assert_no_script_violations(&self) {
+        let violations = self.script_violations();
+        assert!(
+            violations.is_empty(),
+            "conversation scripts departed from: {violations:#?}\nconversations: {:#?}\nrequests: {}",
+            self.conversations(),
+            self.request_log_summary()
+        );
+    }
+
+    pub fn conversations(&self) -> Vec<ReadConversation> {
+        self.overrides.conversations(&self.requests())
+    }
+
+    pub fn conversation(&self, number: usize) -> Option<ReadConversation> {
+        self.conversations()
+            .into_iter()
+            .find(|conversation| conversation.number() == number)
+    }
+
+    pub fn conversation_for_system_prompt(&self, contains: &str) -> Option<ReadConversation> {
+        self.conversations().into_iter().find(|conversation| {
+            conversation
+                .first_system_prompt()
+                .is_some_and(|prompt| prompt.contains(contains))
+        })
+    }
+
+    pub fn replies_served(&self, conversation: usize) -> usize {
+        self.overrides
+            .conversation_scripts()
+            .replies_served(conversation)
+    }
+
+    pub fn answered_turns(&self, conversation: usize) -> std::collections::BTreeSet<usize> {
+        self.overrides
+            .conversation_scripts()
+            .answered_turns(conversation)
+    }
+
+    pub fn arm_reply_hold(&self) -> crate::ArmedReplyHold {
+        self.overrides.arm_reply_hold()
+    }
+    pub fn arm_chunk_release(&self) {
+        self.overrides.arm_chunk_release();
+    }
+    pub fn release_one_chunk(&self) {
+        self.overrides.release_one_chunk();
+    }
+    pub fn release_remaining_chunks(&self) {
+        self.overrides.release_remaining_chunks();
+    }
+    pub fn hold_only_conversation(&self, conversation: usize) {
+        self.overrides.hold_only_conversation(conversation);
+    }
+    pub fn hold_conversation(&self, conversation: usize) {
+        self.overrides
+            .hold_conversation(crate::conversation::ConversationId::nth(conversation));
+    }
+    pub fn release_conversation(&self, conversation: usize) {
+        self.overrides
+            .release_conversation(crate::conversation::ConversationId::nth(conversation));
+    }
+    pub fn release_parked_replies(&self) {
+        self.overrides.release_parked_replies();
+    }
+    pub fn release_auxiliary_replies(&self) {
+        self.overrides.release_auxiliary_replies();
+    }
+    pub fn set_foreground_hold(&self) {
+        self.overrides.set_foreground_hold();
+    }
+    pub fn set_auxiliary_hold(&self) {
+        self.overrides.set_auxiliary_hold();
+    }
+    pub fn set_auxiliary_hold_matching(&self, prefix: impl Into<String>) {
+        self.overrides.set_auxiliary_hold_matching(prefix.into());
+    }
+    pub async fn wait_until_matching_parked(&self, at_least: usize) {
+        self.overrides.wait_until_matching_parked(at_least).await;
+    }
+
+    pub async fn wait_for_inference_requests(&self, n: usize) {
+        let mut arrivals = self.log.inference_arrivals.subscribe();
+        let arrived = tokio::time::timeout(
+            crate::scaled(Duration::from_secs(30)),
+            arrivals.wait_for(|count| *count >= n),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        assert!(
+            arrived,
+            "expected {n} foreground inference requests, saw {} within 30s",
+            *arrivals.borrow()
+        );
+    }
+
+    pub fn request_count_for(&self, path: &str) -> usize {
+        self.requests()
+            .iter()
+            .filter(|entry| entry.path == path)
+            .count()
+    }
+    pub fn set_capture_request_bytes(&self, enabled: bool) {
+        self.log
+            .capture_request_bytes
+            .store(enabled, Ordering::SeqCst);
+    }
+    pub fn arm_scripted_park(&self) -> u64 {
+        self.overrides.arm_scripted_park()
+    }
+    pub fn release_scripted_park(&self, token: u64) {
+        self.overrides.release_scripted_park(token);
+    }
+    pub async fn wait_until_scripted_park(&self, token: u64) {
+        self.overrides.wait_until_scripted_park(token).await;
+    }
+    pub async fn wait_until_parked_replies(&self, at_least: usize) {
+        self.overrides.wait_until_parked_replies(at_least).await;
+    }
+    pub async fn wait_until_parked_replies_for(&self, conversation: usize, at_least: usize) {
+        self.overrides
+            .wait_until_parked_replies_for(conversation, at_least)
+            .await;
+    }
+    pub fn agent_completion_parked(&self) -> bool {
+        self.overrides.agent_completion_parked()
+    }
+    pub async fn wait_until_a_reply_is_held(&self) {
+        self.overrides.wait_until_a_reply_is_held().await;
     }
 
     /// Stream this fixed text from all inference endpoints instead of echoing
@@ -530,7 +886,54 @@ impl MockInferenceServer {
     /// Make `/v1/models` and `/v1/settings` hang forever, standing in for a
     /// black-holed backend in non-blocking-startup tests.
     pub fn set_hang(&self, hang: bool) {
-        self.hang.store(hang, std::sync::atomic::Ordering::Release);
+        self.startup_stall.set_hang(hang);
+    }
+
+    pub fn set_startup_fetch_delay(&self, delay: Duration) {
+        self.startup_stall.set_delay(delay);
+    }
+
+    pub fn clear_startup_fetch_stall(&self) {
+        self.startup_stall.clear();
+    }
+
+    pub fn startup_stalls_served(&self) -> u32 {
+        self.startup_stall.served()
+    }
+
+    pub fn set_user_coding_data_retention_opt_out(&self, opt_out: Option<bool>) {
+        *self.user_opt_out.write().unwrap() = opt_out;
+    }
+
+    pub fn hold_user_info(&self) {
+        self.user_info_released.send_replace(false);
+    }
+
+    pub fn release_user_info(&self) {
+        self.user_info_released.send_replace(true);
+    }
+
+    pub async fn user_info_arrived(&self, count: usize) {
+        let mut receiver = self.user_info_arrivals.subscribe();
+        let arrived = tokio::time::timeout(
+            crate::scaled(Duration::from_secs(5)),
+            receiver.wait_for(|n| *n >= count),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        assert!(
+            arrived,
+            "expected {count} user info requests, saw {}",
+            *self.user_info_arrivals.borrow()
+        );
+    }
+
+    pub fn set_managed_gateway(&self, catalog: Value, call_result: Value) {
+        self.managed_gateway.set_script(catalog, call_result);
+    }
+
+    pub fn managed_gateway_calls(&self) -> Vec<ManagedGatewayCall> {
+        self.managed_gateway.calls()
     }
 
     /// Set the `subscriptionTier` served by `GET /v1/user`. `None`
@@ -602,6 +1005,15 @@ impl MockInferenceServer {
 
     pub fn requests(&self) -> Vec<LogEntry> {
         self.log.entries.lock().unwrap().clone()
+    }
+
+    pub fn arrived_since_observation(&self) -> ObservationRecords {
+        ObservationRecords {
+            requests: self.log.take_for_observation(),
+            telemetry: self.telemetry.take_for_observation(),
+            storage_uploads: self.storage.take_for_observation(),
+            gateway_calls: self.managed_gateway.take_for_observation(),
+        }
     }
 
     /// Every product-telemetry event posted to `/v1/events` so far, flattened out of its batch, in arrival order.
@@ -819,14 +1231,18 @@ impl MockInferenceServer {
         messages_stop_reason: Arc<std::sync::RwLock<String>>,
         chunk_delay: Arc<std::sync::RwLock<Option<Duration>>>,
         storage: Arc<StorageState>,
-        hang: Arc<std::sync::atomic::AtomicBool>,
+        startup_stall: Arc<StartupStall>,
+        user_opt_out: Arc<std::sync::RwLock<Option<bool>>>,
+        user_info_released: Arc<tokio::sync::watch::Sender<bool>>,
+        user_info_arrivals: Arc<tokio::sync::watch::Sender<usize>>,
+        managed_gateway: Arc<ManagedGatewayEndpointState>,
         user_tier: Arc<std::sync::RwLock<Option<String>>>,
         user_team: Arc<std::sync::RwLock<Option<MockUserTeam>>>,
         user_can_administer_team: Arc<std::sync::RwLock<MockCanAdministerTeam>>,
         telemetry: Arc<TelemetryEventsState>,
     ) -> Router {
-        let hang_models = hang.clone();
-        let hang_settings = hang;
+        let hang_models = startup_stall.clone();
+        let hang_settings = startup_stall;
         let log_cc = log.clone();
         let log_rs = log.clone();
         let log_msg = log.clone();
@@ -842,6 +1258,7 @@ impl MockInferenceServer {
         let overrides_settings = overrides.clone();
         let overrides_msg = overrides;
         let overrides_privacy = overrides_msg.clone();
+        let overrides_consent = overrides_msg.clone();
         let scripted_agent_turns_cc = scripted_agent_turns.clone();
         let scripted_agent_turns_rs = scripted_agent_turns.clone();
         let scripted_agent_turns_msg = scripted_agent_turns;
@@ -855,7 +1272,7 @@ impl MockInferenceServer {
         Router::new()
             .route(
                 "/v1/chat/completions",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                post(move |uri: Uri, headers: HeaderMap, raw: Bytes| {
                     let log = log_cc.clone();
                     let mode = mode_cc.clone();
                     let overrides = overrides_cc.clone();
@@ -863,14 +1280,33 @@ impl MockInferenceServer {
                     let agent_turns = agent_turns_cc.clone();
                     let delay = delay_cc.clone();
                     async move {
+                        let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "inference request body was not JSON",
+                            )
+                                .into_response();
+                        };
                         let auth = Self::extract_auth(&headers);
-                        log.record(
+                        let replay = overrides.replay_request(
+                            InferenceEndpoint::ChatCompletions,
+                            &headers,
+                            &body,
+                        );
+                        let sequence = log.record_entry(
                             "POST",
                             "/v1/chat/completions",
                             Some(&body),
                             auth.as_deref(),
                             Self::headers_vec(&headers),
+                            Some(&replay),
+                            Some(&raw),
+                            uri.query(),
                         );
+                        overrides
+                            .conversation_scripts()
+                            .release_parks(&body.to_string());
+                        overrides.hold_next_foreground(&replay).await;
 
                         if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
                         {
@@ -882,11 +1318,20 @@ impl MockInferenceServer {
                             overrides.classify(InferenceEndpoint::ChatCompletions, &headers, &body);
                         let chunk_delay = *delay.read().unwrap();
                         if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
+                            .response_override_replay(
+                                &request,
+                                &headers,
+                                chunk_delay,
+                                &replay,
+                                &log,
+                                sequence,
+                            )
                             .await
                         {
                             return response;
                         }
+
+                        overrides.hold_next_auxiliary(&replay).await;
 
                         let user_msg = body
                             .get("messages")
@@ -916,8 +1361,9 @@ impl MockInferenceServer {
                                 }
                             },
                         };
-                        let gate = overrides.fallback_terminal_wait(&request);
+                        let gate = overrides.replay_terminal_wait(&replay);
                         let stream = paced_events(events, *delay.read().unwrap(), gate);
+                        log.note_finished(sequence);
                         Sse::new(stream)
                             .keep_alive(KeepAlive::default())
                             .into_response()
@@ -926,7 +1372,7 @@ impl MockInferenceServer {
             )
             .route(
                 "/v1/responses",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                post(move |uri: Uri, headers: HeaderMap, raw: Bytes| {
                     let log = log_rs.clone();
                     let mode = mode_rs.clone();
                     let overrides = overrides_rs.clone();
@@ -934,14 +1380,30 @@ impl MockInferenceServer {
                     let agent_turns = agent_turns_rs.clone();
                     let delay = delay_rs.clone();
                     async move {
+                        let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "inference request body was not JSON",
+                            )
+                                .into_response();
+                        };
                         let auth = Self::extract_auth(&headers);
-                        log.record(
+                        let replay =
+                            overrides.replay_request(InferenceEndpoint::Responses, &headers, &body);
+                        let sequence = log.record_entry(
                             "POST",
                             "/v1/responses",
                             Some(&body),
                             auth.as_deref(),
                             Self::headers_vec(&headers),
+                            Some(&replay),
+                            Some(&raw),
+                            uri.query(),
                         );
+                        overrides
+                            .conversation_scripts()
+                            .release_parks(&body.to_string());
+                        overrides.hold_next_foreground(&replay).await;
 
                         if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
                         {
@@ -953,11 +1415,20 @@ impl MockInferenceServer {
                             overrides.classify(InferenceEndpoint::Responses, &headers, &body);
                         let chunk_delay = *delay.read().unwrap();
                         if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
+                            .response_override_replay(
+                                &request,
+                                &headers,
+                                chunk_delay,
+                                &replay,
+                                &log,
+                                sequence,
+                            )
                             .await
                         {
                             return response;
                         }
+
+                        overrides.hold_next_auxiliary(&replay).await;
 
                         let user_msg = body
                             .get("input")
@@ -1004,8 +1475,9 @@ impl MockInferenceServer {
                                 }
                             },
                         };
-                        let gate = overrides.fallback_terminal_wait(&request);
+                        let gate = overrides.replay_terminal_wait(&replay);
                         let stream = paced_events(events, *delay.read().unwrap(), gate);
+                        log.note_finished(sequence);
                         Sse::new(stream)
                             .keep_alive(KeepAlive::default())
                             .into_response()
@@ -1014,7 +1486,7 @@ impl MockInferenceServer {
             )
             .route(
                 "/v1/messages",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                post(move |uri: Uri, headers: HeaderMap, raw: Bytes| {
                     let log = log_msg.clone();
                     let mode = mode_msg.clone();
                     let overrides = overrides_msg.clone();
@@ -1023,14 +1495,30 @@ impl MockInferenceServer {
                     let stop_reason = messages_stop_reason.clone();
                     let delay = delay_msg.clone();
                     async move {
+                        let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "inference request body was not JSON",
+                            )
+                                .into_response();
+                        };
                         let auth = Self::extract_auth(&headers);
-                        log.record(
+                        let replay =
+                            overrides.replay_request(InferenceEndpoint::Messages, &headers, &body);
+                        let sequence = log.record_entry(
                             "POST",
                             "/v1/messages",
                             Some(&body),
                             auth.as_deref(),
                             Self::headers_vec(&headers),
+                            Some(&replay),
+                            Some(&raw),
+                            uri.query(),
                         );
+                        overrides
+                            .conversation_scripts()
+                            .release_parks(&body.to_string());
+                        overrides.hold_next_foreground(&replay).await;
 
                         if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
                         {
@@ -1042,7 +1530,14 @@ impl MockInferenceServer {
                             overrides.classify(InferenceEndpoint::Messages, &headers, &body);
                         let chunk_delay = *delay.read().unwrap();
                         if let Some(response) = overrides
-                            .response_override(&request, &headers, chunk_delay)
+                            .response_override_replay(
+                                &request,
+                                &headers,
+                                chunk_delay,
+                                &replay,
+                                &log,
+                                sequence,
+                            )
                             .await
                         {
                             return response;
@@ -1050,6 +1545,8 @@ impl MockInferenceServer {
 
                         // Anthropic content is either a plain string or an
                         // array of typed blocks; extract the last user text.
+                        overrides.hold_next_auxiliary(&replay).await;
+
                         let user_msg = body
                             .get("messages")
                             .and_then(|m| m.as_array())
@@ -1096,8 +1593,9 @@ impl MockInferenceServer {
                                 }
                             },
                         };
-                        let gate = overrides.fallback_terminal_wait(&request);
+                        let gate = overrides.replay_terminal_wait(&replay);
                         let stream = paced_events(events, *delay.read().unwrap(), gate);
+                        log.note_finished(sequence);
                         Sse::new(stream)
                             .keep_alive(KeepAlive::default())
                             .into_response()
@@ -1116,9 +1614,7 @@ impl MockInferenceServer {
                         let hang = hang.clone();
                         async move {
                             log.record("GET", "/v1/models", None, None, Vec::new());
-                            if hang.load(std::sync::atomic::Ordering::Acquire) {
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
-                            }
+                            hang.apply().await;
                             let models_json = models.read().unwrap().clone();
                             Json(json!({
                                 "object": "list",
@@ -1141,9 +1637,7 @@ impl MockInferenceServer {
                         let hang = hang.clone();
                         async move {
                             log.record("GET", "/v1/settings", None, None, Vec::new());
-                            if hang.load(std::sync::atomic::Ordering::Acquire) {
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
-                            }
+                            hang.apply().await;
                             // Scripted one-shots take precedence (FIFO), so a
                             // test can serve a transient payload (e.g. one
                             // stale gated snapshot) and fall back to the
@@ -1193,6 +1687,68 @@ impl MockInferenceServer {
                 }),
             )
             .route(
+                "/v1/consent/accept",
+                post({
+                    let log = log.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let log = log.clone();
+                        let overrides = overrides_consent.clone();
+                        async move {
+                            let path = "/v1/consent/accept";
+                            let auth = Self::extract_auth(&headers);
+                            log.record(
+                                "POST",
+                                path,
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
+                            if let Some(s) = overrides.pop_scripted(path) {
+                                return s.into_response_paced(None, None).await;
+                            }
+                            Json(body).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/mcp/tools/list",
+                get({
+                    let log = log.clone();
+                    let gateway = managed_gateway.clone();
+                    move || {
+                        let log = log.clone();
+                        let gateway = gateway.clone();
+                        async move {
+                            log.record("GET", "/v1/mcp/tools/list", None, None, Vec::new());
+                            gateway.list()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/mcp/tools/call",
+                post({
+                    let log = log.clone();
+                    let gateway = managed_gateway.clone();
+                    move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let log = log.clone();
+                        let gateway = gateway.clone();
+                        async move {
+                            let auth = Self::extract_auth(&headers);
+                            log.record(
+                                "POST",
+                                "/v1/mcp/tools/call",
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
+                            gateway.call(&headers, &body)
+                        }
+                    }
+                }),
+            )
+            .route(
                 "/v1/user",
                 get(
                     move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
@@ -1200,6 +1756,9 @@ impl MockInferenceServer {
                         let user_tier = user_tier.clone();
                         let user_team = user_team.clone();
                         let user_can_administer_team = user_can_administer_team.clone();
+                        let user_opt_out = user_opt_out.clone();
+                        let user_info_released = user_info_released.clone();
+                        let user_info_arrivals = user_info_arrivals.clone();
                         async move {
                             // Keep the query string in the log so tests can
                             // count `?include=subscription` checks separately
@@ -1209,6 +1768,12 @@ impl MockInferenceServer {
                                 _ => "/v1/user".to_owned(),
                             };
                             log.record("GET", &path, None, None, Vec::new());
+                            user_info_arrivals.send_modify(|count| *count += 1);
+                            let mut released = user_info_released.subscribe();
+                            if !*released.borrow_and_update() {
+                                let _ = released.wait_for(|ready| *ready).await;
+                            }
+                            let opt_out = *user_opt_out.read().unwrap();
                             let tier = user_tier.read().unwrap().clone();
                             let team = user_team.read().unwrap().clone();
                             let can_administer =
@@ -1218,6 +1783,9 @@ impl MockInferenceServer {
                                 "email": "mock-user@test.invalid",
                             });
                             if let Some(obj) = body.as_object_mut() {
+                                if let Some(opt_out) = opt_out {
+                                    obj.insert("codingDataRetentionOptOut".into(), json!(opt_out));
+                                }
                                 if let Some(t) = tier {
                                     obj.insert("subscriptionTier".into(), json!(t));
                                 }
@@ -1340,8 +1908,14 @@ impl MockInferenceServer {
 
 impl Drop for MockInferenceServer {
     fn drop(&mut self) {
+        self.overrides.release_parked_replies();
+        self.overrides.release_completions();
+        self.overrides.release_remaining_chunks();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if !std::thread::panicking() {
+            self.assert_no_script_violations();
         }
     }
 }
@@ -1349,6 +1923,113 @@ impl Drop for MockInferenceServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn installed_models_replace_boot_catalog_and_preserve_unmentioned_models() {
+        let server = MockInferenceServer::start().await.unwrap();
+        server.install_models(
+            &[MockModelEntry::new("one").with_system_prompt_label("One")],
+            &[],
+        );
+        server.install_models(&[MockModelEntry::new("two")], &[]);
+        let response: Value = reqwest::get(format!("{}/models", server.url()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let models = response["data"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "two");
+        assert_eq!(models[1]["id"], "one");
+        assert_eq!(models[1]["systemPromptLabel"], "One");
+    }
+
+    #[tokio::test]
+    async fn user_info_hold_observes_arrival_then_releases_retention_flag() {
+        let server = MockInferenceServer::start().await.unwrap();
+        server.set_user_coding_data_retention_opt_out(Some(true));
+        server.hold_user_info();
+        let url = format!("{}/user", server.url());
+        let pending = tokio::spawn(async move { reqwest::get(url).await.unwrap() });
+        server.user_info_arrived(1).await;
+        assert!(!pending.is_finished());
+        server.release_user_info();
+        let response = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["codingDataRetentionOptOut"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_startup_fetch_is_counted() {
+        let server = MockInferenceServer::start().await.unwrap();
+        server.set_startup_fetch_delay(Duration::from_millis(1));
+        reqwest::get(format!("{}/models", server.url()))
+            .await
+            .unwrap();
+        assert_eq!(server.startup_stalls_served(), 1);
+        server.clear_startup_fetch_stall();
+        reqwest::get(format!("{}/models", server.url()))
+            .await
+            .unwrap();
+        assert_eq!(server.startup_stalls_served(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_scripts_route_failures_and_replies_on_all_endpoints() {
+        for endpoint in [
+            InferenceEndpoint::ChatCompletions,
+            InferenceEndpoint::Responses,
+            InferenceEndpoint::Messages,
+        ] {
+            let server = MockInferenceServer::start_with_required_auth(
+                vec![MockModelEntry::new("test-model")],
+                "secret",
+            )
+            .await
+            .unwrap();
+            server.set_capture_request_bytes(true);
+            server.set_conversations([Conversation::nth(1)
+                .refuse(crate::StatusFailure::new(503))
+                .reply("scripted answer")]);
+            let body = r#"{ "model":"test-model", "messages":[{"role":"user","content":"hi"}] }"#;
+            let url = format!("{}{}?capture=yes", server.origin(), endpoint.path());
+            let client = reqwest::Client::new();
+            let send = || {
+                client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("x-grok-turn-idx", "1")
+                    .header("x-grok-session-id", "session-1")
+                    .header("authorization", "Bearer secret")
+                    .body(body)
+                    .send()
+            };
+            assert_eq!(
+                send().await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let answer = send().await.unwrap();
+            assert_eq!(answer.status(), StatusCode::OK);
+            assert!(answer.text().await.unwrap().contains("scripted"));
+            let entries = server.requests();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].conversation, Some(1));
+            assert_eq!(entries[0].raw_body.as_deref(), Some(body));
+            assert_eq!(entries[0].query.as_deref(), Some("capture=yes"));
+            assert_eq!(
+                entries[0].observed_failure,
+                Some(ObservedFailure::Status(503))
+            );
+            assert_eq!(server.conversation(1).unwrap().requests().len(), 2);
+            assert!(server.script_violations().is_empty());
+        }
+    }
 
     const MERMAID_TEXT: &str =
         "Here is a flow:\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\nDone.\n";

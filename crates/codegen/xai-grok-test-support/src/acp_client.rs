@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+pub use crate::acp_harness::GrokStdioClient;
 use crate::scaled;
 
 use agent_client_protocol::{self as acp, Agent as _};
@@ -112,14 +113,14 @@ impl acp::Client for TestAcpClient {
 ///
 /// Handles the full lifecycle: spawn → initialize → authenticate → session → prompt.
 /// Child process is killed on drop.
-pub struct GrokStdioClient {
+pub struct LegacyGrokStdioClient {
     conn: acp::ClientSideConnection,
     process: TestProcess,
     sandbox: Option<TestSandbox>,
     capture: Arc<TextCapture>,
 }
 
-impl GrokStdioClient {
+impl LegacyGrokStdioClient {
     pub async fn spawn(server: &MockInferenceServer, cwd: &Path) -> Self {
         Self::spawn_with_sandbox(server, cwd, TestSandbox::new()).await
     }

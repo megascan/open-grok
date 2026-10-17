@@ -1216,3 +1216,10 @@ mod tests {
         assert_eq!(created["type"], "response.created");
     }
 }
+pub use crate::replay_sse::{
+    UsageReport, chat_completion_script_chunks, chat_completions_no_content_events,
+    messages_api_no_content_events, messages_api_script, messages_api_script_chunks,
+    responses_api_completed_only_events, responses_api_script_chunks,
+    responses_api_with_doom_loop_frame_after_text, with_doom_loop_frame_before_completed,
+    with_doom_loop_frame_before_type, with_terminal_output_items,
+};
