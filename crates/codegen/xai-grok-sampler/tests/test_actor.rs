@@ -375,6 +375,105 @@ async fn chat_stream_without_unused_chunk_metadata_completes_without_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_eof_without_finish_reason_retries_and_accepts_only_complete_response() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let events = if attempt == 0 {
+                    vec![
+                        text_chunk_event("partial", false),
+                        Event::default().data("[DONE]"),
+                    ]
+                } else {
+                    vec![
+                        text_chunk_event("complete", true),
+                        Event::default().data("[DONE]"),
+                    ]
+                };
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.submit(RequestId::from("chat-eof-retry"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SamplingEvent::Retrying { .. }))
+    );
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { response, .. }) if response.assistant_text() == "complete")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SamplingEvent::Completed { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_eof_after_output_respects_retry_only_before_output() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = vec![
+                    text_chunk_event("partial", false),
+                    Event::default().data("[DONE]"),
+                ];
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let policy = RetryPolicy {
+        retry_only_before_output: true,
+        ..RetryPolicy::default()
+    };
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        policy,
+        event_tx,
+    );
+    handle.submit(RequestId::from("chat-eof-no-retry"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::Retrying { .. } | SamplingEvent::Completed { .. }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kimi_chat_request_uses_provider_key_and_standard_function_tools() {
     use std::sync::Mutex;
 

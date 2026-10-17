@@ -78,7 +78,7 @@ pub fn stream_chat_completions<'a>(
         //
         // Chat Completions has no per-call "arguments done" signal, so
         // completion is inferred only once the chunk carrying `finish_reason`
-        // has been processed or the stream ends. Parallel calls may interleave
+        // has been processed. Parallel calls may interleave
         // arbitrarily, so a later index never proves an earlier call is done.
         let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
 
@@ -268,17 +268,18 @@ pub fn stream_chat_completions<'a>(
             }
         }
 
-        // Streams that end without a `finish_reason` chunk still finalize
-        // every started call before the response is assembled.
-        for (index, (id, name, _)) in tool_call_acc.iter() {
-            if arguments_complete_emitted.insert(*index) {
-                yield SamplingEvent::ToolCallArgumentsComplete {
-                    request_id: request_id.clone(),
-                    tool_index: *index,
-                    id: Some(id.clone()),
-                    name: Some(name.clone()),
-                };
-            }
+        // EOF (including [DONE] without a finish chunk) does not establish
+        // that streamed text or tool arguments are complete. Retry through the
+        // normal transport-error path and never finalize partial tool calls.
+        if finish_reason.is_none() {
+            let err = SamplingError::EventStreamError(
+                "Chat Completions stream ended without a finish_reason".to_string(),
+            );
+            yield SamplingEvent::Failed {
+                request_id: request_id.clone(),
+                error: SamplingErrorInfo::from(&err),
+            };
+            return;
         }
 
         // ── Build the final response ─────────────────────────────────
@@ -291,8 +292,7 @@ pub fn stream_chat_completions<'a>(
             })
             .collect();
 
-        // Honor tool calls by overriding the stop reason if the model
-        // forgot to set it (mirrors the shell's behavior).
+        // Honor tool calls even if the provider used a generic stop reason.
         if !tool_calls.is_empty() && finish_reason != Some(StopReason::Length) {
             finish_reason = Some(StopReason::ToolCalls);
         }
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_stream_yields_started_then_completed() {
+    async fn empty_stream_yields_started_then_retryable_failure() {
         let raw = stream::iter(Vec::<Result<ChatCompletionChunk, SamplingError>>::new()).boxed();
         let events = collect(stream_chat_completions(
             raw,
@@ -432,12 +432,7 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], SamplingEvent::StreamStarted { .. }));
-        match &events[1] {
-            SamplingEvent::Completed { response, .. } => {
-                assert!(response.is_empty());
-            }
-            other => panic!("expected Completed, got {other:?}"),
-        }
+        assert!(matches!(&events[1], SamplingEvent::Failed { error, .. } if error.is_retryable));
     }
 
     #[tokio::test]
@@ -483,6 +478,29 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn partial_text_at_eof_without_finish_reason_fails() {
+        let raw = stream::iter(vec![Ok(text_chunk("partial"))]).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+        assert!(events.iter().any(
+            |event| matches!(event, SamplingEvent::ChannelToken { text, .. } if text == "partial")
+        ));
+        assert!(
+            matches!(events.last(), Some(SamplingEvent::Failed { error, .. }) if error.is_retryable)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SamplingEvent::Completed { .. }))
+        );
     }
 
     #[tokio::test]
@@ -957,6 +975,7 @@ mod tests {
         let raw = stream::iter::<Vec<Result<ChatCompletionChunk, SamplingError>>>(vec![
             Ok(chunk1),
             Ok(chunk2),
+            Ok(final_chunk(FinishReason::ToolCalls)),
         ])
         .boxed();
         let events = collect(stream_chat_completions(
@@ -1297,10 +1316,8 @@ mod tests {
         }
     }
 
-    /// Streams that end without a finish_reason chunk still finalize every
-    /// started call before Completed.
     #[tokio::test]
-    async fn tool_call_completion_flushes_at_stream_end_without_finish_reason() {
+    async fn tool_call_at_eof_without_finish_reason_fails_without_finalizing() {
         let raw = stream::iter(vec![Ok(tool_delta_chunk(
             0,
             Some("call_z"),
@@ -1315,11 +1332,15 @@ mod tests {
             Duration::from_secs(60),
         ))
         .await;
-        assert_eq!(completes(&events), vec![0]);
-        assert!(matches!(
-            events.last().unwrap(),
-            SamplingEvent::Completed { .. }
-        ));
+        assert!(completes(&events).is_empty());
+        assert!(
+            matches!(events.last(), Some(SamplingEvent::Failed { error, .. }) if error.is_retryable)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SamplingEvent::Completed { .. }))
+        );
     }
 
     #[tokio::test]

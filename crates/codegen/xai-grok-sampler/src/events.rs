@@ -98,7 +98,7 @@ pub enum SamplingEvent {
     /// `content_block_stop` for complete JSON input; ambiguous empty placeholders
     /// wait for a known non-truncated stop. Chat Completions has no
     /// per-call completion signal and calls may interleave, so it completes
-    /// calls only at `finish_reason` or stream end.
+    /// calls only at `finish_reason`.
     ///
     /// Never emitted after `Completed`/`Failed` for that call. `id`/`name`
     /// repeat the identity only when this event is the first to carry it;
@@ -280,11 +280,9 @@ pub struct SamplingErrorInfo {
 
 /// Coarse-grained classification of a sampling failure.
 ///
-/// Intentionally narrow — context-window-exceeded does NOT have its own
-/// variant because the sampler cannot reliably detect it (it lacks
-/// tracked token counts). Context-window errors arrive as
-/// `Api { status: 400, .. }` with model metadata; the session inspects
-/// the metadata and decides whether to compact.
+/// Intentionally narrow — context-window-exceeded does not have its own
+/// variant. The session uses a provider error code or message, and any
+/// available model metadata and token estimate, to decide whether to compact.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SamplingErrorKind {
     Auth,
