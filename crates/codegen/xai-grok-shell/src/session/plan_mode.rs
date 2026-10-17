@@ -81,6 +81,9 @@ pub struct PlanModeTracker {
     /// Lives inside the session directory:
     /// `~/.opengrok/sessions/<cwd>/<session_id>/plan.md`
     plan_file_path: PathBuf,
+    /// Production captures the trusted Open Grok home at session startup.
+    /// `None` is reserved for isolated trackers used outside session startup.
+    plan_file_root: Option<Result<xai_grok_tools::types::resources::PlanFileRoot, String>>,
 }
 /// A buffered mid-turn activation reminder plus the state needed to roll the
 /// activation back if it is withdrawn before delivery.
@@ -122,6 +125,7 @@ impl PlanModeTracker {
             awaiting_plan_approval: false,
             pending_activation: None,
             plan_file_path: session_dir.join("plan.md"),
+            plan_file_root: None,
         }
     }
     /// Restore a tracker from a persisted snapshot.
@@ -152,7 +156,23 @@ impl PlanModeTracker {
             awaiting_plan_approval: snapshot.awaiting_plan_approval,
             pending_activation: None,
             plan_file_path: session_dir.join("plan.md"),
+            plan_file_root: None,
         }
+    }
+    pub(crate) fn set_plan_file_root(
+        &mut self,
+        root: Result<
+            xai_grok_tools::types::resources::PlanFileRoot,
+            xai_grok_tools::computer::types::ComputerError,
+        >,
+    ) {
+        self.plan_file_root = Some(root.map_err(|error| error.to_string()));
+    }
+
+    pub(crate) fn plan_file_root(
+        &self,
+    ) -> Option<Result<xai_grok_tools::types::resources::PlanFileRoot, String>> {
+        self.plan_file_root.clone()
     }
     pub(crate) fn set_permission_handle(
         &mut self,
@@ -225,7 +245,19 @@ impl PlanModeTracker {
     /// targets the plan file. Used to bypass the permission prompt for
     /// plan file edits during plan mode.
     pub(crate) fn should_auto_approve_edit(&self, edit_path: &Path) -> bool {
-        self.is_active() && is_plan_file_write(edit_path, &self.plan_file_path)
+        self.is_active()
+            && is_plan_file_write(edit_path, &self.plan_file_path)
+            && self.plan_file_is_safe()
+    }
+
+    /// The plan exception only applies to a regular file or a new file. The
+    /// write implementation must also enforce this at open time, since this
+    /// preflight alone cannot prevent a concurrent symlink replacement.
+    pub(crate) fn plan_file_is_safe(&self) -> bool {
+        match std::fs::symlink_metadata(&self.plan_file_path) {
+            Ok(metadata) => metadata.file_type().is_file(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
     }
     /// Whether the next reminder should be the full variant.
     /// Even count = full, odd count = sparse.

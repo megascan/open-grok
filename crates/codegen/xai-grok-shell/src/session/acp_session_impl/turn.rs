@@ -342,7 +342,7 @@ impl SessionActor {
         }
         user_images
     }
-    pub(super) fn persist_host_turn_user_echo(&self, text: &str, prompt_id: &str) {
+    pub(super) fn persist_host_turn_user_echo(&self, text: &str, input_origin: &InputOrigin) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -352,7 +352,10 @@ impl SessionActor {
             crate::session::storage::HOST_TURN_META_KEY.into(),
             serde_json::json!(true),
         );
-        if super::super::PromptOrigin::from_prompt_id(prompt_id).hide_user_echo_from_scrollback() {
+        if input_origin
+            .as_prompt_origin()
+            .hide_user_echo_from_scrollback()
+        {
             chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
         }
         let update = acp::SessionUpdate::UserMessageChunk(
@@ -652,7 +655,10 @@ impl SessionActor {
                                 vec![text_block(reminder)]
                             }
                             GoalResumeOutcome::Message(msg) => {
-                                self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.persist_host_turn_user_echo(
+                                    &original_prompt_text,
+                                    &input_origin,
+                                );
                                 self.mark_front_message_committed().await;
                                 self.send_host_turn_slash_command_output(&msg).await;
                                 return ok_end_turn(0, None);
@@ -663,7 +669,7 @@ impl SessionActor {
                         let Some(workflow_registry) = workflow_registry.as_ref() else {
                             unreachable!("workflow slash commands require human authority")
                         };
-                        self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        self.persist_host_turn_user_echo(&original_prompt_text, &input_origin);
                         self.mark_front_message_committed().await;
                         let msg = self
                             .launch_named_workflow(workflow_registry, &name, &input)
@@ -673,7 +679,7 @@ impl SessionActor {
                     }
                     _ => {
                         if policy.authority.is_human_intent() {
-                            self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                            self.persist_host_turn_user_echo(&original_prompt_text, &input_origin);
                         }
                         return self.execute_builtin_slash_command(action).await;
                     }
@@ -821,6 +827,9 @@ impl SessionActor {
         );
         if origin.hide_user_echo_from_scrollback() {
             chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+        }
+        if policy.authority == InputAuthority::ModelAuthoredUntrusted {
+            chunk_meta.insert("syntheticReason".into(), serde_json::json!("agent_message"));
         }
         let user_chunk_meta = Some(chunk_meta);
         let text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
@@ -1134,8 +1143,7 @@ impl SessionActor {
                 if trace_gcs_config.is_some() {
                     self.chat_state_handle.begin_turn_capture();
                 }
-                let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-                let mut user_chat = match &origin {
+                let mut user_chat = match origin {
                     super::super::PromptOrigin::TaskCompleted { .. } => {
                         ConversationItem::task_completed(user_message)
                     }
@@ -4318,6 +4326,7 @@ impl SessionActor {
                     // it so a following direct dispatch is counted normally.
                     self.events.tool_finished();
                     if let Some(stop) = self.current_hook_stop() {
+                        self.flush_code_mode_hook_followups();
                         return Ok(hook_stop_outcome(stop));
                     }
                     continue;
@@ -4377,6 +4386,11 @@ impl SessionActor {
                     }
                     _ => {}
                 }
+            } else {
+                // Nested hooks are buffered until the enclosing transport
+                // output is recorded. An exec-only round has no ordinary
+                // dispatch to perform that flush for us.
+                self.flush_code_mode_hook_followups();
             }
             if self
                 .events

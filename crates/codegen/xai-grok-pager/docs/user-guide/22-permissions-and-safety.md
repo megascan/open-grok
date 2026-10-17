@@ -130,20 +130,22 @@ Open Grok can still load Claude-style permission **rules** from managed settings
 
 When the model requests a tool, the following checks happen in order:
 
-1. **`PreToolUse` hooks**. A hook can deny a tool call before any other check. A hook that allows a call does not skip the checks below; it only declines to deny. See [10-hooks.md](10-hooks.md).
+1. **Plan mode and `PreToolUse` hooks**. Plan mode restricts edits to the session plan file, including after a hook rewrites a call. A hook can deny a tool call, and a hook that allows a call does not skip the checks below. See [19-plan-mode.md](19-plan-mode.md) and [10-hooks.md](10-hooks.md).
 
 2. **Permission rules** (from configuration files or `--allow`/`--deny` flags)
    - A matching `deny` rule rejects the call. `deny` wins over every other rule.
    - A matching `ask` rule prompts you, including for file reads, searches, and shell commands that would otherwise be auto-approved.
    - A matching `allow` rule approves the call.
 
-3. **Remembered grants**. Per-command approvals you saved from earlier prompts apply here, scoped to the current project. An existing grant can satisfy an `ask` rule instead of re-prompting. Commands on the [dangerous list](#dangerous-commands) prompt again rather than using a remembered prefix. See [Interactive Approvals](#interactive-approvals-and-where-they-persist).
+3. **Remembered grants**. Per-command approvals you saved from earlier prompts apply here, scoped to the current project. An existing command grant can satisfy a shell `ask` rule; an edit `ask` rule still prompts despite a remembered edit grant. Commands on the [dangerous list](#dangerous-commands) prompt again rather than using a remembered prefix. See [Interactive Approvals](#interactive-approvals-and-where-they-persist).
 
 4. **Built-in auto-approvals**. Read-only tools and a fixed set of read-only shell commands run without prompting (see below).
 
 5. **Prompt policy** (set by the [permission mode](#permission-modes)): prompt you, auto-approve, or auto-deny the call.
 
 [Always-approve](#always-approve) short-circuits this pipeline after step 2: `deny` rules, hooks, and `ask` rules that match a shell command's segments still apply, but remembered grants (including remembered "never allow" entries) are not consulted, and `ask` rules on non-shell tools do not prompt.
+
+For `apply_patch`, Edit rules are checked against every file the patch adds, updates, deletes, or moves, including both sides of a move. A deny or ask on any target applies to the whole patch; a configured allow covers it only if it covers every target. A permitted plan-file edit is auto-approved unless a hook asks for approval. Safe plan writes require support from the active filesystem; if unavailable, the edit is rejected.
 
 ---
 

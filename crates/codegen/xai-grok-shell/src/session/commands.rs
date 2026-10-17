@@ -430,6 +430,9 @@ pub enum SessionCommand {
     },
     Prompt {
         prompt_id: String,
+        /// Explicit provenance for internally produced prompts. Older client
+        /// and runtime callers may leave this unset and use ID-based routing.
+        origin: Option<super::PromptOrigin>,
         prompt_blocks: Vec<acp::ContentBlock>,
         /// Prompt mode parsed from request `_meta.mode`.
         prompt_mode: PromptMode,

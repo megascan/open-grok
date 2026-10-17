@@ -735,6 +735,8 @@ pub(crate) struct PreparedToolCall {
     is_read_only: bool,
     /// Pathless edits (such as multi-file patches) exclude all file dispatches.
     is_edit: bool,
+    /// Capability scoped to the current plan-file write, when plan mode gates it.
+    plan_file: Option<xai_grok_tools::types::resources::PlanFile>,
     rewriting_hook: Option<String>,
     additional_context: Vec<xai_grok_hooks::dispatcher::AdditionalContext>,
 }
@@ -954,7 +956,7 @@ pub(crate) struct SessionActor {
     /// Pending mid-turn interjections from the user (Ctrl+Enter).
     /// Pushed by `SessionCommand::Interject` handler, drained at safe
     /// points in `process_conversation_turn`. Internally synchronized.
-    pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
+    pub(crate) pending_interjections: InterjectionBuffer,
     pub(crate) pending_native_agent_messages: Mutex<Vec<ConversationItem>>,
     pub(crate) code_mode_hook_followups: std::cell::RefCell<Vec<ConversationItem>>,
     pub(crate) hook_stop_latch: HookStopLatch,

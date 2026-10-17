@@ -311,6 +311,16 @@ pub(super) fn plan_mode_edit_gate(
         };
     }
     match access_kind {
+        AccessKind::Edit(_)
+            if !matches!(
+                tool_input,
+                ToolInput::SearchReplace(_) | ToolInput::HashlineEdit(_) | ToolInput::Write(_)
+            ) =>
+        {
+            // Only tools that consume the per-invocation plan capability may
+            // use the plan exception. Dynamic and future edit tools fail closed.
+            PlanEditGate::RejectNonPlanFile
+        }
         AccessKind::Edit(path) if !tracker.should_auto_approve_edit(Path::new(path)) => {
             PlanEditGate::RejectNonPlanFile
         }
@@ -339,7 +349,7 @@ fn apply_patch_only_edits_plan_file(
     let Ok(parsed) = parse_patch(&input.patch) else {
         return false;
     };
-    if parsed.hunks.is_empty() {
+    if parsed.hunks.is_empty() || !tracker.plan_file_is_safe() {
         return false;
     }
     let Some(plan_file) = canonical_file_target(tracker.plan_file_path()) else {
@@ -361,6 +371,81 @@ fn apply_patch_only_edits_plan_file(
         };
         canonical_file_target(&cwd.join(path)).is_some_and(|target| target == plan_file)
     })
+}
+
+fn plan_edit_auto_approved(
+    tracker: &crate::session::plan_mode::PlanModeTracker,
+    input: &ToolInput,
+    access: &AccessKind,
+    cwd: &Path,
+    hook_asks: bool,
+) -> bool {
+    if hook_asks {
+        return false;
+    }
+    match input {
+        ToolInput::ApplyPatch(patch) => {
+            tracker.is_active() && apply_patch_only_edits_plan_file(tracker, patch, cwd)
+        }
+        _ => match access {
+            AccessKind::Edit(path) => tracker.should_auto_approve_edit(Path::new(path)),
+            _ => false,
+        },
+    }
+}
+
+/// A call may have waited for permission or a file lock since preparation.
+/// Once plan mode activates, only an edit carrying the capability acquired
+/// for this plan can be admitted; subagent tasks keep their existing exemption.
+fn plan_dispatch_allowed(
+    tracker: &crate::session::plan_mode::PlanModeTracker,
+    prepared: &PreparedToolCall,
+    is_task: bool,
+) -> bool {
+    !tracker.is_active()
+        || !prepared.is_edit
+        || is_task
+        || prepared
+            .plan_file
+            .as_ref()
+            .is_some_and(|plan| plan.path() == tracker.plan_file_path())
+}
+
+/// Resolve every path a patch will write, delete, or move using the same cwd
+/// and parser as the patch tool. Inspect the effective input after hooks.
+fn patch_edit_targets(tool_input: &ToolInput, cwd: &Path) -> Result<Option<Vec<String>>, String> {
+    use xai_grok_tools::implementations::codex::apply_patch::{Hunk, parse_patch};
+
+    let ToolInput::ApplyPatch(input) = tool_input else {
+        return Ok(None);
+    };
+    let parsed = parse_patch(&input.patch).map_err(|error| format!("Invalid patch: {error}"))?;
+    if parsed.hunks.is_empty() {
+        return Err("Patch has no file targets".to_owned());
+    }
+    let mut targets = Vec::new();
+    for hunk in &parsed.hunks {
+        let mut add = |path: &Path| -> Result<(), String> {
+            let resolved = cwd.join(path);
+            let target = resolved
+                .to_str()
+                .ok_or_else(|| "Patch target is not valid UTF-8".to_owned())?;
+            targets.push(target.to_owned());
+            Ok(())
+        };
+        match hunk {
+            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => add(path)?,
+            Hunk::UpdateFile {
+                path, move_path, ..
+            } => {
+                add(path)?;
+                if let Some(destination) = move_path {
+                    add(destination)?;
+                }
+            }
+        }
+    }
+    Ok(Some(targets))
 }
 /// Typed view of an `exit_plan_mode` approval decision. The wire type
 /// (`ExitPlanModeExtResponse`) carries `outcome` as a string; both the mid-turn
@@ -539,7 +624,6 @@ impl SessionActor {
                 .await?;
             }
         }
-        deferred_followups.extend(self.code_mode_hook_followups.borrow_mut().drain(..));
         {
             let _span = if !deferred_followups.is_empty() {
                 Some(
@@ -556,12 +640,21 @@ impl SessionActor {
                 self.chat_state_handle.push_user_message(chat);
             }
         }
+        self.flush_code_mode_hook_followups();
         self.drain_interjections_at_safe_point().await;
         self.flush_pending_skill_reminders().await;
         if let Some(final_result) = final_result {
             return Ok(final_result);
         }
         Ok(ToolLoop::Continue)
+    }
+
+    /// Deliver nested Code Mode hook context once, even when no direct tool
+    /// batch follows the control call that collected it.
+    pub(super) fn flush_code_mode_hook_followups(&self) {
+        for chat in self.code_mode_hook_followups.borrow_mut().drain(..) {
+            self.chat_state_handle.push_user_message(chat);
+        }
     }
     async fn reject_excess_media_gen_calls(
         &self,
@@ -807,6 +900,7 @@ impl SessionActor {
         let turn = i64::try_from(self.current_turn_number.get()).ok();
         let display_cwd = self.display_cwd.get().cloned();
         let hook_stop_token = self.current_hook_stop_token();
+        let plan_mode = self.plan_mode.clone();
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -827,6 +921,9 @@ impl SessionActor {
                 let display_cwd = display_cwd.clone();
                 let hook_stop_token = hook_stop_token.clone();
                 let delivery_scope = delivery_scope.clone();
+                let plan_mode = plan_mode.clone();
+                let is_task = path_toolset.tool_kind_map().get(&prepared.tool_name)
+                    == Some(&xai_grok_tools::types::tool::ToolKind::Task);
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, prepared.authored_arguments())
                         || (native_agents_enabled && prepared.tool_name == "wait_agent");
@@ -889,6 +986,7 @@ impl SessionActor {
                         let origin = origin.clone();
                         let hook_stop_token = hook_stop_token.clone();
                         let delivery_scope = delivery_scope.clone();
+                        let plan_mode = plan_mode.clone();
                         async move {
                             let slot =
                                 xai_grok_tools::types::source_summary::SourceSummarySlot::new();
@@ -903,6 +1001,12 @@ impl SessionActor {
                                     return Err(xai_tool_runtime::ToolError::new(
                                         xai_tool_runtime::ToolErrorKind::Cancelled,
                                         "Tool execution stopped by a hook".to_string(),
+                                    ));
+                                }
+                                if !plan_dispatch_allowed(&plan_mode.lock(), &prepared, is_task) {
+                                    return Err(xai_tool_runtime::ToolError::custom(
+                                        "plan_mode_changed",
+                                        "Tool was not executed because plan mode became active; only the plan file may be edited".to_owned(),
                                     ));
                                 }
                                 dispatch_observed(
@@ -1560,6 +1664,8 @@ impl SessionActor {
                 },
             );
         let path_toolset = self.agent.borrow().tool_bridge().toolset();
+        let is_task = path_toolset.tool_kind_map().get(&prepared.tool_name)
+            == Some(&xai_grok_tools::types::tool::ToolKind::Task);
         let lock_path =
             lock_path_for_prepared(&prepared, self.tool_context.cwd.as_path(), &path_toolset);
         let dispatch = || async {
@@ -1575,6 +1681,12 @@ impl SessionActor {
                 return Err(xai_tool_runtime::ToolError::new(
                     xai_tool_runtime::ToolErrorKind::Cancelled,
                     "Code Mode tool execution stopped with its turn".to_string(),
+                ));
+            }
+            if !plan_dispatch_allowed(&self.plan_mode.lock(), &prepared, is_task) {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "plan_mode_changed",
+                    "Tool was not executed because plan mode became active; only the plan file may be edited".to_owned(),
                 ));
             }
             dispatch_code_mode_nested_tool_streaming(
@@ -1737,9 +1849,13 @@ impl SessionActor {
                     if let Some(scrollback) = scrollback {
                         self.emit_post_tool_use_scrollback(scrollback).await;
                     }
-                    self.code_mode_hook_followups
-                        .borrow_mut()
-                        .extend(self.tool_hook_followups(&prepared, delivery, failure_contexts));
+                    if !cancellation_token.is_cancelled()
+                        && self.hook_stop_identity().as_ref() == Some(&identity)
+                    {
+                        self.code_mode_hook_followups.borrow_mut().extend(
+                            self.tool_hook_followups(&prepared, delivery, failure_contexts),
+                        );
+                    }
                     bridge_result.map_err(|error| error.to_string())?;
                     if let Some(evidence) = trusted_nested_evidence
                         && self.memory.uses_legacy_pipeline()
@@ -1776,9 +1892,13 @@ impl SessionActor {
                 let failure_contexts = self
                     .dispatch_tool_failure(&prepared, message.clone(), duration_ms)
                     .await;
-                self.code_mode_hook_followups
-                    .borrow_mut()
-                    .extend(self.tool_hook_followups(&prepared, None, failure_contexts));
+                if !cancellation_token.is_cancelled()
+                    && self.hook_stop_identity().as_ref() == Some(&identity)
+                {
+                    self.code_mode_hook_followups
+                        .borrow_mut()
+                        .extend(self.tool_hook_followups(&prepared, None, failure_contexts));
+                }
                 Err(message)
             }
         };
@@ -2399,12 +2519,25 @@ impl SessionActor {
             }
         }
         let access_kind = AccessKind::from(&tool_input);
-        let plan_gate = plan_mode_edit_gate(
-            &self.plan_mode.lock(),
-            &tool_input,
-            &access_kind,
-            self.tool_context.cwd.as_path(),
-        );
+        let (plan_gate, guarded_plan_path) = {
+            let tracker = self.plan_mode.lock();
+            let gate = plan_mode_edit_gate(
+                &tracker,
+                &tool_input,
+                &access_kind,
+                self.tool_context.cwd.as_path(),
+            );
+            let target = (tracker.is_active()
+                && matches!(access_kind, AccessKind::Edit(_))
+                && !matches!(tool_input, ToolInput::Task(_)))
+            .then(|| {
+                (
+                    tracker.plan_file_path().to_path_buf(),
+                    tracker.plan_file_root(),
+                )
+            });
+            (gate, target)
+        };
         if plan_gate != PlanEditGate::Allow {
             tracing::info_span!(
                 "tool.decision",
@@ -2420,6 +2553,59 @@ impl SessionActor {
                 .await?;
             return Ok(Err(ToolLoop::Continue));
         }
+        let plan_file = if let Some((path, trusted_root)) = guarded_plan_path {
+            let backend = match &self.workspace_ops {
+                xai_grok_workspace::WorkspaceOps::Local { handle } => {
+                    if let Some(session) = handle.session(&self.session_id_string()) {
+                        let toolset = session.toolset();
+                        let resources = toolset.resources.lock().await;
+                        resources
+                            .get::<xai_grok_tools::types::resources::FileSystem>()
+                            .map(|fs| fs.0.clone())
+                    } else {
+                        None
+                    }
+                }
+                xai_grok_workspace::WorkspaceOps::Proxy { .. } => None,
+            };
+            let capability = match (backend, trusted_root) {
+                (Some(fs), Some(Ok(root))) => fs
+                    .open_plan_file_at(&path, &root)
+                    .await
+                    .map_err(|error| error.to_string()),
+                (Some(_), Some(Err(error))) => Err(error),
+                // Isolated trackers in tests use the strict filesystem-root traversal.
+                (Some(fs), None) => fs
+                    .open_plan_file(&path)
+                    .await
+                    .map_err(|error| error.to_string()),
+                (None, _) => {
+                    Err("the active workspace cannot safely write the plan file".to_owned())
+                }
+            };
+            match capability {
+                Ok(capability) => Some(capability),
+                Err(error) => {
+                    self.handle_tool_not_executed(
+                        &call.id,
+                        &tool_call_id,
+                        format!("Cannot safely edit the plan file: {error}"),
+                    )
+                    .await?;
+                    return Ok(Err(ToolLoop::Continue));
+                }
+            }
+        } else {
+            None
+        };
+        let edit_targets = match patch_edit_targets(&tool_input, self.tool_context.cwd.as_path()) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.handle_tool_not_executed(&call.id, &tool_call_id, error)
+                    .await?;
+                return Ok(Err(ToolLoop::Continue));
+            }
+        };
         let tool_call_display = mcp_preparation
             .approval(self, &tool_call_id, &call.function.name, &mut tool_input)
             .await;
@@ -2440,15 +2626,13 @@ impl SessionActor {
                 .await?;
             return Ok(Err(ToolLoop::Continue));
         }
-        let plan_file_auto_approve = if let AccessKind::Edit(ref path) = access_kind
-            && hook_ask.is_none()
-        {
-            self.plan_mode
-                .lock()
-                .should_auto_approve_edit(std::path::Path::new(path))
-        } else {
-            false
-        };
+        let plan_file_auto_approve = plan_edit_auto_approved(
+            &self.plan_mode.lock(),
+            &tool_input,
+            &access_kind,
+            self.tool_context.cwd.as_path(),
+            hook_ask.is_some(),
+        );
         let swarm_parent_auto_approve = resolved_tool_name == "agent_swarm" && hook_ask.is_none();
         if plan_file_auto_approve || swarm_parent_auto_approve {
             tracing::info_span!(
@@ -2556,6 +2740,7 @@ impl SessionActor {
                 self.permissions
                     .request_with_context(PermissionRequest {
                         access: access_kind.clone(),
+                        edit_targets,
                         tool_call_update,
                         path_context,
                         session_id: Some(self.session_info.id.0.to_string()),
@@ -2869,6 +3054,7 @@ impl SessionActor {
             dispatch_target_name,
             is_read_only,
             is_edit: matches!(access_kind, AccessKind::Edit(_)),
+            plan_file,
             rewriting_hook,
             additional_context: hook_additional_context,
         };
@@ -4795,7 +4981,7 @@ mod exit_plan_intercept_tests {
 }
 #[cfg(test)]
 mod plan_mode_edit_gate_tests {
-    use super::{PlanEditGate, plan_mode_edit_gate};
+    use super::{PlanEditGate, patch_edit_targets, plan_edit_auto_approved, plan_mode_edit_gate};
     use crate::session::plan_mode::PlanModeTracker;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -4883,6 +5069,17 @@ mod plan_mode_edit_gate_tests {
     }
 
     #[test]
+    fn unguarded_dynamic_edit_is_rejected_even_for_plan_file() {
+        let fixture = active_fixture();
+        let input = ToolInput::Dynamic(serde_json::json!({
+            "filePath": fixture.tracker.plan_file_path(),
+            "oldString": "old",
+            "newString": "new"
+        }));
+        assert_eq!(gate(&fixture, &input), PlanEditGate::RejectNonPlanFile);
+    }
+
+    #[test]
     fn apply_patch_plan_add_or_update_allowed() {
         let fixture = active_fixture();
         assert_eq!(
@@ -4903,6 +5100,533 @@ mod plan_mode_edit_gate_tests {
             ),
             PlanEditGate::Allow
         );
+    }
+
+    #[test]
+    fn patch_targets_include_move_source_and_destination_and_all_hunks() {
+        let fixture = active_fixture();
+        let patch = apply_patch(
+            "*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: secrets/a.rs\n@@\n-old\n+new\n*** Add File: src/b.rs\n+new\n*** Delete File: src/c.rs\n*** End Patch",
+        );
+        let actual = patch_edit_targets(&patch, &fixture.cwd).unwrap().unwrap();
+        let expected = ["src/a.rs", "secrets/a.rs", "src/b.rs", "src/c.rs"]
+            .into_iter()
+            .map(|path| fixture.cwd.join(path).to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(patch_edit_targets(&apply_patch("invalid"), &fixture.cwd).is_err());
+    }
+
+    #[test]
+    fn patch_permissions_cover_rewritten_and_nested_calls() {
+        use super::super::support::{
+            create_test_actor, install_pre_tool_use_hooks, pre_tool_use_spec,
+            run_on_session_sized_stack, test_agent_with_tools,
+        };
+        use xai_grok_workspace::permission::types::{
+            PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+
+        run_on_session_sized_stack(|| {
+            Box::pin(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = msg {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+                *actor.agent.borrow_mut() = test_agent_with_tools(vec![
+                    xai_grok_tools::registry::types::ToolConfig::from_id("Codex:apply_patch"),
+                ])
+                .await;
+                let cwd = actor.tool_context.cwd.as_path().to_path_buf();
+                std::fs::create_dir_all(cwd.join("src")).unwrap();
+                std::fs::create_dir_all(cwd.join("secrets")).unwrap();
+                let safe = cwd.join("src/safe.txt");
+                let secret = cwd.join("secrets/token.txt");
+                let safe_patch = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+safe\n*** End Patch",
+                    safe.display()
+                );
+                let mixed_patch = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+safe\n*** Add File: {}\n+secret\n*** End Patch",
+                    safe.display(),
+                    secret.display()
+                );
+                let config = PermissionConfig::new(vec![PermissionRule {
+                    action: RuleAction::Deny,
+                    tool: ToolFilter::Edit,
+                    pattern: Some("**/secrets/**".into()),
+                    pattern_mode: PatternMode::Glob,
+                }]);
+                let (handle, _events) = xai_grok_workspace::permission::spawn_permission_manager(
+                    actor.session_info.id.clone(),
+                    actor.notifications.gateway.clone(),
+                    xai_grok_paths::AbsPathBuf::new(cwd.clone()).unwrap(),
+                    xai_grok_workspace::permission::ClientType::Generic,
+                    Some(config),
+                    vec![],
+                    vec![],
+                    true,
+                    None,
+                );
+                actor.permissions = handle;
+                let call = |id: &str, patch: &str| crate::sampling::types::ToolCallResponse {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: crate::sampling::types::ToolCallFunction::new(
+                        "apply_patch",
+                        serde_json::json!({"patch":patch}).to_string(),
+                    ),
+                };
+                let mut deferred = Vec::new();
+                assert!(
+                    actor
+                        .prepare_tool_call(call("safe", &safe_patch), &mut deferred, None)
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                assert!(matches!(
+                    actor
+                        .prepare_tool_call(call("mixed", &mixed_patch), &mut deferred, None)
+                        .await
+                        .unwrap(),
+                    Err(super::super::ToolLoop::Continue)
+                ));
+
+                let hook_output = serde_json::json!({"hookSpecificOutput":{"updatedInput":{"patch":mixed_patch}}}).to_string();
+                let script = format!("printf '%s' '{hook_output}'");
+                install_pre_tool_use_hooks(
+                    &mut actor,
+                    vec![pre_tool_use_spec("rewrite-patch", None, &script)],
+                );
+                assert!(matches!(
+                    actor
+                        .prepare_tool_call(call("rewritten", &safe_patch), &mut deferred, None)
+                        .await
+                        .unwrap(),
+                    Err(super::super::ToolLoop::Continue)
+                ));
+
+                let (handle, _receiver) =
+                    xai_grok_tools::notification::ToolNotificationHandle::bridge_channel();
+                let _delivery = handle.begin_turn_delivery();
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .unwrap()
+                    .tools_notification_handle = handle;
+                *actor.current_prompt_id.lock().unwrap() = Some("patch-permission-test".into());
+                let (progress, _receiver) =
+                    xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                let result = actor
+                    .dispatch_code_mode_nested_tool(
+                        xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                            cell_id: xai_grok_code_mode_protocol::CellId::new("patch-cell".into()),
+                            runtime_tool_call_id: "nested-patch".into(),
+                            tool_name: xai_grok_code_mode_protocol::ToolName::plain("apply_patch"),
+                            tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Freeform,
+                            input: Some(serde_json::Value::String(safe_patch)),
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                        progress,
+                    )
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "hook-rewritten nested patch must be denied: {result:?}"
+                );
+                assert!(!safe.exists() && !secret.exists());
+            })
+        });
+    }
+
+    #[test]
+    fn activating_plan_while_permission_waits_blocks_direct_and_nested_edits() {
+        use super::super::support::{
+            create_test_actor, install_permission_manager, read_and_edit_toolset,
+            run_on_session_sized_stack, search_replace_call_at, test_agent_with_tools,
+        };
+
+        run_on_session_sized_stack(|| {
+            Box::pin(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut actor =
+                    create_test_actor(0, 256_000, 85, gateway_tx.clone(), persistence_tx).await;
+                *actor.agent.borrow_mut() = test_agent_with_tools(read_and_edit_toolset()).await;
+                actor
+                    .workspace_ops
+                    .bind_local_session(
+                        &actor.session_id_string(),
+                        actor.tool_context.cwd.as_path().to_path_buf(),
+                        actor.tool_context.hunk_tracker_handle.clone(),
+                        actor.agent.borrow().tool_bridge().toolset(),
+                        None,
+                    )
+                    .unwrap();
+                install_permission_manager(
+                    &mut actor,
+                    false,
+                    xai_acp_lib::AcpAgentGatewaySender::new(gateway_tx),
+                );
+                let (delivery_handle, _delivery_rx) =
+                    xai_grok_tools::notification::ToolNotificationHandle::bridge_channel();
+                let _delivery = delivery_handle.begin_turn_delivery();
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .unwrap()
+                    .tools_notification_handle = delivery_handle;
+                *actor.current_prompt_id.lock().unwrap() = Some("plan-activation-test".into());
+                let target = actor.tool_context.cwd.as_path().join("source.txt");
+                std::fs::write(&target, "a").unwrap();
+                let target_str = target.to_str().unwrap().to_owned();
+                let actor = std::rc::Rc::new(actor);
+                let (pending_tx, mut pending_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::RequestPermission(args) => {
+                                let _ = pending_tx.send(args);
+                            }
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                let direct = {
+                    let actor = actor.clone();
+                    let target = target_str.clone();
+                    tokio::task::spawn_local(async move {
+                        actor
+                            .execute_tool_calls(
+                                vec![search_replace_call_at("direct-wait", &target)],
+                                None,
+                            )
+                            .await
+                    })
+                };
+                let prompt =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), pending_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                {
+                    let mut tracker = actor.plan_mode.lock();
+                    assert!(tracker.enter_pending());
+                    assert!(tracker.activate());
+                }
+                let _ = prompt.response_tx.send(Ok(
+                    agent_client_protocol::RequestPermissionResponse::new(
+                        agent_client_protocol::RequestPermissionOutcome::Selected(
+                            agent_client_protocol::SelectedPermissionOutcome::new(
+                                agent_client_protocol::PermissionOptionId::new("allow-once"),
+                            ),
+                        ),
+                    ),
+                ));
+                tokio::time::timeout(std::time::Duration::from_secs(5), direct)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "a");
+
+                *actor.plan_mode.lock() =
+                    PlanModeTracker::new(std::env::temp_dir().join("unused-plan"));
+                let held_lock = actor
+                    .tool_context
+                    .file_dispatch_locks
+                    .lock(None, false, true)
+                    .await;
+                let nested = {
+                    let actor = actor.clone();
+                    let target = target_str.clone();
+                    tokio::task::spawn_local(async move {
+                        let (progress, _receiver) =
+                            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                        actor.dispatch_code_mode_nested_tool(
+                        xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                            cell_id: xai_grok_code_mode_protocol::CellId::new("activation-cell".into()),
+                            runtime_tool_call_id: "nested-wait".into(),
+                            tool_name: xai_grok_code_mode_protocol::ToolName::plain("search_replace"),
+                            tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                            input: Some(serde_json::json!({"file_path":target,"old_string":"a","new_string":"b"})),
+                        }, tokio_util::sync::CancellationToken::new(), progress,
+                    ).await
+                    })
+                };
+                let prompt =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), pending_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                {
+                    let mut tracker = actor.plan_mode.lock();
+                    assert!(tracker.enter_pending());
+                    assert!(tracker.activate());
+                }
+                let _ = prompt.response_tx.send(Ok(
+                    agent_client_protocol::RequestPermissionResponse::new(
+                        agent_client_protocol::RequestPermissionOutcome::Selected(
+                            agent_client_protocol::SelectedPermissionOutcome::new(
+                                agent_client_protocol::PermissionOptionId::new("allow-once"),
+                            ),
+                        ),
+                    ),
+                ));
+                drop(held_lock);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), nested)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    result.is_err(),
+                    "nested edit must be rejected after plan activation"
+                );
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "a");
+            })
+        });
+    }
+
+    #[test]
+    fn plan_patch_auto_approval_respects_hook_ask() {
+        let fixture = active_fixture();
+        let patch = apply_patch(
+            "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** End Patch",
+        );
+        let access = AccessKind::from(&patch);
+        assert!(plan_edit_auto_approved(
+            &fixture.tracker,
+            &patch,
+            &access,
+            &fixture.cwd,
+            false
+        ));
+        assert!(!plan_edit_auto_approved(
+            &fixture.tracker,
+            &patch,
+            &access,
+            &fixture.cwd,
+            true
+        ));
+        let mixed = apply_patch(
+            "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** Add File: src/main.rs\n+bad\n*** End Patch",
+        );
+        assert!(!plan_edit_auto_approved(
+            &fixture.tracker,
+            &mixed,
+            &AccessKind::from(&mixed),
+            &fixture.cwd,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_patch_capability_is_used_in_direct_and_nested_dispatch() {
+        use super::super::support::{
+            create_test_actor, install_permission_manager, run_on_session_sized_stack,
+            test_agent_with_tools,
+        };
+
+        run_on_session_sized_stack(|| {
+            Box::pin(async {
+                let root = tempfile::tempdir().unwrap();
+                // On macOS the temporary directory may be spelled through /var.
+                let session_dir = dunce::canonicalize(root.path()).unwrap().join("session");
+                std::fs::create_dir(&session_dir).unwrap();
+                let plan = session_dir.join("plan.md");
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = msg {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+                *actor.agent.borrow_mut() = test_agent_with_tools(vec![
+                    xai_grok_tools::registry::types::ToolConfig::from_id("Codex:apply_patch"),
+                ])
+                .await;
+                actor
+                    .workspace_ops
+                    .bind_local_session(
+                        &actor.session_id_string(),
+                        actor.tool_context.cwd.as_path().to_path_buf(),
+                        actor.tool_context.hunk_tracker_handle.clone(),
+                        actor.agent.borrow().tool_bridge().toolset(),
+                        None,
+                    )
+                    .unwrap();
+                let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
+                drop(permission_rx); // An unexpected prompt cannot approve the plan patch.
+                install_permission_manager(
+                    &mut actor,
+                    false,
+                    xai_acp_lib::AcpAgentGatewaySender::new(permission_tx),
+                );
+                {
+                    let mut tracker = actor.plan_mode.lock();
+                    *tracker = PlanModeTracker::new(session_dir);
+                    assert!(tracker.enter_pending());
+                    assert!(tracker.activate());
+                }
+                let add = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+# Plan\n*** End Patch",
+                    plan.display()
+                );
+                let call = |id: &str, patch: &str| crate::sampling::types::ToolCallResponse {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: crate::sampling::types::ToolCallFunction::new(
+                        "apply_patch",
+                        serde_json::json!({"patch":patch}).to_string(),
+                    ),
+                };
+                let mut deferred = Vec::new();
+                let prepared = actor
+                    .prepare_tool_call(call("direct-plan", &add), &mut deferred, None)
+                    .await
+                    .unwrap()
+                    .expect("plan patch should be auto-approved");
+                assert!(prepared.plan_file.is_some());
+                super::super::tool_dispatch::dispatch_tool(
+                    &actor.workspace_ops,
+                    &prepared,
+                    &actor.session_id_string(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# Plan\n");
+
+                let (handle, _receiver) =
+                    xai_grok_tools::notification::ToolNotificationHandle::bridge_channel();
+                let _delivery = handle.begin_turn_delivery();
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .unwrap()
+                    .tools_notification_handle = handle;
+                *actor.current_prompt_id.lock().unwrap() = Some("plan-capability-test".into());
+                let update = format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-# Plan\n+# Updated\n*** End Patch",
+                    plan.display()
+                );
+                let (progress, _receiver) =
+                    xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                actor
+                    .dispatch_code_mode_nested_tool(
+                        xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                            cell_id: xai_grok_code_mode_protocol::CellId::new("plan-cell".into()),
+                            runtime_tool_call_id: "nested-plan".into(),
+                            tool_name: xai_grok_code_mode_protocol::ToolName::plain("apply_patch"),
+                            tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Freeform,
+                            input: Some(serde_json::Value::String(update)),
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                        progress,
+                    )
+                    .await
+                    .expect("nested plan patch should succeed");
+                assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# Updated\n");
+
+                let prepared = actor
+                    .prepare_tool_call(call("swapped-plan", &add), &mut deferred, None)
+                    .await
+                    .unwrap()
+                    .expect("plan patch should be prepared");
+                let source = root.path().join("source.txt");
+                std::fs::write(&source, "protected\n").unwrap();
+                std::fs::remove_file(&plan).unwrap();
+                std::os::unix::fs::symlink(&source, &plan).unwrap();
+                let _ = super::super::tool_dispatch::dispatch_tool(
+                    &actor.workspace_ops,
+                    &prepared,
+                    &actor.session_id_string(),
+                )
+                .await;
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), "protected\n");
+
+                // A configured home may be a symlink (including macOS /tmp).
+                // Capture it before tool calls; a later swap cannot redirect I/O.
+                let actual_home = root.path().join("actual-home");
+                let other_home = root.path().join("other-home");
+                let home_link = root.path().join("home-link");
+                std::fs::create_dir_all(actual_home.join("session")).unwrap();
+                std::fs::create_dir_all(other_home.join("session")).unwrap();
+                std::fs::write(other_home.join("session/plan.md"), "protected\n").unwrap();
+                std::os::unix::fs::symlink(&actual_home, &home_link).unwrap();
+                let trusted_root =
+                    xai_grok_tools::types::resources::PlanFileRoot::capture(&home_link);
+                {
+                    let mut tracker = actor.plan_mode.lock();
+                    *tracker = PlanModeTracker::new(home_link.join("session"));
+                    tracker.set_plan_file_root(trusted_root);
+                    assert!(tracker.enter_pending());
+                    assert!(tracker.activate());
+                }
+                std::fs::remove_file(&home_link).unwrap();
+                std::os::unix::fs::symlink(&other_home, &home_link).unwrap();
+                let alias_patch = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+# Pinned\n*** End Patch",
+                    home_link.join("session/plan.md").display(),
+                );
+                let prepared = actor
+                    .prepare_tool_call(call("pinned-home", &alias_patch), &mut deferred, None)
+                    .await
+                    .unwrap()
+                    .expect("symlinked home should use the captured root");
+                super::super::tool_dispatch::dispatch_tool(
+                    &actor.workspace_ops,
+                    &prepared,
+                    &actor.session_id_string(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(actual_home.join("session/plan.md")).unwrap(),
+                    "# Pinned\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(other_home.join("session/plan.md")).unwrap(),
+                    "protected\n"
+                );
+            })
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_edit_gate_rejects_symlinked_or_dangling_plan_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = active_fixture();
+        let plan = fixture.tracker.plan_file_path();
+        let source = fixture.cwd.join("source.rs");
+        std::fs::write(&source, "old\n").unwrap();
+        for target in [&source, &fixture.cwd.join("missing.rs")] {
+            symlink(target, plan).unwrap();
+            let path = plan.to_str().unwrap();
+            assert_eq!(
+                gate(&fixture, &search_replace(path)),
+                PlanEditGate::RejectNonPlanFile
+            );
+            let patch = apply_patch(
+                "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** End Patch",
+            );
+            assert_eq!(gate(&fixture, &patch), PlanEditGate::RejectNonPlanFile);
+            std::fs::remove_file(plan).unwrap();
+        }
+        assert_eq!(
+            gate(&fixture, &write(plan.to_str().unwrap())),
+            PlanEditGate::Allow
+        );
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "old\n");
     }
 
     #[test]
@@ -5244,9 +5968,8 @@ mod wait_interrupt_tests {
     #[tokio::test(start_paused = true)]
     async fn pending_interjection_aborts_in_flight_wait() {
         use super::InterjectionBuffer;
-        use xai_interjection_core::PendingInterjection;
-        let buf: InterjectionBuffer<agent_client_protocol::ImageContent> =
-            InterjectionBuffer::default();
+        use crate::session::acp_session::PendingInterjection;
+        let buf: InterjectionBuffer = InterjectionBuffer::default();
         let parent = ParentInterjectSignal::default();
         let out = tokio::select! {
             biased;
@@ -5257,6 +5980,7 @@ mod wait_interrupt_tests {
         buf.push(PendingInterjection {
             text: "user message".into(),
             attachments: Vec::new(),
+            origin: crate::session::PromptOrigin::User,
         });
         let out = tokio::select! {
             biased;

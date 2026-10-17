@@ -113,6 +113,26 @@ mod finalization_tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn abort_cancels_only_the_live_turns_code_mode_owner() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let first = super::super::support::running_task_stub("first");
+                let next = super::super::support::running_task_stub("next");
+                first.abort();
+                assert!(first.code_mode_owner.is_cancelled());
+                assert!(!next.code_mode_owner.is_cancelled());
+
+                let finished = tokio::task::spawn_local(async {});
+                let completed = AgentTask::new("completed", finished.abort_handle());
+                finished.await.unwrap();
+                completed.abort();
+                assert!(!completed.code_mode_owner.is_cancelled());
+                next.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stale_spawn_identity_cannot_finalize_reused_prompt_and_epoch() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -314,6 +334,9 @@ pub(crate) struct AgentTask {
     pub(crate) prompt_id: String,
     pub(super) epoch: TurnEpoch,
     pub(super) identity: TaskIdentity,
+    /// Chat timeline boundary before this task is allowed to run.
+    pub(super) prompt_index_at_start: usize,
+    code_mode_owner: tokio_util::sync::CancellationToken,
     pub(crate) handle: tokio::task::AbortHandle,
     pub(crate) started_at: std::time::Instant,
     delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
@@ -337,6 +360,19 @@ mod elapsed_ms_tests {
 }
 
 impl SessionActor {
+    /// Bind nested Code Mode work to the exact live turn that receives it.
+    pub(crate) async fn current_code_mode_turn_owner(
+        &self,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.state
+            .lock()
+            .await
+            .running_task
+            .as_ref()
+            .filter(|task| !task.handle.is_finished())
+            .map(|task| task.code_mode_owner.clone())
+    }
+
     pub(super) async fn clear_pinned_prompt_if_current(&self, prompt_id: &str) {
         let cleared = {
             let mut current = self
@@ -432,6 +468,8 @@ impl AgentTask {
             prompt_id: prompt_id.to_string(),
             epoch,
             identity: TaskIdentity::new(()),
+            prompt_index_at_start: 0,
+            code_mode_owner: tokio_util::sync::CancellationToken::new(),
             handle,
             started_at: std::time::Instant::now(),
             delivery_scope: None,
@@ -451,10 +489,12 @@ impl AgentTask {
         session: Arc<SessionActor>,
         request: TurnInputRequest,
         epoch: TurnEpoch,
+        prompt_index_at_start: usize,
         completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) -> Self {
         let started_at = std::time::Instant::now();
         let identity = TaskIdentity::new(());
+        let code_mode_owner = tokio_util::sync::CancellationToken::new();
         let delivery_guard = session
             .rebuild_spec
             .tools_notification_handle
@@ -464,15 +504,22 @@ impl AgentTask {
             prompt_id: request.prompt_id.clone(),
             epoch,
             identity: identity.clone(),
-            handle: xai_grok_telemetry::session_ctx::spawn_local_in_session_ctx(run_task(
-                session,
-                request,
-                epoch,
-                identity,
-                completion_tx,
-                started_at,
-                delivery_guard,
-            ))
+            prompt_index_at_start,
+            code_mode_owner: code_mode_owner.clone(),
+            handle: xai_grok_telemetry::session_ctx::spawn_local_in_session_ctx(
+                crate::session::code_mode::CODE_MODE_TURN_OWNER.scope(
+                    code_mode_owner,
+                    run_task(
+                        session,
+                        request,
+                        epoch,
+                        identity,
+                        completion_tx,
+                        started_at,
+                        delivery_guard,
+                    ),
+                ),
+            )
             .abort_handle(),
             started_at,
             delivery_scope: Some(delivery_scope),
@@ -484,6 +531,7 @@ impl AgentTask {
             scope.revoke();
         }
         if !self.handle.is_finished() {
+            self.code_mode_owner.cancel();
             self.handle.abort();
         }
     }
@@ -561,8 +609,18 @@ async fn run_task(
                 "Code Mode still has a yielded cell; wait for it to finish before ending a headless turn".to_owned(),
             ));
         }
-        let runtime = session.rebuild_spec.code_mode_runtime.current();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown()).await;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.rebuild_spec.code_mode_runtime.reset(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed to reset unfinished headless Code Mode cell")
+            }
+            Err(_) => tracing::warn!("timed out resetting unfinished headless Code Mode cell"),
+        }
     } else if let Err(error) = delivery_scope
         .wait_bounded(std::time::Duration::from_secs(30))
         .await

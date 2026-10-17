@@ -524,6 +524,7 @@ async fn pre_tool_use_ask_under_plan_mode_block_forces_no_prompt() {
         .await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn pre_tool_use_ask_on_a_plan_file_edit_forces_a_prompt() {
     let local = tokio::task::LocalSet::new();
@@ -531,15 +532,32 @@ async fn pre_tool_use_ask_on_a_plan_file_edit_forces_a_prompt() {
         .run_until(async {
             let (gateway_tx, gateway_rx) =
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let actor = Arc::new(actor_with_pre_tool_use_hook(ASK_HOOK, true, gateway_tx).await);
+            let actor = actor_with_pre_tool_use_hook(ASK_HOOK, true, gateway_tx).await;
+            let plan_temp = tempfile::tempdir().unwrap();
+            let plan_dir = dunce::canonicalize(plan_temp.path()).unwrap();
+            *actor.plan_mode.lock() = crate::session::plan_mode::PlanModeTracker::new(plan_dir);
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .unwrap();
+            let plan = actor
+                .plan_mode
+                .lock()
+                .plan_file_path()
+                .to_string_lossy()
+                .into_owned();
+            let actor = Arc::new(actor);
             activate_plan_mode(&actor);
             let gateway = RecordingGateway::spawn(gateway_rx, PromptAnswer::Select("allow-once"));
 
-            let result = prepare_call(
-                &actor,
-                search_replace_call_at("call_plan_file_ask", "/tmp/test-session/plan.md"),
-            )
-            .await;
+            let result =
+                prepare_call(&actor, search_replace_call_at("call_plan_file_ask", &plan)).await;
             assert!(
                 result.is_ok(),
                 "the prompted plan-file edit resolves via the user's answer; got {:?}",

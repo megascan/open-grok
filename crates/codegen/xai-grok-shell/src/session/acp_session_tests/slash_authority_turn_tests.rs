@@ -128,7 +128,9 @@ fn runtime_request(text: &str) -> TurnInputRequest {
 fn parent_request(text: &str, prompt_blocks: Vec<acp::ContentBlock>) -> TurnInputRequest {
     let message_id = uuid::Uuid::new_v4().to_string();
     TurnInputRequest {
-        prompt_id: format!("parent-message-{message_id}"),
+        // Child attempts use an ordinary UUID, so authority must come from
+        // the typed origin, never from a recognizable prompt-id prefix.
+        prompt_id: uuid::Uuid::new_v4().to_string(),
         input_origin: InputOrigin::new(PromptOrigin::ParentAgentMessage {
             message_id,
             sender_session_id: "root-session".into(),

@@ -116,7 +116,7 @@ Under `$OPENGROK_HOME/sessions/<encoded-cwd>/<session-id>/`:
 | Path | Role |
 | --- | --- |
 | `summary.json` | Index + sticky metadata (`Summary`). Written under `summary.json.lock`. |
-| `updates.jsonl` | **Authoritative ACP stream for resume / rewind / cross-compaction replay.** Envelope: `{ timestamp, method, params }` for ACP `session/update` or `_x.ai/session/update`. |
+| `updates.jsonl` | Authoritative ACP presentation stream and timeline markers. Envelope: `{ timestamp, method, params }` for ACP `session/update` or `_x.ai/session/update`. It does not contain the complete model-facing history. |
 | `chat_history.jsonl` | Model-facing `ConversationItem` lines (format version in summary; `CHAT_FORMAT_VERSION = 1`). Compaction rewrites this file wholesale via `ReplaceChatHistory`. |
 
 ### Plan / goals / tools
@@ -257,7 +257,7 @@ JsonlStorageAdapter       (filesystem; optional torn-tail heal on append)
 
 ### Fork
 
-**Module:** `session/fork.rs` → `JsonlStorageAdapter::copy_session_data(_sync)`.
+**Module:** `session/fork.rs` → `JsonlStorageAdapter::copy_new_session_data_sync` (subagent bootstrap uses the separate copy path).
 
 ```text
 ForkSessionRequest
@@ -275,7 +275,9 @@ copy_session_data (spawn_blocking for true parallelism off LocalSet)
 background backend upsert if allows_xai_export (telemetry; not required for local success)
 ```
 
-`CopySessionOptions` flags control plan/signals/tool_state/announcement copy, cwd transform, strip reasoning, fork filter, inherited prefix, etc. Defaults copy plan/signals/tool state; **do not** copy compaction segments unless enabled (size).
+`CopySessionOptions` flags control plan/signals/tool_state/announcement copy, cwd transform, strip reasoning, fork filter, inherited prefix, etc. Whole-history forks can copy compaction archives when enabled. A fork at a prompt instead selects an inclusive boundary, omits unversioned future sidecars and archive segments, clips valid usage, and retains a sanitized plan-mode restriction when the saved snapshot requires it. A compacted point fork requires an exact surviving checkpoint prefix in the current model-facing chat; it fails if that history or the target is unavailable. Source-session references and unsupported cwd references in retained checkpoints also fail closed.
+
+Forks read source files independently; there is no atomic snapshot or persistence flush handshake with a live source, including queued plan-mode changes. Callers must not assume a fork is a consistent view of a changing live session. A coordinated live-source snapshot is still needed.
 
 Worktree resume/fork also lives in `session/worktree.rs` / workspace worktree APIs.
 
@@ -285,13 +287,13 @@ Worktree resume/fork also lives in `session/worktree.rs` / workspace worktree AP
 
 | Mode | Conversation | Files |
 | --- | --- | --- |
-| `All` | Truncate / replay to target | Revert to snapshots at target |
-| `ConversationOnly` | Truncate / replay | Leave disk files; may merge rewind points on disk |
+| `All` | Truncate to target | Revert to snapshots at target |
+| `ConversationOnly` | Truncate | Leave disk files; may merge rewind points on disk |
 | `FilesOnly` | Leave chat | Revert files only (prompt index validation exempt when conversation is server-side) |
 
 Semantics: restore state **before** prompt N ran (keep prompts `0..N-1`).
 
-**Cross-compaction:** after any compaction, in-memory user-message counts diverge from `prompt_index`. Always use `helpers/replay.rs` → `replay_to_prompt(updates.jsonl, session_dir, target)` which understands `CompactionCheckpoint` and `RewindMarker`. Do not rely on `truncate_to_prompt_index` alone post-compaction.
+**Cross-compaction:** after compaction, use the surviving checkpoint and its exact matching model-facing history as the truncation boundary. ACP updates omit prompt expansion, tool data, and other model-facing items, so reconstructing from them is not faithful. If an exact history is unavailable, reject the rewind before changing conversation or files. A file restore failure reports the already restored paths and preserves conversation and rewind snapshots for retry.
 
 Persistence messages after rewind:
 

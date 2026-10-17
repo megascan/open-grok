@@ -2820,6 +2820,7 @@ async fn await_subagent_turn_with_summary_floor(
         .cmd_tx
         .send(crate::session::commands::SessionCommand::Prompt {
             prompt_id: format!("subagent-summary-floor-{}", uuid::Uuid::now_v7()),
+            origin: None,
             prompt_blocks: vec![agent_client_protocol::ContentBlock::Text(
                 agent_client_protocol::TextContent::new(SUBAGENT_FINAL_SUMMARY_CONTINUATION_PROMPT),
             )],
@@ -3023,6 +3024,7 @@ fn inject_subagent_completed_prompt(
     if cmd_tx
         .send(SessionCommand::Prompt {
             prompt_id: prompt_id.clone(),
+            origin: None,
             prompt_blocks,
             prompt_mode: crate::session::plan_mode::PromptMode::Agent,
             artifact_upload_ctx: None,

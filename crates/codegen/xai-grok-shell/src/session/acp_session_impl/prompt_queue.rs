@@ -70,6 +70,16 @@ impl SessionActor {
     /// cancel the running turn.
     #[must_use = "true means the caller must cancel the running turn"]
     pub(super) async fn queue_input(&self, request: QueueInputRequest) -> bool {
+        let origin = crate::session::PromptOrigin::from_prompt_id(&request.prompt_id);
+        self.queue_input_with_origin(request, origin).await
+    }
+
+    #[must_use = "true means the caller must cancel the running turn"]
+    pub(super) async fn queue_input_with_origin(
+        &self,
+        request: QueueInputRequest,
+        origin: crate::session::PromptOrigin,
+    ) -> bool {
         let QueueInputRequest {
             prompt_blocks,
             prompt_id,
@@ -114,8 +124,6 @@ impl SessionActor {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-
-        let origin = crate::session::PromptOrigin::from_prompt_id(&prompt_id);
 
         // Bump before any await so a LocalSet recap cannot commit/emit after
         // this Prompt was accepted but before handle_prompt runs.
@@ -664,6 +672,7 @@ impl SessionActor {
         let InputItem {
             prompt_id,
             prompt_blocks,
+            origin,
             respond_to,
             ..
         } = item;
@@ -686,6 +695,7 @@ impl SessionActor {
         self.pending_interjections.push(PendingInterjection {
             text: text.clone(),
             attachments,
+            origin,
         });
         self.broadcast_interjection(&text, Some(&prompt_id));
         self.events

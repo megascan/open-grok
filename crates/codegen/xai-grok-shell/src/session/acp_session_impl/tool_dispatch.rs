@@ -123,6 +123,9 @@ pub(super) async fn dispatch_observed(
     );
     ctx.insert(origin);
     ctx.insert(slot);
+    if let Some(plan_file) = &prepared.plan_file {
+        ctx.insert(plan_file.clone());
+    }
     if let Some(scope) = delivery_scope {
         ctx.insert(scope);
     }
@@ -225,6 +228,9 @@ where
         "dispatch_code_mode_nested_tool_streaming"
     );
     let mut extensions = xai_tool_runtime::TypedExtensions::new();
+    if let Some(plan_file) = &prepared.plan_file {
+        extensions.insert(plan_file.clone());
+    }
     if let Some(scope) = delivery_scope {
         extensions.insert(scope);
     }
@@ -806,6 +812,7 @@ mod tests {
 
     fn nested_prepared_call() -> PreparedToolCall {
         PreparedToolCall {
+            plan_file: None,
             mcp_request_meta: None,
             call_id: "model-call-1".to_string(),
             tool_call_id: acp::ToolCallId::from("acp-call-1"),

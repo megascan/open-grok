@@ -280,6 +280,7 @@ async fn e2e_crash_recovers_drops_client_then_restart_succeeds() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -361,6 +362,7 @@ async fn e2e_crash_permanently_dead_exhausts_after_three_attempts() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -438,6 +440,7 @@ async fn e2e_handshake_failed_schedules_restart_without_dropping_client() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -504,6 +507,7 @@ async fn e2e_config_removed_keeps_replacement_client_marks_shutdown_no_restart()
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -567,6 +571,7 @@ async fn e2e_intentional_shutdown_suppresses_restart_on_transport_closed() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -644,6 +649,7 @@ async fn e2e_unconfigured_http_server_drops_client_but_no_restart() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -706,6 +712,7 @@ async fn e2e_server_disabled_mid_backoff_emits_disabled_no_respawn() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -770,6 +777,7 @@ async fn e2e_burst_transport_closed_coalesces_to_single_restart() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -846,6 +854,7 @@ async fn e2e_flapping_server_restarts_on_each_crash_cycle() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -936,6 +945,7 @@ async fn e2e_intermittently_healthy_recovers_after_transient_failure() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -1008,6 +1018,7 @@ async fn e2e_auto_restart_disabled_drops_client_but_schedules_nothing() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 restart_actions,
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -1075,6 +1086,7 @@ async fn e2e_remove_readd_race_keeps_replacement_client() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 
@@ -1176,6 +1188,7 @@ async fn e2e_http_transport_closed_recovers_in_place_not_evicted() {
                 state_for_dispatcher,
                 Arc::clone(&shutdown),
                 Some(restart_actions),
+                None,
                 std::path::PathBuf::from("."),
             ));
 

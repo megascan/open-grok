@@ -366,6 +366,11 @@ impl SessionActor {
         }
     }
     pub(super) async fn flush_pending_skill_reminders(&self) {
+        // A native carrier is accepted agent mail. Once committed to chat,
+        // rewinding the pre-turn snapshot must not erase it.
+        if !self.pending_native_agent_messages.lock().is_empty() {
+            self.close_rewind_window().await;
+        }
         self.flush_native_agent_messages();
         let activation = self.plan_mode.lock().take_pending_activation();
         if let Some(text) = activation {

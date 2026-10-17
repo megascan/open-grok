@@ -8,6 +8,272 @@ use xai_grok_tools::implementations::grok_build::task::types::{
     HandedOffForegroundSubagent, SubagentEvent, SubagentHandOffForegroundRequest,
 };
 
+fn indexed_user(text: &str, index: usize) -> ConversationItem {
+    let mut item = ConversationItem::user(text);
+    if let ConversationItem::User(user) = &mut item {
+        user.prompt_index = Some(index);
+    }
+    item
+}
+
+#[test]
+fn promotion_binds_rewind_boundary_before_task_can_run() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (actor, _gateway) = build_actor().await;
+            let chat = &actor.chat_state_handle;
+            chat.push_user_message(indexed_user("previous", 0));
+            chat.increment_prompt_index();
+            chat.cache_prompt_text("previous".into());
+            chat.push_assistant_response(ConversationItem::assistant("answer"));
+            let before = chat.snapshot().await.unwrap();
+            let (input, response) = user_item_with_rx("running", "owner");
+            actor.state.lock().await.pending_inputs.push_back(input);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.clone().maybe_start_running_task(tx).await;
+            {
+                let state = actor.state.lock().await;
+                assert_eq!(
+                    state.running_task.as_ref().unwrap().prompt_index_at_start,
+                    1
+                );
+            }
+            let outcome = actor
+                .cancel_running_task(crate::session::CancelOptions {
+                    history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                        prompt_id: Some("running".into()),
+                    },
+                    trigger: Some(crate::session::CancelTrigger::Esc),
+                    ..Default::default()
+                })
+                .await;
+            assert!(outcome.settled);
+            assert!(matches!(
+                response.await.unwrap().unwrap().completion_kind,
+                PromptCompletionKind::Rewound
+            ));
+            let after = chat.snapshot().await.unwrap();
+            assert_eq!(after.prompt_index, before.prompt_index);
+            assert_eq!(after.prompt_texts, before.prompt_texts);
+            assert_eq!(after.conversation.len(), before.conversation.len());
+        })
+    });
+}
+
+#[test]
+fn rewind_preserves_the_boundary_before_and_after_task_start() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            for (requested_id, task_started) in [
+                (Some("running".to_owned()), false),
+                (None, false),
+                (Some("running".to_owned()), true),
+                (None, true),
+            ] {
+                let (actor, _gateway) = build_actor().await;
+                let chat = &actor.chat_state_handle;
+                chat.push_user_message(indexed_user("previous", 0));
+                chat.increment_prompt_index();
+                chat.cache_prompt_text("previous".into());
+                chat.push_assistant_response(ConversationItem::assistant("answer"));
+                let before = chat.snapshot().await.unwrap();
+                let (input, response) = user_item_with_rx("running", "owner");
+                let mut task = running_task_stub("running");
+                task.prompt_index_at_start = before.prompt_index;
+                {
+                    let mut state = actor.state.lock().await;
+                    state.pending_inputs.push_back(input);
+                    state.running_task = Some(task);
+                    state.rewindable = true;
+                }
+                *actor.current_prompt_id.lock().unwrap() = Some("running".into());
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                bridge.update_resource(
+                    xai_grok_tools::implementations::grok_build::task::types::CurrentPromptIdResource("running".into()),
+                ).await;
+                if task_started {
+                    chat.push_user_message(indexed_user("current", 1));
+                    chat.increment_prompt_index();
+                    chat.cache_prompt_text("current".into());
+                    let _ = chat.get_prompt_index().await;
+                }
+                let outcome = actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                            prompt_id: requested_id,
+                        },
+                        trigger: Some(crate::session::CancelTrigger::Esc),
+                        user_initiated: true,
+                        ..Default::default()
+                    })
+                    .await;
+                assert!(outcome.settled);
+                assert!(matches!(
+                    response.await.unwrap().unwrap().completion_kind,
+                    PromptCompletionKind::Rewound
+                ));
+                let after = chat.snapshot().await.unwrap();
+                assert_eq!(after.prompt_index, before.prompt_index);
+                assert_eq!(after.prompt_texts, before.prompt_texts);
+                assert_eq!(after.conversation.len(), before.conversation.len());
+                assert!(actor.current_prompt_id.lock().unwrap().is_none());
+                let scoped = bridge.read_resource::<xai_grok_tools::implementations::grok_build::task::types::CurrentPromptIdResource>().await;
+                assert!(scoped.is_none_or(|id| id.0.is_empty()));
+                let state = actor.state.lock().await;
+                assert!(state.running_task.is_none());
+                assert!(!state.finalization_gate.is_active());
+            }
+        })
+    });
+}
+
+#[test]
+fn closed_rewind_window_settles_and_preserves_the_next_prompt() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            for requested_id in [Some("running".to_owned()), None] {
+                let (actor, _gateway) = build_actor().await;
+                let (input, response) = user_item_with_rx("running", "owner");
+                {
+                    let mut state = actor.state.lock().await;
+                    state.pending_inputs.push_back(input);
+                    state.pending_inputs.push_back(user_item("next", "owner"));
+                    state.running_task = Some(running_task_stub("running"));
+                    state.rewindable = false;
+                }
+                let outcome = actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                            prompt_id: requested_id,
+                        },
+                        trigger: Some(crate::session::CancelTrigger::Esc),
+                        user_initiated: true,
+                        ..Default::default()
+                    })
+                    .await;
+                assert!(outcome.settled);
+                assert!(outcome.turn_stopped);
+                assert!(matches!(
+                    response.await.unwrap().unwrap().completion_kind,
+                    PromptCompletionKind::Cancelled { .. }
+                ));
+                let state = actor.state.lock().await;
+                assert!(state.running_task.is_none());
+                assert!(!state.finalization_gate.is_active());
+                assert_eq!(state.pending_inputs.front().unwrap().prompt_id, "next");
+            }
+        })
+    });
+}
+
+#[derive(Default)]
+struct PausingAbort {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+struct MarkOnDrop(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for MarkOnDrop {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl xai_agent_lifecycle::LocalTurnLifecycleContributor for PausingAbort {
+    async fn on_turn_abort(&self, _input: &xai_agent_lifecycle::TurnAbortInput) {
+        self.entered.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+#[test]
+fn rewind_holds_finalization_until_cleanup_finishes() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let lifecycle = std::rc::Rc::new(PausingAbort::default());
+            let mut builder = xai_agent_lifecycle::LocalExtensionRegistryBuilder::default();
+            builder.turn_lifecycle_contributor(lifecycle.clone());
+            actor.extension_registry = builder.build();
+            let actor = Arc::new(actor);
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let mark = MarkOnDrop(dropped.clone());
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_local(async move {
+                let _mark = mark;
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+            started_rx.await.unwrap();
+            {
+                let mut state = actor.state.lock().await;
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.pending_inputs.push_back(user_item("next", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    task.abort_handle(),
+                ));
+                state.rewindable = true;
+            }
+            let cancel_actor = actor.clone();
+            let cancel = tokio::task::spawn_local(async move {
+                cancel_actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                            prompt_id: Some("running".into()),
+                        },
+                        trigger: Some(crate::session::CancelTrigger::Esc),
+                        ..Default::default()
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), lifecycle.entered.notified())
+                .await
+                .unwrap();
+            assert!(
+                dropped.get(),
+                "aborted task guards must drop before cleanup"
+            );
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.clone().maybe_start_running_task(tx).await;
+            {
+                let state = actor.state.lock().await;
+                assert!(state.finalization_gate.is_active());
+                assert_eq!(state.running_task.as_ref().unwrap().prompt_id, "running");
+                assert_eq!(state.pending_inputs.front().unwrap().prompt_id, "next");
+            }
+            lifecycle.resume.notify_one();
+            assert!(cancel.await.unwrap().settled);
+            {
+                let state = actor.state.lock().await;
+                assert!(state.running_task.is_none());
+                assert!(!state.finalization_gate.is_active());
+                assert_eq!(state.pending_inputs.front().unwrap().prompt_id, "next");
+            }
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.clone().maybe_start_running_task(tx).await;
+            assert_eq!(
+                actor
+                    .state
+                    .lock()
+                    .await
+                    .running_task
+                    .as_ref()
+                    .unwrap()
+                    .prompt_id,
+                "next"
+            );
+        })
+    });
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_revokes_claimed_turn_before_delayed_terminal_start() {
     use xai_grok_tools::computer::types::{TaskKind, TerminalRunRequest as BackendRequest};
@@ -2319,7 +2585,6 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
             for trigger in [
                 Some(crate::session::CancelTrigger::SendNow),
                 Some(crate::session::CancelTrigger::SessionDelete),
-                None,
             ] {
                 let (gateway_tx, _gateway_rx) =
                     tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();

@@ -6380,6 +6380,28 @@ pub fn resolve_aux_model_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
 ) -> Option<SamplerConfig> {
+    resolve_aux_model_sampling_config_at_home(
+        model_id,
+        models,
+        endpoints,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+        &crate::util::grok_home::grok_home(),
+    )
+}
+
+fn resolve_aux_model_sampling_config_at_home(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    endpoints: &EndpointsConfig,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+    grok_home: &std::path::Path,
+) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
     if let Some(entry) = &catalog_entry {
         // Session/global xAI credentials are scoped to first-party xAI hosts.
@@ -6388,7 +6410,7 @@ pub fn resolve_aux_model_sampling_config(
         // session bearer to an arbitrary configured URL.
         let trusted_provider_endpoint =
             trusted_built_in_session_endpoint(entry.info().provider, &entry.info().base_url);
-        if !trusted_provider_endpoint && !entry.has_usable_provider_credentials() {
+        if !trusted_provider_endpoint && !entry.has_usable_provider_credentials_at(grok_home) {
             tracing::warn!(
                 aux_model = %model_id,
                 provider = ?entry.info().provider,
@@ -6397,10 +6419,11 @@ pub fn resolve_aux_model_sampling_config(
             );
             return None;
         }
-        let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
+        let mut credentials = resolve_credentials_at_home(entry, session_key, grok_home);
+        enforce_disable_api_key_auth(&mut credentials, disable_api_key_auth, session_key);
         let resolved_endpoint_is_trusted =
             trusted_built_in_session_endpoint(entry.info().provider, &credentials.base_url);
-        if !resolved_endpoint_is_trusted && !entry.has_usable_provider_credentials() {
+        if !resolved_endpoint_is_trusted && !entry.has_usable_provider_credentials_at(grok_home) {
             tracing::warn!(
                 aux_model = %model_id,
                 provider = ?entry.info().provider,
@@ -6424,6 +6447,16 @@ pub fn resolve_aux_model_sampling_config(
             tracing::warn!(
                 model = %model_id,
                 "aux model uses an auth provider with no cached token; the caller falls back to its session default"
+            );
+            return None;
+        }
+        // A catalog entry carries its provider identity. Missing credentials
+        // must not silently send its model and request to the xAI fallback.
+        if !entry.info().provider.is_xai() {
+            tracing::warn!(
+                model = %model_id,
+                provider = ?entry.info().provider,
+                "auxiliary model has no usable provider credentials"
             );
             return None;
         }
@@ -6493,7 +6526,8 @@ pub fn resolve_aux_model_sampling_config(
             auth_provider: None,
             api_base_url: None,
         };
-        let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
+        let mut credentials = resolve_credentials_at_home(&entry, session_key, grok_home);
+        enforce_disable_api_key_auth(&mut credentials, disable_api_key_auth, session_key);
         let sampler = sampling_config_for_model(
             &entry,
             credentials,
@@ -6560,6 +6594,23 @@ pub fn stamp_session_local_sampler_fields(
 /// xAI routing slugs; silently using them from a Codex session would disclose
 /// session content to a second provider. A non-default model remains an
 /// explicit cross-provider opt-in.
+/// A synthetic fallback is not a catalog identity and must not be accepted as
+/// a remote auxiliary recommendation.
+pub(crate) fn auxiliary_route_matches_catalog(
+    intended: Option<ModelProvider>,
+    resolved: ModelProvider,
+) -> bool {
+    intended == Some(resolved)
+}
+
+pub(crate) fn auxiliary_recommendation_allowed(
+    locally_selected: bool,
+    intended: Option<ModelProvider>,
+    active: ModelProvider,
+) -> bool {
+    locally_selected || intended == Some(active)
+}
+
 pub fn should_use_active_for_implicit_aux_model(
     requested_model: &str,
     default_model: &str,
@@ -7743,6 +7794,79 @@ reasoning_effort = "low"
         assert_eq!(resolved.model, "v9m-rl-learnability-tp8");
         assert_eq!(resolved.base_url, "https://vendor.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
+    }
+    #[test]
+    fn auxiliary_catalog_identity_rejects_unknown_and_mismatched_providers() {
+        assert!(!auxiliary_route_matches_catalog(None, ModelProvider::Xai));
+        assert!(!auxiliary_route_matches_catalog(
+            Some(ModelProvider::Fireworks),
+            ModelProvider::Xai,
+        ));
+        assert!(auxiliary_route_matches_catalog(
+            Some(ModelProvider::Fireworks),
+            ModelProvider::Fireworks,
+        ));
+        assert!(!auxiliary_recommendation_allowed(
+            false,
+            None,
+            ModelProvider::Xai
+        ));
+        assert!(!auxiliary_recommendation_allowed(
+            false,
+            Some(ModelProvider::Fireworks),
+            ModelProvider::Xai
+        ));
+        assert!(auxiliary_recommendation_allowed(
+            false,
+            Some(ModelProvider::Xai),
+            ModelProvider::Xai
+        ));
+        assert!(auxiliary_recommendation_allowed(
+            true,
+            Some(ModelProvider::Fireworks),
+            ModelProvider::Xai
+        ));
+    }
+    #[test]
+    fn auxiliary_provider_key_rotation_and_removal_never_reroute_to_xai() {
+        let home = tempfile::tempdir().unwrap();
+        let endpoints = EndpointsConfig::default();
+        let mut entry = test_model_entry(
+            "accounts/fireworks/models/test",
+            "https://api.fireworks.ai/inference/v1",
+            None,
+            None,
+            None,
+        );
+        entry.info.provider = ModelProvider::Fireworks;
+        entry.info.api_backend = ApiBackend::ChatCompletions;
+        let mut catalog = IndexMap::new();
+        catalog.insert("helper".to_owned(), entry);
+        let resolve = || {
+            resolve_aux_model_sampling_config_at_home(
+                "helper",
+                &catalog,
+                &endpoints,
+                Some("xai-session-key"),
+                false,
+                None,
+                None,
+                home.path(),
+            )
+        };
+        assert!(
+            resolve().is_none(),
+            "missing Fireworks key must not select xAI"
+        );
+        for key in ["fireworks-a", "fireworks-b"] {
+            crate::auth::store_provider_api_key(home.path(), ModelProvider::Fireworks, key)
+                .unwrap();
+            let route = resolve().expect("stored provider key resolves");
+            assert_eq!(route.provider, ModelProvider::Fireworks);
+            assert_eq!(route.api_key.as_deref(), Some(key));
+        }
+        crate::auth::clear_provider_api_key(home.path(), ModelProvider::Fireworks).unwrap();
+        assert!(resolve().is_none(), "removed key must not select xAI");
     }
     /// Cold cache falls back to the session model, never the xAI proxy;
     /// warm cache serves the provider token at the provider endpoint.

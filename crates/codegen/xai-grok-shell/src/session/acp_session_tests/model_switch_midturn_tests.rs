@@ -304,3 +304,39 @@ async fn context_selection_is_applied_and_preserved_across_model_switches() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn child_denied_provider_switch_requires_persisted_parent_boundary() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.tool_context.subagent_depth = 1;
+            drop(persistence_rx);
+            let before = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            let mut next = replacement_config("fireworks-model");
+            next.provider = xai_grok_sampling_types::ModelProvider::Fireworks;
+            next.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+            let result = actor
+                .handle_set_session_model(
+                    acp::ModelId::new("fireworks-model"),
+                    next,
+                    false,
+                    false,
+                    true,
+                    85,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+            assert!(result.is_err());
+            let after = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(after.provider, before.provider);
+            assert_eq!(after.model, before.model);
+            assert!(!actor.feedback_manager.allows_xai_export());
+        })
+        .await;
+}

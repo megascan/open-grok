@@ -670,6 +670,82 @@ pub(crate) async fn drop_dead_clients(
     stale
 }
 
+/// Drop queued HTTP closures when their client was replaced or its current
+/// service has already recovered. HTTP clients survive in-place recovery, so
+/// client identity alone cannot distinguish successive connections.
+async fn strip_stale_http_closes(
+    win: &mut CoalescedWindow,
+    http_servers: &HashSet<McpServerName>,
+    mcp_state: &Arc<TokioMutex<McpState>>,
+) {
+    let candidates: Vec<_> = {
+        let state = mcp_state.lock().await;
+        win.buf
+            .iter()
+            .filter_map(|((server, kind), event)| {
+                if !http_servers.contains(server) || *kind != McpClientEventKind::TransportClosed {
+                    return None;
+                }
+                let McpClientEvent::TransportClosed { client_id, .. } = event else {
+                    return None;
+                };
+                state
+                    .get_client(server)
+                    .cloned()
+                    .map(|client| (server.clone(), *client_id, client))
+            })
+            .collect()
+    };
+    for (server, closed_id, client) in candidates {
+        if client.client_id() != closed_id || client.is_healthy().await {
+            win.buf
+                .remove(&(server, McpClientEventKind::TransportClosed));
+        }
+    }
+}
+
+/// Session-owned catalog reconciliation, independent of automatic restart.
+#[async_trait::async_trait(?Send)]
+pub(crate) trait McpCatalogRefresh {
+    async fn refresh_catalog(&self, server: &str);
+}
+
+/// Coalesce refreshes per server while retaining notifications that arrive
+/// during a list request. Never hold a RefCell borrow across the await.
+fn schedule_catalog_refresh(
+    actions: Rc<dyn McpCatalogRefresh>,
+    pending: Rc<std::cell::RefCell<HashMap<McpServerName, bool>>>,
+    server: McpServerName,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    {
+        let mut pending = pending.borrow_mut();
+        if let Some(dirty) = pending.get_mut(&server) {
+            *dirty = true;
+            return;
+        }
+        pending.insert(server.clone(), false);
+    }
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    pending.borrow_mut().remove(&server);
+                    return;
+                }
+                _ = actions.refresh_catalog(&server) => {}
+            }
+            let mut pending = pending.borrow_mut();
+            if pending.get(&server).copied().unwrap_or(false) {
+                pending.insert(server.clone(), false);
+            } else {
+                pending.remove(&server);
+                return;
+            }
+        }
+    });
+}
+
 /// Drive the dispatcher loop. Runs until `rx` is closed.
 ///
 /// Spawned via `tokio::task::spawn_local` from the session actor's
@@ -698,6 +774,7 @@ pub(crate) async fn run_dispatcher(
     mcp_state: Arc<TokioMutex<McpState>>,
     shutdown: SharedShutdownState,
     restart_actions: Option<Rc<dyn crate::session::mcp_restart::RestartActions>>,
+    catalog_refresh: Option<Rc<dyn McpCatalogRefresh>>,
     cwd: std::path::PathBuf,
 ) {
     // Cancellation source for spawned `auto_restart_stdio` tasks. The
@@ -707,6 +784,8 @@ pub(crate) async fn run_dispatcher(
     // gateway that is already tearing down. Tasks select on this token
     // during their backoff (see `mcp_restart::auto_restart_stdio`).
     let restart_cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = restart_cancel.clone().drop_guard();
+    let pending_catalogs = Rc::new(std::cell::RefCell::new(HashMap::new()));
     loop {
         let Some(mut win) = collect_window(&mut rx, COALESCE_WINDOW).await else {
             tracing::debug!(
@@ -753,6 +832,8 @@ pub(crate) async fn run_dispatcher(
             (HashSet::new(), HashMap::new())
         };
 
+        strip_stale_http_closes(&mut win, &http_servers, &mcp_state).await;
+
         // Evict dead stdio clients, gated on client identity (see
         // [`collect_close_candidates`]). HTTP `TransportClosed` clients
         // are KEPT for in-place recovery; `ConfigRemoved` is not evicted
@@ -766,6 +847,27 @@ pub(crate) async fn run_dispatcher(
         for server in &stale {
             win.buf
                 .remove(&(server.clone(), McpClientEventKind::TransportClosed));
+        }
+        if let Some(actions) = catalog_refresh.as_ref() {
+            let servers: HashSet<_> = win
+                .buf
+                .keys()
+                .filter(|(_, kind)| {
+                    matches!(
+                        kind,
+                        McpClientEventKind::ToolsChanged | McpClientEventKind::Ready
+                    )
+                })
+                .map(|(server, _)| server.clone())
+                .collect();
+            for server in servers {
+                schedule_catalog_refresh(
+                    Rc::clone(actions),
+                    Rc::clone(&pending_catalogs),
+                    server,
+                    restart_cancel.clone(),
+                );
+            }
         }
         let buf = win.buf;
         if buf.is_empty() {
@@ -847,6 +949,57 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc::unbounded_channel;
 
+    /// Notifications received during an in-flight list must trigger one
+    /// follow-up list; collapsing them into the first refresh loses changes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_changes_during_refresh_schedule_one_follow_up() {
+        struct Refresh {
+            started: std::cell::Cell<usize>,
+            gate: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait(?Send)]
+        impl McpCatalogRefresh for Refresh {
+            async fn refresh_catalog(&self, _server: &str) {
+                self.started.set(self.started.get() + 1);
+                self.gate.acquire().await.unwrap().forget();
+            }
+        }
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let actions = Rc::new(Refresh {
+                    started: std::cell::Cell::new(0),
+                    gate: tokio::sync::Semaphore::new(0),
+                });
+                let pending = Rc::new(std::cell::RefCell::new(HashMap::new()));
+                let dyn_actions: Rc<dyn McpCatalogRefresh> = actions.clone();
+                let cancel = tokio_util::sync::CancellationToken::new();
+                schedule_catalog_refresh(
+                    dyn_actions.clone(),
+                    pending.clone(),
+                    "svr".into(),
+                    cancel.clone(),
+                );
+                tokio::task::yield_now().await;
+                assert_eq!(actions.started.get(), 1);
+                for _ in 0..3 {
+                    schedule_catalog_refresh(
+                        dyn_actions.clone(),
+                        pending.clone(),
+                        "svr".into(),
+                        cancel.clone(),
+                    );
+                }
+                actions.gate.add_permits(1);
+                tokio::task::yield_now().await;
+                assert_eq!(actions.started.get(), 2);
+                actions.gate.add_permits(1);
+                tokio::task::yield_now().await;
+                assert!(pending.borrow().is_empty());
+                assert_eq!(actions.started.get(), 2);
+            })
+            .await;
+    }
+
     /// Contract: 100 ToolsChanged events for the same server within
     /// 10 ms coalesce into exactly one buffer entry.
     #[tokio::test(start_paused = true)]
@@ -922,6 +1075,7 @@ mod tests {
                     gateway,
                     mcp_state,
                     shutdown,
+                    None,
                     None,
                     std::path::PathBuf::from("."),
                 ));
@@ -1617,6 +1771,7 @@ mod tests {
                     mcp_state,
                     shutdown,
                     Some(restart_actions),
+                    None,
                     std::path::PathBuf::from("."),
                 ));
 
@@ -1701,6 +1856,7 @@ mod tests {
                     state_for_dispatcher,
                     Arc::clone(&shutdown),
                     Some(restart_actions),
+                    None,
                     std::path::PathBuf::from("."),
                 ));
 

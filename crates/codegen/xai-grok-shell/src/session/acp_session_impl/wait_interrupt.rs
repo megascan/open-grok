@@ -1,7 +1,7 @@
 use std::time::Duration;
 
+use super::interjection::InterjectionBuffer;
 use xai_grok_tools::types::output::{ToolOutput as ToolsToolOutput, ToolRunResult};
-use xai_interjection_core::InterjectionBuffer;
 use xai_tool_types::{TaskOutputOutput, TaskOutputResult};
 
 use crate::tools::tool_context::{BlockingWaitState, ParentInterjectSignal};
@@ -18,7 +18,7 @@ const WAIT_INTERRUPT_POLL: Duration = Duration::from_millis(50);
 /// Human first, then parent. Parent Interject uses a dedicated flag so the
 /// follow-up is not also pushed into `pending_interjections`.
 pub(super) async fn wait_for_wait_interrupt(
-    human: &InterjectionBuffer<agent_client_protocol::ImageContent>,
+    human: &InterjectionBuffer,
     parent: &ParentInterjectSignal,
 ) -> WaitInterruptCause {
     loop {

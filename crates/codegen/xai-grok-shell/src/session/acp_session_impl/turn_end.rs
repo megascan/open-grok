@@ -368,6 +368,15 @@ impl SessionActor {
             )
             .await;
         }
+        // Only this exact turn may move its late-arriving messages. Keep the
+        // lease held until they are queued so a successor cannot consume the
+        // old turn's buffers or have its own buffers stolen by a stale result.
+        if finalizes_turn {
+            self.flush_native_agent_messages();
+            if self.flush_stranded_interjections().await > 0 {
+                tracing::info!("Flushed stranded interjection(s) into prompt turns");
+            }
+        }
         if !self.finish_finalization_lease(&mut lease).await {
             tracing::error!(%prompt_id, "turn finalization lease could not be released");
         }

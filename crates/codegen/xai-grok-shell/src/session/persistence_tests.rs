@@ -50,6 +50,8 @@ fn test_actor_inner(
             created_fresh: false,
             relay_sync: None,
             summary,
+            summary_cross_provider_allowed: false,
+            parent_export: None,
             registry_title_sync: None,
             gateway: None,
             disk_full_tx,
@@ -79,6 +81,424 @@ fn test_actor_with_remote_sync(
     remote_sync: Option<RemoteSync>,
 ) -> ActorGuard {
     test_actor_inner(info, storage, remote_sync, false)
+}
+
+#[tokio::test]
+async fn persistence_uses_chat_provider_before_starting_sinks_on_new_and_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("provider-route-boundary"),
+        cwd: root.path().to_string_lossy().into_owned(),
+    };
+    let title_client = |provider| {
+        OaiCompatClient::new(xai_grok_sampler::SamplerConfig {
+            provider,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let handle = new_with_root(
+        root.path().to_path_buf(),
+        &info,
+        default_model_id(),
+        ModelProvider::Xai,
+        title_client(ModelProvider::Fireworks),
+        false,
+        StorageMode::Local,
+        None,
+        None,
+        None,
+        "title-helper".to_owned(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(handle.provider_boundary.allows_xai_export());
+    let storage = JsonlStorageAdapter::with_root(root.path().to_path_buf());
+    assert!(!storage.load_summary(&info).await.unwrap().ever_used_codex);
+    drop(handle);
+
+    // On resume, the selected route is determined from the loaded session,
+    // before the persistence actor can create any export sink.
+    let (loaded, resumed) = load_light_with_root(
+        root.path().to_path_buf(),
+        &info,
+        |_| {
+            Ok((
+                ModelProvider::Fireworks,
+                Some(ModelProvider::Xai),
+                title_client(ModelProvider::Xai),
+                "title-helper".to_owned(),
+                false,
+            ))
+        },
+        StorageMode::Local,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(loaded.summary.ever_used_codex);
+    assert!(!resumed.provider_boundary.allows_xai_export());
+    assert!(storage.load_summary(&info).await.unwrap().ever_used_codex);
+
+    for (name, persisted_provider) in [
+        ("non-xai", Some(ModelProvider::Fireworks)),
+        ("unknown", None),
+    ] {
+        let info = Info {
+            id: acp::SessionId::new(format!("legacy-resume-{name}")),
+            cwd: root.path().to_string_lossy().into_owned(),
+        };
+        let created = new_with_root(
+            root.path().to_path_buf(),
+            &info,
+            default_model_id(),
+            ModelProvider::Xai,
+            title_client(ModelProvider::Xai),
+            false,
+            StorageMode::Local,
+            None,
+            None,
+            None,
+            "title-helper".to_owned(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(created);
+        let (loaded, resumed) = load_light_with_root(
+            root.path().to_path_buf(),
+            &info,
+            |_| {
+                Ok((
+                    ModelProvider::Xai,
+                    persisted_provider,
+                    title_client(ModelProvider::Xai),
+                    "title-helper".to_owned(),
+                    false,
+                ))
+            },
+            StorageMode::Local,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(loaded.summary.ever_used_codex, "{name}");
+        assert!(!resumed.provider_boundary.allows_xai_export(), "{name}");
+        assert!(
+            storage.load_summary(&info).await.unwrap().ever_used_codex,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn title_provider_boundary_closes_only_for_an_actual_explicit_cross_provider_request() {
+    for (name, explicit, already_titled, expect_request) in [
+        ("implicit", false, false, false),
+        ("explicit", true, false, true),
+        ("already-titled", true, true, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let info = Info {
+            id: acp::SessionId::new(format!("title-boundary-{name}")),
+            cwd: root.path().to_string_lossy().into_owned(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = || {
+            OaiCompatClient::new(xai_grok_sampler::SamplerConfig {
+                provider: ModelProvider::Fireworks,
+                base_url: format!("http://{address}/v1"),
+                api_key: Some("test-key".into()),
+                api_backend: xai_grok_sampling_types::ApiBackend::ChatCompletions,
+                max_retries: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let created = new_with_root(
+            root.path().to_path_buf(),
+            &info,
+            default_model_id(),
+            ModelProvider::Xai,
+            client(),
+            explicit,
+            StorageMode::Local,
+            None,
+            None,
+            None,
+            "title-helper".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let storage = JsonlStorageAdapter::with_root(root.path().to_path_buf());
+        let handle = if already_titled {
+            drop(created);
+            storage
+                .update_session_title(&info, "Existing title".into())
+                .await
+                .unwrap();
+            let (_, resumed) = load_light_with_root(
+                root.path().to_path_buf(),
+                &info,
+                |_| {
+                    Ok((
+                        ModelProvider::Xai,
+                        Some(ModelProvider::Xai),
+                        client(),
+                        "title-helper".into(),
+                        explicit,
+                    ))
+                },
+                StorageMode::Local,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            resumed
+        } else {
+            created
+        };
+        handle
+            .tx
+            .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Title this conversation",
+                ))],
+            )))
+            .unwrap();
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .tx
+            .send(PersistenceMsg::FlushAndAck { respond_to })
+            .unwrap();
+        response.await.unwrap().unwrap();
+        assert_eq!(
+            !handle.provider_boundary.allows_xai_export(),
+            expect_request,
+            "{name}"
+        );
+        assert_eq!(
+            storage.load_summary(&info).await.unwrap().ever_used_codex,
+            expect_request,
+            "{name}"
+        );
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        assert_eq!(accepted.is_ok(), expect_request, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn child_auxiliary_boundary_closes_parent_and_waits_for_both_markers() {
+    let root = tempfile::tempdir().unwrap();
+    let parent_info = Info {
+        id: acp::SessionId::new("parent-boundary"),
+        cwd: root.path().to_string_lossy().into_owned(),
+    };
+    let parent_dir = root.path().join("parent");
+    let parent_storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(parent_dir));
+    parent_storage
+        .init_session(&parent_info, default_model_id())
+        .await
+        .unwrap();
+    let parent = test_actor(parent_info.clone(), parent_storage.clone());
+    let child_info = Info {
+        id: acp::SessionId::new("child-boundary"),
+        cwd: root.path().to_string_lossy().into_owned(),
+    };
+    let child_dir = root.path().join("child");
+    let child_storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir.clone());
+    let client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
+    let child = new_with_explicit_dir_and_parent(
+        &child_info,
+        child_dir,
+        default_model_id(),
+        client,
+        "helper".into(),
+        parent.handle.provider_boundary.clone(),
+        Some(parent.handle.tx.clone()),
+    )
+    .await
+    .unwrap();
+    child.provider_boundary.observe(ModelProvider::Fireworks);
+    assert!(!parent.handle.provider_boundary.allows_xai_export());
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    child
+        .tx
+        .send(PersistenceMsg::CloseXaiExportAndAck { respond_to })
+        .unwrap();
+    response.await.unwrap().unwrap();
+    assert!(
+        child_storage
+            .load_summary(&child_info)
+            .await
+            .unwrap()
+            .ever_used_codex
+    );
+    assert!(
+        parent_storage
+            .load_summary(&parent_info)
+            .await
+            .unwrap()
+            .ever_used_codex
+    );
+    parent.stop().await;
+}
+
+#[tokio::test]
+async fn child_auxiliary_boundary_accepts_only_explicitly_ephemeral_parent_without_a_sink() {
+    let root = tempfile::tempdir().unwrap();
+    for ephemeral in [true, false] {
+        let parent = if ephemeral {
+            PersistenceHandle::noop().provider_boundary
+        } else {
+            ProviderBoundary::default()
+        };
+        let child_info = Info {
+            id: acp::SessionId::new(format!("child-ephemeral-{ephemeral}")),
+            cwd: root.path().to_string_lossy().into_owned(),
+        };
+        let child_dir = root.path().join(format!("child-{ephemeral}"));
+        let child_storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir.clone());
+        let client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
+        let child = new_with_explicit_dir_and_parent(
+            &child_info,
+            child_dir,
+            default_model_id(),
+            client,
+            "helper".into(),
+            parent.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        child.provider_boundary.observe(ModelProvider::Fireworks);
+        assert!(!parent.allows_xai_export());
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        child
+            .tx
+            .send(PersistenceMsg::CloseXaiExportAndAck { respond_to })
+            .unwrap();
+        assert_eq!(response.await.unwrap().is_ok(), ephemeral);
+        assert!(
+            child_storage
+                .load_summary(&child_info)
+                .await
+                .unwrap()
+                .ever_used_codex
+        );
+    }
+}
+
+#[tokio::test]
+async fn new_session_and_fork_share_exclusive_target_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_string_lossy().into_owned();
+    let info = |id: &str| Info {
+        id: acp::SessionId::new(id.to_owned()),
+        cwd: cwd.clone(),
+    };
+    let source = info("reservation-source");
+    let fork_first = info("fork-first");
+    let new_first = info("new-first");
+    let adapter = JsonlStorageAdapter::with_root(root.path().to_path_buf());
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .copy_new_session_data_sync(
+            &source,
+            &fork_first,
+            crate::session::storage::CopySessionOptions::default(),
+        )
+        .unwrap();
+    let make_session = |target: Info| {
+        let root = root.path().to_path_buf();
+        async move {
+            new_with_root(
+                root,
+                &target,
+                default_model_id(),
+                ModelProvider::Xai,
+                OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap(),
+                false,
+                StorageMode::Local,
+                None,
+                None,
+                None,
+                "helper".into(),
+                None,
+                None,
+            )
+            .await
+        }
+    };
+    let error = match make_session(fork_first.clone()).await {
+        Ok(_) => panic!("session/new accepted an occupied fork target"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert!(adapter.load_summary(&fork_first).await.is_ok());
+    let created = make_session(new_first.clone()).await.unwrap();
+    let error = adapter
+        .copy_new_session_data_sync(
+            &source,
+            &new_first,
+            crate::session::storage::CopySessionOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert!(adapter.load_summary(&new_first).await.is_ok());
+    drop(created);
+}
+
+#[test]
+fn chat_session_reservation_cleans_only_empty_owned_directories() {
+    let root = tempfile::tempdir().unwrap();
+    for keep_asset in [false, true] {
+        let info = Info {
+            id: acp::SessionId::new(if keep_asset {
+                "chat-asset"
+            } else {
+                "empty-chat"
+            }),
+            cwd: root.path().to_string_lossy().into_owned(),
+        };
+        let path = session_dir_in(root.path(), &info);
+        let reservation = NewSessionReservation::reserve(root.path(), &info).unwrap();
+        let handle =
+            PersistenceHandle::noop_for_provider_with_reservation(ModelProvider::Xai, reservation);
+        let boundary = handle.provider_boundary.clone();
+        if keep_asset {
+            std::fs::write(path.join("asset"), b"user data").unwrap();
+        }
+        drop(handle);
+        assert!(path.exists(), "shared boundary retains the reservation");
+        drop(boundary);
+        assert_eq!(path.exists(), keep_asset);
+        if keep_asset {
+            assert_eq!(std::fs::read(path.join("asset")).unwrap(), b"user data");
+        }
+    }
 }
 
 #[tokio::test]

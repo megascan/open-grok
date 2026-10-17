@@ -192,6 +192,8 @@ struct ReplayState {
     current_user_text: String,
 
     current_user_prompt_index: Option<usize>,
+    /// Whether this run was sent by an agent instead of a human.
+    current_user_is_agent: bool,
 
     /// True once any user chunk with `_meta.promptIndex` has been seen.
     /// Unnumbered user runs after that are mid-turn phantoms (not turns).
@@ -229,6 +231,7 @@ impl ReplayState {
             in_user_message: false,
             current_user_text: String::new(),
             current_user_prompt_index: None,
+            current_user_is_agent: false,
             seen_prompt_index_marker: false,
             current_agent_text: String::new(),
             has_pending_agent: false,
@@ -517,6 +520,12 @@ impl ReplayState {
             .and_then(|m| m.get("promptIndex"))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let chunk_is_agent = chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("syntheticReason"))
+            .and_then(|value| value.as_str())
+            == Some("agent_message");
         if chunk_prompt_index.is_some() {
             self.seen_prompt_index_marker = true;
         }
@@ -526,14 +535,17 @@ impl ReplayState {
             self.in_user_message = true;
             self.current_user_text.clear();
             self.current_user_prompt_index = chunk_prompt_index;
-        } else if chunk_prompt_index != self.current_user_prompt_index
-            && (chunk_prompt_index.is_some() || self.current_user_prompt_index.is_some())
+            self.current_user_is_agent = chunk_is_agent;
+        } else if chunk_is_agent != self.current_user_is_agent
+            || (chunk_prompt_index != self.current_user_prompt_index
+                && (chunk_prompt_index.is_some() || self.current_user_prompt_index.is_some()))
         {
             // New run: promptIndex changed, or transition between marked/unmarked.
             self.flush_pending_user();
             self.in_user_message = true;
             self.current_user_text.clear();
             self.current_user_prompt_index = chunk_prompt_index;
+            self.current_user_is_agent = chunk_is_agent;
         } else if self.current_user_prompt_index.is_none() {
             self.current_user_prompt_index = chunk_prompt_index;
         }
@@ -600,17 +612,21 @@ impl ReplayState {
         }
         let text = std::mem::take(&mut self.current_user_text);
         let pi = self.current_user_prompt_index.take();
+        let mut item = if self.current_user_is_agent {
+            ConversationItem::agent_message(text)
+        } else {
+            ConversationItem::user(text)
+        };
         if let Some(pi) = pi {
-            let mut item = ConversationItem::user(text);
             item.set_prompt_index(pi);
             self.conversation.push(item);
             self.prompt_counter += 1;
         } else if !self.seen_prompt_index_marker {
-            self.conversation.push(ConversationItem::user(text));
+            self.conversation.push(item);
             self.prompt_counter += 1;
         } else {
             // Mid-turn phantom after markers: keep text, do not count.
-            self.conversation.push(ConversationItem::user(text));
+            self.conversation.push(item);
         }
     }
 
@@ -1252,5 +1268,31 @@ mod tests {
         assert_eq!(result.conversation.len(), 2);
         assert_eq!(result.conversation[0].text_content(), "sys");
         assert_eq!(result.conversation[1].text_content(), "summary2");
+    }
+    #[test]
+    fn adjacent_agent_and_user_chunks_keep_distinct_authority() {
+        let mut state = ReplayState::new(10);
+        let human = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("human")))
+            .meta(serde_json::json!({"promptIndex": 0}).as_object().cloned());
+        let agent = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("agent")))
+            .meta(
+                serde_json::json!({"promptIndex": 0, "syntheticReason": "agent_message"})
+                    .as_object()
+                    .cloned(),
+            );
+        state.handle_user_chunk(&human);
+        state.handle_user_chunk(&agent);
+        state.flush_pending_user();
+        assert_eq!(state.conversation.len(), 2);
+        match (&state.conversation[0], &state.conversation[1]) {
+            (ConversationItem::User(human), ConversationItem::User(agent)) => {
+                assert!(human.synthetic_reason.is_none());
+                assert_eq!(
+                    agent.synthetic_reason,
+                    Some(xai_grok_sampling_types::SyntheticReason::AgentMessage)
+                );
+            }
+            _ => panic!("expected separate user and agent messages"),
+        }
     }
 }

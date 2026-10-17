@@ -3,6 +3,18 @@
 
 use super::*;
 
+fn stopped_agent_message_is_held(state: &State) -> bool {
+    state.notifications_suppressed
+        && state.pending_inputs.front().is_some_and(|input| {
+            matches!(
+                &input.origin,
+                super::PromptOrigin::AgentMessage { .. }
+                    | super::PromptOrigin::PeerSessionMessage { .. }
+                    | super::PromptOrigin::ParentAgentMessage { .. }
+            )
+        })
+}
+
 /// Maximum number of pending notifications before oldest are dropped.
 pub(super) const MAX_PENDING_NOTIFICATIONS: usize = 50;
 
@@ -160,6 +172,9 @@ impl SessionActor {
             if state.pending_inputs.is_empty() {
                 return;
             }
+            if stopped_agent_message_is_held(&state) {
+                return;
+            }
             // A merge needs 2+ queued prompts; sample here so the common
             // single-prompt promote skips the config disk read below.
             may_combine = state.pending_inputs.len() >= 2;
@@ -236,6 +251,9 @@ impl SessionActor {
                 Self::respond_removed_prompt(item.respond_to);
             }
         }
+        if stopped_agent_message_is_held(&state) {
+            return;
+        }
 
         // GC stale edit-holds: an id that is no longer queued (promoted,
         // removed, or whose fire-and-forget `release_edit` was dropped) can
@@ -264,6 +282,10 @@ impl SessionActor {
             let skip: Vec<&str> = holds.iter().map(String::as_str).collect();
             SessionActor::combine_front_pending_inputs(&mut state.pending_inputs, &skip);
         }
+
+        // Bind the rewind boundary before spawning the task. The task may be
+        // cancelled before it ever increments the chat index.
+        let prompt_index_at_start = self.chat_state_handle.get_prompt_index().await;
 
         // Start the next pending user prompt. Pull all needed fields from the
         // queue head in one `front_mut` scope so we can mutate `state` again
@@ -385,6 +407,7 @@ impl SessionActor {
                 traceparent,
             },
             self.turn_report.epoch(),
+            prompt_index_at_start,
             completion_tx,
         ));
         if let Some(ready) = initial_child_prompt_ready {

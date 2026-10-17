@@ -616,7 +616,13 @@ impl MvpAgent {
                 session_sampling.reasoning_effort = model_default;
             }
         }
-        let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
+        let (summary_client, summary_model, summary_cross_provider_allowed) =
+            self.build_summary_client(&session_sampling)?;
+        let reservation = crate::session::persistence::NewSessionReservation::reserve(
+            &crate::util::grok_home::grok_home(),
+            &session_info,
+        )
+        .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
         let relay_sync = if session_sampling.provider == xai_grok_sampling_types::ModelProvider::Xai
         {
             self.start_relay_sync(&session_id, &session_info)
@@ -632,16 +638,20 @@ impl MvpAgent {
         let session_model_id = model_id.clone();
         self.report_setup_phase(SessionSetupPhase::PersistenceInit);
         let persistence = if is_chat_kind {
-            crate::session::persistence::PersistenceHandle::noop_for_provider(
+            crate::session::persistence::PersistenceHandle::noop_for_provider_with_reservation(
                 session_sampling.provider,
+                reservation,
             )
         } else {
             let _timer = crate::instrumentation_timer!("session.persistence_init");
             let registry_title_sync = self.registry_title_sync();
             crate::session::persistence::new(
                 &session_info,
+                reservation,
                 model_id,
+                session_sampling.provider,
                 summary_client,
+                summary_cross_provider_allowed,
                 self.storage_mode.get(),
                 Some(self.auth_manager.clone()),
                 relay_sync,
@@ -993,11 +1003,21 @@ impl MvpAgent {
             drop(flush_timer);
         }
         let origin_client = self.origin_client_info_from_meta(request_meta.as_ref());
-        let load_session_sampling = self.resolve_sampling_config_for_model(
-            &self.models_manager.current_model_id(),
-            origin_client.clone(),
-        );
-        let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
+        // Resolve the same route used for the restored actor before admitting
+        // any provider-specific persistence or relay work.
+        let startup_auth_model_for_summary = |summary: &crate::session::persistence::Summary| {
+            let model_id = requested_model_id
+                .clone()
+                .unwrap_or_else(|| summary.current_model_id.clone());
+            if requested_model_id.is_none() {
+                let models = self.models_manager.models();
+                let available = self.models_manager.available();
+                selectable_catalog_key_for_persisted(&models, &available, &model_id)
+                    .unwrap_or(model_id)
+            } else {
+                model_id
+            }
+        };
         // RelaySync connects as soon as it is constructed, so fail closed
         // before loading the persistence actor. A missing/legacy summary is
         // not enough provenance to start an xAI-only relay.
@@ -1008,9 +1028,18 @@ impl MvpAgent {
             if summary.ever_used_codex {
                 return false;
             }
-            self.resolve_sampling_config_for_model(&summary.current_model_id, origin_client.clone())
-                .provider
-                == xai_grok_sampling_types::ModelProvider::Xai
+            let persisted_provider = self
+                .resolve_model_id(&summary.current_model_id)
+                .ok()
+                .map(|entry| entry.info().provider);
+            let startup_provider = self
+                .resolve_sampling_config_for_model(
+                    &startup_auth_model_for_summary(&summary),
+                    origin_client.clone(),
+                )
+                .provider;
+            persisted_provider == Some(xai_grok_sampling_types::ModelProvider::Xai)
+                && startup_provider == xai_grok_sampling_types::ModelProvider::Xai
         });
         let relay_sync = if persisted_relay_allowed {
             self.start_relay_sync(&session_id, &session_info)
@@ -1027,13 +1056,29 @@ impl MvpAgent {
         let registry_title_sync = self.registry_title_sync();
         let (persistence_info, persistence) = crate::session::persistence::load_light(
             &session_info,
-            summary_client,
+            |summary| {
+                let active = self.resolve_sampling_config_for_model(
+                    &startup_auth_model_for_summary(summary),
+                    origin_client.clone(),
+                );
+                let (client, model, allow_cross_provider) = self
+                    .build_summary_client(&active)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                Ok((
+                    active.provider,
+                    self.resolve_model_id(&summary.current_model_id)
+                        .ok()
+                        .map(|entry| entry.info().provider),
+                    client,
+                    model,
+                    allow_cross_provider,
+                ))
+            },
             self.storage_mode.get(),
             Some(self.auth_manager.clone()),
             backend.as_ref(),
             relay_sync,
             Some(self.gateway.clone()),
-            summary_model,
             registry_title_sync,
         )
         .await
@@ -1060,16 +1105,7 @@ impl MvpAgent {
         // catalog key. Resolve it through the selectable projection before
         // checking credentials so a configured BYOK alias can win over an
         // unavailable embedded OAuth row with the same slug.
-        let startup_auth_model_id = if requested_model_id.is_none() {
-            let models = self.models_manager.models();
-            let available = self.models_manager.available();
-            selectable_catalog_key_for_persisted(&models, &available, &startup_model_id)
-                .unwrap_or_else(|| startup_model_id.clone())
-        } else {
-            // An explicit request is a catalog identity, not an ambiguous
-            // persisted routing slug. Preserve exact-key semantics.
-            startup_model_id.clone()
-        };
+        let startup_auth_model_id = startup_auth_model_for_summary(&summary);
         let startup_sampling =
             self.resolve_sampling_config_for_model(&startup_auth_model_id, origin_client.clone());
         let startup_tool_policy_override = requested_model_id

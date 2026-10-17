@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
 mod copy;
+pub(crate) use copy::rewind_exact_checkpoint_chat;
 #[derive(Clone)]
 enum SessionDirMode {
     FromRoot(PathBuf),

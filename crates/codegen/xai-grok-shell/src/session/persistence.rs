@@ -1072,6 +1072,71 @@ pub(crate) fn session_dir_in(grok_home: &Path, info: &Info) -> PathBuf {
     crate::util::grok_home::sessions_cwd_dir_in(grok_home, &info.cwd).join(info.id.to_string())
 }
 
+/// Atomically reserve a new root session directory against fork and other
+/// session creators. Existing directories are never adopted by session/new.
+pub(crate) fn reserve_new_session_dir_in(grok_home: &Path, info: &Info) -> io::Result<PathBuf> {
+    let id = info.id.to_string();
+    let mut components = Path::new(&id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session ID",
+        ));
+    }
+    let cwd_dir = crate::util::grok_home::sessions_cwd_dir_in(grok_home, &info.cwd);
+    crate::session::storage::create_dir_all_durable(&cwd_dir, |_| {
+        crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd)?;
+        crate::session::storage::sync_cwd_marker_if_present(&cwd_dir)
+    })?;
+    let path = cwd_dir.join(&id);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path)?;
+    if let Err(error) = crate::session::storage::sync_dir_durable(&cwd_dir) {
+        let _ = std::fs::remove_dir(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+pub(crate) struct NewSessionReservation(Option<PathBuf>);
+
+impl NewSessionReservation {
+    pub(crate) fn reserve(grok_home: &Path, info: &Info) -> io::Result<Self> {
+        reserve_new_session_dir_in(grok_home, info).map(|path| Self(Some(path)))
+    }
+
+    fn into_empty_dir_guard(mut self) -> EmptySessionDirGuard {
+        EmptySessionDirGuard(self.0.take().expect("reservation is live"))
+    }
+}
+
+impl Drop for NewSessionReservation {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0
+            && !path.join("summary.json").exists()
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EmptySessionDirGuard(PathBuf);
+
+impl Drop for EmptySessionDirGuard {
+    fn drop(&mut self) {
+        // Chat sessions can persist assets here; only remove an empty directory.
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 /// Get file path for storing a large prompt.
 /// Creates the prompts subdirectory if it doesn't exist.
 /// Path format: `{session_dir}/prompts/prompt_{prompt_index}.txt`
@@ -2205,13 +2270,28 @@ mod generated_title_tests {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderBoundary {
     ever_used_codex: Arc<AtomicBool>,
+    parent: Option<Arc<AtomicBool>>,
+    _empty_dir_guard: Option<Arc<EmptySessionDirGuard>>,
+    ephemeral: bool,
 }
 
 impl ProviderBoundary {
     pub(crate) fn new(ever_used_codex: bool) -> Self {
         Self {
             ever_used_codex: Arc::new(AtomicBool::new(ever_used_codex)),
+            parent: None,
+            _empty_dir_guard: None,
+            ephemeral: false,
         }
+    }
+
+    pub(crate) fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    fn with_parent(mut self, parent: &Self) -> Self {
+        self.parent = Some(parent.ever_used_codex.clone());
+        self
     }
 
     /// Observe a provider and return true only when it first closes the xAI
@@ -2227,6 +2307,9 @@ impl ProviderBoundary {
     /// External agents are not sampler providers, but their content must
     /// close the same cumulative boundary immediately.
     pub(crate) fn close_xai_export(&self) -> bool {
+        if let Some(parent) = &self.parent {
+            parent.store(true, Ordering::Release);
+        }
         self.ever_used_codex
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -2234,6 +2317,10 @@ impl ProviderBoundary {
 
     pub(crate) fn ever_used_codex(&self) -> bool {
         self.ever_used_codex.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.load(Ordering::Acquire))
     }
 
     pub(crate) fn allows_xai_export(&self) -> bool {
@@ -2305,7 +2392,10 @@ impl PersistenceHandle {
 
     pub(crate) fn noop_for_provider(provider: ModelProvider) -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let provider_boundary = ProviderBoundary::default();
+        let provider_boundary = ProviderBoundary {
+            ephemeral: true,
+            ..ProviderBoundary::default()
+        };
         provider_boundary.observe(provider);
         Self {
             tx,
@@ -2313,6 +2403,16 @@ impl PersistenceHandle {
             noop: true,
             disk_full_rx: watch::channel(false).1,
         }
+    }
+
+    pub(crate) fn noop_for_provider_with_reservation(
+        provider: ModelProvider,
+        reservation: NewSessionReservation,
+    ) -> Self {
+        let mut handle = Self::noop_for_provider(provider);
+        handle.provider_boundary._empty_dir_guard =
+            Some(Arc::new(reservation.into_empty_dir_guard()));
+        handle
     }
 
     pub fn is_noop(&self) -> bool {
@@ -2407,6 +2507,10 @@ struct SessionPersistence {
     relay_sync: Option<crate::relay::RelaySync>,
     /// Session title generation lifecycle.
     summary: crate::session::summary::SummaryGenerator,
+    /// The title route was explicitly selected locally by the user.
+    summary_cross_provider_allowed: bool,
+    /// `Some(None)` means this child has no available parent persistence sink.
+    parent_export: Option<Option<mpsc::UnboundedSender<PersistenceMsg>>>,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
     /// Client gateway for `SessionSummaryGenerated` notifications. Used to
     /// announce an auto-generated title only once it has actually been adopted
@@ -3072,7 +3176,31 @@ impl SessionPersistence {
                     self.remote_sync.take();
                     self.relay_sync.take();
                     self.registry_title_sync.take();
-                    let result = self.storage.mark_ever_used_codex(&self.info).await;
+                    let mut result = self.storage.mark_ever_used_codex(&self.info).await;
+                    if result.is_ok()
+                        && let Some(parent) = &self.parent_export
+                    {
+                        result = match parent {
+                            Some(parent) => {
+                                let (parent_respond_to, response) = tokio::sync::oneshot::channel();
+                                if parent
+                                    .send(PersistenceMsg::CloseXaiExportAndAck {
+                                        respond_to: parent_respond_to,
+                                    })
+                                    .is_err()
+                                {
+                                    Err(io::Error::other("parent persistence is unavailable"))
+                                } else {
+                                    response.await.unwrap_or_else(|_| {
+                                        Err(io::Error::other(
+                                            "parent persistence acknowledgement was lost",
+                                        ))
+                                    })
+                                }
+                            }
+                            None => Err(io::Error::other("parent persistence is unavailable")),
+                        };
+                    }
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::RefreshCodexSummaryAuth { bearer_resolver } => {
@@ -3143,8 +3271,36 @@ impl SessionPersistence {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if self.summary.provider() == self.current_provider {
-                        self.summary.update(content_part);
+                    let summary_provider = self.summary.provider();
+                    if summary_provider == self.current_provider
+                        || self.summary_cross_provider_allowed
+                    {
+                        // Before sending content to an explicitly selected
+                        // non-xAI helper, close and persist the export boundary.
+                        let boundary_ready = if self.summary.is_idle()
+                            && !content_part.trim().is_empty()
+                            && !summary_provider.profile().allows_xai_services()
+                        {
+                            self.provider_boundary.observe(summary_provider);
+                            self.remote_sync.take();
+                            self.relay_sync.take();
+                            self.registry_title_sync.take();
+                            match self.storage.mark_ever_used_codex(&self.info).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        ?error,
+                                        "failed to persist title provider boundary"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if boundary_ready {
+                            self.summary.update(content_part);
+                        }
                     } else {
                         tracing::debug!(
                             active_provider = ?self.current_provider,
@@ -3688,8 +3844,11 @@ async fn initialize_provider_boundary(
 
 pub(crate) async fn new(
     info: &Info,
+    reservation: NewSessionReservation,
     model_id: acp::ModelId,
+    current_provider: ModelProvider,
     sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
     relay_sync: Option<crate::relay::RelaySync>,
@@ -3698,7 +3857,84 @@ pub(crate) async fn new(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
     session_kind: Option<String>,
 ) -> io::Result<PersistenceHandle> {
-    let root_dir = grok_home();
+    new_with_reserved_root(
+        grok_home(),
+        info,
+        reservation,
+        model_id,
+        current_provider,
+        sampling_client,
+        summary_cross_provider_allowed,
+        storage_mode,
+        auth_manager,
+        relay_sync,
+        gateway,
+        session_summary_model,
+        registry_title_sync,
+        session_kind,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn new_with_root(
+    root_dir: PathBuf,
+    info: &Info,
+    model_id: acp::ModelId,
+    current_provider: ModelProvider,
+    sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    session_summary_model: String,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
+) -> io::Result<PersistenceHandle> {
+    let reservation = NewSessionReservation::reserve(&root_dir, info)?;
+    new_with_reserved_root(
+        root_dir,
+        info,
+        reservation,
+        model_id,
+        current_provider,
+        sampling_client,
+        summary_cross_provider_allowed,
+        storage_mode,
+        auth_manager,
+        relay_sync,
+        gateway,
+        session_summary_model,
+        registry_title_sync,
+        session_kind,
+    )
+    .await
+}
+
+async fn new_with_reserved_root(
+    root_dir: PathBuf,
+    info: &Info,
+    reservation: NewSessionReservation,
+    model_id: acp::ModelId,
+    current_provider: ModelProvider,
+    sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    session_summary_model: String,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
+) -> io::Result<PersistenceHandle> {
+    if reservation.0.as_deref() != Some(session_dir_in(&root_dir, info).as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session reservation does not match target",
+        ));
+    }
+    let _reservation = reservation;
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
 
     // Initialize session in storage
@@ -3719,7 +3955,6 @@ pub(crate) async fn new(
     }
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
     let provider_boundary =
         initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
             .await?;
@@ -3758,6 +3993,8 @@ pub(crate) async fn new(
                     persistence_tx: summary_tx,
                 },
             ),
+            summary_cross_provider_allowed,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,
@@ -3792,6 +4029,48 @@ pub(crate) async fn new_with_explicit_dir(
     sampling_client: OaiCompatClient,
     session_summary_model: String,
 ) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_inner(
+        info,
+        target_dir,
+        model_id,
+        sampling_client,
+        session_summary_model,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_with_explicit_dir_and_parent(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    session_summary_model: String,
+    parent_boundary: ProviderBoundary,
+    parent_persistence_tx: Option<mpsc::UnboundedSender<PersistenceMsg>>,
+) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_inner(
+        info,
+        target_dir,
+        model_id,
+        sampling_client,
+        session_summary_model,
+        Some((parent_boundary, parent_persistence_tx)),
+    )
+    .await
+}
+
+async fn new_with_explicit_dir_inner(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    session_summary_model: String,
+    parent: Option<(
+        ProviderBoundary,
+        Option<mpsc::UnboundedSender<PersistenceMsg>>,
+    )>,
+) -> io::Result<PersistenceHandle> {
     let summary_path = target_dir.join("summary.json");
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_explicit_session_dir(target_dir));
@@ -3817,9 +4096,16 @@ pub(crate) async fn new_with_explicit_dir(
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let current_provider = sampling_client.provider();
-    let provider_boundary =
+    let mut provider_boundary =
         initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
             .await?;
+    let parent_export = parent.and_then(|(parent_boundary, tx)| {
+        provider_boundary = provider_boundary.clone().with_parent(&parent_boundary);
+        (!parent_boundary.is_ephemeral()).then_some(tx)
+    });
+    if !provider_boundary.allows_xai_export() && !summary.ever_used_codex {
+        storage.mark_ever_used_codex(info).await?;
+    }
 
     let (handle, rx, summary_tx, disk_full_tx) = actor_channel(provider_boundary.clone());
     let info_clone = info.clone();
@@ -3842,6 +4128,8 @@ pub(crate) async fn new_with_explicit_dir(
                     persistence_tx: summary_tx,
                 },
             ),
+            summary_cross_provider_allowed: false,
+            parent_export,
             registry_title_sync: None,
             gateway: None,
             disk_full_tx,
@@ -3906,6 +4194,7 @@ async fn pull_on_miss(
 #[expect(dead_code, reason = "wired when session restore flow calls load")]
 pub(crate) async fn load(
     info: &Info,
+    current_provider: ModelProvider,
     sampling_client: OaiCompatClient,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
@@ -3943,7 +4232,6 @@ pub(crate) async fn load(
     };
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
     let provider_boundary = initialize_provider_boundary(
         storage.as_ref(),
         &loaded_info,
@@ -3990,6 +4278,8 @@ pub(crate) async fn load(
             created_fresh: false,
             relay_sync,
             summary: summary_gen,
+            summary_cross_provider_allowed: false,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,
@@ -4011,16 +4301,55 @@ pub(crate) async fn load(
 /// Use this for memory-efficient session loading when replaying updates.
 pub(crate) async fn load_light(
     info: &Info,
-    sampling_client: OaiCompatClient,
+    route_for_summary: impl FnOnce(
+        &Summary,
+    ) -> io::Result<(
+        ModelProvider,
+        Option<ModelProvider>,
+        OaiCompatClient,
+        String,
+        bool,
+    )>,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
     backend: Option<&crate::remote::BackendClient>,
     relay_sync: Option<crate::relay::RelaySync>,
     gateway: Option<GatewaySender>,
-    session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
-    let root_dir = grok_home();
+    load_light_with_root(
+        grok_home(),
+        info,
+        route_for_summary,
+        storage_mode,
+        auth_manager,
+        backend,
+        relay_sync,
+        gateway,
+        registry_title_sync,
+    )
+    .await
+}
+
+async fn load_light_with_root(
+    root_dir: PathBuf,
+    info: &Info,
+    route_for_summary: impl FnOnce(
+        &Summary,
+    ) -> io::Result<(
+        ModelProvider,
+        Option<ModelProvider>,
+        OaiCompatClient,
+        String,
+        bool,
+    )>,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    backend: Option<&crate::remote::BackendClient>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -4055,7 +4384,22 @@ pub(crate) async fn load_light(
     };
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
+    let (
+        current_provider,
+        persisted_provider,
+        sampling_client,
+        session_summary_model,
+        summary_cross_provider_allowed,
+    ) = route_for_summary(&persisted_info.summary)?;
+    // A legacy summary may lack the monotonic marker. Preserve the persisted
+    // route's boundary even when the caller selects a different startup model;
+    // an unknown persisted route is insufficient provenance for export.
+    if !persisted_provider.is_some_and(|provider| provider.profile().allows_xai_services())
+        && !persisted_info.summary.ever_used_codex
+    {
+        storage.mark_ever_used_codex(&loaded_info).await?;
+        persisted_info.summary.ever_used_codex = true;
+    }
     let provider_boundary = initialize_provider_boundary(
         storage.as_ref(),
         &loaded_info,
@@ -4102,6 +4446,8 @@ pub(crate) async fn load_light(
             created_fresh: false,
             relay_sync,
             summary: summary_gen,
+            summary_cross_provider_allowed,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,

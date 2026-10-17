@@ -4,20 +4,23 @@
 
 use super::*;
 
-// Buffer, entry type, and formatting live in the shared
-// xai-interjection-core crate so the server-side agent loop can adopt the
-// same semantics. The shell keeps arrival (ACP ext methods), persistence,
-// and pager echo.
+// Framing is shared with xai-interjection-core. The shell retains typed
+// provenance alongside each entry because model-authored messages share this
+// queue with human interjections.
 //
 // Re-exported for `acp_session.rs` which does `pub(crate) use interjection::*;`
 // so retained code and co-located tests keep resolving by `acp_session::` path.
 #[allow(unused_imports)]
-pub(crate) use xai_interjection_core::{
-    INTERRUPT_NOTE, InterjectionBuffer, drain_formatted, format_interjection, frame_user_turn,
-};
+pub(crate) use xai_interjection_core::{INTERRUPT_NOTE, format_interjection, frame_user_turn};
 
-/// Shell instantiation of the shared entry type: images are ACP content.
-pub(crate) type PendingInterjection = xai_interjection_core::PendingInterjection<acp::ImageContent>;
+#[derive(Debug, Clone)]
+pub(crate) struct PendingInterjection {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<acp::ImageContent>,
+    pub(crate) origin: super::super::PromptOrigin,
+}
+
+pub(crate) type InterjectionBuffer = xai_interjection_core::EventQueue<PendingInterjection>;
 
 /// Prompt-id prefix for interjections that missed their turn and were
 /// converted into standalone prompt turns (arrived while idle, or after the
@@ -55,7 +58,35 @@ impl SessionActor {
         images: Vec<acp::ImageContent>,
         front: bool,
     ) {
-        let prompt_id = format!("{INTERJECT_FALLBACK_PROMPT_PREFIX}{}", uuid::Uuid::now_v7());
+        self.queue_stranded_interjection(
+            PendingInterjection {
+                text,
+                attachments: images,
+                origin: super::super::PromptOrigin::User,
+            },
+            front,
+        )
+        .await;
+    }
+
+    async fn queue_stranded_interjection(&self, entry: PendingInterjection, front: bool) {
+        let PendingInterjection {
+            text,
+            attachments: images,
+            origin,
+        } = entry;
+        let prompt_id = match &origin {
+            super::super::PromptOrigin::AgentMessage { message_id } => {
+                format!("agent-message-{message_id}")
+            }
+            super::super::PromptOrigin::PeerSessionMessage { message_id } => {
+                format!("peer-message-{message_id}")
+            }
+            super::super::PromptOrigin::ParentAgentMessage { message_id, .. } => {
+                format!("parent-message-{message_id}")
+            }
+            _ => format!("{INTERJECT_FALLBACK_PROMPT_PREFIX}{}", uuid::Uuid::now_v7()),
+        };
         let mut prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
         prompt_blocks.extend(images.into_iter().map(acp::ContentBlock::Image));
         // Respect an active plan mode: the interjection was aimed at a turn
@@ -66,8 +97,10 @@ impl SessionActor {
             crate::session::plan_mode::PromptMode::Agent
         };
         let (respond_to, _) = tokio::sync::oneshot::channel();
-        // User message (skips queue_input); invalidate in-flight recap now.
-        self.invalidate_side_calls_for_new_prompt();
+        // Only a human follow-up invalidates in-flight recap.
+        if !origin.is_synthetic() {
+            self.invalidate_side_calls_for_new_prompt();
+        }
         let item = InputItem {
             prompt_id,
             prompt_blocks,
@@ -76,9 +109,9 @@ impl SessionActor {
             artifact_tracker: None,
             client_identifier: None,
             screen_mode: None,
-            verbatim: false,
+            verbatim: origin.is_synthetic(),
             json_schema: None,
-            origin: super::super::PromptOrigin::User,
+            origin,
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -113,10 +146,32 @@ impl SessionActor {
         let count = stranded.len();
         // Reversed push_fronts keep entry 0 front-most.
         for entry in stranded.into_iter().rev() {
-            self.queue_interjection_fallback_prompt(entry.text, entry.attachments, true)
-                .await;
+            self.queue_stranded_interjection(entry, true).await;
         }
         count
+    }
+
+    /// On Stop, drop human steering but retain already accepted model mail
+    /// behind previously queued work. The caller must first abort the turn so
+    /// its in-flight drain cannot also commit an entry.
+    pub(super) async fn preserve_agent_interjections_after_cancel(&self) -> usize {
+        let entries = self.pending_interjections.drain_all();
+        let mut count = 0;
+        for entry in entries {
+            if entry.origin.policy().authority
+                == crate::session::InputAuthority::ModelAuthoredUntrusted
+            {
+                self.queue_stranded_interjection(entry, false).await;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn finish_interjection_entry(&self) {
+        let first = std::cell::Cell::new(true);
+        self.pending_interjections
+            .drain_matching(|_| first.replace(false));
     }
     /// Normalize interjection images for injection (shared pipeline above);
     /// notices append to `wrapped` (TEXT side only). Returns the images to
@@ -213,9 +268,18 @@ impl SessionActor {
         images: &[acp::ImageContent],
     ) {
         let model_id = self.current_model_id().await;
-        let user_chunk_meta = serde_json::json!({ "modelId": model_id })
+        let mut user_chunk_meta = serde_json::json!({ "modelId": model_id })
             .as_object()
             .cloned();
+        if matches!(&item, ConversationItem::User(user) if user.synthetic_reason == Some(xai_grok_sampling_types::SyntheticReason::AgentMessage))
+        {
+            user_chunk_meta
+                .get_or_insert_with(Default::default)
+                .insert("hideFromScrollback".into(), serde_json::json!(true));
+            user_chunk_meta
+                .get_or_insert_with(Default::default)
+                .insert("syntheticReason".into(), serde_json::json!("agent_message"));
+        }
 
         // Persist to updates.jsonl: one UserMessageChunk per content block
         // (text first, then any images — Image chunks already round-trip).
@@ -333,22 +397,41 @@ impl SessionActor {
     }
 
     pub(super) async fn drain_pending_interjections(&self) -> bool {
+        if !self.pending_native_agent_messages.lock().is_empty() {
+            // A committed native carrier is also accepted agent mail and
+            // must not disappear if the active turn is rewound.
+            self.close_rewind_window().await;
+        }
         let native_activity = self.flush_native_agent_messages();
         // Manual drain (not `drain_formatted`): skill parsing needs the raw
         // text — parsed post-wrap, the envelope's closing `</user_query>` tag
         // would pollute the trailing skill's args.
-        let entries = self.pending_interjections.drain_all();
-        if entries.is_empty() {
-            return native_activity;
-        }
-
-        for PendingInterjection { text, attachments } in entries {
+        let mut activity = native_activity;
+        while let Some(PendingInterjection {
+            text,
+            attachments,
+            origin,
+        }) = self.pending_interjections.snapshot().first().cloned()
+        {
             // Sanitizer drops `[Image #N: <path>]` → `[Image #N]` before the
             // text reaches the model, covering legacy-client raw text AND the
             // queue-interject harvest. Wrapping and truncation stay in the
             // shared crate (`format_interjection`).
             let sanitized =
                 crate::session::placeholder_images::strip_paths_from_image_placeholders(text);
+            if origin.policy().authority == crate::session::InputAuthority::ModelAuthoredUntrusted {
+                // The sender envelope is already present in the text. Do not
+                // frame it as a user query or expand human skill invocations.
+                // Rewinding the turn's pre-input snapshot after this commit
+                // would discard accepted mail that is no longer buffered.
+                self.close_rewind_window().await;
+                let item = ConversationItem::agent_message(sanitized.clone());
+                self.inject_synthetic_user_message(&sanitized, item, false, &[])
+                    .await;
+                self.finish_interjection_entry();
+                activity = true;
+                continue;
+            }
             let skill_information = self.interjection_skill_information(&sanitized).await;
             let mut wrapped = format_interjection(sanitized);
             let images = self
@@ -374,12 +457,14 @@ impl SessionActor {
             }
             self.inject_synthetic_user_message(&wrapped, item, false, &images)
                 .await;
+            self.finish_interjection_entry();
+            activity = true;
             tracing::info!("Injected mid-turn interjection as standalone synthetic user message");
         }
         // An interjection never cancels the turn, so it leaves no marker on the
         // next user turn (that field is reserved for fatal aborts). The
         // interjection itself is recorded at enqueue time via
         // `Event::Interjected` (carrying the shared `redirect_kind`).
-        true
+        activity
     }
 }

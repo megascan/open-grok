@@ -1143,17 +1143,62 @@ impl SessionActor {
             &xai_chat_state::compaction_utils::extract_user_query(&original_user_message),
         );
         let active_session_config = self.reconstruct_full_config().await;
-        let resolved_describe = self
+        let models = self.models_manager.models();
+        let intended_provider =
+            crate::agent::config::find_model_by_id(&models, &self.image_description_model)
+                .map(|entry| entry.info().provider);
+        let locally_selected = crate::util::config::load_config()
+            .await
+            .models
+            .image_description
+            .as_deref()
+            == Some(self.image_description_model.as_str())
+            || std::env::var("GROK_IMAGE_DESCRIPTION_MODEL")
+                .ok()
+                .is_some_and(|value| value.trim() == self.image_description_model.as_str());
+        if locally_selected && intended_provider.is_none() {
+            return Err(acp::Error::auth_required()
+                .data("the configured image-description model has no usable provider route"));
+        }
+        let mut resolved_describe = self
             .resolve_aux_sampler_config(&self.image_description_model)
             .await;
-        let (describe_model, sampler_config) =
+        let wrong_provider = resolved_describe.as_ref().is_some_and(|route| {
+            !crate::agent::config::auxiliary_route_matches_catalog(
+                intended_provider,
+                route.provider,
+            )
+        });
+        if locally_selected && (wrong_provider || resolved_describe.is_none()) {
+            return Err(acp::Error::auth_required()
+                .data("the configured image-description model has no usable provider route"));
+        }
+        if !locally_selected
+            && (wrong_provider
+                || resolved_describe
+                    .as_ref()
+                    .is_some_and(|route| route.provider != active_session_config.provider))
+        {
+            resolved_describe = None;
+        }
+        let (describe_model, sampler_config) = if locally_selected {
+            let mut cfg = resolved_describe.expect("local route checked above");
+            crate::agent::config::stamp_session_local_sampler_fields(
+                &mut cfg,
+                &active_session_config,
+                self.client_identifier.clone(),
+                Some(self.max_retries),
+            );
+            (cfg.model.clone(), cfg)
+        } else {
             crate::agent::config::finalize_image_describe_sampler_config(
                 resolved_describe,
                 &self.image_description_model,
                 &active_session_config,
                 self.client_identifier.clone(),
                 Some(self.max_retries),
-            );
+            )
+        };
         let client = xai_grok_sampler::SamplingClient::new(sampler_config).map_err(|e| {
             acp::Error::internal_error().data(format!(
                 "failed to build image-describe sampling client: {e}"
@@ -1186,6 +1231,15 @@ impl SessionActor {
                         &current_query,
                         crate::session::image_describe::ImageDescribeSource::UserAttachment,
                         "",
+                        || async {
+                            self.ensure_auxiliary_export_boundary(client.provider())
+                                .await
+                                .map_err(|error| {
+                                    crate::session::image_describe::DescribeError::Sampling(
+                                        error.to_string(),
+                                    )
+                                })
+                        },
                     )
                     .await
                     .map_err(|e| {

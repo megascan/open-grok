@@ -258,7 +258,7 @@ impl ImageDescribeCache {
     /// Returns a cached description when `(source, path_key, bytes, prompt)`
     /// matches a prior successful describe; otherwise calls the vision
     /// model, stores the result, and returns it.
-    pub(crate) async fn get_or_describe(
+    pub(crate) async fn get_or_describe<F, Fut>(
         &self,
         client: xai_grok_sampler::SamplingClient,
         model: &str,
@@ -268,13 +268,19 @@ impl ImageDescribeCache {
         current_query: &str,
         source: ImageDescribeSource,
         path_key: &str,
-    ) -> Result<String, DescribeError> {
+        before_request: F,
+    ) -> Result<String, DescribeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), DescribeError>>,
+    {
         let content_fp = content_fingerprint(raw_bytes);
         let prompt_fp = describe_prompt_fingerprint(outline, current_query);
         let cache_key = (source, path_key.to_owned(), content_fp, prompt_fp);
         if let Some(d) = self.inner.lock().get(&cache_key).cloned() {
             return Ok(d);
         }
+        before_request().await?;
         let url = format!(
             "data:{};base64,{}",
             mime_type,
@@ -474,6 +480,58 @@ pub(crate) fn persist_and_prepend_image_files(
 mod tests {
     use super::*;
     use xai_grok_sampling_types::conversation::{ConversationItem, UserItem};
+
+    #[tokio::test]
+    async fn image_cache_checks_boundary_only_on_cache_miss() {
+        let cache = ImageDescribeCache::new();
+        let source = ImageDescribeSource::UserAttachment;
+        let bytes = b"test image";
+        cache.inner.lock().insert(
+            (
+                source,
+                String::new(),
+                content_fingerprint(bytes),
+                describe_prompt_fingerprint(None, "query"),
+            ),
+            "cached".to_owned(),
+        );
+        let client =
+            xai_grok_sampler::SamplingClient::new(xai_grok_sampler::SamplerConfig::default())
+                .unwrap();
+        let before_request = || async { Err(DescribeError::Sampling("boundary rejected".into())) };
+        let cached = cache
+            .get_or_describe(
+                client.clone(),
+                "model",
+                bytes,
+                "image/png",
+                None,
+                "query",
+                source,
+                "",
+                before_request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached, "cached");
+        let rejected = cache
+            .get_or_describe(
+                client,
+                "model",
+                b"new image",
+                "image/png",
+                None,
+                "query",
+                source,
+                "",
+                before_request,
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(DescribeError::Sampling(message)) if message == "boundary rejected")
+        );
+    }
+
     #[test]
     fn persist_and_prepend_image_files_writes_assets_and_lists_paths() {
         let dir = tempfile::tempdir().unwrap();

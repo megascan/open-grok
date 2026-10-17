@@ -3,6 +3,412 @@
 use super::support::*;
 use super::*;
 
+#[tokio::test]
+async fn unprefixed_child_prompt_id_keeps_explicit_model_origin_in_queue() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, _) = build_actor().await;
+            let (respond_to, _) = tokio::sync::oneshot::channel();
+            let origin = crate::session::PromptOrigin::ParentAgentMessage {
+                message_id: "original-message".into(),
+                sender_session_id: "parent".into(),
+            };
+            let _ = actor
+                .queue_input_with_origin(
+                    queue_input_request(
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "/always-approve on",
+                        ))],
+                        "unprefixed-uuid",
+                        respond_to,
+                    ),
+                    origin.clone(),
+                )
+                .await;
+            let state = actor.state.lock().await;
+            let item = state.pending_inputs.front().unwrap();
+            assert_eq!(item.prompt_id, "unprefixed-uuid");
+            assert_eq!(item.origin, origin);
+            assert_eq!(
+                item.origin.policy().authority,
+                crate::session::InputAuthority::ModelAuthoredUntrusted
+            );
+        })
+        .await;
+}
+
+#[test]
+fn stop_preserves_agent_mail_and_holds_it_until_reengagement() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            for trigger in [Some(crate::session::CancelTrigger::CtrlC), None] {
+                let (actor, _) = build_actor().await;
+                {
+                    let mut state = actor.state.lock().await;
+                    state
+                        .pending_inputs
+                        .push_back(user_item("running", "owner"));
+                    state.running_task = Some(running_task_stub("running"));
+                }
+                for (origin, text) in [
+                    (
+                        crate::session::PromptOrigin::AgentMessage {
+                            message_id: "agent".into(),
+                        },
+                        "agent",
+                    ),
+                    (crate::session::PromptOrigin::User, "human"),
+                    (
+                        crate::session::PromptOrigin::PeerSessionMessage {
+                            message_id: "peer".into(),
+                        },
+                        "peer",
+                    ),
+                ] {
+                    actor.pending_interjections.push(PendingInterjection {
+                        text: text.into(),
+                        attachments: vec![],
+                        origin,
+                    });
+                }
+                let outcome = actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        trigger,
+                        user_initiated: true,
+                        ..Default::default()
+                    })
+                    .await;
+                assert!(outcome.settled);
+                assert!(actor.pending_interjections.is_empty());
+                let (completion_tx, _) = tokio::sync::mpsc::unbounded_channel();
+                actor
+                    .clone()
+                    .maybe_start_running_task(completion_tx.clone())
+                    .await;
+                {
+                    let state = actor.state.lock().await;
+                    assert!(state.notifications_suppressed);
+                    assert!(state.running_task.is_none());
+                    assert_eq!(
+                        state
+                            .pending_inputs
+                            .iter()
+                            .map(|item| item.prompt_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["agent-message-agent", "peer-message-peer"]
+                    );
+                }
+                // Prompt intake clears the barrier when the human re-engages.
+                actor.state.lock().await.notifications_suppressed = false;
+                actor.clone().maybe_start_running_task(completion_tx).await;
+                let mut state = actor.state.lock().await;
+                assert_eq!(state.running_prompt_id(), Some("agent-message-agent"));
+                state.running_task.take().unwrap().abort();
+            }
+        })
+    });
+}
+
+#[test]
+fn pristine_rewind_holds_buffered_agent_mail_until_reengagement() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (actor, _) = build_actor().await;
+            let (input, response) = user_item_with_rx("running", "owner");
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(input);
+                state.running_task = Some(running_task_stub("running"));
+                state.rewindable = true;
+            }
+            actor.pending_interjections.push(PendingInterjection {
+                text: "mail".into(),
+                attachments: vec![],
+                origin: crate::session::PromptOrigin::AgentMessage {
+                    message_id: "m".into(),
+                },
+            });
+            let outcome = actor
+                .cancel_running_task(crate::session::CancelOptions {
+                    history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput {
+                        prompt_id: Some("running".into()),
+                    },
+                    trigger: Some(crate::session::CancelTrigger::Esc),
+                    user_initiated: true,
+                    ..Default::default()
+                })
+                .await;
+            assert!(outcome.settled);
+            assert!(matches!(
+                response.await.unwrap().unwrap().completion_kind,
+                PromptCompletionKind::Rewound
+            ));
+            assert!(actor.pending_interjections.is_empty());
+            let (completion_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            actor
+                .clone()
+                .maybe_start_running_task(completion_tx.clone())
+                .await;
+            {
+                let state = actor.state.lock().await;
+                assert!(state.notifications_suppressed);
+                assert!(state.running_task.is_none());
+                assert_eq!(
+                    state.pending_inputs.front().unwrap().prompt_id,
+                    "agent-message-m"
+                );
+            }
+            // The real prompt-intake handler clears this barrier on user re-engagement.
+            actor.state.lock().await.notifications_suppressed = false;
+            actor.clone().maybe_start_running_task(completion_tx).await;
+            let mut state = actor.state.lock().await;
+            assert_eq!(state.running_prompt_id(), Some("agent-message-m"));
+            state.running_task.take().unwrap().abort();
+        })
+    });
+}
+
+#[test]
+fn real_user_prompt_releases_stopped_mail_barrier() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let (actor, events) =
+                create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let actor = Arc::new(actor);
+            {
+                let mut state = actor.state.lock().await;
+                state.notifications_suppressed = true;
+                let mut mail = user_item("agent-message-m", "owner");
+                mail.origin = crate::session::PromptOrigin::AgentMessage {
+                    message_id: "m".into(),
+                };
+                state.pending_inputs.push_back(mail);
+            }
+            tokio::task::spawn_local(async move {
+                while let Some(message) = gateway_rx.recv().await {
+                    if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                        let _ = args.response_tx.send(Ok(()));
+                    }
+                }
+            });
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
+            let loop_handle = tokio::task::spawn_local(super::run_session(
+                actor.clone(),
+                cmd_rx,
+                chat_rx,
+                events,
+                None,
+                Arc::new(parking_lot::Mutex::new(
+                    xai_grok_workspace::file_system::CodebaseIndexManager::new(),
+                )),
+                std::path::PathBuf::from("/tmp"),
+                crate::session::fs_watch::FsWatchCapabilities::none(),
+            ));
+            let (respond_to, _response) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(SessionCommand::Prompt {
+                    prompt_id: "human".into(),
+                    origin: None,
+                    prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new("continue"))],
+                    prompt_mode: PromptMode::Agent,
+                    artifact_upload_ctx: None,
+                    client_identifier: None,
+                    screen_mode: None,
+                    verbatim: false,
+                    traceparent: None,
+                    json_schema: None,
+                    send_now: false,
+                    admission: None,
+                    tool_overrides_update: None,
+                    respond_to,
+                    persist_ack: None,
+                    parsed_prompt_tx: None,
+                    initial_child_prompt_ready: None,
+                })
+                .unwrap();
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(SessionCommand::GetToolOverrides { respond_to })
+                .unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut state = actor.state.lock().await;
+            assert!(!state.notifications_suppressed);
+            if let Some(task) = state.running_task.take() {
+                task.abort();
+            }
+            loop_handle.abort();
+        })
+    });
+}
+
+#[test]
+fn stale_targeted_cancel_leaves_the_new_turns_interjections_intact() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (actor, _) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("new", "owner"));
+                state.running_task = Some(running_task_stub("new"));
+            }
+            actor.pending_interjections.push(PendingInterjection {
+                text: "mail".into(),
+                attachments: vec![],
+                origin: crate::session::PromptOrigin::AgentMessage {
+                    message_id: "m".into(),
+                },
+            });
+            let outcome = actor
+                .cancel_running_task(crate::session::CancelOptions {
+                    history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput {
+                        prompt_id: Some("old".into()),
+                    },
+                    trigger: Some(crate::session::CancelTrigger::Esc),
+                    user_initiated: true,
+                    ..Default::default()
+                })
+                .await;
+            assert!(!outcome.settled);
+            assert_eq!(actor.pending_interjections.snapshot().len(), 1);
+            let mut state = actor.state.lock().await;
+            assert_eq!(state.running_prompt_id(), Some("new"));
+            state.running_task.take().unwrap().abort();
+        })
+    });
+}
+
+#[test]
+fn finalizing_turn_keeps_its_front_when_agent_mail_arrives() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            use xai_grok_tools::implementations::grok_build::task::types::{
+                AgentMailboxMessage, AgentMailboxMessageKind, NativeAgentMessage,
+            };
+            let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let (actor, events) =
+                create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let actor = Arc::new(actor);
+            {
+                let mut state = actor.state.lock().await;
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+            // The turn scope guard has cleared its prompt pin, but completion
+            // bookkeeping still owns the task slot and its front row.
+            assert!(actor.current_prompt_id.lock().unwrap().is_none());
+            tokio::task::spawn_local(async move {
+                while let Some(message) = gateway_rx.recv().await {
+                    if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                        let _ = args.response_tx.send(Ok(()));
+                    }
+                }
+            });
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
+            let loop_handle = tokio::task::spawn_local(super::run_session(
+                actor.clone(),
+                cmd_rx,
+                chat_rx,
+                events,
+                None,
+                Arc::new(parking_lot::Mutex::new(
+                    xai_grok_workspace::file_system::CodebaseIndexManager::new(),
+                )),
+                std::path::PathBuf::from("/tmp"),
+                crate::session::fs_watch::FsWatchCapabilities::none(),
+            ));
+            let mut message = AgentMailboxMessage {
+                message_id: "team".into(),
+                team_scope_id: "root".into(),
+                from_agent_id: "worker".into(),
+                to_agent_id: "root".into(),
+                kind: AgentMailboxMessageKind::Message,
+                body: "team mail".into(),
+                created_at_ms: 0,
+                native: None,
+            };
+            cmd_tx
+                .send(SessionCommand::AgentMessage {
+                    message: message.clone(),
+                })
+                .unwrap();
+            cmd_tx
+                .send(SessionCommand::PeerSessionMessage {
+                    message: crate::session_bus::PeerSessionMessage {
+                        message_id: "peer".into(),
+                        target_session: "root".into(),
+                        source_session: "other".into(),
+                        source_project: "project".into(),
+                        body: "peer mail".into(),
+                    },
+                })
+                .unwrap();
+            message.message_id = "native".into();
+            message.kind = AgentMailboxMessageKind::NativeFollowup;
+            message.native = Some(NativeAgentMessage {
+                author: "worker".into(),
+                recipient: "root".into(),
+                encrypted: false,
+                trigger_prompt_id: None,
+            });
+            cmd_tx
+                .send(SessionCommand::AgentMessage { message })
+                .unwrap();
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(SessionCommand::GetToolOverrides { respond_to })
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap();
+            let entries = actor.pending_interjections.snapshot();
+            assert!(entries.iter().any(|entry| matches!(&entry.origin, crate::session::PromptOrigin::AgentMessage { message_id } if message_id == "team")));
+            assert!(entries.iter().any(|entry| matches!(&entry.origin, crate::session::PromptOrigin::PeerSessionMessage { message_id } if message_id == "peer")));
+            assert!(entries.iter().any(|entry| matches!(&entry.origin, crate::session::PromptOrigin::AgentMessage { message_id } if message_id == "native")));
+            assert_eq!(actor.pending_native_agent_messages.lock().len(), 1);
+            let mut state = actor.state.lock().await;
+            assert_eq!(state.pending_inputs.front().unwrap().prompt_id, "running");
+            assert_eq!(state.running_prompt_id(), Some("running"));
+            state.running_task.take().unwrap().abort();
+            loop_handle.abort();
+        })
+    });
+}
+
+#[tokio::test]
+async fn stranded_model_messages_keep_origin_and_fifo() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (actor, _) = build_actor().await;
+        for (origin, text) in [
+            (crate::session::PromptOrigin::AgentMessage { message_id: "team".into() }, "team"),
+            (crate::session::PromptOrigin::User, "human"),
+            (crate::session::PromptOrigin::PeerSessionMessage { message_id: "peer".into() }, "peer"),
+        ] {
+            actor.pending_interjections.push(PendingInterjection { text: text.into(), attachments: vec![], origin });
+        }
+        assert_eq!(actor.flush_stranded_interjections().await, 3);
+        let state = actor.state.lock().await;
+        let rows: Vec<_> = state.pending_inputs.iter().collect();
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[0].origin, crate::session::PromptOrigin::AgentMessage { message_id } if message_id == "team"));
+        assert!(matches!(&rows[1].origin, crate::session::PromptOrigin::User));
+        assert!(matches!(&rows[2].origin, crate::session::PromptOrigin::PeerSessionMessage { message_id } if message_id == "peer"));
+        assert!(!rows[0].is_queue_editable() && !rows[2].is_queue_editable());
+        assert_eq!(rows[0].prompt_id, "agent-message-team");
+        assert_eq!(rows[2].prompt_id, "peer-message-peer");
+    }).await;
+}
+
 /// Send-now of an image-bearing queued prompt keeps its `ContentBlock::Image`s on the promoted row.
 #[tokio::test]
 async fn queue_send_now_keeps_prompt_block_images_on_promoted_row() {
@@ -116,6 +522,7 @@ async fn drain_interjection_with_images_attaches_image_parts() {
         .run_until(async {
             let (actor, _gateway_rx) = build_actor().await;
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "look at [Image #1]".to_string(),
                 attachments: vec![test_image_content()],
             });
@@ -163,6 +570,7 @@ async fn grok_build_interjection_with_images_gets_image_files_block() {
         .run_until(async {
             let (actor, _gateway_rx) = build_actor().await;
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "look at [Image #1]".to_string(),
                 attachments: vec![test_image_content()],
             });
@@ -206,6 +614,7 @@ async fn drain_interjection_strips_placeholder_paths_from_text() {
         .run_until(async {
             let (actor, _gateway_rx) = build_actor().await;
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "look at [Image #1: /tmp/secret/x.png] please".to_string(),
                 attachments: vec![test_image_content()],
             });
@@ -263,6 +672,7 @@ async fn drain_interjection_expands_skill_slash_reference() {
                 .await;
 
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "/find-session foo".to_string(),
                 attachments: vec![],
             });
@@ -291,6 +701,7 @@ async fn drain_interjection_expands_skill_slash_reference() {
             // (no leading slash) stays untouched — mirrors turn-start
             // gating, where "don't run /commit yet" is not an invocation.
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "don't run /find-session yet".to_string(),
                 attachments: vec![],
             });
@@ -317,6 +728,7 @@ async fn drain_interjection_truncation_never_touches_image_data() {
             // Way over LARGE_PROMPT_THRESHOLD so the text path truncates.
             let huge_text = "x".repeat(3_000_000);
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: huge_text,
                 attachments: vec![original_image.clone()],
             });
@@ -418,10 +830,12 @@ async fn flush_stranded_interjections_converts_to_front_prompts_in_order() {
                     .push_back(user_item("queued-later", "A"));
             }
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "first steer".to_string(),
                 attachments: vec![],
             });
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "second steer".to_string(),
                 attachments: vec![],
             });

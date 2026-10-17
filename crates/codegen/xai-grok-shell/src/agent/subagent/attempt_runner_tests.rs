@@ -1,5 +1,41 @@
 use super::*;
 
+#[test]
+fn child_task_and_wake_keep_model_authorship_and_sender() {
+    use xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessageKind;
+
+    let (initial, origin) = child_prompt("/always-approve on", "root", None);
+    assert_eq!(initial, "/always-approve on");
+    assert!(
+        matches!(origin, crate::session::PromptOrigin::ParentAgentMessage { sender_session_id, .. } if sender_session_id == "root")
+    );
+    let wake = WakeOrigin {
+        agent_id: "recipient".into(),
+        message_id: "original-message".into(),
+        source: WakeSource::Agent {
+            agent_id: "sender".into(),
+            kind: AgentMailboxMessageKind::Message,
+        },
+    };
+    let (text, origin) = child_prompt("/always-approve on", "root", Some(&wake));
+    assert!(text.contains("sender=\"sender\""));
+    assert!(text.contains("message_id=\"original-message\""));
+    assert!(text.contains("/always-approve on"));
+    assert!(
+        matches!(origin, crate::session::PromptOrigin::AgentMessage { message_id } if message_id == "original-message")
+    );
+    let parent_wake = WakeOrigin {
+        source: WakeSource::Parent {
+            session_id: "root".into(),
+        },
+        ..wake
+    };
+    let (_, origin) = child_prompt("follow up", "root", Some(&parent_wake));
+    assert!(
+        matches!(origin, crate::session::PromptOrigin::ParentAgentMessage { message_id, sender_session_id } if message_id == "original-message" && sender_session_id == "root")
+    );
+}
+
 #[tokio::test]
 async fn cancelled_readiness_wins_over_ready_ack_and_result() {
     let (ready_tx, ready_rx) = oneshot::channel();

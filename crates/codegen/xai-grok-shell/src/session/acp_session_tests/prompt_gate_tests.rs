@@ -315,6 +315,7 @@ fn flushed_interjection_stays_parked_under_hold() {
             actor
                 .pending_interjections
                 .push(crate::session::acp_session::PendingInterjection {
+                    origin: crate::session::PromptOrigin::User,
                     text: "steer text typed during the blocked turn".to_string(),
                     attachments: vec![],
                 });

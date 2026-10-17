@@ -3,6 +3,16 @@ use super::*;
 use crate::session::mcp_servers::McpOauthDiscovery;
 use xai_grok_telemetry::instrument_task;
 use xai_grok_telemetry::region::Parent;
+fn mcp_liveness_watchers_enabled() -> bool {
+    let user_cfg = crate::config::load_effective_config().ok();
+    let requirements = crate::agent::config::read_requirements_toml();
+    crate::util::config::resolve_mcp_liveness_watchers(
+        requirements.as_ref(),
+        user_cfg.as_ref(),
+        None,
+    )
+}
+
 /// Wire the session's elicitation inbox into a freshly built client so its `elicitation/create` requests reach the coordinator.
 /// Takes the already-locked `McpState` so each caller keeps its own lock scope.
 fn attach_elicitation_tx(
@@ -13,6 +23,15 @@ fn attach_elicitation_tx(
         client.set_elicitation_tx(Some(tx));
     }
 }
+#[async_trait::async_trait(?Send)]
+impl crate::session::mcp_dispatcher::McpCatalogRefresh for std::sync::Weak<SessionActor> {
+    async fn refresh_catalog(&self, server: &str) {
+        if let Some(session) = self.upgrade() {
+            session.refresh_changed_mcp_catalog(server).await;
+        }
+    }
+}
+
 impl SessionActor {
     /// Wait for MCP tools to be initialized.
     /// If initialization is in progress by another task, this will poll until complete.
@@ -31,58 +50,137 @@ impl SessionActor {
         }
         self.ensure_mcp_tools_initialized().await;
     }
+    /// Reconcile a complete server catalog after a list-changed notification.
+    /// Listing runs without the state lock; a replaced client or changed config
+    /// must not publish the old result over its successor.
+    async fn refresh_changed_mcp_catalog(&self, server: &str) {
+        loop {
+            let (client, generation) = {
+                let state = self.mcp_state.lock().await;
+                let Some(client) = state.get_client(server).cloned() else {
+                    return;
+                };
+                (client, state.generation())
+            };
+            let budget = std::time::Duration::from_secs(
+                client
+                    .startup_timeout_sec()
+                    .saturating_mul(2)
+                    .saturating_add(5),
+            );
+            let refresh = async {
+                let service = client.ensure_initialized().await?;
+                let revision = client.catalog_revision();
+                let registrations = client
+                    .get_tool_registrations(std::sync::Arc::clone(&self.mcp_state))
+                    .await;
+                Ok::<_, xai_grok_mcp::servers::McpError>((service, revision, registrations))
+            };
+            let (service, revision, registrations) =
+                match tokio::time::timeout(budget, refresh).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        tracing::warn!(server, %error, "failed to refresh MCP tool catalog");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(server, "timed out refreshing MCP tool catalog");
+                        return;
+                    }
+                };
+            let mut state = self.mcp_state.lock().await;
+            if !client.is_current_service(&service).await
+                || client.catalog_revision() != revision
+                || state.generation() != generation
+                || !state
+                    .get_client(server)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &client))
+            {
+                if state.get_client(server).is_none() {
+                    return;
+                }
+                // A different client, configuration, or service won while the
+                // list was in flight. Retry against that current generation.
+                drop(state);
+                continue;
+            }
+            let registrations = match registrations {
+                Ok(registrations) => registrations,
+                Err(error) => {
+                    tracing::warn!(server, %error, "failed to refresh MCP tool catalog");
+                    return;
+                }
+            };
+            let prefix = format!(
+                "{}{}",
+                server,
+                crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+            );
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .unregister_tools_by_prefix(&prefix);
+            state
+                .mcp_tool_meta
+                .retain(|name, _| !name.starts_with(&prefix));
+            state
+                .mcp_tool_icons
+                .retain(|name, _| !name.starts_with(&prefix));
+            state
+                .disabled_tool_registrations
+                .retain(|name, _| !name.starts_with(&prefix));
+            let mut ui_tools = std::collections::HashMap::new();
+            ui_tools.insert(server.to_owned(), Vec::new());
+            for registration in registrations {
+                self.register_mcp_tool(server, registration, &mut state, &mut ui_tools)
+                    .await;
+            }
+            drop(state);
+            self.refresh_mcp_snapshot_and_schedule_reminder().await;
+            self.emit_mcp_tools_changed_notifications(ui_tools);
+            return;
+        }
+    }
+
+    /// Observe revisions of inherited clients without owning their transports
+    /// or their parent session's status and liveness event channel.
+    pub(super) async fn start_shared_mcp_catalog_listeners(
+        self: &std::sync::Arc<Self>,
+    ) -> Vec<tokio_util::task::AbortOnDropHandle<()>> {
+        let subscriptions: Vec<_> = {
+            let state = self.mcp_state.lock().await;
+            state
+                .shared_clients
+                .iter()
+                .filter(|(name, _)| !state.owned_clients.contains_key(name))
+                .map(|(name, client)| (name.clone(), client.subscribe_catalog_changes()))
+                .collect()
+        };
+        subscriptions
+            .into_iter()
+            .map(|(server, mut changes)| {
+                let actor = std::sync::Arc::downgrade(self);
+                tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_local(async move {
+                    while changes.changed().await.is_ok() {
+                        let Some(actor) = actor.upgrade() else { break };
+                        actor.refresh_changed_mcp_catalog(&server).await;
+                    }
+                }))
+            })
+            .collect()
+    }
+
     /// Register tools from shared (inherited) MCP clients on this session's ToolBridge.
     ///
     /// Shared clients are already connected (Arc-shared from parent), so
     /// `get_tool_registrations` reuses the existing transport — no new handshakes.
     async fn register_shared_client_tools(&self) {
-        let shared_clients: Vec<(
-            String,
-            std::sync::Arc<crate::session::mcp_servers::McpClient>,
-        )> = {
-            let st = self.mcp_state.lock().await;
-            if st.shared_clients.is_empty() {
-                return;
-            }
-            st.shared_clients
-                .iter()
-                .map(|(n, c)| (n.clone(), std::sync::Arc::clone(c)))
-                .collect()
+        let names: Vec<String> = {
+            let state = self.mcp_state.lock().await;
+            state.shared_clients.keys().cloned().collect()
         };
-        tracing::info!(
-            session_id = %self.session_info.id.0,
-            count = shared_clients.len(),
-            "Registering tools from shared MCP clients"
-        );
-        let mcp_state_arc = std::sync::Arc::clone(&self.mcp_state);
-        let mut ui_tools: std::collections::HashMap<
-            String,
-            Vec<crate::extensions::mcp::McpToolEntry>,
-        > = std::collections::HashMap::new();
-        for (server_name, client) in &shared_clients {
-            let regs = match client
-                .get_tool_registrations(std::sync::Arc::clone(&mcp_state_arc))
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        server = %server_name,
-                        error = %e,
-                        "Failed to list tools from shared MCP client, skipping"
-                    );
-                    continue;
-                }
-            };
-            let mut mcp_state = self.mcp_state.lock().await;
-            for reg in regs {
-                self.register_mcp_tool(server_name, reg, &mut mcp_state, &mut ui_tools)
-                    .await;
-            }
-        }
-        self.refresh_mcp_snapshot_and_schedule_reminder().await;
-        if !ui_tools.is_empty() {
-            self.emit_mcp_tools_changed_notifications(ui_tools);
+        for server in names {
+            self.refresh_changed_mcp_catalog(&server).await;
         }
     }
     pub(super) async fn register_mcp_tool(
@@ -557,9 +655,11 @@ impl SessionActor {
                     mcp_state
                         .owned_clients
                         .insert(server_name.clone(), arc.clone());
-                    let _ = arc
-                        .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
-                        .await;
+                    if mcp_liveness_watchers_enabled() {
+                        let _ = arc
+                            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+                            .await;
+                    }
                     let mut ui_tools: std::collections::HashMap<
                         String,
                         Vec<crate::extensions::mcp::McpToolEntry>,
@@ -944,7 +1044,10 @@ impl SessionActor {
         if !client.is_http() {
             return Err(format!("server '{server}' is not an HTTP client"));
         }
-        client.recover().await.map_err(|e| e.to_string())?;
+        client
+            .recover_if_closed()
+            .await
+            .map_err(|e| e.to_string())?;
         let still_current = {
             let mcp_state = self.mcp_state.lock().await;
             mcp_state
@@ -1128,21 +1231,25 @@ impl SessionActor {
                 "config for server '{server}' changed during respawn"
             ));
         }
-        if let Some(tx) = event_tx {
+        if let Some(tx) = event_tx.as_ref() {
             new_client.set_event_tx(Some(tx.clone()));
-            let _ = tx.send(xai_grok_mcp::servers::McpClientEvent::ToolsChanged {
-                server: server.to_string(),
-            });
         }
         let arc_client = std::sync::Arc::new(new_client);
-        let _ = arc_client
-            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
-            .await;
+        if mcp_liveness_watchers_enabled() {
+            let _ = arc_client
+                .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+                .await;
+        }
         {
             let mut mcp_state = self.mcp_state.lock().await;
             mcp_state
                 .owned_clients
                 .insert(server.to_string(), arc_client);
+        }
+        if let Some(tx) = event_tx {
+            let _ = tx.send(xai_grok_mcp::servers::McpClientEvent::ToolsChanged {
+                server: server.to_string(),
+            });
         }
         Ok(())
     }
@@ -1849,12 +1956,18 @@ impl SessionActor {
                     for c in mcp_clients {
                         let arc = std::sync::Arc::new(c);
 
-                        let _ = arc
-                            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
-                            .await;
-                        mcp_state
-                            .owned_clients
-                            .insert(arc.server_name().to_string(), arc);
+                        if mcp_liveness_watchers_enabled() {
+                            let _ = arc
+                                .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+                                .await;
+                        }
+                        let server_name = arc.server_name().to_string();
+                        mcp_state.owned_clients.insert(server_name.clone(), arc);
+                        if let Some(tx) = mcp_state.client_event_tx() {
+                            let _ = tx.send(xai_grok_mcp::servers::McpClientEvent::ToolsChanged {
+                                server: server_name,
+                            });
+                        }
                     }
                     mcp_state.mark_all_servers_ready();
                     tracing::info!(
@@ -1892,6 +2005,14 @@ impl SessionActor {
                 }
 
                 for (server_name, client) in &shared_clients_for_bg {
+                    let service = match client.ensure_initialized().await {
+                        Ok(service) => service,
+                        Err(error) => {
+                            tracing::warn!(server = %server_name, %error, "Failed to initialize shared MCP client");
+                            continue;
+                        }
+                    };
+                    let revision = client.catalog_revision();
                     let regs = match client
                         .get_tool_registrations(Arc::clone(&mcp_state_bg))
                         .await
@@ -1907,6 +2028,15 @@ impl SessionActor {
                         }
                     };
                     let mut mcp_state = mcp_state_bg.lock().await;
+                    if !mcp_state
+                        .get_client(server_name)
+                        .is_some_and(|current| Arc::ptr_eq(current, client))
+                        || !client.is_current_service(&service).await
+                        || client.catalog_revision() != revision
+                    {
+                        // The revision listener owns the newer listing.
+                        continue;
+                    }
                     for reg in regs {
                         let qualified_name = reg.name.clone();
                         let prefix = format!(
@@ -2118,3 +2248,7 @@ pub(super) fn format_mcp_connecting_reminder(
     }
     text
 }
+
+#[cfg(test)]
+#[path = "mcp_catalog_refresh_tests.rs"]
+mod mcp_catalog_refresh_tests;

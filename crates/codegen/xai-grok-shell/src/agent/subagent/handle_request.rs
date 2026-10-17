@@ -1,6 +1,6 @@
 use super::attempt_runner::{
     InitialChildPromptReadiness, OneTurnAttemptInput, OneTurnAttemptOutcome, OneTurnTraceCapture,
-    OneTurnUsageInput, capture_and_fold_one_turn_usage, run_one_turn_attempt,
+    OneTurnUsageInput, capture_and_fold_one_turn_usage, child_prompt, run_one_turn_attempt,
     wait_initial_child_prompt_readiness,
 };
 use super::prompt_turn_receipt::{
@@ -13,6 +13,28 @@ use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_telemetry::events::{SubagentModelOverrideRejected, SubagentModelRejectionReason};
 use xai_grok_tools::implementations::grok_build::task::model_policy::{self, TaskModelSelection};
 use xai_grok_tools::implementations::{grok_build, opencode};
+
+/// Close the shared boundary immediately, then require its durable parent
+/// marker before starting work with a provider that denies xAI exports.
+async fn admit_child_provider(
+    provider: xai_grok_sampling_types::ModelProvider,
+    boundary: &crate::session::persistence::ProviderBoundary,
+    parent_persistence: Option<&mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg>>,
+) -> std::io::Result<()> {
+    boundary.observe(provider);
+    if provider.profile().allows_xai_services() || boundary.is_ephemeral() {
+        return Ok(());
+    }
+    let tx = parent_persistence
+        .ok_or_else(|| std::io::Error::other("parent session persistence is unavailable"))?;
+    let (respond_to, response) = oneshot::channel();
+    tx.send(crate::session::persistence::PersistenceMsg::CloseXaiExportAndAck { respond_to })
+        .map_err(|_| std::io::Error::other("parent session persistence is unavailable"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("parent session persistence acknowledgement was lost"))?
+}
+
 /// `None` on resume: the source model stays pinned.
 pub(super) fn explicit_tool_model(
     overrides: &SubagentRuntimeOverrides,
@@ -813,19 +835,15 @@ pub(crate) async fn run_shell_child(
             "Resolved subagent fork directive"
         );
     }
-    ctx.provider_boundary
-        .observe(effective_sampling_config.provider);
-    if !effective_sampling_config
-        .provider
-        .profile()
-        .allows_xai_services()
-        && let Some(tx) = &ctx.parent_persistence_tx
+    if let Err(error) = admit_child_provider(
+        effective_sampling_config.provider,
+        &ctx.provider_boundary,
+        ctx.parent_persistence_tx.as_ref(),
+    )
+    .await
     {
-        let _ = tx.send(
-            crate::session::persistence::PersistenceMsg::ObserveProvider(
-                effective_sampling_config.provider,
-            ),
-        );
+        let message = format!("Failed to persist the parent export boundary for child: {error}");
+        return child_run_output(failure_result(&request, &message), completion_data, None);
     }
     let subagent_id = request.id.clone();
     let child_session_id = acp::SessionId::new(subagent_id.clone());
@@ -886,7 +904,8 @@ pub(crate) async fn run_shell_child(
     provider_registry_guard.set_provider(tracker_provider);
     let verbatim_mirror_fork =
         context_source == InitialContextSource::Forked && context_verbatim_fork;
-    let task_prompt_text = prompt.clone();
+    let (task_prompt_text, prompt_origin) =
+        child_prompt(&prompt, &ctx.parent_session_id, wake_origin.as_ref());
     let (mut forked_conversation, mut inherited_prefix_len) =
         (forked_conversation, inherited_prefix_len.unwrap_or(0));
     if let Some(message) = request
@@ -1075,12 +1094,14 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
-    let persistence = match session::persistence::new_with_explicit_dir(
+    let persistence = match session::persistence::new_with_explicit_dir_and_parent(
         &child_session_info,
         child_session_dir.clone(),
         effective_model_id.clone(),
         sampling_client,
         effective_sampling_config.model.clone(),
+        ctx.provider_boundary.clone(),
+        ctx.parent_persistence_tx.clone(),
     )
     .await
     {
@@ -1596,6 +1617,7 @@ pub(crate) async fn run_shell_child(
         child_session_id: child_session_id.0.as_ref(),
         worktree_path: worktree_path.as_deref(),
         task_prompt_text: &task_prompt_text,
+        prompt_origin,
         inherited_tool_overrides: ctx.inherited_tool_overrides.clone(),
         gcs_bucket_url: child_gcs_bucket_url.as_deref(),
         gcs_upload_method: child_gcs_upload_method.as_ref(),
@@ -2240,6 +2262,101 @@ pub(crate) async fn run_shell_child(
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+
+#[cfg(test)]
+mod child_provider_boundary_tests {
+    use super::*;
+    use crate::session::persistence::{PersistenceMsg, ProviderBoundary};
+    use xai_grok_sampling_types::ModelProvider;
+
+    #[tokio::test]
+    async fn denying_child_waits_for_durable_parent_boundary() {
+        let boundary = ProviderBoundary::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let admission = admit_child_provider(ModelProvider::Codex, &boundary, Some(&tx));
+        tokio::pin!(admission);
+        let respond_to = tokio::select! {
+            message = rx.recv() => match message.unwrap() {
+                PersistenceMsg::CloseXaiExportAndAck { respond_to } => respond_to,
+                other => panic!("unexpected persistence message: {other:?}"),
+            },
+            result = &mut admission => panic!("child admitted before durable acknowledgement: {result:?}"),
+        };
+        assert!(!boundary.allows_xai_export());
+        assert!(matches!(
+            futures::poll!(&mut admission),
+            std::task::Poll::Pending
+        ));
+        respond_to.send(Ok(())).unwrap();
+        assert!(admission.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn denying_child_fails_when_parent_boundary_cannot_be_persisted() {
+        let no_sink = ProviderBoundary::default();
+        assert!(
+            admit_child_provider(ModelProvider::Codex, &no_sink, None)
+                .await
+                .is_err()
+        );
+        assert!(!no_sink.allows_xai_export());
+
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_rx);
+        let closed = ProviderBoundary::default();
+        assert!(
+            admit_child_provider(ModelProvider::Codex, &closed, Some(&closed_tx))
+                .await
+                .is_err()
+        );
+        assert!(!closed.allows_xai_export());
+
+        for drop_ack in [false, true] {
+            let boundary = ProviderBoundary::default();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let writer = async {
+                let PersistenceMsg::CloseXaiExportAndAck { respond_to } = rx.recv().await.unwrap()
+                else {
+                    panic!("expected boundary acknowledgement request");
+                };
+                if !drop_ack {
+                    respond_to
+                        .send(Err(std::io::Error::other("disk failure")))
+                        .unwrap();
+                }
+            };
+            let (_, result) = tokio::join!(
+                writer,
+                admit_child_provider(ModelProvider::Codex, &boundary, Some(&tx))
+            );
+            assert!(result.is_err());
+            assert!(!boundary.allows_xai_export());
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_child_does_not_require_a_parent_boundary_write() {
+        let boundary = ProviderBoundary::default();
+        assert!(
+            admit_child_provider(ModelProvider::Xai, &boundary, None)
+                .await
+                .is_ok()
+        );
+        assert!(boundary.allows_xai_export());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_parent_closes_memory_gate_without_a_disk_writer() {
+        let boundary = crate::session::persistence::PersistenceHandle::noop().provider_boundary;
+        assert!(boundary.is_ephemeral());
+        assert!(
+            admit_child_provider(ModelProvider::Codex, &boundary, None)
+                .await
+                .is_ok()
+        );
+        assert!(!boundary.allows_xai_export());
+    }
 }
 
 #[cfg(test)]

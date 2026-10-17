@@ -1,8 +1,8 @@
 use super::*;
+use crate::session::acp_session::{InterjectionBuffer, PendingInterjection};
 use crate::tools::tool_context::{BlockingWaitState, ParentInterjectSignal};
 use std::time::Duration;
 use xai_grok_tools::types::output::ToolOutput;
-use xai_interjection_core::{InterjectionBuffer, PendingInterjection};
 use xai_tool_types::TaskOutputOutput;
 
 fn ids(xs: &[&str]) -> Vec<String> {
@@ -431,15 +431,16 @@ fn parent_interject_wait_result_is_cancelled_with_the_agent_head() {
     }
 }
 
-fn user_message() -> PendingInterjection<agent_client_protocol::ImageContent> {
+fn user_message() -> PendingInterjection {
     PendingInterjection {
         text: "user message".to_owned(),
         attachments: Vec::new(),
+        origin: crate::session::PromptOrigin::User,
     }
 }
 
 async fn race_wait(
-    human: &InterjectionBuffer<agent_client_protocol::ImageContent>,
+    human: &InterjectionBuffer,
     parent: &ParentInterjectSignal,
     wait: impl Future<Output = &'static str>,
 ) -> Result<&'static str, WaitInterruptCause> {

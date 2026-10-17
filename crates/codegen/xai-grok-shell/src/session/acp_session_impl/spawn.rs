@@ -868,6 +868,9 @@ pub(crate) async fn spawn_session_actor(
         } else {
             crate::session::plan_mode::PlanModeTracker::new(session_dir)
         };
+        tracker.set_plan_file_root(xai_grok_tools::types::resources::PlanFileRoot::capture(
+            &crate::util::grok_home::grok_home(),
+        ));
         tracker.set_permission_handle(permissions.clone());
         Arc::new(parking_lot::Mutex::new(tracker))
     };

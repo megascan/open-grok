@@ -999,8 +999,8 @@ async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_ou
         let before = actor.chat_state_handle.get_conversation().await;
         assert!(!before.iter().any(|item| item.text_content().contains("pre-note")));
         actor.chat_state_handle.push_tool_result(ConversationItem::tool_result("outer-exec", "outer-result"));
-        actor.execute_tool_calls(Vec::new(), None).await.unwrap();
-        actor.execute_tool_calls(Vec::new(), None).await.unwrap();
+        actor.flush_code_mode_hook_followups();
+        actor.flush_code_mode_hook_followups();
         let conversation = actor.chat_state_handle.get_conversation().await;
         let result_index = conversation.iter().position(|item| item.text_content().contains("outer-result")).unwrap();
         let mut previous = result_index;
@@ -1013,6 +1013,262 @@ async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_ou
         assert!(!conversation.iter().any(|item| item.text_content().contains("private-original-output")));
         assert!(actor.code_mode_hook_followups.borrow().is_empty());
     }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nested_hook_context_is_discarded_when_dispatch_is_cancelled_or_changes_turn() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for cancel in [true, false] {
+                let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+                let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+                *actor.current_prompt_id.lock().unwrap() = Some("old-turn".into());
+                *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+                actor
+                    .agent
+                    .borrow()
+                    .tool_bridge()
+                    .clone()
+                    .register_mcp_tools(
+                        "mock_replacement_tool".into(),
+                        McpReplacementResultTool,
+                        Some(serde_json::json!({"type": "object"})),
+                    )
+                    .await
+                    .unwrap();
+                install_client_hook(
+                    &actor,
+                    xai_grok_hooks::event::HookEventName::PostToolUse,
+                    &["late-context"],
+                );
+                actor
+                    .workspace_ops
+                    .bind_local_session(
+                        &actor.session_id_string(),
+                        actor.tool_context.cwd.as_path().to_path_buf(),
+                        actor.tool_context.hunk_tracker_handle.clone(),
+                        actor.agent.borrow().tool_bridge().toolset(),
+                        None,
+                    )
+                    .unwrap();
+                let actor = Arc::new(actor);
+                let token = tokio_util::sync::CancellationToken::new();
+                let callback_token = token.clone();
+                let callback_actor = actor.clone();
+                let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let callback_seen = seen.clone();
+                spawn_run_responder(gateway_rx, move |params| {
+                    if params["hookCallbackId"] != "late-context" {
+                        return serde_json::json!({});
+                    }
+                    callback_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if cancel {
+                        callback_token.cancel();
+                    } else {
+                        *callback_actor.current_prompt_id.lock().unwrap() = Some("new-turn".into());
+                    }
+                    serde_json::json!({"additionalContext": "stale-context"})
+                });
+                let (progress, _receiver) =
+                    xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                let _ = actor
+                    .dispatch_code_mode_nested_tool(
+                        xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                            cell_id: xai_grok_code_mode_protocol::CellId::new("late-cell".into()),
+                            runtime_tool_call_id: "late-call".into(),
+                            tool_name: xai_grok_code_mode_protocol::ToolName::plain(
+                                "mock_replacement_tool",
+                            ),
+                            tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                            input: Some(serde_json::json!({})),
+                        },
+                        token,
+                        progress,
+                    )
+                    .await;
+                assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(actor.code_mode_hook_followups.borrow().is_empty());
+                actor.flush_code_mode_hook_followups();
+                assert!(
+                    !actor
+                        .chat_state_handle
+                        .get_conversation()
+                        .await
+                        .iter()
+                        .any(|item| item.text_content().contains("stale-context"))
+                );
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exec_only_turn_delivers_nested_hook_context_to_next_sample() {
+    use xai_grok_test_support::sse::{
+        responses_api_reasoning_then_tool_call_events, responses_api_script_exact,
+    };
+    use xai_grok_test_support::{MockInferenceServer, ScriptedResponse};
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = MockInferenceServer::start().await.unwrap();
+            let arguments =
+                serde_json::json!({"source": "text(await tools.mock_replacement_tool({}));"})
+                    .to_string();
+            server.enqueue_response(
+                "/v1/responses",
+                ScriptedResponse::sse(responses_api_reasoning_then_tool_call_events(
+                    "use tool",
+                    "exec-call",
+                    "exec",
+                    &arguments,
+                    "test",
+                )),
+            );
+            server.enqueue_response(
+                "/v1/responses",
+                ScriptedResponse::sse(responses_api_script_exact("done", "test")),
+            );
+            let (mut actor, gateway_rx, mut persistence_rx) = test_actor().await;
+            let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+            spawn_run_responder(gateway_rx, |_| serde_json::json!({}));
+            tokio::task::spawn_local(async move {
+                while let Some(message) = persistence_rx.recv().await {
+                    if let PersistenceMsg::FlushAndAck { respond_to } = message {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                }
+            });
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+            actor
+                .agent
+                .borrow_mut()
+                .set_tool_mode(xai_grok_sampling_types::ToolMode::CodeMode);
+            actor
+                .agent
+                .borrow()
+                .tool_bridge()
+                .clone()
+                .register_mcp_tools(
+                    "mock_replacement_tool".into(),
+                    McpReplacementResultTool,
+                    Some(serde_json::json!({"type": "object"})),
+                )
+                .await
+                .unwrap();
+            install_pre_tool_use_hooks(
+                &mut actor,
+                vec![post_tool_use_spec(
+                    "post-context",
+                    None,
+                    r#"echo '{"hookSpecificOutput":{"additionalContext":"exec-only-hook-note"}}'"#,
+                )],
+            );
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .unwrap();
+            let sampler_config = xai_grok_sampler::SamplerConfig {
+                api_key: Some("test-key".into()),
+                base_url: server.url(),
+                model: "test".into(),
+                api_backend: xai_grok_sampler::ApiBackend::Responses,
+                context_window: 256_000,
+                max_retries: Some(0),
+                idle_timeout_secs: Some(30),
+                ..Default::default()
+            };
+            let (sampler_tx, mut sampler_rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.sampler_handle = xai_grok_sampler::SamplerActor::spawn(
+                sampler_config,
+                xai_grok_sampler::RetryPolicy {
+                    max_retries: 0,
+                    rate_limit_retry_threshold: 0,
+                    ..Default::default()
+                },
+                sampler_tx,
+            );
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.model = "test".into();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            let mut creds = actor.chat_state_handle.get_credentials().await;
+            creds.api_key = Some("test-key".into());
+            actor.chat_state_handle.update_credentials(creds);
+            actor.state.lock().await.running_task = Some(running_task_stub("exec-only"));
+            *actor.current_prompt_id.lock().unwrap() = Some("exec-only".into());
+            let actor = Arc::new(actor);
+            actor
+                .rebuild_spec
+                .code_mode_runtime
+                .start_dispatch_loop(Arc::downgrade(&actor))
+                .await
+                .unwrap();
+            let turn_owner = actor.current_code_mode_turn_owner().await.unwrap();
+            let drainer = actor.clone();
+            tokio::task::spawn_local(async move {
+                while let Some(event) = sampler_rx.recv().await {
+                    drainer.handle_sampling_event(event).await;
+                }
+            });
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                crate::session::code_mode::CODE_MODE_TURN_OWNER.scope(
+                    turn_owner,
+                    actor.handle_prompt(
+                        "exec-only",
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "use the tool",
+                        ))],
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                ),
+            )
+            .await
+            .expect("turn timed out");
+            assert!(outcome.is_ok(), "turn failed: {outcome:?}");
+            let requests: Vec<_> = server
+                .requests()
+                .into_iter()
+                .filter(|request| request.path == "/v1/responses")
+                .collect();
+            assert_eq!(
+                requests.len(),
+                2,
+                "expected an exec round and a follow-up sample"
+            );
+            let second = requests[1].body.as_ref().unwrap().to_string();
+            assert!(
+                second.contains("private-original-output"),
+                "exec result must be present: {second}"
+            );
+            assert_eq!(
+                second.matches("exec-only-hook-note").count(),
+                1,
+                "hook context must reach the next sample once: {second}"
+            );
+            assert!(
+                second.find("private-original-output").unwrap()
+                    < second.find("exec-only-hook-note").unwrap()
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1860,6 +2116,7 @@ async fn post_tool_use_dispatch_merges_file_then_client_contributions() {
                 tool_name: "search__memory".to_string(),
                 raw_arguments: "{}".to_string(),
                 mcp_file: None,
+                plan_file: None,
                 parsed_args: serde_json::json!({}),
                 model_id: Some("test-model".to_string()),
                 invocation_id: "018f6b6c-7b3a-7c3a-8c3a-000000000001".to_string(),

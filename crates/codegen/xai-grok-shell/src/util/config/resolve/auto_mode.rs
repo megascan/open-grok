@@ -172,13 +172,24 @@ fn merge_auto_mode_config(
     }
 }
 
+fn merge_auto_mode_config_with_classifier_source(
+    config: crate::agent::config::AutoModeConfig,
+    remote: crate::agent::config::AutoModeConfig,
+) -> (crate::agent::config::AutoModeConfig, bool) {
+    let locally_selected_classifier = config.classifier_model.is_some();
+    (
+        merge_auto_mode_config(config, remote),
+        locally_selected_classifier,
+    )
+}
+
 /// Resolve the full Auto-mode config for the rare classifier-wiring read. Loads
 /// the effective `config.toml` ONCE and reads the remote cache ONCE, then merges
 /// field-wise: `[auto_mode]` config > cached remote settings `auto_mode` > `None`
 /// (unset fields stay `None`; the wire fn applies the built-in defaults). No env
 /// layer (mirrors goal's model resolvers); the gate's own env layer is handled by
 /// the disk gate reader.
-pub(crate) fn resolve_auto_mode_config_from_disk() -> crate::agent::config::AutoModeConfig {
+pub(crate) fn resolve_auto_mode_config_from_disk() -> (crate::agent::config::AutoModeConfig, bool) {
     let effective = crate::config::load_effective_config().ok();
     let config = auto_mode_config_from_toml(effective.as_ref()).unwrap_or_default();
     let remote = REMOTE_AUTO_MODE_CONFIG
@@ -186,7 +197,7 @@ pub(crate) fn resolve_auto_mode_config_from_disk() -> crate::agent::config::Auto
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default();
-    merge_auto_mode_config(config, remote)
+    merge_auto_mode_config_with_classifier_source(config, remote)
 }
 
 pub(crate) fn auto_mode_classify_timeout(
@@ -418,6 +429,36 @@ mod auto_permission_mode_gate_tests {
         );
         unsafe { std::env::remove_var(ENV_AUTO_PERMISSION_MODE) };
         cache_remote_auto_mode(None);
+    }
+
+    #[test]
+    fn classifier_model_source_preserves_local_opt_in() {
+        use crate::agent::config::AutoModeConfig;
+        let remote = AutoModeConfig {
+            classifier_model: Some("remote-helper".into()),
+            ..AutoModeConfig::default()
+        };
+        let (remote_route, local) = merge_auto_mode_config_with_classifier_source(
+            AutoModeConfig::default(),
+            remote.clone(),
+        );
+        assert_eq!(
+            remote_route.classifier_model.as_deref(),
+            Some("remote-helper")
+        );
+        assert!(!local);
+        let (local_route, local) = merge_auto_mode_config_with_classifier_source(
+            AutoModeConfig {
+                classifier_model: Some("local-helper".into()),
+                ..AutoModeConfig::default()
+            },
+            remote,
+        );
+        assert_eq!(
+            local_route.classifier_model.as_deref(),
+            Some("local-helper")
+        );
+        assert!(local);
     }
 
     #[test]

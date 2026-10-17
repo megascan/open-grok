@@ -54,10 +54,26 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
-    ) -> Result<(OaiCompatClient, String), acp::Error> {
+    ) -> Result<(OaiCompatClient, String, bool), acp::Error> {
         let slug = self.resolve_session_summary_model();
+        // Only a local setting, CLI override, or environment override opts
+        // the user into sending title content to a different provider.
+        let locally_selected = {
+            let cfg = self.cfg.borrow();
+            cfg.session_summary_model_override.as_deref() == Some(slug.as_str())
+                || cfg.models.session_summary.as_deref() == Some(slug.as_str())
+                || std::env::var("GROK_SESSION_SUMMARY_MODEL")
+                    .ok()
+                    .is_some_and(|value| value.trim() == slug.as_str())
+        };
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
+        let intended_provider = crate::agent::config::find_model_by_id(&models, &slug)
+            .map(|entry| entry.info().provider);
+        if locally_selected && intended_provider.is_none() {
+            return Err(acp::Error::auth_required()
+                .data("the configured session-summary model has no usable provider route"));
+        }
         let endpoints = self.models_manager.endpoints();
         let (disable_api_key_auth, alpha_test_key, client_version) = {
             let cfg = self.cfg.borrow();
@@ -76,13 +92,19 @@ impl MvpAgent {
             alpha_test_key,
             client_version,
         ) {
+            Some(cfg) if locally_selected && !crate::agent::config::auxiliary_route_matches_catalog(intended_provider, cfg.provider) => {
+                return Err(acp::Error::auth_required()
+                    .data("the configured session-summary model resolved through a different provider"));
+            }
+            Some(cfg) if !crate::agent::config::auxiliary_route_matches_catalog(intended_provider, cfg.provider) => primary.clone(),
             Some(cfg)
-                if crate::agent::config::should_use_active_for_implicit_aux_model(
+                if !locally_selected && crate::agent::config::should_use_active_for_implicit_aux_model(
                     &slug,
                     crate::models::default_session_summary_model(),
                     &cfg,
                     primary,
                 ) => primary.clone(),
+            Some(cfg) if !locally_selected && cfg.provider != primary.provider => primary.clone(),
             Some(mut cfg) => {
                 crate::agent::config::stamp_session_local_sampler_fields(
                     &mut cfg,
@@ -95,11 +117,15 @@ impl MvpAgent {
             // Keep the active model when the requested helper cannot be
             // resolved. Rewriting only the slug would send an xAI helper name
             // such as `grok-build` to a Codex endpoint and guarantee a 404.
+            None if locally_selected => {
+                return Err(acp::Error::auth_required()
+                    .data("the configured session-summary model has no usable provider credentials"));
+            }
             None => primary.clone(),
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
-        Ok((client, model))
+        Ok((client, model, locally_selected))
     }
     fn has_proxy_credentials(&self) -> bool {
         self.cfg.borrow().endpoints.deployment_key.is_some()

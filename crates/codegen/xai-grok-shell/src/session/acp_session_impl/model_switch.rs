@@ -267,6 +267,17 @@ impl SessionActor {
         // state mutation, await, or telemetry task can observe Codex content.
         self.feedback_manager
             .observe_provider(sampling_config.provider);
+        if self.tool_context.subagent_depth > 0
+            && let Err(error) = self
+                .ensure_auxiliary_export_boundary(sampling_config.provider)
+                .await
+        {
+            self.rebuild_spec
+                .replace_web_search_state(web_search_previous);
+            self.rebuild_spec
+                .replace_active_sampling_config(sampling_config_previous);
+            return Err(error);
+        }
         if code_mode_runtime_reset_required(
             previous_provider,
             sampling_config.provider,

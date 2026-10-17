@@ -16,6 +16,71 @@ pub(super) enum AuxiliaryModelPurpose {
     TitleRefresh,
 }
 
+async fn close_auxiliary_export_boundary(
+    provider: xai_grok_sampling_types::ModelProvider,
+    boundary: &crate::session::persistence::ProviderBoundary,
+    persistence_tx: &tokio::sync::mpsc::UnboundedSender<PersistenceMsg>,
+) -> std::io::Result<()> {
+    if provider.profile().allows_xai_services() {
+        return Ok(());
+    }
+    // Close the shared in-memory gate before waiting for the durable marker.
+    boundary.observe(provider);
+    if boundary.is_ephemeral() {
+        return Ok(());
+    }
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    persistence_tx
+        .send(PersistenceMsg::CloseXaiExportAndAck { respond_to })
+        .map_err(|_| std::io::Error::other("session persistence is unavailable"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("session persistence acknowledgement was lost"))?
+}
+
+#[cfg(test)]
+mod auxiliary_boundary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn denying_auxiliary_request_waits_for_durable_boundary_and_fails_closed() {
+        let boundary = crate::session::persistence::ProviderBoundary::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let responder = async {
+            match rx.recv().await.unwrap() {
+                PersistenceMsg::CloseXaiExportAndAck { respond_to } => {
+                    assert!(!boundary.allows_xai_export());
+                    respond_to
+                        .send(Err(std::io::Error::other("disk failure")))
+                        .unwrap();
+                }
+                other => panic!("unexpected persistence message: {other:?}"),
+            }
+        };
+        let request = close_auxiliary_export_boundary(
+            xai_grok_sampling_types::ModelProvider::Fireworks,
+            &boundary,
+            &tx,
+        );
+        let (_, result) = tokio::join!(responder, request);
+        assert!(result.is_err());
+        assert!(!boundary.allows_xai_export());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_auxiliary_request_closes_gate_without_a_persistence_sink() {
+        let persistence = crate::session::persistence::PersistenceHandle::noop();
+        close_auxiliary_export_boundary(
+            xai_grok_sampling_types::ModelProvider::Fireworks,
+            &persistence.provider_boundary,
+            &persistence.tx,
+        )
+        .await
+        .unwrap();
+        assert!(!persistence.provider_boundary.allows_xai_export());
+    }
+}
+
 fn auxiliary_model_selection(
     purpose: AuxiliaryModelPurpose,
     call_override: Option<&str>,
@@ -1262,28 +1327,22 @@ impl SessionActor {
         if self.permissions.has_llm_side_query() {
             return;
         }
-        let auto_cfg = crate::util::config::resolve_auto_mode_config_from_disk();
+        let (auto_cfg, locally_selected_classifier) =
+            crate::util::config::resolve_auto_mode_config_from_disk();
         let session_model = self
             .chat_state_handle
             .get_sampling_config()
             .await
             .map(|c| c.model)
             .unwrap_or_default();
-        let aux_classifier_sampler = match auto_cfg.classifier_model.as_deref() {
-            Some(slug) => self.resolve_auto_classifier_sampler(slug).await,
-            None => None,
-        };
         let models = self.models_manager.models();
         let effective_supports_re = crate::agent::config::effective_classifier_supports_re(
-            aux_classifier_sampler
-                .as_ref()
-                .map(|(_, model, _)| model.as_str()),
+            auto_cfg.classifier_model.as_deref(),
             &session_model,
             &models,
         );
-        let (prompt_type, classifier_reasoning_effort) =
+        let (prompt_type, _) =
             crate::util::config::auto_mode_classifier_defaults(&auto_cfg, effective_supports_re);
-        let classify_timeout = crate::util::config::auto_mode_classify_timeout(&auto_cfg);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
             Vec<xai_grok_workspace::permission::ClassifierMessage>,
             tokio::sync::oneshot::Sender<
@@ -1295,10 +1354,37 @@ impl SessionActor {
             while let Some((messages, respond_to)) = rx.recv().await {
                 let request_span = region!("permission.classifier_request", Parent::Root);
                 let result = async {
-                    let (sampling_client, model, context_window) = match &aux_classifier_sampler {
-                        Some((client, model, context_window)) => {
-                            (client.clone(), model.clone(), *context_window)
+                    // Provider keys and model routing can change while the
+                    // session is live. Never retain a classifier client with
+                    // a static credential across separate review requests.
+                    let candidate = if let Some(slug) = auto_cfg.classifier_model.as_deref() {
+                        let models = session.models_manager.models();
+                        let intended_provider = crate::agent::config::find_model_by_id(&models, slug)
+                            .map(|entry| entry.info().provider);
+                        let active_provider = session.reconstruct_full_config().await.provider;
+                        if crate::agent::config::auxiliary_recommendation_allowed(
+                            locally_selected_classifier, intended_provider, active_provider,
+                        ) {
+                            let resolved = session.resolve_auto_classifier_sampler(slug).await;
+                            if !locally_selected_classifier {
+                                let active_provider = session.reconstruct_full_config().await.provider;
+                                resolved.filter(|(client, _, _)| client.provider() == active_provider)
+                            } else {
+                                resolved
+                            }
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
+                    if locally_selected_classifier && candidate.is_none() {
+                        return Err(xai_grok_workspace::permission::ClassifierFailure::TransportError(
+                            "configured permission classifier route is unavailable".to_owned(),
+                        ));
+                    }
+                    let (sampling_client, model, context_window) = match candidate {
+                        Some(route) => route,
                         None => {
                             let client = session
                                 .prepare_chat_completion(false)
@@ -1315,6 +1401,15 @@ impl SessionActor {
                             (client, model, context_window)
                         }
                     };
+                    let models = session.models_manager.models();
+                    let supports_re = crate::agent::config::effective_classifier_supports_re(
+                        auto_cfg.classifier_model.as_ref().map(|_| model.as_str()),
+                        &model,
+                        &models,
+                    );
+                    let (_, classifier_reasoning_effort) =
+                        crate::util::config::auto_mode_classifier_defaults(&auto_cfg, supports_re);
+                    let classify_timeout = crate::util::config::auto_mode_classify_timeout(&auto_cfg);
                     let session_id = session.session_info.id.to_string();
                     let items = messages
                         .into_iter()
@@ -1333,6 +1428,8 @@ impl SessionActor {
                             "permission auto classifier request exceeds context window".to_owned(),
                         ));
                     }
+                    session.ensure_auxiliary_export_boundary(sampling_client.provider()).await
+                        .map_err(|error| xai_grok_workspace::permission::ClassifierFailure::TransportError(error.to_string()))?;
                     let request = ConversationRequest {
                         items,
                         tools: vec![],
@@ -1439,6 +1536,23 @@ impl SessionActor {
         Some(resolved)
     }
 
+    pub(super) async fn ensure_auxiliary_export_boundary(
+        &self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> Result<(), acp::Error> {
+        close_auxiliary_export_boundary(
+            provider,
+            &self.feedback_manager.provider_boundary(),
+            &self.notifications.persistence_tx,
+        )
+        .await
+        .map_err(|error| {
+            acp::Error::internal_error().data(format!(
+                "failed to persist auxiliary provider boundary: {error}"
+            ))
+        })
+    }
+
     /// Resolve a recap, memory, or title model as an independent, provider-correct
     /// sampling route.
     ///
@@ -1533,6 +1647,10 @@ impl SessionActor {
             }
         }
 
+        if configured.is_some() && allow_cross_provider && selected.is_none() {
+            return Err(acp::Error::auth_required()
+                .data("the configured auxiliary model has no usable provider route"));
+        }
         let mut config = selected.unwrap_or(active);
         let supports_reasoning_effort =
             crate::agent::config::find_model_by_id(&models, &config.model)
@@ -1565,6 +1683,7 @@ impl SessionActor {
         let provider = config.provider;
         let client = xai_grok_sampler::SamplingClient::new(config)
             .map_err(|error| self.to_acp_error(error))?;
+        self.ensure_auxiliary_export_boundary(provider).await?;
         tracing::info!(
             auxiliary_purpose = ?purpose,
             auxiliary_model = %model,
@@ -1584,14 +1703,21 @@ impl SessionActor {
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
     /// on the resolver, not a config override, for `base_url`/`api_backend` so
-    /// credentials stay consistent). `None` ⇒ caller falls back to the session
-    /// client + model.
+    /// credentials stay consistent). A missing or mismatched route fails closed.
     async fn resolve_auto_classifier_sampler(
         &self,
         slug: &str,
     ) -> Option<(xai_grok_sampler::SamplingClient, String, u64)> {
+        let models = self.models_manager.models();
+        let intended_provider = crate::agent::config::find_model_by_id(&models, slug)
+            .map(|entry| entry.info().provider)?;
         let active_session_config = self.reconstruct_full_config().await;
         let mut cfg = self.resolve_aux_sampler_config(slug).await?;
+        if cfg.provider != intended_provider
+            || (cfg.api_key.is_none() && cfg.bearer_resolver.is_none())
+        {
+            return None;
+        }
         crate::agent::config::stamp_session_local_sampler_fields(
             &mut cfg,
             &active_session_config,
@@ -1602,7 +1728,7 @@ impl SessionActor {
         let context_window = cfg.context_window;
         let client = xai_grok_sampler::SamplingClient::new(cfg)
             .map_err(
-                |e| tracing::warn!(error = %e, "auto classifier aux sampler build failed; using session model"),
+                |e| tracing::warn!(error = %e, "auto classifier auxiliary sampler build failed"),
             )
             .ok()?;
         Some((client, model, context_window))

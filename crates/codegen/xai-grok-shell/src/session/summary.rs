@@ -113,13 +113,11 @@ impl SummaryGenerator {
         self.state = State::Idle;
     }
 
-    #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
         matches!(self.state, State::Idle)
     }
 
-    /// Provider used by this frozen auxiliary client. Title generation is
-    /// allowed only while it matches the session's active provider.
+    /// Provider used by this frozen auxiliary client.
     pub(crate) fn provider(&self) -> xai_grok_sampling_types::ModelProvider {
         self.config.sampling_client.provider()
     }
