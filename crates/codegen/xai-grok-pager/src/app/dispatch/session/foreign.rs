@@ -109,6 +109,7 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     {
         lanes.foreign_loading = foreign_loading;
         lanes.pending_notice = None;
+        lanes.pending_resume_argument = None;
         if let Some(fresh) = modal_generation {
             *generation = fresh;
         }
@@ -116,8 +117,46 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     }
     app.session_picker_lanes.foreign_loading = foreign_loading && !modal_lanes_set;
     app.session_picker_lanes.pending_notice = None;
+    app.session_picker_lanes.pending_resume_argument = None;
     effects.extend(foreign_effect);
     effects
+}
+
+/// Resolve an exact ID before an exact normalized title. Never guess between rows.
+fn unique_resume_match(
+    entries: &[SessionPickerEntry],
+    filter: crate::views::session_picker::SourceFilter,
+    argument: &str,
+) -> Option<usize> {
+    let visible = || {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| filter.matches(&entry.source, entry.session_kind.as_deref()))
+    };
+    let parsed_id = uuid::Uuid::try_parse(argument).ok();
+    let ids: Vec<_> = visible()
+        .filter(|(_, entry)| {
+            entry.id == argument
+                || parsed_id.is_some_and(|id| uuid::Uuid::try_parse(&entry.id).ok() == Some(id))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !ids.is_empty() {
+        return (ids.len() == 1).then_some(ids[0]);
+    }
+    if parsed_id.is_some() {
+        return None;
+    }
+    let key = crate::app::session_title_resolve::title_key(argument);
+    if key.is_empty() {
+        return None;
+    }
+    let titles: Vec<_> = visible()
+        .filter(|(_, entry)| crate::app::session_title_resolve::title_key(&entry.summary) == key)
+        .map(|(index, _)| index)
+        .collect();
+    (titles.len() == 1).then(|| titles[0])
 }
 
 pub(in crate::app::dispatch) fn handle_session_list_loaded(
@@ -131,6 +170,7 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     let chat_mode = app.chat_mode;
     let is_browse = query.is_none();
     let notice;
+    let auto_pick;
     {
         let Some(mut target) =
             accept_picker_result(app, request, PickerSeqKind::List, "session list")
@@ -149,11 +189,23 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
             |partial| partial.picker_notice().to_owned(),
         );
         let partial_notice = partial.map(ConversationsPartial::picker_notice);
+        let argument = target.lanes.pending_resume_argument.take();
         notice = target.native_loaded(sessions, query, chat_mode, empty_notice, partial_notice);
+        auto_pick = argument
+            .filter(|argument| {
+                is_browse && partial.is_none() && target.state.query().trim() == argument
+            })
+            .and_then(|argument| {
+                target.entries.as_deref().and_then(|entries| {
+                    unique_resume_match(entries, target.source_filter, &argument)
+                })
+            });
         *target.detail_seq += 1;
     }
     if let Some(notice) = notice {
         app.show_toast(&notice);
+    } else if partial == Some(ConversationsPartial::BuildIncomplete) {
+        app.show_toast(ConversationsPartial::BuildIncomplete.picker_notice());
     } else if scope.is_relaxed()
         && app.session_picker_relaxed_notified_for.as_deref() != Some(app.cwd.as_path())
         && !matches!(app.active_view, crate::app::app_view::ActiveView::Welcome)
@@ -170,6 +222,16 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     }
     if !scope.is_relaxed() && is_browse {
         app.session_picker_relaxed_notified_for = None;
+    }
+    if let Some(index) = auto_pick {
+        return match request.host {
+            SessionPickerHost::Dashboard => {
+                super::super::dashboard::dispatch_dashboard_pick_session(app, index)
+            }
+            SessionPickerHost::AgentModal | SessionPickerHost::Welcome => {
+                super::load::dispatch_pick_session(app, index)
+            }
+        };
     }
     vec![]
 }
@@ -189,6 +251,7 @@ pub(in crate::app::dispatch) fn handle_session_list_failed(
         else {
             return vec![];
         };
+        target.lanes.pending_resume_argument = None;
         tracing::warn!(error = %error, "session list fetch failed");
         let error_notice = format!("Couldn't load sessions: {error}");
         notice = target.native_failed(error_notice, is_search, chat_mode);

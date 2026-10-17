@@ -414,14 +414,24 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if xai_grok_shell::session::resolve_local_session(&session_id, &local_cwd).is_some() {
         return dispatch_load_session(app, session_id, None, false);
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
-    {
-        return dispatch_load_session(
-            app,
-            session_id,
-            Some(std::path::PathBuf::from(original_cwd)),
-            false,
-        );
+    match xai_grok_shell::session::persistence::resolve_local_session_any_cwd_result(&session_id) {
+        Ok(Some(original_cwd)) => {
+            return dispatch_load_session(
+                app,
+                session_id,
+                Some(std::path::PathBuf::from(original_cwd)),
+                false,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            #[cfg(feature = "local-workspace")]
+            {
+                app.welcome_history_load_as_build = false;
+            }
+            app.show_toast(&format!("Couldn't check local sessions: {error}"));
+            return vec![];
+        }
     }
     if source == "remote" || source == "both" {
         if focus_if_session_already_open(app, &session_id, false).is_some() {
@@ -688,6 +698,12 @@ pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
     app: &mut AppView,
 ) -> Vec<Effect> {
     use crate::views::modal::ActiveModal;
+    if let Some(agent) = get_active_agent_mut(app)
+        && let Some(ActiveModal::SessionPicker { lanes, .. }) = agent.active_modal.as_mut()
+    {
+        lanes.pending_resume_argument = None;
+    }
+    app.session_picker_lanes.pending_resume_argument = None;
     let chat_mode = app.chat_mode;
     let mut has_crossed_headless = false;
     let mut is_handled_by_modal = false;
@@ -796,6 +812,12 @@ pub(in crate::app::dispatch) fn dispatch_trigger_deep_search(
     force: bool,
 ) -> Vec<Effect> {
     use crate::views::modal::ActiveModal;
+    if let Some(agent) = get_active_agent_mut(app)
+        && let Some(ActiveModal::SessionPicker { lanes, .. }) = agent.active_modal.as_mut()
+    {
+        lanes.pending_resume_argument = None;
+    }
+    app.session_picker_lanes.pending_resume_argument = None;
     if app.chat_mode {
         return dispatch_chat_search_refetch(app, force);
     }
@@ -1045,14 +1067,20 @@ pub(in crate::app::dispatch) fn dispatch_pick_content_session(
     if xai_grok_shell::session::resolve_local_session(&session_id, &local_cwd).is_some() {
         return dispatch_load_session(app, session_id, None, false);
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
-    {
-        return dispatch_load_session(
-            app,
-            session_id,
-            Some(std::path::PathBuf::from(original_cwd)),
-            false,
-        );
+    match xai_grok_shell::session::persistence::resolve_local_session_any_cwd_result(&session_id) {
+        Ok(Some(original_cwd)) => {
+            return dispatch_load_session(
+                app,
+                session_id,
+                Some(std::path::PathBuf::from(original_cwd)),
+                false,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            app.show_toast(&format!("Couldn't check local sessions: {error}"));
+            return vec![];
+        }
     }
     if focus_if_session_already_open(app, &session_id, false).is_some() {
         return vec![];
@@ -1699,6 +1727,52 @@ pub(in crate::app::dispatch) fn dispatch_show_session_picker(app: &mut AppView) 
         });
     });
     dispatch_fetch_session_list(app)
+}
+/// Turn a browse request into an exhaustive lookup for an initial argument.
+pub(in crate::app::dispatch) fn exhaustive_resume_fetch(effects: &mut [Effect], argument: &str) {
+    for effect in effects {
+        if let Effect::FetchSessionList {
+            host,
+            cwd_override,
+            generation,
+            query: None,
+            seq,
+            kind_filter,
+            headless_policy,
+        } = effect
+        {
+            *effect = Effect::FetchSessionListForResume {
+                argument: argument.to_owned(),
+                host: *host,
+                cwd_override: cwd_override.take(),
+                generation: *generation,
+                seq: *seq,
+                kind_filter: kind_filter.take(),
+                headless_policy: *headless_policy,
+            };
+        }
+    }
+}
+
+pub(in crate::app::dispatch) fn dispatch_show_session_picker_for(
+    app: &mut AppView,
+    argument: String,
+) -> Vec<Effect> {
+    let mut effects = dispatch_show_session_picker(app);
+    if let Some(agent) = get_active_agent_mut(app)
+        && let Some(crate::views::modal::ActiveModal::SessionPicker { state, lanes, .. }) =
+            agent.active_modal.as_mut()
+    {
+        state.set_query(&argument);
+        state.search_active = true;
+        lanes.pending_resume_argument = Some(argument.clone());
+    } else {
+        app.session_picker_state.set_query(&argument);
+        app.session_picker_state.search_active = true;
+        app.session_picker_lanes.pending_resume_argument = Some(argument.clone());
+    }
+    exhaustive_resume_fetch(&mut effects, &argument);
+    effects
 }
 /// The picker (modal `/resume` or welcome screen) was dismissed without a pick.
 /// A modal's fields (and generation) die with it, so its in-flight fetches are dropped by host liveness.

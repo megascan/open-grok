@@ -4,6 +4,7 @@
 //! Resume, new-with-id, and fork are thus not re-derived in three places.
 use super::cli::PagerArgs;
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 /// Session-create intent deferred until [`AppView::session_startup_allowed`].
 ///
 /// Replaces the prior matrix of `startup_load_session`, cwd, the `startup_fork` tuple, and ad-hoc preferred-only replay.
@@ -1018,7 +1019,9 @@ async fn resolve_existing_session(
     session_id: &str,
     cwd: &str,
 ) -> anyhow::Result<ResolvedExisting> {
-    if let Some(local_id) = xai_grok_shell::session::resolve_local_session(session_id, cwd) {
+    if super::session_title_resolve::is_local_id_component(session_id)
+        && let Some(local_id) = xai_grok_shell::session::resolve_local_session(session_id, cwd)
+    {
         tracing::info!(session_id = %session_id, local_id = %local_id, "Session found locally");
         if !in_place_restore_code_allowed(ctx.restore_code, ctx.has_worktree, session_id, &local_id)
         {
@@ -1032,7 +1035,10 @@ async fn resolve_existing_session(
             suppress_code_restore: false,
         });
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(session_id) {
+    if super::session_title_resolve::is_local_id_component(session_id)
+        && let Some(original_cwd) =
+            xai_grok_shell::session::persistence::resolve_local_session_any_cwd_result(session_id)?
+    {
         tracing::info!(
             session_id = %session_id,
             original_cwd = %original_cwd,
@@ -1093,9 +1099,18 @@ async fn resolve_existing_session(
         }
         RemoteMissPlan::NotFound { title_miss_hint } => {
             if title_miss_hint {
+                let candidates: Vec<_> =
+                    xai_grok_shell::session::persistence::list_summaries_for_mutation(Some(cwd))
+                        .await?
+                        .into_iter()
+                        .filter(|summary| ctx.recent_session_selection.admits(summary))
+                        .collect();
                 anyhow::bail!(
                     "Session does not exist: {}",
-                    super::session_title_resolve::title_miss_hint(session_id)
+                    super::session_title_resolve::title_miss_with_suggestions(
+                        session_id,
+                        &candidates
+                    )
                 );
             }
             anyhow::bail!("Session does not exist")
@@ -1146,6 +1161,13 @@ pub(crate) fn in_place_restore_code_allowed(
     requested_id == resolved_id
 }
 pub(crate) fn plan_remote_miss(ctx: MaterializeCtx, arg_is_uuid: bool) -> RemoteMissPlan {
+    // Local legacy IDs have already been checked. A remaining non-UUID is a
+    // title miss, even when a worktree or remote restore was requested.
+    if !arg_is_uuid {
+        return RemoteMissPlan::NotFound {
+            title_miss_hint: true,
+        };
+    }
     if ctx.has_worktree {
         return RemoteMissPlan::DeferToWorktree {
             deferred_local_miss: !arg_is_uuid,
@@ -1163,7 +1185,7 @@ pub(crate) fn plan_remote_miss(ctx: MaterializeCtx, arg_is_uuid: bool) -> Remote
     }
     RemoteMissPlan::RestoreConversation
 }
-/// Remote-restore tail of [`resolve_existing_session`], split out so non-id targets can wrap every failure with the title-miss hint.
+/// Remote-restore tail of [`resolve_existing_session`] for UUID targets.
 ///
 /// Always restores session state and memory only.
 /// Codebase checkout is refused in-place ([`RemoteMissPlan::RejectInPlaceCodeRestore`]) or deferred to the worktree handler.
@@ -1354,7 +1376,8 @@ async fn resolve_session_by_title(
     cwd: &str,
     selection: RecentSessionSelection,
 ) -> anyhow::Result<Option<ResolvedExisting>> {
-    let summaries = xai_grok_shell::session::persistence::list_summaries(Some(cwd)).await?;
+    let summaries =
+        xai_grok_shell::session::persistence::list_summaries_for_mutation(Some(cwd)).await?;
     let candidates: Vec<_> = summaries
         .into_iter()
         .filter(|summary| selection.admits(summary))
@@ -1926,7 +1949,7 @@ mod tests {
         );
         assert_eq!(
             plan_remote_miss(remote_miss_ctx(true, false), false),
-            RemoteMissPlan::RejectInPlaceCodeRestore {
+            RemoteMissPlan::NotFound {
                 title_miss_hint: true,
             }
         );
@@ -1941,8 +1964,8 @@ mod tests {
         );
         assert_eq!(
             plan_remote_miss(remote_miss_ctx(false, true), false),
-            RemoteMissPlan::DeferToWorktree {
-                deferred_local_miss: true,
+            RemoteMissPlan::NotFound {
+                title_miss_hint: true,
             }
         );
     }
@@ -1956,8 +1979,8 @@ mod tests {
         );
         assert_eq!(
             plan_remote_miss(remote_miss_ctx(true, true), false),
-            RemoteMissPlan::DeferToWorktree {
-                deferred_local_miss: true,
+            RemoteMissPlan::NotFound {
+                title_miss_hint: true,
             }
         );
     }
@@ -2043,7 +2066,6 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(title_err.contains("--worktree"), "{title_err}");
         assert!(
             title_err.contains("no session id or title matched"),
             "{title_err}"
@@ -2052,7 +2074,7 @@ mod tests {
     /// `--restore-code --worktree` stays on the existing defer path.
     #[tokio::test]
     async fn remote_miss_restore_code_with_worktree_defers() {
-        let id = "no such remote target";
+        let id = "99999999-9999-4999-8999-999999999999";
         let out = materialize_startup_for_cwd(
             remote_miss_ctx(true, true),
             SessionStartupIntent::Resume {
@@ -2071,7 +2093,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(session_id, id);
-                assert!(deferred_local_miss, "non-uuid defer must flag a title miss");
+                assert!(!deferred_local_miss, "UUID defer is not a title miss");
                 assert!(
                     !suppress_code_restore,
                     "--restore-code --worktree must still restore snapshot code"
@@ -2082,7 +2104,7 @@ mod tests {
     }
     #[tokio::test]
     async fn remote_miss_worktree_without_restore_code_suppresses_snapshot() {
-        let id = "no such remote target";
+        let id = "99999999-9999-4999-8999-999999999999";
         let out = materialize_startup_for_cwd(
             remote_miss_ctx(false, true),
             SessionStartupIntent::Resume {
@@ -2401,9 +2423,8 @@ mod tests {
                 other => panic!("expected Resume, got {other:?}"),
             }
         }
-        /// Provenance for the worktree failure hint: only the defer arm (a
-        /// local id/title miss under `--worktree`) flags the target; a
-        /// resolved local id — even a legacy non-UUID one — never does.
+        /// Local legacy IDs remain valid; unmatched titles stop before a
+        /// worktree restore, while UUID misses still defer.
         #[serial_test::serial(OPENGROK_HOME)]
         #[tokio::test]
         async fn worktree_defer_flags_local_miss_and_local_hit_does_not() {
@@ -2439,18 +2460,9 @@ mod tests {
                 &cwd_str,
             )
             .await
-            .unwrap();
-            match miss {
-                MaterializedStartup::Resume {
-                    session_id,
-                    deferred_local_miss,
-                    ..
-                } => {
-                    assert_eq!(session_id, "no such target");
-                    assert!(deferred_local_miss, "defer must flag the local miss");
-                }
-                other => panic!("expected Resume, got {other:?}"),
-            }
+            .unwrap_err()
+            .to_string();
+            assert!(miss.contains("no session id or title matched"), "{miss}");
             let uuid_miss = materialize_startup_for_cwd(
                 worktree_ctx,
                 resume_intent("99999999-9999-4999-8999-999999999999"),

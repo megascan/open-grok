@@ -37,6 +37,46 @@ fn single_match_is_case_insensitive_and_trimmed() {
     assert_eq!(id_of(select_by_title("  FIX login bug ", &s).unwrap()), "a");
 }
 
+#[test]
+fn title_selection_normalizes_separators_without_reordering_words() {
+    let sessions = [summary("a", Some("Fix login_bug"), false)];
+    assert_eq!(
+        id_of(select_by_title("FIX-login bug", &sessions).unwrap()),
+        "a"
+    );
+    assert!(
+        select_by_title("login fix bug", &sessions)
+            .unwrap()
+            .is_none()
+    );
+    assert!(select_by_title("--", &sessions).unwrap().is_none());
+}
+
+#[test]
+fn ambiguity_and_suggestions_show_newest_first_with_dates() {
+    let mut older = summary("old", Some("Fix-login_bug"), false);
+    older.updated_at = "2026-01-01T00:00:00Z".parse().unwrap();
+    let mut newer = summary("new", Some("Fix login bug"), false);
+    newer.updated_at = "2026-03-01T00:00:00Z".parse().unwrap();
+    let unrelated = summary("unrelated", Some("Other work"), false);
+    let sessions = [older, unrelated, newer];
+    let ambiguity = select_by_title("fix login bug", &sessions)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        ambiguity.find("\n  new  ").unwrap() < ambiguity.find("\n  old  ").unwrap(),
+        "{ambiguity}"
+    );
+    assert!(ambiguity.contains("2026-03-01"));
+    let suggestions = title_miss_with_suggestions("fxi logn bug", &sessions);
+    assert!(
+        suggestions.find("\n  new  ").unwrap() < suggestions.find("\n  old  ").unwrap(),
+        "{suggestions}"
+    );
+    assert!(suggestions.contains("2026-03-01"));
+    assert!(!suggestions.contains("unrelated"));
+}
+
 /// The contract is a simple lowercase comparison: accented letters match across case, but one-to-many case folds do not.
 /// `to_lowercase` maps U+00DF to itself, so "STRASSE" never equals a stored "straße".
 #[test]
@@ -113,6 +153,128 @@ fn title_miss_hint_escapes_arg_and_suggests_search() {
     assert!(
         hint.contains("grok sessions search"),
         "missing hint: {hint}"
+    );
+}
+
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn missing_title_stops_before_remote_or_worktree_restore() {
+    use crate::app::session_startup::{
+        MaterializeCtx, SessionStartupIntent, materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "local-id",
+        serde_json::json!({"generated_title": "Fix login bug"}),
+    );
+    for has_worktree in [false, true] {
+        for restore_code in [false, true] {
+            let ctx = MaterializeCtx {
+                has_worktree,
+                allow_remote_restore: true,
+                restore_code,
+                ..pinned_local_ctx()
+            };
+            let err = materialize_startup_for_cwd(
+                ctx,
+                SessionStartupIntent::Resume {
+                    session_id: Some("fix logn bug".into()),
+                    most_recent_for_cwd: false,
+                },
+                &cwd,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no session id or title matched"), "{err}");
+            assert!(err.contains("Fix login bug"), "{err}");
+            assert!(!err.contains("remote") && !err.contains("sign in"), "{err}");
+        }
+    }
+}
+
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn title_with_path_separators_is_resolved_as_title() {
+    use crate::app::session_startup::{
+        MaterializeCtx, MaterializedStartup, SessionStartupIntent, TitleResolution,
+        materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "local-id",
+        serde_json::json!({"generated_title": "Fix login bug"}),
+    );
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("Fix/login-bug".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, MaterializedStartup::Resume { session_id, .. } if session_id == "local-id")
+    );
+    assert!(
+        matches!(presandbox_resume_target("Fix/login-bug", Some(&cwd), RecentSessionSelection::Interactive).unwrap(), PinnedResumeTarget::Title { id, .. } if id == "local-id")
+    );
+}
+
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn title_selection_fails_closed_when_a_local_summary_is_malformed() {
+    use crate::app::session_startup::{
+        MaterializeCtx, SessionStartupIntent, TitleResolution, materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "valid",
+        serde_json::json!({"generated_title": "Target title"}),
+    );
+    fx.write_summary(&cwd, "broken", serde_json::json!({}));
+    let path = xai_grok_shell::util::grok_home::grok_home()
+        .join("sessions")
+        .join(xai_grok_shell::util::grok_home::encode_cwd_dirname(&cwd))
+        .join("broken")
+        .join("summary.json");
+    std::fs::write(path, b"{malformed").unwrap();
+    assert!(
+        presandbox_resume_target(
+            "target title",
+            Some(&cwd),
+            RecentSessionSelection::Interactive
+        )
+        .is_err()
+    );
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("target title".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an incomplete listing cannot establish a unique title"
     );
 }
 
@@ -410,12 +572,8 @@ async fn pinned_non_uuid_id_is_not_reinterpreted_as_title() {
 }
 
 /// Regression: a legacy id duplicated across cwd dirs is ambiguous to the
-/// session listings (`RelocationView::select` drops multi-path journal-less
-/// ids before the cwd filter), so its title never reaches selection: the pin
-/// stays unresolved, the profile peek finds nothing, and materialization
-/// fails closed with the hint instead of resuming under an unverified
-/// profile. The carried-profile path for unique ids is pinned by
-/// `pin_title_resume_finds_saved_profile_and_conflicts`.
+/// session listings. A title lookup must fail closed rather than resume under
+/// an unverified profile when an ambiguous candidate was omitted.
 #[serial_test::serial(OPENGROK_HOME)]
 #[tokio::test]
 async fn duplicate_legacy_id_is_not_title_addressable() {
@@ -440,25 +598,29 @@ async fn duplicate_legacy_id_is_not_title_addressable() {
 
     let mut args =
         crate::app::cli::PagerArgs::try_parse_from(["grok", "-r", "locked down"]).unwrap();
-    args.pin_local_resume_target_for_cwd(Some(&cwd_str))
-        .unwrap();
-    assert!(args.resume_target_pinned);
-    assert_eq!(args.session_to_resume(), Some("locked down"));
-    assert!(args.saved_resume_profile_for_cwd(Some(&cwd_str)).is_none());
+    assert!(
+        args.pin_local_resume_target_for_cwd(Some(&cwd_str))
+            .is_err()
+    );
 
     use crate::app::session_startup::{
-        MaterializeCtx, TitleResolution, materialize_startup_for_cwd,
+        MaterializeCtx, SessionStartupIntent, TitleResolution, materialize_startup_for_cwd,
     };
-    let ctx = MaterializeCtx::from_pager_args(&args);
-    assert_eq!(ctx.title_resolution, TitleResolution::PinnedPreSandbox);
-
-    let intent = args.session_startup_intent().unwrap();
-    let msg = materialize_startup_for_cwd(pinned_local_ctx(), intent, &cwd_str)
-        .await
-        .unwrap_err()
-        .to_string();
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("locked down".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd_str,
+    )
+    .await;
     assert!(
-        msg.contains("no session id or title matched"),
-        "duplicate-id session must fail closed, not resume: {msg}"
+        result.is_err(),
+        "duplicate IDs must make title selection fail closed"
     );
 }

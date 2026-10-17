@@ -82,7 +82,11 @@ impl AppView {
             }
             PickerOutcome::Closed => InputOutcome::Action(Action::DashboardCloseSessionPicker),
             PickerOutcome::Unchanged => InputOutcome::Unchanged,
-            PickerOutcome::Changed | PickerOutcome::QueryChanged => InputOutcome::Changed,
+            PickerOutcome::QueryChanged => {
+                surface.lanes.pending_resume_argument = None;
+                InputOutcome::Changed
+            }
+            PickerOutcome::Changed => InputOutcome::Changed,
             _ => InputOutcome::Changed,
         })
     }

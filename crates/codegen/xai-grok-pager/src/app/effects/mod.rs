@@ -3563,6 +3563,100 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchSessionListForResume {
+            argument, host, cwd_override, generation, seq, kind_filter, headless_policy,
+        } => {
+            let tx = acp_tx.clone();
+            let cwd = cwd_override.unwrap_or_else(|| cwd.to_path_buf());
+            tasks.spawn(async move {
+                let fail = |error: String| TaskResult::SessionListFailed {
+                    host, generation, error, seq, query: None,
+                };
+                let mut params = serde_json::json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "limit": 1000,
+                    "headless": headless_policy.as_wire_str(),
+                    "allowRelax": true,
+                    "_meta": { "x.ai/exhaustiveBuild": true },
+                });
+                if uuid::Uuid::try_parse(&argument).is_ok() {
+                    params["query"] = serde_json::Value::String(argument);
+                }
+                if let Some(kinds) = kind_filter {
+                    params["_meta"]["x.ai/facetFilters"] = serde_json::json!({ "kind": kinds });
+                }
+                let mut sessions = Vec::new();
+                let mut partial = None;
+                let mut scope = None;
+                let mut seen_cursors = std::collections::HashSet::new();
+                let mut build_complete = true;
+                // Bound defective servers and avoid trusting a repeating cursor.
+                for _ in 0..10 {
+                    let request = acp::ExtRequest::new(
+                        "x.ai/session/list",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize session list params").into(),
+                    );
+                    let response = match acp_send(request, &tx).await {
+                        Ok(response) => response,
+                        Err(error) => return fail(sanitize_user_error(&format!("{error}"))),
+                    };
+                    let wrapper: serde_json::Value = match serde_json::from_str(response.0.get()) {
+                        Ok(value) => value,
+                        Err(_) => return fail("Invalid session list response".into()),
+                    };
+                    if let Some(error) = wrapper.get("error") {
+                        return fail(error.as_str().unwrap_or("unknown error").to_string());
+                    }
+                    let payload = wrapper.get("result").unwrap_or(&wrapper);
+                    let Some(rows) = payload.get("sessions").and_then(|rows| rows.as_array()) else {
+                        return fail("Invalid session list response".into());
+                    };
+                    build_complete &= payload.get("_meta")
+                        .and_then(|meta| meta.get("x.ai/buildListComplete"))
+                        .and_then(|complete| complete.as_bool()) == Some(true);
+                    // Unparseable identities cannot be silently omitted from a uniqueness check.
+                    build_complete &= rows.iter().all(|row| {
+                        row.get("sessionId").or_else(|| row.get("session_id"))
+                            .and_then(|id| id.as_str()).is_some_and(|id| !id.is_empty())
+                            && row.get("summary").and_then(|summary| summary.as_str()).is_some()
+                    });
+                    let page_scope = parse_session_list_scope(payload);
+                    if scope.is_some_and(|s| s != page_scope) {
+                        return fail("Session list scope changed while loading".into());
+                    }
+                    scope = Some(page_scope);
+                    partial = partial.or_else(|| parse_session_list_partial(payload));
+                    sessions.extend(parse_session_picker_entries_for_resume(payload));
+                    let next = match payload.get("nextCursor") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(serde_json::Value::String(cursor)) if !cursor.is_empty() => Some(cursor),
+                        _ => return fail("Invalid session list cursor".into()),
+                    };
+                    let Some(next) = next else {
+                        if !build_complete {
+                            partial = partial.or(Some(ConversationsPartial::BuildIncomplete));
+                        }
+                        return TaskResult::SessionListLoaded {
+                            host, generation, sessions, partial,
+                            scope: scope.unwrap_or_default(), seq, query: None,
+                        };
+                    };
+                    // Each page is a new live snapshot. Never infer title uniqueness
+                    // when a row can move across the cursor between requests.
+                    build_complete = false;
+                    if !seen_cursors.insert(next.to_owned()) {
+                        return fail("Session list cursor repeated".into());
+                    }
+                    params["cursor"] = serde_json::Value::String(next.to_owned());
+                }
+                TaskResult::SessionListLoaded {
+                    host, generation, sessions,
+                    partial: partial.or(Some(ConversationsPartial::BuildIncomplete)),
+                    scope: scope.unwrap_or_default(), seq, query: None,
+                }
+            });
+        }
         Effect::DebounceSessionSearch { host, generation, query, seq } => {
             tasks
                 .spawn(async move {

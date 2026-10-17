@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::agent::session_registry_client::{SessionRecord, SessionRegistryClient};
-use crate::session::persistence::{Summary, list_summaries};
+use crate::session::persistence::{Summary, list_summaries_with_completeness};
 use xai_grok_workspace::session::git::normalize_repo_url;
 
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,6 +71,7 @@ pub(crate) struct SessionLanes {
     pub remote: Vec<SessionRecord>,
     pub repo_urls: Vec<String>,
     pub rows_dropped_by_policy: bool,
+    pub complete: bool,
 }
 
 /// Which directories a cwd-scoped listing draws from.
@@ -177,12 +178,17 @@ pub(crate) async fn fetch_lanes_with_policy(
 
     let local_fut = async {
         // Aggregate sessions from worktree sibling CWDs when possible
+        let mut complete = true;
         let cwds = if let Some(ref c) = cwd_owned {
             match scope {
                 CwdScope::Only => exact_keys.clone(),
                 CwdScope::WithSiblings | CwdScope::RelaxIfEmpty => {
                     crate::session::worktree::candidate_worktree_cwds_for_same_repo(Path::new(c))
-                        .unwrap_or_else(|_| vec![c.clone()])
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "worktree discovery failed during session listing");
+                            complete = false;
+                            vec![c.clone()]
+                        })
                 }
             }
         } else {
@@ -191,36 +197,54 @@ pub(crate) async fn fetch_lanes_with_policy(
         let mut all = Vec::new();
         if cwds.is_empty() {
             // No CWD or worktree lookup failed — list all
-            if let Ok(v) = list_summaries(cwd_owned.as_deref()).await {
-                all.extend(v);
+            match list_summaries_with_completeness(cwd_owned.as_deref()).await {
+                Ok((v, scan_complete)) => {
+                    all.extend(v);
+                    complete &= scan_complete;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "local session listing failed");
+                    complete = false;
+                }
             }
         } else {
             for c in &cwds {
-                if let Ok(v) = list_summaries(Some(c)).await {
-                    all.extend(v);
+                match list_summaries_with_completeness(Some(c)).await {
+                    Ok((v, scan_complete)) => {
+                        all.extend(v);
+                        complete &= scan_complete;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "local session listing failed");
+                        complete = false;
+                    }
                 }
             }
         }
-        all
+        (all, complete)
     };
 
     let remote_fut = async {
         let Some(client) = client else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
-        // Fetch more than the user-facing limit from the remote source to
-        // avoid premature truncation before merging with local results.
         let remote_limit = over_fetch(limit) as i64;
-        tokio::time::timeout(REMOTE_TIMEOUT, client.search(query, remote_limit))
-            .await
-            .unwrap_or_else(|_| {
+        match tokio::time::timeout(REMOTE_TIMEOUT, client.search(query, remote_limit)).await {
+            Ok(Ok(rows)) => {
+                // The registry returns no exhaustion metadata, and may cap
+                // below the requested limit. Its result cannot prove that
+                // an exact-title lookup has seen every remote session.
+                (rows, false)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "remote session search failed");
+                (Vec::new(), false)
+            }
+            Err(_) => {
                 tracing::warn!("remote session search timed out");
-                Ok(Vec::new())
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!("remote session search failed: {e}");
-                Vec::new()
-            })
+                (Vec::new(), false)
+            }
+        }
     };
 
     let repo_urls_fut = async {
@@ -231,7 +255,8 @@ pub(crate) async fn fetch_lanes_with_policy(
             .unwrap_or_default()
     };
 
-    let (mut local, mut remote, repo_urls) = tokio::join!(local_fut, remote_fut, repo_urls_fut);
+    let ((mut local, local_complete), (mut remote, remote_complete), repo_urls) =
+        tokio::join!(local_fut, remote_fut, repo_urls_fut);
     // Every narrowing happens before `merge`, which truncates, and before the
     // caller paginates: a row dropped later would leave a hole in a sized page.
     if matches!(scope, CwdScope::Only) {
@@ -266,6 +291,7 @@ pub(crate) async fn fetch_lanes_with_policy(
         remote,
         repo_urls,
         rows_dropped_by_policy,
+        complete: local_complete && remote_complete,
     }
 }
 
@@ -282,6 +308,34 @@ pub fn merge(
     local_repo_urls: &[String],
     limit: usize,
 ) -> Vec<MergedSession> {
+    merge_impl(remote, local, query, local_repo_urls, limit, true).0
+}
+
+pub(crate) fn merge_for_listing(
+    remote: Vec<SessionRecord>,
+    local: Vec<Summary>,
+    query: Option<&str>,
+    local_repo_urls: &[String],
+    exhaustive: bool,
+) -> (Vec<MergedSession>, bool) {
+    merge_impl(
+        remote,
+        local,
+        query,
+        local_repo_urls,
+        usize::MAX,
+        !exhaustive,
+    )
+}
+
+fn merge_impl(
+    remote: Vec<SessionRecord>,
+    local: Vec<Summary>,
+    query: Option<&str>,
+    local_repo_urls: &[String],
+    limit: usize,
+    dedup_empty: bool,
+) -> (Vec<MergedSession>, bool) {
     let mut by_id: HashMap<String, MergedSession> =
         HashMap::with_capacity(remote.len() + local.len());
 
@@ -400,9 +454,13 @@ pub fn merge(
     // `session_id` ascending.
     merged.sort_by_cached_key(|s| (Reverse(effective_sort_time(s)), s.session_id.clone()));
     // Dedup empty sessions BEFORE truncating so the final list has `limit` entries.
-    dedup_empty_sessions(&mut merged);
+    let before_dedup = merged.len();
+    if dedup_empty {
+        dedup_empty_sessions(&mut merged);
+    }
+    let complete = merged.len() == before_dedup && merged.len() <= limit;
     merged.truncate(limit);
-    merged
+    (merged, complete)
 }
 
 /// Effective timestamp used to order the merged session list.
@@ -495,6 +553,27 @@ mod tests {
         let rows = merge(remote, local, None, &[], 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "interactive");
+    }
+
+    #[test]
+    fn exhaustive_listing_keeps_all_local_and_empty_sessions() {
+        let mut local: Vec<_> = (0..125)
+            .map(|i| {
+                make_summary(
+                    &format!("session-{i:03}"),
+                    "same title",
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect();
+        local[0].num_messages = 0;
+        local[1].num_messages = 0;
+        let (all, complete) = merge_for_listing(Vec::new(), local.clone(), None, &[], true);
+        assert!(complete);
+        assert_eq!(all.len(), 125);
+        let (ordinary, complete) = merge_for_listing(Vec::new(), local, None, &[], false);
+        assert!(!complete);
+        assert_eq!(ordinary.len(), 124);
     }
 
     #[test]

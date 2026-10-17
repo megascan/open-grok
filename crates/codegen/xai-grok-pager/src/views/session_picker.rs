@@ -174,6 +174,8 @@ pub(crate) enum SessionPickerPendingNotice {
 pub struct SessionPickerLanes {
     pub(crate) foreign_loading: bool,
     pub(crate) pending_notice: Option<SessionPickerPendingNotice>,
+    /// Pending initial argument, consumed only by its complete list response.
+    pub(crate) pending_resume_argument: Option<String>,
 }
 impl SessionPickerLanes {
     pub(crate) fn take_ready_notice(&mut self, has_entries: bool) -> Option<String> {
@@ -423,12 +425,15 @@ fn selectable_fallback<T>(map: &[Option<T>], preferred: usize) -> Option<usize> 
 // Filtering
 // ---------------------------------------------------------------------------
 
-/// Case-insensitive substring match (callers pass a pre-lowercased query).
-///
-/// Deliberately not an ordered-chars subsequence match.
-/// That matched so loosely (e.g. "rc" hitting "rust-check") that spurious title rows drowned out the results users actually searched for.
+/// All search words must appear as substrings, in any order. Punctuation and
+/// whitespace separate words in both the query and the title or ID.
 pub(crate) fn fuzzy_matches_session(name: &str, query: &str) -> bool {
-    query.is_empty() || name.to_lowercase().contains(query)
+    if query.trim().is_empty() {
+        return true;
+    }
+    let name = crate::app::session_title_resolve::title_key(name);
+    let query = crate::app::session_title_resolve::title_key(query);
+    !query.is_empty() && query.split_whitespace().all(|word| name.contains(word))
 }
 
 /// The query the picker's local fuzzy filter should apply on top of the current entries.
@@ -1004,11 +1009,21 @@ mod tests {
     fn repo_name_from_cwd_single_dir() {
         assert_eq!(repo_name_from_cwd("/xai"), "xai");
     }
-    /// Substring-only title matching: the old ordered-chars fallback let short queries match most titles, drowning real hits in junk rows.
+    /// Search terms may appear in any order; arbitrary subsequences do not match.
     #[test]
-    fn fuzzy_matches_session_is_substring_only() {
+    fn fuzzy_matches_session_uses_all_words_in_any_order() {
         assert!(fuzzy_matches_session("Rust-Check pipeline", "rust-check"));
         assert!(fuzzy_matches_session("Fix session picker", "picker"));
+        assert!(fuzzy_matches_session("Fix session-picker bug", "BUG_fix"));
+        assert!(fuzzy_matches_session(
+            "Fix session-picker bug",
+            "picker   session"
+        ));
+        assert!(!fuzzy_matches_session(
+            "Fix session-picker bug",
+            "picker missing"
+        ));
+        assert!(!fuzzy_matches_session("Fix session-picker bug", "---"));
         assert!(fuzzy_matches_session("anything", ""));
         assert!(
             !fuzzy_matches_session("rust-check", "rc"),

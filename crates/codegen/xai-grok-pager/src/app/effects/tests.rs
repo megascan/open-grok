@@ -2825,3 +2825,90 @@ fn rewind_execute_params_sends_conversation_only_with_force() {
     assert_eq!(params["mode"], REWIND_MODE_WIRE);
     assert_eq!(params["mode"], "conversation_only");
 }
+
+#[test]
+fn resume_list_parser_keeps_older_and_untitled_rows() {
+    let payload = serde_json::json!({"sessions": [
+        {"sessionId": "old", "summary": "Old title", "updatedAt": "2000-01-01T00:00:00Z"},
+        {"sessionId": "untitled", "summary": "", "updatedAt": "2000-01-01T00:00:00Z"},
+    ]});
+    assert!(parse_session_picker_entries(&payload).is_empty());
+    let entries = parse_session_picker_entries_for_resume(&payload);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].id, "old");
+    assert_eq!(entries[1].id, "untitled");
+}
+
+#[tokio::test]
+async fn resume_list_fetch_pages_and_rejects_repeated_cursors() {
+    use std::sync::{Arc, Mutex};
+    use xai_acp_lib::AcpAgentMessage;
+    use crate::views::session_picker_surface::SessionPickerHost;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(AcpAgentMessage::ExtMethod(args)) = rx.recv().await {
+            let params: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
+            let cursor = params.get("cursor").and_then(|v| v.as_str()).map(str::to_owned);
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let repeated = cwd == "repeat-test";
+            requests_for_server.lock().unwrap().push(params);
+            let body = match cursor.as_deref() {
+                None if repeated => serde_json::json!({"result": {"sessions": [], "nextCursor":"repeat"}}),
+                None if cwd == "complete-test" => serde_json::json!({"result": {"sessions": [{"sessionId":"found", "summary":"Title", "updatedAt":"2000-01-01T00:00:00Z"}], "_meta":{"x.ai/buildListComplete":true}}}),
+                None if cwd == "legacy-test" => serde_json::json!({"result": {"sessions": [{"sessionId":"old-server", "summary":"Title", "updatedAt":"2000-01-01T00:00:00Z"}]}}),
+                None if cwd == "incomplete-test" => serde_json::json!({"result": {"sessions": [{"sessionId":"partial", "summary":"Title", "updatedAt":"2000-01-01T00:00:00Z"}], "_meta":{"x.ai/buildListComplete":false}}}),
+                None => serde_json::json!({"result": {"sessions": [{"sessionId":"first", "summary":"First", "updatedAt":"2000-01-01T00:00:00Z"}], "nextCursor":"next", "_meta":{"x.ai/buildListComplete":true}}}),
+                Some("next") => serde_json::json!({"result": {"sessions": [{"sessionId":"second", "summary":"Second", "updatedAt":"2000-01-01T00:00:00Z"}], "_meta":{"x.ai/buildListComplete":true}}}),
+                Some("repeat") => serde_json::json!({"result": {"sessions": [], "nextCursor":"repeat"}}),
+                other => panic!("unexpected cursor: {other:?}"),
+            };
+            let raw = serde_json::value::RawValue::from_string(body.to_string()).unwrap();
+            let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
+        }
+    });
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    execute(Effect::FetchSessionListForResume {
+        argument: "title".into(), host: SessionPickerHost::AgentModal, cwd_override: None, generation: 1, seq: 2,
+        kind_filter: None, headless_policy: Default::default(),
+    }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
+    match tasks.join_next().await.unwrap().unwrap() {
+        TaskResult::SessionListLoaded { sessions, partial, .. } => {
+            assert_eq!(sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+            assert_eq!(partial, Some(ConversationsPartial::BuildIncomplete));
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["cursor"], "next");
+        assert_eq!(requests[0]["limit"], 1000);
+        assert_eq!(requests[0]["_meta"]["x.ai/exhaustiveBuild"], true);
+    }
+    execute(Effect::FetchSessionListForResume {
+        argument: "title".into(), host: SessionPickerHost::AgentModal, cwd_override: Some("repeat-test".into()), generation: 3, seq: 4,
+        kind_filter: None, headless_policy: Default::default(),
+    }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
+    assert!(matches!(tasks.join_next().await.unwrap().unwrap(),
+        TaskResult::SessionListFailed { error, .. } if error.contains("cursor repeated")));
+    execute(Effect::FetchSessionListForResume {
+        argument: "12345678-1234-1234-1234-123456789abc".into(), host: SessionPickerHost::AgentModal,
+        cwd_override: Some("complete-test".into()), generation: 5, seq: 6,
+        kind_filter: None, headless_policy: Default::default(),
+    }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
+    assert!(matches!(tasks.join_next().await.unwrap().unwrap(),
+        TaskResult::SessionListLoaded { sessions, partial: None, .. } if sessions.len() == 1));
+    assert_eq!(requests.lock().unwrap().last().unwrap()["query"], "12345678-1234-1234-1234-123456789abc");
+    for cwd in ["legacy-test", "incomplete-test"] {
+        execute(Effect::FetchSessionListForResume {
+            argument: "title".into(), host: SessionPickerHost::AgentModal, cwd_override: Some(cwd.into()),
+            generation: 5, seq: 6, kind_filter: None, headless_policy: Default::default(),
+        }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
+        assert!(matches!(tasks.join_next().await.unwrap().unwrap(),
+            TaskResult::SessionListLoaded { sessions, partial: Some(ConversationsPartial::BuildIncomplete), .. } if sessions.len() == 1));
+    }
+}

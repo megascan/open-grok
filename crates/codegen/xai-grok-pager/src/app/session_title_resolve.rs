@@ -13,20 +13,92 @@ pub(crate) fn is_uuid_shaped(arg: &str) -> bool {
     uuid::Uuid::try_parse(arg).is_ok()
 }
 
-/// Canonical key for title equality: trimmed `str::to_lowercase`.
-/// Plain case-insensitive equality, not full Unicode caseless matching.
-fn title_key(s: &str) -> String {
-    s.trim().to_lowercase()
+/// IDs are a single session-directory component; other text may be a title.
+pub(crate) fn is_local_id_component(arg: &str) -> bool {
+    !arg.is_empty() && !matches!(arg, "." | "..") && !arg.contains(['/', '\\'])
 }
 
-/// Hint appended to every terminal failure for a non-id resume target.
-/// The title miss stays visible even when remote restore produces the final error.
+/// Treat punctuation and whitespace as word separators, preserving word order.
+/// Case matching uses lowercase, not full Unicode case folding.
+pub(crate) fn title_key(s: &str) -> String {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Hint appended to a local title miss.
 /// Debug formatting: the arg is arbitrary user text.
 pub(crate) fn title_miss_hint(arg: &str) -> String {
     format!(
         "no session id or title matched {arg:?} for this directory; \
-         try `grok sessions search {arg:?}`"
+         try `open-grok sessions search {arg:?}`"
     )
+}
+
+/// Suggest locally available titles sharing a word or a near-matching word.
+/// Keep output bounded and order it by the session's most recent update.
+pub(crate) fn title_miss_with_suggestions(arg: &str, summaries: &[Summary]) -> String {
+    let needle = title_key(arg);
+    let words: Vec<_> = needle.split_whitespace().collect();
+    let mut similar: Vec<_> = summaries
+        .iter()
+        .filter(|summary| {
+            let candidate = title_key(summary.display_title());
+            let candidate_words: Vec<_> = candidate.split_whitespace().collect();
+            words.iter().any(|word| {
+                candidate_words.iter().any(|other| {
+                    word.contains(other) || other.contains(word) || one_edit_apart(word, other)
+                })
+            })
+        })
+        .collect();
+    similar.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.info.id.to_string().cmp(&b.info.id.to_string()))
+    });
+    let mut message = title_miss_hint(arg);
+    if !similar.is_empty() {
+        message.push_str("\nSimilar local sessions (newest first):");
+        for summary in similar.into_iter().take(5) {
+            message.push_str(&format!(
+                "\n  {}  {:?}  updated {}",
+                summary.info.id,
+                summary.display_title(),
+                summary.updated_at.to_rfc3339()
+            ));
+        }
+    }
+    message
+}
+
+fn one_edit_apart(a: &str, b: &str) -> bool {
+    let a: Vec<_> = a.chars().take(65).collect();
+    let b: Vec<_> = b.chars().take(65).collect();
+    if a.len() < 4 || b.len() < 4 || a.len() > 64 || b.len() > 64 || a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let (mut i, mut j, mut edits) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            if a.len() >= b.len() {
+                i += 1;
+            }
+            if b.len() >= a.len() {
+                j += 1;
+            }
+        }
+    }
+    edits + (a.len() - i) + (b.len() - j) <= 1
 }
 
 /// Select the local session a resume arg names by title.
@@ -46,10 +118,15 @@ pub(crate) fn select_by_title<'a>(
     if needle.is_empty() {
         return Ok(None);
     }
-    let matches: Vec<&Summary> = summaries
+    let mut matches: Vec<&Summary> = summaries
         .iter()
         .filter(|s| title_key(s.display_title()) == needle)
         .collect();
+    matches.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.info.id.to_string().cmp(&b.info.id.to_string()))
+    });
     match matches.as_slice() {
         [] => Ok(None),
         [only] => Ok(Some(*only)),
@@ -66,12 +143,19 @@ pub(crate) fn select_by_title<'a>(
             }
             let listing = matches
                 .iter()
-                .map(|s| format!("  {}  {:?}", s.info.id, s.display_title()))
+                .map(|s| {
+                    format!(
+                        "  {}  {:?}  updated {}",
+                        s.info.id,
+                        s.display_title(),
+                        s.updated_at.to_rfc3339()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!(
                 "Multiple sessions match title {:?}:\n{listing}\n\
-                 Resume by session id instead: grok --resume <session-id>",
+                 Resume by session id instead: open-grok --resume <session-id>",
                 arg.trim()
             );
         }
@@ -119,11 +203,15 @@ pub(crate) fn presandbox_resume_target(
     let Some(cwd) = cwd else {
         return Ok(PinnedResumeTarget::Unresolved);
     };
-    if let Some(local_id) = xai_grok_shell::session::resolve_local_session(arg, cwd) {
-        return Ok(PinnedResumeTarget::Id(local_id));
-    }
-    if xai_grok_shell::session::resolve_local_session_any_cwd(arg).is_some() {
-        return Ok(PinnedResumeTarget::Id(arg.to_string()));
+    if is_local_id_component(arg) {
+        if let Some(local_id) = xai_grok_shell::session::resolve_local_session(arg, cwd) {
+            return Ok(PinnedResumeTarget::Id(local_id));
+        }
+        if xai_grok_shell::session::persistence::resolve_local_session_any_cwd_result(arg)?
+            .is_some()
+        {
+            return Ok(PinnedResumeTarget::Id(arg.to_string()));
+        }
     }
     let summaries =
         xai_grok_shell::session::persistence::local_summaries_for_cwd_sync(cwd, selection)

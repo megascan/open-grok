@@ -326,6 +326,22 @@ pub(super) fn dispatch_dashboard_open_session_picker(app: &mut AppView) -> Vec<E
     }]
 }
 
+pub(super) fn dispatch_dashboard_open_session_picker_for(
+    app: &mut AppView,
+    argument: String,
+) -> Vec<Effect> {
+    let mut effects = dispatch_dashboard_open_session_picker(app);
+    if !effects.is_empty() {
+        if let Some(surface) = app.dashboard_session_picker.as_mut() {
+            surface.state.set_query(&argument);
+            surface.state.search_active = true;
+            surface.lanes.pending_resume_argument = Some(argument.clone());
+        }
+        super::session::load::exhaustive_resume_fetch(&mut effects, &argument);
+    }
+    effects
+}
+
 pub(super) fn dispatch_dashboard_close_session_picker(app: &mut AppView) -> Vec<Effect> {
     if let Some(surface) = app.dashboard_session_picker.as_mut() {
         surface.state.hit_areas = None;
@@ -339,15 +355,23 @@ fn dispatch_dashboard_load_local_build(
     session_id: String,
     cwd_hint: Option<std::path::PathBuf>,
 ) -> Vec<Effect> {
-    let resolved = cwd_hint
-        .and_then(|cwd| {
-            xai_grok_shell::session::resolve_local_session(&session_id, &cwd.to_string_lossy())
-                .map(|resolved_id| (resolved_id, cwd))
-        })
-        .or_else(|| {
-            xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
-                .map(|cwd| (session_id, std::path::PathBuf::from(cwd)))
-        });
+    let resolved = cwd_hint.and_then(|cwd| {
+        xai_grok_shell::session::resolve_local_session(&session_id, &cwd.to_string_lossy())
+            .map(|resolved_id| (resolved_id, cwd))
+    });
+    let resolved = match resolved {
+        Some(resolved) => Some(resolved),
+        None => match xai_grok_shell::session::persistence::resolve_local_session_any_cwd_result(
+            &session_id,
+        ) {
+            Ok(Some(cwd)) => Some((session_id, std::path::PathBuf::from(cwd))),
+            Ok(None) => None,
+            Err(error) => {
+                app.show_toast(&format!("Couldn't check local sessions: {error}"));
+                return vec![];
+            }
+        },
+    };
 
     let Some((resolved_id, resolved_cwd)) = resolved else {
         app.show_toast("Session not found locally");

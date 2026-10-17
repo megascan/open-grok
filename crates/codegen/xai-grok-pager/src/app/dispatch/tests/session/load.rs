@@ -3878,3 +3878,221 @@ fn failed_load_lists_several_held_rows_as_not_sent() {
         "{listed:?}"
     );
 }
+
+#[test]
+fn resume_argument_filters_picker_and_does_not_open_ambiguous_or_partial_matches() {
+    use crate::app::effects::ConversationsPartial;
+    for (duplicate, partial) in [(true, None), (false, Some(ConversationsPartial::Timeout))] {
+        let mut app = test_app_with_agent();
+        let effects = dispatch(
+            Action::ShowSessionPickerFor("Build / Search".into()),
+            &mut app,
+        );
+        let Some(Effect::FetchSessionListForResume {
+            host,
+            generation,
+            seq,
+            ..
+        }) = effects.first()
+        else {
+            panic!("resume must fetch the complete list: {effects:?}");
+        };
+        let (host, generation, seq) = (*host, *generation, *seq);
+        let Some(ActiveModal::SessionPicker { state, .. }) =
+            get_active_agent(&app).and_then(|a| a.active_modal.as_ref())
+        else {
+            panic!("picker missing")
+        };
+        assert_eq!(state.query(), "Build / Search");
+        let mut entry = make_conversation_entry("id-a");
+        entry.summary = "Build Search".into();
+        let mut sessions = vec![entry.clone()];
+        if duplicate {
+            entry.id = "id-b".into();
+            sessions.push(entry);
+        }
+        let result = dispatch(
+            Action::TaskComplete(TaskResult::SessionListLoaded {
+                host,
+                generation,
+                seq,
+                sessions,
+                partial,
+                scope: ListScope::Cwd,
+                query: None,
+            }),
+            &mut app,
+        );
+        assert!(result.is_empty());
+        assert!(matches!(
+            get_active_agent(&app).and_then(|a| a.active_modal.as_ref()),
+            Some(ActiveModal::SessionPicker { .. })
+        ));
+    }
+}
+
+#[test]
+fn resume_argument_cancels_auto_pick_after_user_changes_query() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowSessionPickerFor("target".into()), &mut app);
+    let Some(Effect::FetchSessionListForResume {
+        host,
+        generation,
+        seq,
+        ..
+    }) = effects.first()
+    else {
+        panic!("missing fetch")
+    };
+    let (host, generation, seq) = (*host, *generation, *seq);
+    let Some(ActiveModal::SessionPicker { state, .. }) =
+        get_active_agent_mut(&mut app).and_then(|a| a.active_modal.as_mut())
+    else {
+        panic!("picker missing")
+    };
+    state.set_query("changed");
+    let _ = dispatch(Action::TriggerDeepSearch, &mut app);
+    let Some(ActiveModal::SessionPicker { state, .. }) =
+        get_active_agent_mut(&mut app).and_then(|a| a.active_modal.as_mut())
+    else {
+        panic!("picker missing")
+    };
+    state.set_query("target");
+    let mut entry = make_conversation_entry("id-a");
+    entry.summary = "target".into();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host,
+            generation,
+            seq,
+            sessions: vec![entry],
+            partial: None,
+            scope: ListScope::Cwd,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(matches!(
+        get_active_agent(&app).and_then(|a| a.active_modal.as_ref()),
+        Some(ActiveModal::SessionPicker { .. })
+    ));
+}
+
+#[test]
+fn resume_argument_opens_one_exact_match_only_after_complete_result() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowSessionPickerFor("MY-review".into()), &mut app);
+    let Some(Effect::FetchSessionListForResume {
+        host,
+        generation,
+        seq,
+        ..
+    }) = effects.first()
+    else {
+        panic!("missing fetch")
+    };
+    let (host, generation, seq) = (*host, *generation, *seq);
+    let mut entry = make_conversation_entry("unique-chat");
+    entry.summary = "My Review".into();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host,
+            generation,
+            seq,
+            sessions: vec![entry],
+            partial: None,
+            scope: ListScope::Cwd,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::LoadSession { session_id, chat_kind: true, .. } if session_id == "unique-chat")), "expected chat load: {effects:?}");
+}
+
+#[test]
+fn resume_argument_does_not_open_if_build_list_is_incomplete() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowSessionPickerFor("title".into()), &mut app);
+    let Some(Effect::FetchSessionListForResume {
+        host,
+        generation,
+        seq,
+        ..
+    }) = effects.first()
+    else {
+        panic!("missing fetch")
+    };
+    let (host, generation, seq) = (*host, *generation, *seq);
+    let mut entry = make_conversation_entry("id-a");
+    entry.summary = "title".into();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host,
+            generation,
+            seq,
+            sessions: vec![entry],
+            partial: Some(crate::app::effects::ConversationsPartial::BuildIncomplete),
+            scope: ListScope::Cwd,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(matches!(
+        get_active_agent(&app).and_then(|a| a.active_modal.as_ref()),
+        Some(ActiveModal::SessionPicker { .. })
+    ));
+}
+
+#[test]
+fn welcome_resume_argument_opens_filtered_picker() {
+    let mut app = test_app();
+    let effects = dispatch(Action::ShowSessionPickerFor("Find Me".into()), &mut app);
+    assert!(
+        matches!(effects.first(), Some(Effect::FetchSessionListForResume {
+        host: SessionPickerHost::Welcome, argument, ..
+    }) if argument == "Find Me")
+    );
+    assert_eq!(app.session_picker_state.query(), "Find Me");
+    assert_eq!(
+        app.session_picker_lanes.pending_resume_argument.as_deref(),
+        Some("Find Me")
+    );
+}
+
+#[test]
+fn resume_argument_refresh_cancels_pending_direct_lookup() {
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::ShowSessionPickerFor("target".into()), &mut app);
+    let effects = dispatch(Action::FetchSessionList, &mut app);
+    let Some(Effect::FetchSessionList {
+        host,
+        generation,
+        seq,
+        ..
+    }) = effects.first()
+    else {
+        panic!("missing refresh")
+    };
+    let (host, generation, seq) = (*host, *generation, *seq);
+    let mut entry = make_conversation_entry("target-id");
+    entry.summary = "target".into();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host,
+            generation,
+            seq,
+            sessions: vec![entry],
+            partial: None,
+            scope: ListScope::Cwd,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(matches!(
+        get_active_agent(&app).and_then(|a| a.active_modal.as_ref()),
+        Some(ActiveModal::SessionPicker { .. })
+    ));
+}

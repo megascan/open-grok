@@ -121,6 +121,8 @@ pub enum Action {
     },
     /// Open the session picker overlay (from within an active session via /resume).
     ShowSessionPicker,
+    /// Open the picker with an initial resume ID or title.
+    ShowSessionPickerFor(String),
     /// The session picker overlay was dismissed without a pick: invalidate any
     /// in-flight list/search/foreign scan so a late response can't fall
     /// through to the welcome picker fields.
@@ -2057,6 +2059,16 @@ pub enum Effect {
         kind_filter: Option<Vec<String>>,
         /// Server-side `session_kind=headless` policy: `Only` while the picker is on the Headless page, `Exclude` everywhere else.
         /// Applied by the shell before its page truncation, so it cannot be a client refilter.
+        headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
+    },
+    /// Fetch every page before resolving a direct `/resume` argument.
+    FetchSessionListForResume {
+        argument: String,
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        cwd_override: Option<std::path::PathBuf>,
+        generation: u64,
+        seq: u64,
+        kind_filter: Option<Vec<String>>,
         headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
     },
     /// Coalesce picker search keystrokes: fires

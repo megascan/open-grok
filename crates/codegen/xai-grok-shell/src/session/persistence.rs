@@ -763,7 +763,9 @@ pub fn resolve_local_session_any_cwd(session_id: &str) -> Option<String> {
         .flatten()
 }
 
-pub(crate) fn resolve_local_session_any_cwd_result(session_id: &str) -> io::Result<Option<String>> {
+/// Resolve across workspaces while preserving incomplete-scan and relocation errors.
+/// Callers deciding whether to restore remotely must not treat an error as a miss.
+pub fn resolve_local_session_any_cwd_result(session_id: &str) -> io::Result<Option<String>> {
     resolve_local_session_any_cwd_in_root(session_id, &grok_home().join("sessions"))
         .map_err(io::Error::other)
 }
@@ -920,7 +922,10 @@ fn most_recent_local_summary_for_cwd_in_view(
         let summary = match read_summary(&session_dir) {
             Ok(summary) => summary,
             Err(RelocationError::Json { .. }) => continue,
-            Err(RelocationError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Err(RelocationError::Io { path, source, .. }) => {
+                if source.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %source, "skipping unreadable session summary");
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -954,10 +959,17 @@ fn local_summaries_for_cwd_sync_in_root(
     sessions_root: &Path,
 ) -> io::Result<Vec<Summary>> {
     let view = storage_view(sessions_root).map_err(io::Error::other)?;
-    let dirs = view.session_dirs(Some(cwd)).map_err(io::Error::other)?;
+    let (dirs, complete) = view
+        .listing_dirs_with_completeness(Some(cwd), &Default::default())
+        .map_err(io::Error::other)?;
+    if !complete || view.has_journals() {
+        return Err(io::Error::other("local session discovery is incomplete"));
+    }
     Ok(dirs
         .iter()
-        .filter_map(|dir| read_summary_from_dir(dir).ok())
+        .map(|dir| read_summary_from_dir(dir).map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|summary| !summary.is_hidden() && selection.admits(summary))
         .collect())
 }
@@ -4113,14 +4125,36 @@ fn recover_session_relocations_in(root: &Path) -> crate::session::storage::reloc
 }
 
 pub async fn list_summaries(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
+    list_summaries_with_completeness(cwd)
+        .await
+        .map(|(summaries, _)| summaries)
+}
+
+/// Mutations and exports must not interpret a partial listing as a unique
+/// match or a missing session.
+pub async fn list_summaries_for_mutation(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
+    let (summaries, complete) = list_summaries_with_completeness(cwd).await?;
+    if !complete {
+        return Err(io::Error::other("local session discovery is incomplete"));
+    }
+    Ok(summaries)
+}
+
+pub(crate) async fn list_summaries_with_completeness(
+    cwd: Option<&str>,
+) -> io::Result<(Vec<Summary>, bool)> {
     let root_dir = crate::util::grok_home::grok_home();
     let recovery_root = root_dir.clone();
-    tokio::task::spawn_blocking(move || recover_session_relocations_in(&recovery_root))
+    let excluded = tokio::task::spawn_blocking(move || {
+        crate::session::storage::relocation::RelocationStorage::new(recovery_root)
+            .recover_all_for_listing()
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    JsonlStorageAdapter::with_root(root_dir)
+        .list_sessions_with_completeness(cwd, excluded)
         .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
-    storage.list_sessions(cwd).await
 }
 
 /// Failure modes of [`delete_session_history`].
@@ -4192,7 +4226,7 @@ pub async fn delete_session_history(
     // Resolve the local session info, scoping to cwd if provided. A
     // remote-only session won't be found here — that's fine, the remote
     // delete (if applicable) still runs.
-    let summaries = list_summaries(cwd)
+    let summaries = list_summaries_for_mutation(cwd)
         .await
         .map_err(DeleteSessionError::List)?;
     let local_info = summaries
@@ -4337,12 +4371,16 @@ mod delete_session_history_tests {
 pub async fn list_recent_summaries(limit: usize) -> io::Result<Vec<Summary>> {
     let root_dir = crate::util::grok_home::grok_home();
     let recovery_root = root_dir.clone();
-    tokio::task::spawn_blocking(move || recover_session_relocations_in(&recovery_root))
+    let excluded = tokio::task::spawn_blocking(move || {
+        crate::session::storage::relocation::RelocationStorage::new(recovery_root)
+            .recover_all_for_listing()
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    JsonlStorageAdapter::with_root(root_dir)
+        .list_sessions_recent_with_exclusions(limit, excluded)
         .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
-    let storage = JsonlStorageAdapter::with_root(root_dir);
-    storage.list_sessions_recent(limit).await
 }
 
 // Session folder TTL cleanup
@@ -5385,7 +5423,7 @@ mod resumed_sandbox_profile_tests {
     }
 
     #[test]
-    fn most_recent_cwd_propagates_non_not_found_io_errors() {
+    fn most_recent_cwd_skips_unreadable_summary() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("sessions");
         let cwd = "/work/proj";
@@ -5409,7 +5447,7 @@ mod resumed_sandbox_profile_tests {
         );
         let view = RelocationView::load_for_sessions_root(&root).unwrap();
 
-        let error = most_recent_local_summary_for_cwd_in_view(
+        let picked = most_recent_local_summary_for_cwd_in_view(
             cwd,
             &view,
             |session_dir| {
@@ -5425,12 +5463,9 @@ mod resumed_sandbox_profile_tests {
             },
             RecentSessionSelection::Interactive,
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            RelocationError::Io { source, .. }
-                if source.kind() == io::ErrorKind::PermissionDenied
-        ));
+        .unwrap()
+        .unwrap();
+        assert_eq!(picked.info.id.0.as_ref(), "older");
     }
 
     #[test]
@@ -5519,6 +5554,62 @@ mod resumed_sandbox_profile_tests {
 }
 
 #[cfg(test)]
+mod exact_title_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn title_discovery_rejects_corrupt_and_ambiguous_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let cwd = "/project/title";
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join("good");
+        std::fs::create_dir_all(&dir).unwrap();
+        let summary = Summary::new(
+            &Info {
+                id: acp::SessionId::new("good"),
+                cwd: cwd.into(),
+            },
+            acp::ModelId::new("test"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root)
+                .unwrap()
+                .len(),
+            1
+        );
+        let bad = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("summary.json"), b"{").unwrap();
+        assert!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root).is_err()
+        );
+        std::fs::remove_dir_all(&bad).unwrap();
+        let duplicate = root
+            .join(crate::util::grok_home::encode_cwd_dirname("/elsewhere"))
+            .join("good");
+        std::fs::create_dir_all(&duplicate).unwrap();
+        std::fs::write(
+            duplicate.join("summary.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod session_exists_for_cwd_tests {
     use super::{
         resolve_local_session_any_cwd_in_root, session_exists_for_cwd_in_root,
@@ -5526,6 +5617,24 @@ mod session_exists_for_cwd_tests {
     };
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn any_cwd_resolution_reports_duplicate_ids_instead_of_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        for cwd in ["/project/a", "/project/b"] {
+            let dir = root
+                .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+                .join("same-id");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("summary.json"), b"{}").unwrap();
+        }
+        assert!(resolve_local_session_any_cwd_in_root("same-id", &root).is_err());
+        assert_eq!(
+            resolve_local_session_any_cwd_in_root("missing", &root).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn returns_true_when_session_exists_under_matching_cwd() {

@@ -339,6 +339,15 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 dispatch_show_session_picker(app)
             }
         }
+        Action::ShowSessionPickerFor(argument) => {
+            if app.workspace_dashboard_enabled
+                && matches!(app.active_view, ActiveView::AgentDashboard)
+            {
+                super::dashboard::dispatch_dashboard_open_session_picker_for(app, argument)
+            } else {
+                super::session::load::dispatch_show_session_picker_for(app, argument)
+            }
+        }
         Action::SessionPickerClosed => dispatch_session_picker_closed(app),
         Action::PickSession(index) => dispatch_pick_session(app, index),
         Action::PickSessionInWorktree(index) => dispatch_pick_session_in_worktree(app, index),

@@ -757,6 +757,8 @@ pub enum ConversationsPartial {
     NoOauth,
     Timeout,
     Error,
+    /// Exact resume lookup could not prove the native list was complete.
+    BuildIncomplete,
 }
 impl ConversationsPartial {
     /// Actionable picker notice for a degraded conversations lane.
@@ -764,6 +766,7 @@ impl ConversationsPartial {
         match self {
             Self::NoOauth => "Couldn't load your chats \u{2014} log in with /login",
             Self::Timeout | Self::Error => "Couldn't load conversations \u{2014} retry",
+            Self::BuildIncomplete => "Session list may be incomplete; choose a session from the picker",
         }
     }
 }
@@ -808,6 +811,20 @@ pub(super) fn parse_session_list_scope(payload: &serde_json::Value) -> ListScope
 pub(super) fn parse_session_picker_entries(
     payload: &serde_json::Value,
 ) -> Vec<crate::app::app_view::SessionPickerEntry> {
+    parse_session_picker_entries_inner(payload, false)
+}
+
+/// Include older and untitled rows when checking an exact resume argument.
+pub(super) fn parse_session_picker_entries_for_resume(
+    payload: &serde_json::Value,
+) -> Vec<crate::app::app_view::SessionPickerEntry> {
+    parse_session_picker_entries_inner(payload, true)
+}
+
+fn parse_session_picker_entries_inner(
+    payload: &serde_json::Value,
+    include_all: bool,
+) -> Vec<crate::app::app_view::SessionPickerEntry> {
     use crate::app::app_view::SessionPickerEntry;
     let entries: Vec<serde_json::Value> = payload
         .get("sessions")
@@ -851,13 +868,13 @@ pub(super) fn parse_session_picker_entries(
                 .and_then(|s| s.parse().ok());
             let updated_at: chrono::DateTime<chrono::Utc> = match parsed_updated {
                 Some(ts) => {
-                    if !is_conversation && ts < cutoff {
+                    if !include_all && !is_conversation && ts < cutoff {
                         return None;
                     }
                     ts
                 }
                 None => {
-                    if !is_conversation {
+                    if !include_all && !is_conversation {
                         return None;
                     }
                     parsed_created.unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
@@ -957,7 +974,7 @@ pub(super) fn parse_session_picker_entries(
             })
         })
         .filter_map(|mut e| {
-            if e.summary.is_empty() {
+            if e.summary.is_empty() && !include_all {
                 if e.source == "conversation" {
                     e.summary = "Untitled".to_string();
                 } else {

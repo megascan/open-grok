@@ -6924,3 +6924,59 @@ fn dashboard_attach_build_roster_row_keeps_disk_resume() {
         "expected Build disk resume with roster cwd, got {effects:?}"
     );
 }
+
+#[test]
+fn dashboard_resume_argument_cancels_auto_pick_after_query_change() {
+    use crate::views::session_picker_surface::SessionPickerHost;
+    let mut app = test_app();
+    app.workspace_dashboard_enabled = true;
+    app.active_view = ActiveView::AgentDashboard;
+    ensure_dashboard_state(&mut app);
+    let effects = dispatch(
+        Action::DashboardDispatchSlash {
+            text: "/resume target".into(),
+        },
+        &mut app,
+    );
+    let [
+        Effect::FetchSessionListForResume {
+            host: SessionPickerHost::Dashboard,
+            argument,
+            generation,
+            seq,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected dashboard fetch: {effects:?}")
+    };
+    assert_eq!(argument, "target");
+    let (generation, seq) = (*generation, *seq);
+    assert_eq!(
+        app.dashboard_session_picker.as_ref().unwrap().state.query(),
+        "target"
+    );
+    let _ = app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    )));
+    let surface = app.dashboard_session_picker.as_mut().unwrap();
+    assert!(surface.lanes.pending_resume_argument.is_none());
+    surface.state.set_query("target");
+    let mut entry = super::make_picker_entry("target-id", "/repo");
+    entry.summary = "target".into();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Dashboard,
+            generation,
+            seq,
+            sessions: vec![entry],
+            partial: None,
+            scope: ListScope::Cwd,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(app.dashboard_session_picker.is_some());
+}

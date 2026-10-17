@@ -28,7 +28,9 @@ use serde::Deserialize;
 use super::{ExtResult, parse_params, to_raw_response};
 use crate::agent::MvpAgent;
 use crate::leader::protocol::InternalMethod;
-use crate::session::persistence::{ValidatedRenameTitle, list_summaries, validate_rename_title};
+use crate::session::persistence::{
+    ValidatedRenameTitle, list_summaries_for_mutation, validate_rename_title,
+};
 use crate::session::storage::StorageAdapter;
 use crate::session::storage::jsonl::JsonlStorageAdapter;
 use crate::session::unified_list::SessionKind;
@@ -117,7 +119,7 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     let session_id = acp::SessionId::new(Arc::from(req.session_id.as_str()));
 
     // Find the session info, scoping to cwd if provided
-    let summaries = list_summaries(req.cwd.as_deref())
+    let summaries = list_summaries_for_mutation(req.cwd.as_deref())
         .await
         .map_err(|e| acp::Error::internal_error().data(format!("failed to list sessions: {e}")))?;
 
@@ -211,7 +213,7 @@ async fn reset_session_title_to_auto(
 
     let session_id_acp = acp::SessionId::new(Arc::from(session_id));
 
-    let summaries = list_summaries(cwd)
+    let summaries = list_summaries_for_mutation(cwd)
         .await
         .map_err(|e| acp::Error::internal_error().data(format!("failed to list sessions: {e}")))?;
 

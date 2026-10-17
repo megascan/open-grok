@@ -7,6 +7,7 @@ use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use async_trait::async_trait;
 use fs2::FileExt;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -270,34 +271,59 @@ impl JsonlStorageAdapter {
     /// Returns the path to each session directory (not the summary file).
     /// Shared by both `list_sessions` (full scan) and `list_sessions_recent`
     /// (mtime-based tail).
+    #[cfg(test)]
     fn scan_session_dirs(&self, cwd: Option<&str>) -> io::Result<Vec<PathBuf>> {
+        self.scan_session_dirs_with_completeness(cwd, &HashSet::new())
+            .map(|(dirs, _)| dirs)
+    }
+    fn scan_session_dirs_with_completeness(
+        &self,
+        cwd: Option<&str>,
+        excluded: &HashSet<String>,
+    ) -> io::Result<(Vec<PathBuf>, bool)> {
         let root_dir = match &self.dir_mode {
             SessionDirMode::FromRoot(root) => root,
-            SessionDirMode::Explicit(_) => return Ok(Vec::new()),
+            SessionDirMode::Explicit(_) => return Ok((Vec::new(), true)),
         };
         crate::session::storage::relocation::RelocationView::load(root_dir)
-            .and_then(|view| view.session_dirs(cwd))
+            .and_then(|view| view.listing_dirs_with_completeness(cwd, excluded))
             .map_err(io::Error::other)
     }
-    fn list_sessions_sync(&self, cwd: Option<&str>) -> io::Result<Vec<Summary>> {
-        let session_dirs = self.scan_session_dirs(cwd)?;
+    pub(crate) async fn list_sessions_with_completeness(
+        &self,
+        cwd: Option<&str>,
+        excluded: HashSet<String>,
+    ) -> io::Result<(Vec<Summary>, bool)> {
+        let adapter = self.clone();
+        let cwd = cwd.map(str::to_owned);
+        tokio::task::spawn_blocking(move || adapter.list_sessions_sync(cwd.as_deref(), &excluded))
+            .await
+            .map_err(io::Error::other)?
+    }
+    fn list_sessions_sync(
+        &self,
+        cwd: Option<&str>,
+        excluded: &HashSet<String>,
+    ) -> io::Result<(Vec<Summary>, bool)> {
+        let (session_dirs, mut complete) =
+            self.scan_session_dirs_with_completeness(cwd, excluded)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
             let summary_path = session_dir.join(super::SUMMARY_FILE);
-            match std::fs::read(&summary_path) {
-                Ok(bytes) => {
-                    if let Ok(mut summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
-                    {
-                        super::summary_write::repair_untagged_worktree_summary(
-                            &mut summary,
-                            &summary_path,
-                            &session_dir.join(format!("{}.lock", super::SUMMARY_FILE)),
-                        );
-                        summaries.push(summary);
-                    }
+            match std::fs::read(&summary_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok())
+            {
+                Some(mut summary) if !summary.is_hidden() => {
+                    super::summary_write::repair_untagged_worktree_summary(
+                        &mut summary,
+                        &summary_path,
+                        &session_dir.join(format!("{}.lock", super::SUMMARY_FILE)),
+                    );
+                    summaries.push(summary);
                 }
-                Err(_) => continue,
+                Some(_) => {}
+                None => complete = false,
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -306,19 +332,35 @@ impl JsonlStorageAdapter {
                 s.info.id.0.to_string(),
             )
         });
-        Ok(summaries)
+        Ok((summaries, complete))
     }
     const RECENT_LIST_READ_SLACK: usize = 8;
     ///
     /// Final order among candidates uses `last_active_at` else `updated_at`.
     pub async fn list_sessions_recent(&self, limit: usize) -> io::Result<Vec<Summary>> {
         let adapter = self.clone();
-        tokio::task::spawn_blocking(move || adapter.list_sessions_recent_sync(limit))
+        tokio::task::spawn_blocking(move || {
+            adapter.list_sessions_recent_sync(limit, &HashSet::new())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+    pub(crate) async fn list_sessions_recent_with_exclusions(
+        &self,
+        limit: usize,
+        excluded: HashSet<String>,
+    ) -> io::Result<Vec<Summary>> {
+        let adapter = self.clone();
+        tokio::task::spawn_blocking(move || adapter.list_sessions_recent_sync(limit, &excluded))
             .await
             .map_err(io::Error::other)?
     }
-    fn list_sessions_recent_sync(&self, limit: usize) -> io::Result<Vec<Summary>> {
-        let session_dirs = self.scan_session_dirs(None)?;
+    fn list_sessions_recent_sync(
+        &self,
+        limit: usize,
+        excluded: &HashSet<String>,
+    ) -> io::Result<Vec<Summary>> {
+        let (session_dirs, _) = self.scan_session_dirs_with_completeness(None, excluded)?;
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
@@ -1779,11 +1821,9 @@ impl StorageAdapter for JsonlStorageAdapter {
         Ok(summary)
     }
     async fn list_sessions(&self, cwd: Option<&str>) -> io::Result<Vec<Summary>> {
-        let adapter = self.clone();
-        let cwd = cwd.map(str::to_owned);
-        tokio::task::spawn_blocking(move || adapter.list_sessions_sync(cwd.as_deref()))
+        self.list_sessions_with_completeness(cwd, HashSet::new())
             .await
-            .map_err(io::Error::other)?
+            .map(|(summaries, _)| summaries)
     }
     async fn delete_session(&self, info: &Info) -> io::Result<()> {
         let dir = self.session_dir(info);
@@ -1832,6 +1872,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use std::collections::HashSet;
             use std::fs::OpenOptions;
             let adapter = adapter_clone;
             #[cfg(test)]
