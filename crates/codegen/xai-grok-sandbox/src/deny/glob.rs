@@ -12,7 +12,7 @@
 use nono::CapabilitySet;
 #[cfg(all(feature = "enforce", target_os = "linux"))]
 use std::collections::BTreeSet;
-#[cfg(all(feature = "enforce", unix))]
+#[cfg(any(all(feature = "enforce", unix), target_os = "macos"))]
 use std::path::{Path, PathBuf};
 #[cfg(all(feature = "enforce", target_os = "linux"))]
 use std::sync::Mutex;
@@ -42,8 +42,8 @@ pub(crate) fn partition_deny_entries(deny: &[PathBuf]) -> (Vec<PathBuf>, Vec<Str
 /// `/home` + `**/.ssh`). Root plus tail always re-joins to the original
 /// pattern, so the macOS regex body is unchanged; the alias set follows the
 /// (possibly deeper) root.
-#[cfg(all(feature = "enforce", unix))]
-fn split_glob_root(workspace: &Path, glob: &str) -> (PathBuf, String) {
+#[cfg(any(all(feature = "enforce", unix), target_os = "macos"))]
+pub(crate) fn split_glob_root(workspace: &Path, glob: &str) -> (PathBuf, String) {
     let (mut root, rest) = match glob.strip_prefix('/') {
         Some(absolute) => (PathBuf::from("/"), absolute),
         None => (workspace.to_path_buf(), glob),
@@ -73,7 +73,7 @@ fn split_glob_root(workspace: &Path, glob: &str) -> (PathBuf, String) {
 ///    separate deny entries.
 /// 2. Compile through `globset` (the Linux matcher) so a malformed glob (`a**b`,
 ///    unterminated `[`) fails closed identically on both platforms.
-#[cfg(all(feature = "enforce", unix))]
+#[cfg(any(all(feature = "enforce", unix), target_os = "macos"))]
 pub(crate) fn validate_deny_glob(glob: &str) -> anyhow::Result<()> {
     if let Some(c) = glob.chars().find(|&c| matches!(c, '{' | '}' | '\\')) {
         anyhow::bail!(
@@ -147,7 +147,7 @@ pub(crate) fn validate_deny_glob(glob: &str) -> anyhow::Result<()> {
 }
 
 /// Push `c` as a regex literal, escaping it when it is a regex metacharacter.
-#[cfg(all(feature = "enforce", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn push_escaped_regex_literal(out: &mut String, c: char) {
     if matches!(
         c,
@@ -159,7 +159,7 @@ fn push_escaped_regex_literal(out: &mut String, c: char) {
 }
 
 /// Regex-escape every character of a literal path segment.
-#[cfg(all(feature = "enforce", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn escape_regex_literal_str(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -173,7 +173,7 @@ fn escape_regex_literal_str(s: &str) -> String {
 /// `[...]` classes copied with a leading `!`/`^` -> regex negation `[^…]`, all
 /// other literal text regex-escaped. Only the class subset `validate_deny_glob`
 /// accepts reaches here, so it always matches globset.
-#[cfg(all(feature = "enforce", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn glob_tail_to_regex(tail: &str) -> String {
     let mut out = String::new();
     let mut chars = tail.chars().peekable();
@@ -269,12 +269,20 @@ fn glob_to_seatbelt_regexes(workspace: &Path, glob: &str) -> Vec<String> {
     regexes
 }
 
+/// Translate one already selected root spelling to an anchored Seatbelt regex.
+#[cfg(target_os = "macos")]
+pub(crate) fn anchored_glob_regex(root: &Path, tail: &str) -> Option<String> {
+    let escaped_root = escape_regex_literal_str(root.to_str()?);
+    let sep = if escaped_root.ends_with('/') { "" } else { "/" };
+    Some(format!("^{escaped_root}{sep}{}$", glob_tail_to_regex(tail)))
+}
+
 /// Wrap a finished regex body in a Seatbelt `(regex #"…")` filter, escaping the
 /// SBPL string delimiter and rejecting control chars. Fail-closed: returns
 /// `None` for an inexpressible pattern so the caller errors rather than emitting
 /// a rule that silently targets the wrong path.
-#[cfg(all(feature = "enforce", target_os = "macos"))]
-fn seatbelt_regex_filter(regex: &str) -> Option<String> {
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_regex_filter(regex: &str) -> Option<String> {
     if regex.chars().any(|c| c.is_control()) {
         return None;
     }

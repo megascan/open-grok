@@ -45,15 +45,6 @@ fn assert_no_auto_socket_denies(profile: &SandboxProfile) {
     }
 }
 
-fn assert_materialized_auto_socket_denies(profile: &SandboxProfile) {
-    let paths = materialize_runtime_socket_deny_paths().expect("socket deny paths materialize");
-    assert_eq!(
-        profile.deny, paths,
-        "{} must use the materialized socket policy",
-        profile.name
-    );
-}
-
 #[cfg(unix)]
 fn temp_runtime_root(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -332,49 +323,59 @@ fn runtime_socket_handoff_deduplicates_entries() {
 }
 
 #[test]
+#[cfg(unix)]
 #[serial(bwrap_env)]
 fn restrict_network_profiles_deny_container_runtime_sockets() {
     if skip_if_host_hook_write_deny_unresolvable() {
         return;
     }
-    let workspace = std::env::temp_dir();
+    let workspace = temp_runtime_root("profile-sockets");
+    let socket = workspace.join("docker.sock");
+    std::fs::write(&socket, "fixture").unwrap();
+    let socket = std::fs::canonicalize(socket).unwrap();
     let config = SandboxConfig::default();
     for name in [ProfileName::Strict, ProfileName::ReadOnly] {
         let profile = name
-            .resolve_profile(&workspace, &config)
+            .resolve_with_test_socket_candidates(&workspace, &config, &[socket.clone()])
             .expect("profile resolves");
         assert!(profile.restrict_network, "{name}");
-        assert_materialized_auto_socket_denies(&profile);
+        assert_eq!(profile.deny, vec![socket.clone()]);
     }
     for name in [ProfileName::Workspace, ProfileName::Devbox] {
         let profile = name
-            .resolve_profile(&workspace, &config)
+            .resolve_with_test_socket_candidates(&workspace, &config, &[socket.clone()])
             .expect("profile resolves");
         assert!(!profile.restrict_network, "{name}");
-        assert_no_auto_socket_denies(&profile);
+        assert!(!profile.deny.contains(&socket));
     }
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]
+#[cfg(unix)]
 #[serial(bwrap_env)]
 fn custom_restrict_network_override_controls_auto_socket_denies() {
     if skip_if_host_hook_write_deny_unresolvable() {
         return;
     }
-    let workspace = std::env::temp_dir();
+    let workspace = temp_runtime_root("profile-sockets");
+    let socket = workspace.join("docker.sock");
+    std::fs::write(&socket, "fixture").unwrap();
+    let socket = std::fs::canonicalize(socket).unwrap();
     let config = network_inheritance_config();
 
     let unrestricted = ProfileName::Custom("strict-unrestricted".to_string())
-        .resolve_profile(&workspace, &config)
+        .resolve_with_test_socket_candidates(&workspace, &config, &[socket.clone()])
         .expect("custom resolves");
     assert!(!unrestricted.restrict_network);
-    assert_no_auto_socket_denies(&unrestricted);
+    assert!(!unrestricted.deny.contains(&socket));
 
     let restricted = ProfileName::Custom("workspace-restricted".to_string())
-        .resolve_profile(&workspace, &config)
+        .resolve_with_test_socket_candidates(&workspace, &config, &[socket.clone()])
         .expect("custom resolves");
     assert!(restricted.restrict_network);
-    assert_materialized_auto_socket_denies(&restricted);
+    assert_eq!(restricted.deny, vec![socket]);
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]

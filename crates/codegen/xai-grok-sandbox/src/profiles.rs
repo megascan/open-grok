@@ -402,6 +402,24 @@ impl ProfileName {
         Ok((profile, runtime_socket_denies))
     }
 
+    /// Resolve against explicit socket candidates to keep tests independent of host services.
+    #[cfg(test)]
+    pub(crate) fn resolve_with_test_socket_candidates(
+        &self,
+        workspace: &Path,
+        config: &SandboxConfig,
+        candidates: &[PathBuf],
+    ) -> anyhow::Result<SandboxProfile> {
+        let mut profile = self.resolve(workspace, config)?;
+        if profile.restrict_network {
+            crate::runtime_sockets::append_test_runtime_socket_denies(
+                &mut profile.deny,
+                candidates,
+            )?;
+        }
+        Ok(profile)
+    }
+
     fn resolve(&self, workspace: &Path, config: &SandboxConfig) -> anyhow::Result<SandboxProfile> {
         match self {
             // Selected `off` is handled before resolve (empty CapabilitySet /
@@ -649,7 +667,9 @@ mod tests {
             (ProfileName::ReadOnly, true),
             (ProfileName::Strict, true),
         ] {
-            let resolved = name.resolve_profile(&workspace, &config).unwrap();
+            let resolved = name
+                .resolve_with_test_socket_candidates(&workspace, &config, &[])
+                .unwrap();
             assert_eq!(resolved.restrict_network, expected, "{name}");
         }
     }
@@ -669,7 +689,9 @@ mod tests {
             ("workspace-restricted", true),
         ] {
             let profile_name = ProfileName::Custom(name.to_string());
-            let resolved = profile_name.resolve_profile(&workspace, &config).unwrap();
+            let resolved = profile_name
+                .resolve_with_test_socket_candidates(&workspace, &config, &[])
+                .unwrap();
             assert_eq!(resolved.restrict_network, expected, "{name}");
         }
     }
@@ -683,7 +705,7 @@ mod tests {
         // Regression: /run (resolv realpath) + /var (NSS/SSSD) when present.
         let workspace = std::env::temp_dir();
         let profile = ProfileName::Strict
-            .resolve_profile(&workspace, &SandboxConfig::default())
+            .resolve_with_test_socket_candidates(&workspace, &SandboxConfig::default(), &[])
             .expect("strict resolves");
         assert!(!profile.default_read);
         if PathBuf::from("/run").exists() {
@@ -714,12 +736,20 @@ mod tests {
         let cases = [
             (
                 "strict",
-                ProfileName::Strict.resolve_profile(&workspace, &SandboxConfig::default()),
+                ProfileName::Strict.resolve_with_test_socket_candidates(
+                    &workspace,
+                    &SandboxConfig::default(),
+                    &[],
+                ),
             ),
             (
                 "strict-inherited",
                 ProfileName::Custom("strict-inherited".to_string())
-                    .resolve_profile(&workspace, &network_inheritance_config()),
+                    .resolve_with_test_socket_candidates(
+                        &workspace,
+                        &network_inheritance_config(),
+                        &[],
+                    ),
             ),
         ];
         for (label, resolved) in cases {
@@ -773,7 +803,7 @@ mod tests {
         let home = grok_home();
         for name in [ProfileName::Workspace, ProfileName::ReadOnly] {
             let profile = name
-                .resolve_profile(&workspace, &config)
+                .resolve_with_test_socket_candidates(&workspace, &config, &[])
                 .unwrap_or_else(|e| panic!("{name} resolves: {e}"));
             assert!(
                 profile.read_write.iter().any(|p| p == &home),
@@ -817,7 +847,10 @@ mod tests {
         };
 
         let profile = ProfileName::Custom("project".to_string());
-        let result = profile.to_capability_set_with_config(&workspace, &config);
+        let resolved = profile
+            .resolve_with_test_socket_candidates(&workspace, &config, &[])
+            .unwrap();
+        let result = ProfileName::capability_set_from_profile(&workspace, &resolved);
         assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
 
@@ -1152,7 +1185,10 @@ read_write = ["/tmp/ci-artifacts"]
             return;
         }
         let workspace = std::env::current_dir().unwrap();
-        let result = ProfileName::Strict.to_capability_set(&workspace);
+        let profile = ProfileName::Strict
+            .resolve_with_test_socket_candidates(&workspace, &SandboxConfig::default(), &[])
+            .unwrap();
+        let result = ProfileName::capability_set_from_profile(&workspace, &profile);
         assert!(
             result.is_ok(),
             "strict CapabilitySet must build even if /dev/tty is unopenable: {:?}",

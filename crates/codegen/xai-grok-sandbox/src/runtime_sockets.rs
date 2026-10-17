@@ -218,6 +218,16 @@ pub(crate) fn append_runtime_socket_denies(
     Ok(())
 }
 
+// Tests supply their own candidates rather than inspect host runtime endpoints.
+#[cfg(test)]
+pub(crate) fn append_test_runtime_socket_denies(
+    deny: &mut Vec<PathBuf>,
+    candidates: &[PathBuf],
+) -> io::Result<()> {
+    let materialized = materialize_runtime_socket_deny_paths_from(candidates.iter().cloned())?;
+    merge_runtime_socket_denies(deny, &materialized, candidates)
+}
+
 fn merge_runtime_socket_denies(
     deny: &mut Vec<PathBuf>,
     auto_sockets: &[PathBuf],

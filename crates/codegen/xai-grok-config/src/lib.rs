@@ -22,7 +22,9 @@ mod loader;
 mod macos_managed;
 mod managed_cache;
 pub mod managed_text;
+mod mcp_bearer_token_file;
 mod paths;
+pub mod sandbox_mode;
 pub mod shell;
 pub mod signed_policy;
 mod validation;
@@ -68,6 +70,9 @@ pub use managed_cache::{
     managed_config_identity_changed, managed_config_identity_changed_at, managed_config_synced_at,
     managed_deployment_id, managed_policy_compromised_for, mark_managed_config_synced,
     mark_managed_config_synced_at, normalize_identity,
+};
+pub use mcp_bearer_token_file::{
+    BearerTokenPath, BearerTokenPathError, bearer_token_file_meta, configured_bearer_token_file,
 };
 pub use paths::{
     GrokHomeSource, claude_managed_settings_path, claude_managed_settings_probe_path,
