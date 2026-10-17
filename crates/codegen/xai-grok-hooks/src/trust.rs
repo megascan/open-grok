@@ -46,11 +46,13 @@ pub enum HookSkipReason {
 }
 
 /// One-shot snapshot of the per-spec skip inputs: the disabled-hooks file and the `allow_managed_hooks_only` pin.
+/// An unreadable file disables non-managed hooks because their saved state is unknown.
 /// [`Self::skip_reason`] is the one rule the dispatcher, the stop-gate guard, and the modal apply, so they cannot disagree about what runs.
 #[derive(Debug, Default)]
 pub struct DisabledHooks {
     names: std::collections::HashSet<String>,
     managed_only: bool,
+    read_failed: bool,
 }
 
 impl DisabledHooks {
@@ -58,27 +60,48 @@ impl DisabledHooks {
         Self {
             names: names.into_iter().collect(),
             managed_only,
+            read_failed: false,
         }
     }
 
-    /// Read the disabled-hooks file; `managed_only` is the resolved `allow_managed_hooks_only` pin, which the caller reads from managed settings.
+    /// Read the disabled-hooks file. A missing file is empty; other read failures
+    /// disable non-managed hooks. Managed policy hooks still run.
     pub fn load(managed_only: bool) -> Self {
-        let names = disabled_hooks_file_path()
-            .and_then(|file| std::fs::read_to_string(file).ok())
-            .map(|content| {
+        match disabled_hooks_file_path() {
+            Some(file) => Self::load_file(&file, managed_only),
+            None => {
+                tracing::warn!("cannot resolve disabled-hooks file; skipping non-managed hooks");
+                Self {
+                    read_failed: true,
+                    ..Self::new([], managed_only)
+                }
+            }
+        }
+    }
+
+    fn load_file(file: &Path, managed_only: bool) -> Self {
+        match std::fs::read_to_string(file) {
+            Ok(content) => Self::new(
                 content
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Self::new(names, managed_only)
+                    .map(str::to_string),
+                managed_only,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::new([], managed_only),
+            Err(err) => {
+                tracing::warn!(path = %file.display(), error = %err, "cannot read disabled-hooks file; skipping non-managed hooks");
+                Self {
+                    read_failed: true,
+                    ..Self::new([], managed_only)
+                }
+            }
+        }
     }
 
     pub fn contains(&self, hook_name: &str) -> bool {
-        self.names.contains(hook_name)
+        self.read_failed || self.names.contains(hook_name)
     }
 
     pub fn managed_only(&self) -> bool {
@@ -93,7 +116,7 @@ impl DisabledHooks {
         if self.managed_only {
             return Some(HookSkipReason::ManagedOnly);
         }
-        (!spec.enabled || self.names.contains(&spec.name)).then_some(HookSkipReason::UserDisabled)
+        (!spec.enabled || self.contains(&spec.name)).then_some(HookSkipReason::UserDisabled)
     }
 
     /// Whether dispatch skips `spec`; also what the modal shows as disabled.
@@ -223,5 +246,52 @@ mod tests {
             list_trusted_projects_with_file(Path::new("/nonexistent/trusted-hook-projects"))
                 .expect("missing file resolves to Ok(empty)");
         assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn disabled_hooks_unreadable_file_fails_closed_but_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("disabled-hooks");
+        let missing = DisabledHooks::load_file(&file, false);
+        assert!(!missing.contains("global/disabled"));
+
+        std::fs::write(&file, "# comment\n global/disabled \n").unwrap();
+        let loaded = DisabledHooks::load_file(&file, false);
+        assert!(loaded.contains("global/disabled"));
+        assert!(!loaded.contains("global/other"));
+
+        // Invalid UTF-8 reliably exercises a read failure without depending on
+        // permissions or the privileges of the test runner.
+        std::fs::write(&file, [0xff]).unwrap();
+        let unreadable = DisabledHooks::load_file(&file, false);
+        assert!(unreadable.contains("global/disabled"));
+        assert!(unreadable.contains("global/other"));
+
+        let mut spec = crate::config::HookSpec {
+            name: "global/disabled".into(),
+            event: crate::event::HookEventName::PreToolUse,
+            handler_type: crate::config::HandlerType::Command,
+            configured_matcher: None,
+            matcher: None,
+            enabled: true,
+            command: None,
+            command_raw: None,
+            url: None,
+            url_raw: None,
+            timeout_ms: 1000,
+            source_dir: dir.path().to_owned(),
+            extra_env: Default::default(),
+            layer: crate::config::HookProvenance::File,
+        };
+        assert_eq!(
+            unreadable.skip_reason(&spec),
+            Some(HookSkipReason::UserDisabled)
+        );
+        spec.layer = crate::config::HookProvenance::Requirements;
+        assert_eq!(unreadable.skip_reason(&spec), None);
+        std::fs::write(&file, "").unwrap();
+        assert!(!DisabledHooks::load_file(&file, false).blocks(&spec));
+        spec.layer = crate::config::HookProvenance::File;
+        assert!(!DisabledHooks::load_file(&file, false).blocks(&spec));
     }
 }

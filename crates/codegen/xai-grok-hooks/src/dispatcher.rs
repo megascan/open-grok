@@ -64,6 +64,7 @@ pub struct AdditionalContext {
 
 pub struct PreToolUseResult {
     pub decision: HookDecision,
+    pub force_stop: Option<StopBlock>,
     pub updated_input: Option<InputRewrite>,
     pub additional_context: Vec<AdditionalContext>,
     pub results: Vec<HookRunResult>,
@@ -77,6 +78,7 @@ struct GateBlock {
 
 struct SequentialGateOutcome {
     block: Option<GateBlock>,
+    force_stop: Option<StopBlock>,
     pending_ask: Option<PendingAsk>,
     deferring_hook: Option<String>,
     updated_input: Option<InputRewrite>,
@@ -96,6 +98,7 @@ async fn dispatch_sequential_gate(
     if hooks.is_empty() {
         return SequentialGateOutcome {
             block: None,
+            force_stop: None,
             pending_ask: None,
             deferring_hook: None,
             updated_input: None,
@@ -155,6 +158,7 @@ async fn dispatch_sequential_gate(
                         hook_name: spec.name.clone(),
                         reason,
                     }),
+                    force_stop: None,
                     pending_ask: None,
                     deferring_hook: None,
                     updated_input: None,
@@ -245,6 +249,27 @@ async fn dispatch_sequential_gate(
                     system_message,
                 });
             }
+            HookRunnerResult::Stop(outcome) if outcome.force_stop.is_some() => {
+                let force = outcome.force_stop.expect("guarded force stop");
+                let stop = force_stop_block(&spec.name, force);
+                run_results.push(HookRunResult::Blocked {
+                    hook_name: spec.name.clone(),
+                    detail: format!("stopped: {}", stop.reason),
+                    elapsed,
+                    http_info,
+                    system_message,
+                });
+                record_dispatch_counts(&span, &run_results);
+                return SequentialGateOutcome {
+                    block: None,
+                    force_stop: Some(stop),
+                    pending_ask: None,
+                    deferring_hook: None,
+                    updated_input: None,
+                    additional_context: Vec::new(),
+                    results: run_results,
+                };
+            }
             HookRunnerResult::Success
             | HookRunnerResult::Stop(_)
             | HookRunnerResult::PostToolUse { .. } => {
@@ -266,6 +291,7 @@ async fn dispatch_sequential_gate(
     record_dispatch_counts(&span, &run_results);
     SequentialGateOutcome {
         block: None,
+        force_stop: None,
         pending_ask,
         deferring_hook,
         updated_input,
@@ -343,6 +369,7 @@ pub async fn dispatch_pre_tool_use(
     };
     PreToolUseResult {
         decision,
+        force_stop: outcome.force_stop,
         updated_input: outcome.updated_input,
         additional_context: outcome.additional_context,
         results: outcome.results,
@@ -351,6 +378,7 @@ pub async fn dispatch_pre_tool_use(
 
 pub struct PromptGateResult {
     pub decision: PromptDecision,
+    pub force_stop: Option<StopBlock>,
     pub results: Vec<HookRunResult>,
 }
 
@@ -373,6 +401,7 @@ pub async fn dispatch_prompt_gate(
             Some(GateBlock { hook_name, reason }) => PromptDecision::Block { reason, hook_name },
             None => PromptDecision::Allow,
         },
+        force_stop: outcome.force_stop,
         results: outcome.results,
     }
 }
@@ -380,6 +409,16 @@ pub async fn dispatch_prompt_gate(
 pub struct StopBlock {
     pub hook_name: String,
     pub reason: String,
+}
+
+fn force_stop_block(hook_name: &str, force: crate::result::StopOverride) -> StopBlock {
+    StopBlock {
+        hook_name: hook_name.to_string(),
+        reason: force
+            .reason
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| format!("Stopped by hook '{hook_name}'")),
+    }
 }
 
 /// Aggregated signals from a `Stop`/`SubagentStop` gate dispatch.
@@ -634,6 +673,7 @@ pub struct ReplacementChoice {
 #[derive(Debug, Default)]
 pub struct PostToolUseResult {
     pub blocks: Vec<PostToolUseBlock>,
+    pub force_stop: Option<StopBlock>,
     pub additional_context: Vec<AdditionalContext>,
     pub builtin_replacement: Option<SelectedReplacement>,
     pub mcp_replacement: Option<SelectedReplacement>,
@@ -680,9 +720,13 @@ impl PostToolUseResult {
     ) {
         let crate::result::PostToolUseHookOutcome {
             block_reason,
+            force_stop,
             additional_context,
             output_replacement,
         } = outcome;
+        if self.force_stop.is_none() {
+            self.force_stop = force_stop.map(|force| force_stop_block(hook_name, force));
+        }
         if let Some(reason) = block_reason {
             self.blocks.push(PostToolUseBlock {
                 hook_name: hook_name.to_string(),
@@ -703,11 +747,15 @@ impl PostToolUseResult {
     pub fn merge(&mut self, other: PostToolUseResult) {
         let PostToolUseResult {
             blocks,
+            force_stop,
             additional_context,
             builtin_replacement,
             mcp_replacement,
             results,
         } = other;
+        if self.force_stop.is_none() {
+            self.force_stop = force_stop;
+        }
         debug_assert!(
             builtin_replacement.is_none() && mcp_replacement.is_none(),
             "client results carry no output replacement"
@@ -806,6 +854,9 @@ pub async fn dispatch_post_tool_use(
                 });
                 let run_index = out.results.len() - 1;
                 out.absorb(&spec.name, run_index, outcome);
+                if out.force_stop.is_some() {
+                    break;
+                }
             }
             HookRunnerResult::Failed(err) => {
                 tracing::warn!(
@@ -2254,6 +2305,95 @@ mod tests {
         let mut spec = make_command_spec(name, None, true, script);
         spec.event = HookEventName::PostToolUse;
         spec
+    }
+
+    #[tokio::test]
+    async fn continue_false_stops_each_hook_chain_and_preserves_reason() {
+        let stop = r#"echo '{"continue":false,"stopReason":"done"}'"#;
+        let later = "exit 0";
+        let pre = dispatch_pre_tool_use(
+            &registry_from_specs(vec![
+                make_command_spec("stop", None, true, stop),
+                make_command_spec("later", None, true, later),
+            ]),
+            &pre_tool_use_envelope("run_terminal_cmd"),
+            &run_ctx(),
+        )
+        .await;
+        assert_eq!(
+            pre.force_stop,
+            Some(StopBlock {
+                hook_name: "stop".into(),
+                reason: "done".into()
+            })
+        );
+        assert_eq!(pre.results.len(), 1);
+
+        let prompt = dispatch_prompt_gate(
+            &registry_from_specs(vec![
+                make_prompt_spec("stop", stop),
+                make_prompt_spec("later", later),
+            ]),
+            &prompt_submit_envelope(),
+            &run_ctx(),
+        )
+        .await;
+        assert_eq!(
+            prompt.force_stop,
+            Some(StopBlock {
+                hook_name: "stop".into(),
+                reason: "done".into()
+            })
+        );
+        assert_eq!(prompt.results.len(), 1);
+
+        let post = dispatch_post_tool_use(
+            &registry_from_specs(vec![
+                post_tool_use_spec("stop", stop),
+                post_tool_use_spec("later", later),
+            ]),
+            &post_tool_use_envelope("run_terminal_cmd"),
+            &run_ctx(),
+        )
+        .await;
+        assert_eq!(
+            post.force_stop,
+            Some(StopBlock {
+                hook_name: "stop".into(),
+                reason: "done".into()
+            })
+        );
+        assert_eq!(post.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_and_continue_true_hooks_do_not_force_stop() {
+        for script in [
+            r#"echo '{"continue":false}'; exit 1"#,
+            r#"echo '{"continue":true}'; exit 0"#,
+        ] {
+            let pre = dispatch_pre_tool_use(
+                &registry_from_specs(vec![make_command_spec("pre", None, true, script)]),
+                &pre_tool_use_envelope("run_terminal_cmd"),
+                &run_ctx(),
+            )
+            .await;
+            assert!(pre.force_stop.is_none(), "{script}");
+            let prompt = dispatch_prompt_gate(
+                &registry_from_specs(vec![make_prompt_spec("prompt", script)]),
+                &prompt_submit_envelope(),
+                &run_ctx(),
+            )
+            .await;
+            assert!(prompt.force_stop.is_none(), "{script}");
+            let post = dispatch_post_tool_use(
+                &registry_from_specs(vec![post_tool_use_spec("post", script)]),
+                &post_tool_use_envelope("run_terminal_cmd"),
+                &run_ctx(),
+            )
+            .await;
+            assert!(post.force_stop.is_none(), "{script}");
+        }
     }
 
     #[tokio::test]

@@ -693,6 +693,15 @@ fn parse_blocking_result(
     if let Some(json) = gate_document {
         let health = HookHealth::from_success(exit_code == 0);
         match gate_outcome(json, hook_name, stderr_first_line(stderr), health) {
+            GateOutcome::ForceStop(force_stop) => {
+                return (
+                    HookRunnerResult::Stop(crate::result::StopHookOutcome {
+                        force_stop: Some(force_stop),
+                        ..Default::default()
+                    }),
+                    elapsed,
+                );
+            }
             GateOutcome::Deny(reason) => {
                 if exit_code != GATE_EXIT_CODE && exit_code != 0 {
                     tracing::warn!(
@@ -873,6 +882,15 @@ fn parse_prompt_result(
     let trimmed = stdout.trim();
     if !trimmed.is_empty() {
         match serde_json::from_str::<PromptHookJson>(trimmed) {
+            Ok(json) if exit_code == 0 && json.force_stop().is_some() => {
+                return (
+                    HookRunnerResult::Stop(crate::result::StopHookOutcome {
+                        force_stop: json.force_stop(),
+                        ..Default::default()
+                    }),
+                    elapsed,
+                );
+            }
             Ok(json) => match prompt_json_to_block(&json, hook_name, stderr_message.as_deref()) {
                 Ok(Some(reason)) => {
                     return (
@@ -1123,6 +1141,13 @@ mod tests {
                 }
                 HookRunnerResult::Defer => "defer".to_string(),
                 HookRunnerResult::Deny { reason, .. } => format!("deny: {reason}"),
+                HookRunnerResult::Stop(outcome) => format!(
+                    "stop: {}",
+                    outcome
+                        .force_stop
+                        .and_then(|stop| stop.reason)
+                        .unwrap_or_default()
+                ),
                 HookRunnerResult::Failed(error) => format!("failed: {error}"),
                 other => panic!("expected a gate result, got {other:?}"),
             }
@@ -1138,9 +1163,12 @@ mod tests {
             ),
             (
                 r#"{"decision":"allow","continue":false,"systemMessage":"hi"}"#,
-                "allow",
+                "stop: ",
             ),
-            (r#"{"continue":false,"stopReason":"enough"}"#, "allow"),
+            (
+                r#"{"continue":false,"stopReason":"enough"}"#,
+                "stop: enough",
+            ),
             (
                 r#"{"decision":"allow","hookSpecificOutput":{"updateInput":{"command":"x"}}}"#,
                 "allow",

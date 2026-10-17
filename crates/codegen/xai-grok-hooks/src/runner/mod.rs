@@ -168,8 +168,6 @@ impl GateHookJson {
             .flat_map(|output| output.rest.keys())
             .filter(|key| !SILENTLY_IGNORED_NESTED_KEYS.contains(&key.as_str()))
             .map(|key| format!("hookSpecificOutput.{key}"));
-        let stop_request = (self.rest.get("continue") == Some(&serde_json::Value::Bool(false)))
-            .then(|| "continue: false".to_string());
         let unread_reason = (matches!(decision, DecisionToken::Allow | DecisionToken::Defer)
             && (non_empty(self.reason.as_deref()).is_some()
                 || non_empty(self.permission_decision_reason()).is_some()))
@@ -186,7 +184,6 @@ impl GateHookJson {
         let unread_context = (bad_context || unread_valid_context)
             .then(|| "hookSpecificOutput.additionalContext".to_string());
         top.chain(nested)
-            .chain(stop_request)
             .chain(unread_reason)
             .chain(deferred_rewrite)
             .chain(unread_context)
@@ -205,7 +202,8 @@ impl GateHookJson {
     }
 }
 
-const SILENTLY_IGNORED_TOP_LEVEL_KEYS: &[&str] = &["hookEventName", "continue", "systemMessage"];
+const SILENTLY_IGNORED_TOP_LEVEL_KEYS: &[&str] =
+    &["hookEventName", "continue", "stopReason", "systemMessage"];
 const SILENTLY_IGNORED_NESTED_KEYS: &[&str] = &["hookEventName"];
 
 fn non_empty(text: Option<&str>) -> Option<&str> {
@@ -268,6 +266,7 @@ struct GateDecision {
 }
 
 pub(crate) enum GateOutcome {
+    ForceStop(crate::result::StopOverride),
     Allow {
         updated_input: Option<serde_json::Map<String, serde_json::Value>>,
         additional_context: Option<String>,
@@ -300,6 +299,17 @@ pub(crate) fn gate_outcome(
     fallback_reason: Option<&str>,
     health: HookHealth,
 ) -> GateOutcome {
+    if health == HookHealth::Healthy
+        && json.rest.get("continue") == Some(&serde_json::Value::Bool(false))
+    {
+        return GateOutcome::ForceStop(crate::result::StopOverride {
+            reason: json
+                .rest
+                .get("stopReason")
+                .and_then(serde_json::Value::as_str)
+                .map(clip_reason),
+        });
+    }
     let GateDecision { token, reason } = json.resolve_decision();
     let mut ignored = json.ignored_parts(&token);
     let additional_context = json.additional_context();
@@ -382,6 +392,18 @@ pub(crate) struct PromptHookJson {
     pub decision: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default, rename = "continue")]
+    pub continue_: Option<bool>,
+    #[serde(default, rename = "stopReason")]
+    pub stop_reason: Option<String>,
+}
+
+impl PromptHookJson {
+    pub(crate) fn force_stop(&self) -> Option<crate::result::StopOverride> {
+        (self.continue_ == Some(false)).then(|| crate::result::StopOverride {
+            reason: self.stop_reason.as_deref().map(clip_reason),
+        })
+    }
 }
 
 pub(crate) fn prompt_json_to_block(
@@ -466,6 +488,9 @@ pub(crate) fn stop_json_to_outcome(
 pub(crate) struct PostToolUseHookJson {
     pub decision: Option<String>,
     pub reason: Option<String>,
+    #[serde(rename = "continue")]
+    pub continue_: Option<bool>,
+    pub stop_reason: Option<String>,
     pub hook_specific_output: Option<PostToolUseHookSpecificOutputJson>,
 }
 
@@ -550,6 +575,13 @@ pub(crate) fn post_tool_use_json_to_outcome(
     PostToolUseParse {
         outcome: PostToolUseHookOutcome {
             block_reason,
+            force_stop: if health == HookHealth::Healthy && json.continue_ == Some(false) {
+                Some(crate::result::StopOverride {
+                    reason: json.stop_reason.as_deref().map(clip_reason),
+                })
+            } else {
+                None
+            },
             additional_context: drop_if_broken(
                 additional_context,
                 hook_name,
@@ -607,10 +639,7 @@ mod tests {
                 r#"{"permissionDecision":"deny"}"#,
                 vec!["permissionDecision"],
             ),
-            (
-                r#"{"decision":"allow","continue":false}"#,
-                vec!["continue: false"],
-            ),
+            (r#"{"decision":"allow","continue":false}"#, vec![]),
             (
                 r#"{"decision":"allow","reason":"why"}"#,
                 vec!["reason (only a deny or an ask has one)"],
@@ -742,6 +771,7 @@ mod tests {
                 GateOutcome::Deny(_) => "deny",
                 GateOutcome::Allow { .. } => "allow",
                 GateOutcome::Failed(_) => "failed",
+                GateOutcome::ForceStop(_) => "force stop",
             };
             assert_eq!(got, expected, "the token must survive, for {json}");
         }

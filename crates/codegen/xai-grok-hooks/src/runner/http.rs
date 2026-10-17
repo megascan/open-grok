@@ -389,6 +389,10 @@ fn parse_http_prompt_result(
         return HookRunnerResult::Success;
     }
     match serde_json::from_str::<PromptHookJson>(trimmed) {
+        Ok(json) if json.force_stop().is_some() => HookRunnerResult::Stop(StopHookOutcome {
+            force_stop: json.force_stop(),
+            ..Default::default()
+        }),
         Ok(json) => match prompt_json_to_block(&json, hook_name, None) {
             Ok(Some(reason)) => HookRunnerResult::Block {
                 reason,
@@ -427,6 +431,10 @@ fn parse_http_blocking_result(
         Ok(json) if json.is_gate_document() => {
             let health = HookHealth::from_success(status.is_success());
             match super::gate_outcome(json, hook_name, /* fallback_reason */ None, health) {
+                GateOutcome::ForceStop(force_stop) => HookRunnerResult::Stop(StopHookOutcome {
+                    force_stop: Some(force_stop),
+                    ..Default::default()
+                }),
                 GateOutcome::Deny(reason) => HookRunnerResult::Deny {
                     reason,
                     hook_name: hook_name.to_string(),
@@ -1372,6 +1380,36 @@ mod tests {
                 "{ip} must be blocked"
             );
         }
+    }
+
+    #[test]
+    fn http_continue_false_is_carried_for_all_three_events() {
+        let body = r#"{"continue":false,"stopReason":"done"}"#;
+        for result in [
+            parse_http_blocking_result(body, StatusCode::OK, "hook"),
+            parse_http_prompt_result(body, StatusCode::OK, "hook"),
+        ] {
+            assert!(matches!(result, HookRunnerResult::Stop(StopHookOutcome {
+                force_stop: Some(crate::result::StopOverride { reason: Some(reason) }), ..
+            }) if reason == "done"));
+        }
+        assert!(
+            matches!(parse_http_post_tool_use_result(body, StatusCode::OK, "hook"),
+            HookRunnerResult::PostToolUse { outcome, .. }
+            if outcome.force_stop.as_ref().is_some_and(|stop| stop.reason.as_deref() == Some("done")))
+        );
+        assert!(matches!(
+            parse_http_prompt_result(body, StatusCode::INTERNAL_SERVER_ERROR, "hook"),
+            HookRunnerResult::Failed(_)
+        ));
+        assert!(!matches!(
+            parse_http_blocking_result(body, StatusCode::INTERNAL_SERVER_ERROR, "hook"),
+            HookRunnerResult::Stop(_)
+        ));
+        assert!(matches!(
+            parse_http_post_tool_use_result(body, StatusCode::INTERNAL_SERVER_ERROR, "hook"),
+            HookRunnerResult::Failed(_)
+        ));
     }
 
     #[tokio::test]

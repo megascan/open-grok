@@ -92,6 +92,7 @@ impl OutputReplacement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PostToolUseHookOutcome {
     pub block_reason: Option<String>,
+    pub force_stop: Option<StopOverride>,
     pub additional_context: Option<String>,
     pub output_replacement: Option<OutputReplacement>,
 }
@@ -99,6 +100,7 @@ pub struct PostToolUseHookOutcome {
 impl PostToolUseHookOutcome {
     pub fn is_empty(&self) -> bool {
         self.block_reason.is_none()
+            && self.force_stop.is_none()
             && self.additional_context.is_none()
             && self.output_replacement.is_none()
     }
