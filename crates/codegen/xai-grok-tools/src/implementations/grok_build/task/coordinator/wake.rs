@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::admission::{AdmissionDecision, AdmissionError};
 use super::queue::{QueuedCaller, QueuedSpawn, StartOrigin};
 use super::{ChildRunner, SubagentCoordinator, SubagentLimitDecision};
-use crate::implementations::grok_build::task::coordinator_state::WakeOrigin;
+use crate::implementations::grok_build::task::coordinator_state::{WakeOrigin, WakeSource};
 use crate::implementations::grok_build::task::types::ActiveAgentMessageOutcome;
 
 pub(super) enum WakeAdmit {
@@ -19,6 +19,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         subagent_id: &str,
         parent_session_id: &str,
         prompt: String,
+        message_id: String,
+        source: WakeSource,
     ) -> Result<WakeAdmit, ActiveAgentMessageOutcome> {
         if !self.runner.supports_wake() {
             return Err(ActiveAgentMessageOutcome::NotActiveOrFinalizing);
@@ -54,7 +56,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         wake_request.cancel_token = CancellationToken::new();
         let wake_origin = WakeOrigin {
             agent_id: subagent_id.to_owned(),
-            message_id: uuid::Uuid::now_v7().to_string(),
+            message_id,
+            source,
         };
 
         let running = self.session_running_count(&wake_request.parent_session_id);

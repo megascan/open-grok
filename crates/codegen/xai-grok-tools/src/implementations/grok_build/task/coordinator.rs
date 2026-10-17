@@ -50,7 +50,7 @@ pub use super::coordinator_state::{
     CompletionDisposition, CoordinatorConfig, LimitedSpawnOrigin, LocalBoxFuture,
     MAX_ACTIVE_MESSAGE_ADMISSIONS, MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD, MAX_COMPLETED_ENTRIES,
     SendBoxFuture, StartedChild, SubagentLimitDecision, SubagentLimitNotice, SubagentLimitSink,
-    SubagentProgress, WakeOrigin,
+    SubagentProgress, WakeOrigin, WakeSource,
 };
 use queue::{QUEUED_REAP_INTERVAL, QueuedCaller, SpawnQueue, StartOrigin};
 
@@ -769,6 +769,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 &target,
                 &identity.team_scope_id,
                 message.body.clone(),
+                message.message_id.clone(),
+                WakeSource::Agent {
+                    agent_id: message.from_agent_id.clone(),
+                    kind: message.kind,
+                },
             ) {
                 Ok(wake) => {
                     let status = match wake {
@@ -800,11 +805,16 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         // recipient cannot receive yet — passive mail that nobody polls is
         // how urgent peer messages rot unread. Follow-up tasks are passive
         // by design and always queue for `wait_agent`.
-        let status = if let Some(waiter) = self.mailbox_waiters.remove(&key) {
-            let _ = waiter.respond_to.send(WaitAgentMessagesOutput {
-                messages: vec![message.clone()],
-                timed_out: false,
-            });
+        let delivered_to_waiter = self.mailbox_waiters.remove(&key).is_some_and(|waiter| {
+            waiter
+                .respond_to
+                .send(WaitAgentMessagesOutput {
+                    messages: vec![message.clone()],
+                    timed_out: false,
+                })
+                .is_ok()
+        });
+        let status = if delivered_to_waiter {
             AgentMessageDeliveryStatus::Delivered
         } else if message.kind.steers_recipient() {
             let delivered = if target == identity.team_scope_id {
@@ -909,23 +919,34 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         if let Some(mailbox) = self.mailboxes.get_mut(&key)
             && mailbox.iter().any(|message| message.native.is_none())
         {
-            let mut messages = Vec::new();
-            while messages.len() < MAX_DRAIN_MESSAGES {
-                let Some(index) = mailbox.iter().position(|message| message.native.is_none())
-                else {
-                    break;
-                };
-                if let Some(message) = mailbox.remove(index) {
-                    messages.push(message);
+            // Keep the originals until the receiver accepts the response. A
+            // cancelled tool can drop its receiver before this event is
+            // processed, and removing the messages first would lose them.
+            let selected: Vec<_> = mailbox
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.native.is_none())
+                .take(MAX_DRAIN_MESSAGES)
+                .map(|(index, message)| (index, message.clone()))
+                .collect();
+            let messages = selected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect();
+            if respond_to
+                .send(WaitAgentMessagesOutput {
+                    messages,
+                    timed_out: false,
+                })
+                .is_ok()
+            {
+                for (index, _) in selected.into_iter().rev() {
+                    mailbox.remove(index);
+                }
+                if mailbox.is_empty() {
+                    self.mailboxes.remove(&key);
                 }
             }
-            if mailbox.is_empty() {
-                self.mailboxes.remove(&key);
-            }
-            let _ = respond_to.send(WaitAgentMessagesOutput {
-                messages,
-                timed_out: false,
-            });
             return;
         }
         if timeout_ms == 0 {

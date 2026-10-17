@@ -12,7 +12,7 @@ use crate::implementations::grok_build::task::active_message::{
 };
 use crate::implementations::grok_build::task::coordinator_state::{
     ACTIVE_MESSAGE_ADMISSION_TIMEOUT, ActiveMessageAdmission, ChildControl, ChildRunner,
-    MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD,
+    MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD, WakeSource,
 };
 use crate::implementations::grok_build::task::types::{
     ActiveAgentMessage, ActiveAgentMessageDelivery, ActiveAgentMessageOutcome,
@@ -312,7 +312,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 return;
             }
             let text = request.text().to_string();
-            match self.wake_completed_child(request.subagent_id(), &parent_session_id, text) {
+            match self.wake_completed_child(
+                request.subagent_id(),
+                &parent_session_id,
+                text,
+                uuid::Uuid::now_v7().to_string(),
+                WakeSource::Parent {
+                    session_id: parent_session_id.clone(),
+                },
+            ) {
                 Ok(wake) => {
                     let message_id = match wake {
                         super::wake::WakeAdmit::Started { message_id }

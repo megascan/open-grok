@@ -311,6 +311,7 @@ struct TestRunner {
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
     requests: mpsc::UnboundedSender<SubagentRequest>,
+    wake_origins: mpsc::UnboundedSender<Option<WakeOrigin>>,
     resume_sources: mpsc::UnboundedSender<SubagentResumeLookup>,
     started: mpsc::UnboundedSender<String>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
@@ -358,6 +359,7 @@ impl ChildRunner for TestRunner {
         let mut start = self.start.subscribe();
         let mut finish = self.finish.subscribe();
         let requests = self.requests.clone();
+        let wake_origins = self.wake_origins.clone();
         let resume_sources = self.resume_sources.clone();
         let started = self.started.clone();
         let queue_waits = self.queue_waits.clone();
@@ -368,11 +370,12 @@ impl ChildRunner for TestRunner {
                 request,
                 cancellation,
                 reporter,
-                wake_origin: _,
+                wake_origin,
                 admission_generation: _,
                 queued_for,
                 session_running,
             } = run;
+            let _ = wake_origins.send(wake_origin);
             let _ = queue_waits.send((request.id.clone(), queued_for, session_running));
             if request.id == "identity-resume" {
                 let source_id = request
@@ -530,6 +533,7 @@ struct Harness {
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedReceiver<CompletionDisposition>,
     requests: mpsc::UnboundedReceiver<SubagentRequest>,
+    wake_origins: mpsc::UnboundedReceiver<Option<WakeOrigin>>,
     resume_sources: mpsc::UnboundedReceiver<SubagentResumeLookup>,
     started: mpsc::UnboundedReceiver<String>,
     queue_waits: mpsc::UnboundedReceiver<(String, Option<std::time::Duration>, usize)>,
@@ -573,6 +577,7 @@ fn harness_with_wake(
     let (finish, _) = tokio::sync::broadcast::channel(4);
     let (completion_tx, completions) = mpsc::unbounded_channel();
     let (request_tx, requests) = mpsc::unbounded_channel();
+    let (wake_origin_tx, wake_origins) = mpsc::unbounded_channel();
     let (resume_source_tx, resume_sources) = mpsc::unbounded_channel();
     let (started_tx, started) = mpsc::unbounded_channel();
     let (queue_wait_tx, queue_waits) = mpsc::unbounded_channel();
@@ -591,6 +596,7 @@ fn harness_with_wake(
                 finish: finish.clone(),
                 completions: completion_tx,
                 requests: request_tx,
+                wake_origins: wake_origin_tx,
                 resume_sources: resume_source_tx,
                 started: started_tx,
                 queue_waits: queue_wait_tx,
@@ -611,6 +617,7 @@ fn harness_with_wake(
         finish,
         completions,
         requests,
+        wake_origins,
         resume_sources,
         started,
         queue_waits,
@@ -2656,6 +2663,104 @@ async fn followup_task_queues_mail_for_active_child() {
 }
 
 #[tokio::test]
+async fn cancelled_mailbox_waiter_does_not_consume_later_messages() {
+    use super::super::types::AgentMailboxWaitRequest;
+
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("wait-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("wait-child"));
+
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "wait-child");
+    for steering in [false, true] {
+        let (respond_to, receiver) = oneshot::channel();
+        harness
+            .backend
+            .sender()
+            .send(SubagentEvent::WaitAgentMessages(AgentMailboxWaitRequest {
+                identity: child.clone(),
+                timeout_ms: 60_000,
+                respond_to,
+            }))
+            .unwrap();
+        // A subsequent coordinator request is a barrier ensuring the waiter
+        // was installed before cancellation.
+        harness.backend.list_agents(root.clone()).await;
+        drop(receiver);
+        let message = if steering {
+            mailbox_message("steer", &root, "wait-child", "steer")
+        } else {
+            followup_message("followup", &root, "wait-child", "later")
+        };
+        let output = harness
+            .backend
+            .send_agent_message(root.clone(), "wait-child", message)
+            .await
+            .unwrap();
+        if steering {
+            assert_eq!(output.status, AgentMessageDeliveryStatus::Delivered);
+            assert_eq!(harness.followups.recv().await.unwrap().body, "steer");
+        } else {
+            assert_eq!(output.status, AgentMessageDeliveryStatus::Queued);
+            let inbox = harness.backend.wait_agent_messages(child.clone(), 0).await;
+            assert_eq!(inbox.messages.len(), 1);
+            assert_eq!(inbox.messages[0].body, "later");
+        }
+    }
+
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancelled_immediate_mailbox_drain_leaves_messages_in_order() {
+    use super::super::types::AgentMailboxWaitRequest;
+
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("drain-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("drain-child"));
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "drain-child");
+    for (id, body) in [("f1", "first"), ("f2", "second")] {
+        harness
+            .backend
+            .send_agent_message(
+                root.clone(),
+                "drain-child",
+                followup_message(id, &root, "drain-child", body),
+            )
+            .await
+            .unwrap();
+    }
+    let (respond_to, receiver) = oneshot::channel();
+    drop(receiver);
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::WaitAgentMessages(AgentMailboxWaitRequest {
+            identity: child.clone(),
+            timeout_ms: 0,
+            respond_to,
+        }))
+        .unwrap();
+    let inbox = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(
+        inbox
+            .messages
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
 async fn team_mailbox_rejects_foreign_scope_and_self_send() {
     let mut harness = harness(true, std::time::Duration::from_secs(60));
     let backend = harness.backend.clone();
@@ -2725,6 +2830,7 @@ async fn team_mailbox_wakes_finished_child() {
     let backend = harness.backend.clone();
     let spawn = tokio::spawn(async move { backend.spawn(request("wake-child", true)).await });
     let first = harness.requests.recv().await.expect("first spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
     assert_eq!(first.id, "wake-child");
     assert_eq!(
         harness.started.recv().await.expect("child started"),
@@ -2745,13 +2851,61 @@ async fn team_mailbox_wakes_finished_child() {
         .await
         .expect("wake accepted");
     assert_eq!(output.status, AgentMessageDeliveryStatus::Delivered);
+    assert_eq!(output.message_id, "m1");
 
     let woken = harness.requests.recv().await.expect("wake spawn");
+    let wake = harness.wake_origins.recv().await.unwrap().unwrap();
+    assert_eq!(wake.message_id, "m1");
+    assert_eq!(wake.agent_id, "wake-child");
+    assert!(
+        matches!(wake.source, WakeSource::Agent { agent_id, kind: super::super::types::AgentMailboxMessageKind::Message } if agent_id == "parent")
+    );
     assert_eq!(woken.id, "wake-child");
     assert_eq!(woken.prompt, "keep going");
     assert_eq!(woken.resume_from.as_deref(), Some("wake-child"));
     assert!(woken.run_in_background);
 
+    let _ = harness.finish.send(());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_completed_child_wake_retains_original_sender_and_message_id() {
+    let mut harness = harness_with_wake(false, false, true, limited(1, LimitBehavior::Queue), None);
+    let backend = harness.backend.clone();
+    let first = tokio::spawn(async move { backend.spawn(request("wake-child", true)).await });
+    harness.requests.recv().await.expect("first spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
+    harness.started.recv().await.expect("first started");
+    let _ = harness.finish.send(());
+    let _ = first.await;
+    harness.completions.recv().await.expect("first completed");
+
+    let backend = harness.backend.clone();
+    let busy = tokio::spawn(async move { backend.spawn(request("busy", true)).await });
+    harness.requests.recv().await.expect("busy spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
+    harness.started.recv().await.expect("busy started");
+
+    let root = mailbox_identity("parent", "parent");
+    let sent = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "wake-child",
+            mailbox_message("original-id", &root, "wake-child", "follow up"),
+        )
+        .await
+        .expect("wake queued");
+    assert_eq!(sent.status, AgentMessageDeliveryStatus::Queued);
+    assert_eq!(sent.message_id, "original-id");
+    let _ = harness.finish.send(());
+    let _ = busy.await;
+    harness.completions.recv().await.expect("busy completed");
+    harness.requests.recv().await.expect("queued wake started");
+    let wake = harness.wake_origins.recv().await.unwrap().unwrap();
+    assert_eq!(wake.message_id, "original-id");
+    assert!(matches!(wake.source, WakeSource::Agent { agent_id, .. } if agent_id == "parent"));
     let _ = harness.finish.send(());
     harness.actor.abort();
 }

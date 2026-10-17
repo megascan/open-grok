@@ -90,6 +90,19 @@ pub struct StartedChild<C> {
 pub struct WakeOrigin {
     pub agent_id: String,
     pub message_id: String,
+    pub source: WakeSource,
+}
+
+/// The actual sender of a message that resumes a completed child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeSource {
+    Parent {
+        session_id: String,
+    },
+    Agent {
+        agent_id: String,
+        kind: super::types::AgentMailboxMessageKind,
+    },
 }
 
 /// Input to one runtime-specific child run.
