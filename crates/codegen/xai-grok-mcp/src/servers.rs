@@ -44,6 +44,7 @@ use crate::oauth_config::McpOAuthConfig;
 
 use xai_grok_tools::types::{
     output::{MCPOutputDetails, ToolOutput},
+    resources::McpCatalogBinding,
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
@@ -465,6 +466,9 @@ pub struct McpState {
     pub owned_clients: crate::owned_clients::OwnedClients,
     /// Clients inherited from parent via `SharedMcpPool`; never cleared by config changes.
     pub shared_clients: HashMap<McpServerName, Arc<McpClient>>,
+    inherited_pool: Option<SharedMcpPool>,
+    shared_epochs: HashMap<McpServerName, u64>,
+    shared_ready: HashMap<McpServerName, (u64, u64)>,
     /// The session's in-process SDK MCP servers + their shared invoker/overrides; `None`
     /// when the session has none. See [`AcpMcpRegistry`]. Kept out of `configs` (the closed
     /// `acp::McpServer` enum) so it survives `update_configs` clears.
@@ -544,6 +548,9 @@ impl McpState {
             meta_config_map,
             owned_clients: crate::owned_clients::OwnedClients::new(),
             shared_clients: HashMap::new(),
+            inherited_pool: None,
+            shared_epochs: HashMap::new(),
+            shared_ready: HashMap::new(),
             acp_mcp: None,
             init_progress: InitProgress::default(),
             generation: 0,
@@ -697,6 +704,12 @@ impl McpState {
         self.disabled_tools
             .get(server_name)
             .is_some_and(|set| set.contains(tool_name))
+            || (!self.owned_clients.contains_key(server_name)
+                && self.shared_clients.contains_key(server_name)
+                && self
+                    .inherited_pool
+                    .as_ref()
+                    .is_some_and(|pool| pool.is_tool_disabled(server_name, tool_name)))
     }
 
     /// Update configs and reset initialization state.
@@ -1178,77 +1191,335 @@ impl McpState {
         )
     }
 
-    /// Import shared clients from a parent pool snapshot.
-    /// Clients whose name collides with an agent-definition-owned server
-    /// are skipped (the owned server takes priority).
+    /// Import the live parent pool without taking ownership of its transports.
     pub fn import_shared_clients(&mut self, pool: &SharedMcpPool) {
-        let config_names: std::collections::HashSet<&str> =
-            self.configs.iter().map(mcp_server_name).collect();
-        for (name, client) in &pool.clients {
-            if !config_names.contains(name.as_str()) {
-                self.shared_clients.insert(name.clone(), Arc::clone(client));
+        let mut handle = pool.clone();
+        // A long-lived child must not retain the original snapshot's client Arcs.
+        handle.clients.clear();
+        self.inherited_pool = Some(handle);
+        self.sync_shared_clients();
+    }
+
+    pub fn inherited_pool(&self) -> Option<SharedMcpPool> {
+        self.inherited_pool.clone()
+    }
+
+    pub fn inherits_name(&self, name: &str) -> bool {
+        self.inherited_pool
+            .as_ref()
+            .is_some_and(|pool| pool.allowed(name))
+            && !self
+                .configs
+                .iter()
+                .any(|config| mcp_server_name(config) == name)
+            && !self.owned_clients.contains_key(name)
+    }
+
+    /// Bring the child map to the latest parent publication. Returned names
+    /// need catalog reconciliation before their tools can dispatch.
+    pub fn sync_shared_clients(&mut self) -> Vec<String> {
+        let Some(pool) = &self.inherited_pool else {
+            return Vec::new();
+        };
+        let desired = pool.live_clients();
+        let mut names: std::collections::HashSet<String> =
+            self.shared_clients.keys().cloned().collect();
+        names.extend(desired.keys().cloned());
+        let mut changed = Vec::new();
+        for name in names {
+            let owns_name = self
+                .configs
+                .iter()
+                .any(|config| mcp_server_name(config) == name)
+                || self.owned_clients.contains_key(&name);
+            let current = desired.get(&name).filter(|_| !owns_name);
+            let same = current.is_some_and(|(client, epoch)| {
+                self.shared_epochs.get(&name) == Some(epoch)
+                    && self
+                        .shared_clients
+                        .get(&name)
+                        .is_some_and(|old| Arc::ptr_eq(old, client))
+            });
+            if same && self.shared_catalog_ready(&name) {
+                continue;
             }
+            if current.is_none() && !self.shared_clients.contains_key(&name) {
+                continue;
+            }
+            self.shared_ready.remove(&name);
+            if let Some((client, epoch)) = current {
+                self.shared_clients.insert(name.clone(), client.clone());
+                self.shared_epochs.insert(name.clone(), *epoch);
+            } else {
+                self.shared_clients.remove(&name);
+                self.shared_epochs.remove(&name);
+            }
+            changed.push(name);
         }
+        changed
+    }
+
+    pub fn shared_epoch(&self, server: &str) -> Option<u64> {
+        if self.owned_clients.contains_key(server) {
+            None
+        } else {
+            self.shared_epochs.get(server).copied()
+        }
+    }
+
+    pub fn shared_catalog_ready(&self, server: &str) -> bool {
+        let Some(client) = self.shared_clients.get(server) else {
+            return false;
+        };
+        let Some(epoch) = self.shared_epochs.get(server) else {
+            return false;
+        };
+        self.shared_ready.get(server) == Some(&(*epoch, client.catalog_revision()))
+            && self
+                .inherited_pool
+                .as_ref()
+                .is_some_and(|pool| pool.is_current(server, *epoch, Some(client)))
+    }
+
+    /// Commit a catalog only if the parent still publishes this exact entry
+    /// and its list-changed revision has not advanced during registration.
+    pub fn mark_shared_catalog_ready(&mut self, server: &str, epoch: u64, revision: u64) -> bool {
+        let Some(pool) = &self.inherited_pool else {
+            return true;
+        };
+        if self.shared_epochs.get(server) != Some(&epoch)
+            || !pool.is_current(server, epoch, self.shared_clients.get(server))
+            || self
+                .shared_clients
+                .get(server)
+                .is_none_or(|client| client.catalog_revision() != revision)
+        {
+            return false;
+        }
+        self.shared_ready
+            .insert(server.to_owned(), (epoch, revision));
+        true
+    }
+
+    /// A local server, including one currently connecting or being removed.
+    /// Managed gateway names are deliberately not inferred from their spelling.
+    pub fn has_local_server(&self, server: &str) -> bool {
+        self.owned_clients.contains_key(server)
+            || self.shared_clients.contains_key(server)
+            || self
+                .configs
+                .iter()
+                .any(|config| mcp_server_name(config) == server)
+    }
+
+    /// Capture the exact local MCP route before asynchronous hooks/approval.
+    pub fn capture_catalog_binding(&self, server: &str, tool: &str) -> Option<McpCatalogBinding> {
+        let inherited_epoch = if self.owned_clients.contains_key(server) {
+            None
+        } else {
+            self.shared_epoch(server)
+        };
+        let client = self.admitted_client(server, Some(tool), inherited_epoch)?;
+        let epoch = match inherited_epoch {
+            Some(epoch) => epoch,
+            None => self.owned_clients.current_epoch(server, &client)?,
+        };
+        let pool_id = match inherited_epoch {
+            Some(_) => self.inherited_pool.as_ref()?.pool_id()?,
+            None => self.owned_clients.id(),
+        };
+        Some(McpCatalogBinding {
+            server: server.to_owned(),
+            tool: tool.to_owned(),
+            pool_id,
+            epoch,
+            inherited: inherited_epoch.is_some(),
+            revision: client.catalog_revision(),
+        })
+    }
+
+    pub fn validate_catalog_binding(&self, binding: &McpCatalogBinding) -> bool {
+        self.client_for_catalog_binding(binding).is_some()
+    }
+
+    fn client_for_catalog_binding(&self, binding: &McpCatalogBinding) -> Option<Arc<McpClient>> {
+        let client = self.admitted_client(
+            &binding.server,
+            Some(&binding.tool),
+            binding.inherited.then_some(binding.epoch),
+        )?;
+        if client.catalog_revision() != binding.revision {
+            return None;
+        }
+        let pool_id = if binding.inherited {
+            self.inherited_pool.as_ref()?.pool_id()?
+        } else {
+            self.owned_clients.id()
+        };
+        if pool_id != binding.pool_id {
+            return None;
+        }
+        if !binding.inherited
+            && self.owned_clients.current_epoch(&binding.server, &client) != Some(binding.epoch)
+        {
+            return None;
+        }
+        Some(client)
+    }
+
+    /// Atomically validate the inherited binding and clone its client under
+    /// the parent's publication lock. Calls already admitted may finish.
+    pub fn admitted_client(
+        &self,
+        server: &str,
+        tool: Option<&str>,
+        binding: Option<u64>,
+    ) -> Option<Arc<McpClient>> {
+        if self.is_tool_disabled(server, tool.unwrap_or("")) {
+            return None;
+        }
+        if let Some(client) = self.owned_clients.get(server) {
+            return binding.is_none().then(|| client.clone());
+        }
+        let client = self.shared_clients.get(server)?;
+        let Some(pool) = &self.inherited_pool else {
+            return Some(client.clone());
+        };
+        let epoch = binding.or_else(|| self.shared_epochs.get(server).copied())?;
+        if !self.shared_catalog_ready(server) || self.shared_epochs.get(server) != Some(&epoch) {
+            return None;
+        }
+        pool.admit(server, tool, epoch, client)
     }
 }
 
-/// Snapshot of an MCP connection pool, taken at subagent spawn time.
-///
-/// The HashMap is cloned (cheap — values are `Arc<McpClient>`), so the
-/// subagent's map is independent of the parent's. The `Arc<McpClient>`
-/// entries are shared — both parent and child use the same transport.
-/// This is intentionally snapshot-based, not live-updating.
+/// A child's filtered view of its parent's live, session-owned client pool.
 #[derive(Clone)]
 pub struct SharedMcpPool {
-    clients: HashMap<McpServerName, Arc<McpClient>>,
+    clients: HashMap<McpServerName, std::sync::Weak<McpClient>>,
     configs: Vec<acp::McpServer>,
     meta_config_map: McpMetaConfigMap,
+    live: std::sync::Weak<crate::owned_clients::LiveOwnedClients>,
+    allow: Option<std::collections::HashSet<String>>,
+    exclude: std::collections::HashSet<String>,
 }
 
 impl SharedMcpPool {
-    /// Create a snapshot from an existing `McpState`.
-    /// Captures both owned and shared clients (deduped — owned wins).
     pub fn from_state(state: &McpState) -> Self {
         Self {
             clients: state
                 .all_clients()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .map(|(k, v)| (k.clone(), Arc::downgrade(v)))
                 .collect(),
             configs: state.configs.clone(),
             meta_config_map: state.meta_config_map.clone(),
+            live: state.owned_clients.live(),
+            allow: None,
+            exclude: Default::default(),
         }
     }
 
-    pub fn get_client(&self, name: &str) -> Option<&Arc<McpClient>> {
-        self.clients.get(name)
+    fn pool_id(&self) -> Option<u64> {
+        self.live.upgrade().map(|live| live.id)
     }
 
+    fn allowed(&self, name: &str) -> bool {
+        self.allow.as_ref().is_none_or(|names| names.contains(name)) && !self.exclude.contains(name)
+    }
+
+    pub fn restrict_to(&mut self, names: impl IntoIterator<Item = String>) {
+        self.allow = Some(names.into_iter().collect());
+        self.clients
+            .retain(|name, _| self.allow.as_ref().is_some_and(|set| set.contains(name)));
+    }
+
+    pub fn exclude_names(&mut self, names: impl IntoIterator<Item = String>) {
+        self.exclude.extend(names);
+        self.clients.retain(|name, _| !self.exclude.contains(name));
+    }
+
+    pub fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.live.upgrade().map(|live| live.changes.subscribe())
+    }
+
+    fn live_clients(&self) -> HashMap<String, (Arc<McpClient>, u64)> {
+        let Some(live) = self.live.upgrade() else {
+            return HashMap::new();
+        };
+        let state = live.state.lock();
+        state
+            .clients
+            .iter()
+            .filter(|(name, _)| self.allowed(name))
+            .map(|(name, entry)| (name.clone(), (entry.client.clone(), entry.epoch)))
+            .collect()
+    }
+
+    fn is_current(&self, server: &str, epoch: u64, client: Option<&Arc<McpClient>>) -> bool {
+        let Some(live) = self.live.upgrade() else {
+            return false;
+        };
+        let state = live.state.lock();
+        self.allowed(server)
+            && state.clients.get(server).is_some_and(|entry| {
+                entry.epoch == epoch
+                    && client.is_some_and(|client| Arc::ptr_eq(client, &entry.client))
+            })
+    }
+
+    fn admit(
+        &self,
+        server: &str,
+        tool: Option<&str>,
+        epoch: u64,
+        client: &Arc<McpClient>,
+    ) -> Option<Arc<McpClient>> {
+        let live = self.live.upgrade()?;
+        let state = live.state.lock();
+        let entry = state.clients.get(server)?;
+        if !self.allowed(server)
+            || entry.epoch != epoch
+            || !Arc::ptr_eq(client, &entry.client)
+            || tool.is_some_and(|tool| {
+                state
+                    .disabled
+                    .get(server)
+                    .is_some_and(|set| set.contains(tool))
+            })
+        {
+            return None;
+        }
+        Some(entry.client.clone())
+    }
+
+    pub fn is_tool_disabled(&self, server: &str, tool: &str) -> bool {
+        self.live.upgrade().is_some_and(|live| {
+            live.state
+                .lock()
+                .disabled
+                .get(server)
+                .is_some_and(|set| set.contains(tool))
+        })
+    }
+
+    pub fn get_client(&self, name: &str) -> Option<Arc<McpClient>> {
+        self.clients.get(name).and_then(std::sync::Weak::upgrade)
+    }
     pub fn len(&self) -> usize {
         self.clients.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
-
     pub fn server_names(&self) -> impl Iterator<Item = &str> {
         self.clients.keys().map(String::as_str)
     }
-
     pub fn configs(&self) -> &[acp::McpServer] {
         &self.configs
     }
-
     pub fn meta_config_map(&self) -> &McpMetaConfigMap {
         &self.meta_config_map
     }
-
-    /// Retain only clients whose name satisfies `predicate`.
-    ///
-    /// Only filters the `clients` map. `configs` and `meta_config_map` are
-    /// left unchanged — callers that need config-level consistency should
-    /// filter those separately. In the subagent inheritance path this is
-    /// fine because `import_shared_clients` only iterates `clients`.
     pub fn retain_clients(&mut self, predicate: impl Fn(&str) -> bool) {
         self.clients.retain(|name, _| predicate(name));
     }
@@ -1568,6 +1839,8 @@ pub struct McpTool {
     mcp_state: Arc<Mutex<McpState>>,
     schema: serde_json::Value,
     meta: Option<serde_json::Value>,
+    inherited_epoch: Option<u64>,
+    catalog_revision: Option<u64>,
 }
 
 /// Data needed to register an MCP tool via `register_erased()`.
@@ -1608,7 +1881,19 @@ impl McpTool {
             mcp_state,
             schema,
             meta,
+            inherited_epoch: None,
+            catalog_revision: None,
         }
+    }
+
+    pub fn with_catalog_revision(mut self, revision: Option<u64>) -> Self {
+        self.catalog_revision = revision;
+        self
+    }
+
+    pub fn with_inherited_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.inherited_epoch = epoch;
+        self
     }
 
     /// Convert into the data needed for `ToolBridge::register_erased()`.
@@ -1719,12 +2004,21 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let state_lock_span = region!("mcp.state_lock", Parent::Explicit(call_span.span()));
         let (client, event_writer) = {
             let state = self.tool.mcp_state.lock().await;
-            let c = Arc::clone(state.get_client(&self.tool.server_name).ok_or_else(|| {
-                xai_tool_runtime::ToolError::custom(
-                    "process_manager",
-                    format!("MCP server '{}' not found", self.tool.server_name),
-                )
-            })?);
+            let binding = ctx.get::<McpCatalogBinding>();
+            let c = match binding.as_ref() {
+                Some(binding) if binding.server == self.tool.server_name
+                    && binding.tool == self.tool.name
+                    && self.tool.catalog_revision.is_none_or(|revision| revision == binding.revision)
+                    && self.tool.inherited_epoch == binding.inherited.then_some(binding.epoch) =>
+                    state.client_for_catalog_binding(binding),
+                None if !state.inherits_name(&self.tool.server_name) =>
+                    state.admitted_client(&self.tool.server_name, Some(&self.tool.name), self.tool.inherited_epoch),
+                _ => None,
+            }.filter(|client| self.tool.catalog_revision.is_none_or(|revision| client.catalog_revision() == revision))
+             .ok_or_else(|| xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                format!("MCP server '{}' changed or is unavailable; retry after its catalog refresh", self.tool.server_name),
+            ))?;
             (c, state.event_writer().clone())
         };
         state_lock_span.close();
@@ -1758,7 +2052,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             .await
         {
             Ok(result) => Ok(result),
-            Err(first_err) if client.has_auth() => {
+            Err(first_err) if client.has_auth() && self.binding_is_current(&client).await => {
                 auth_retry_attempted = true;
                 let reauth_ok = client.force_reauth(false).await;
                 ew.emit(xai_grok_session_events::Event::McpAuthRetry {
@@ -1766,7 +2060,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
                     trigger: "tool_call_failed".to_string(),
                     success: reauth_ok,
                 });
-                if reauth_ok {
+                if reauth_ok && self.binding_is_current(&client).await {
                     is_timeout = false;
                     self.try_call_tool_with_meta(
                         &client,
@@ -1921,6 +2215,29 @@ fn mrtr_pending_poll_delay(pending_polls: u32) -> std::time::Duration {
 }
 
 impl McpErasedTool {
+    async fn binding_is_current(&self, client: &Arc<McpClient>) -> bool {
+        if self
+            .tool
+            .catalog_revision
+            .is_some_and(|revision| revision != client.catalog_revision())
+        {
+            return false;
+        }
+        if self.tool.inherited_epoch.is_none() {
+            return true;
+        }
+        self.tool
+            .mcp_state
+            .lock()
+            .await
+            .admitted_client(
+                &self.tool.server_name,
+                Some(&self.tool.name),
+                self.tool.inherited_epoch,
+            )
+            .is_some_and(|current| Arc::ptr_eq(&current, client))
+    }
+
     #[cfg(test)]
     async fn try_call_tool(
         &self,
@@ -1965,6 +2282,12 @@ impl McpErasedTool {
         let mut pending_polls = 0u32;
         let mut pending_since: Option<std::time::Instant> = None;
         loop {
+            if !self.binding_is_current(client).await {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "MCP server changed during the call",
+                ));
+            }
             let response = self
                 .call_tool_round(
                     client,
@@ -2064,6 +2387,12 @@ impl McpErasedTool {
             .ensure_initialized()
             .await
             .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
+        if !self.binding_is_current(client).await {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                "MCP server changed before the call",
+            ));
+        }
         let service_id = mcp_service.service().service_id;
         call.begin_send();
         match send_tool_call(
@@ -2193,6 +2522,12 @@ impl McpErasedTool {
         is_timeout: &mut bool,
         ew: &xai_grok_session_events::EventWriter,
     ) -> Result<rmcp::model::CallToolResponse, xai_tool_runtime::ToolError> {
+        if !self.binding_is_current(client).await {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                "MCP server changed before reconnect",
+            ));
+        }
         *reconnect_attempted = true;
         tracing::warn!(
             server = self.tool.server_name.as_str(),
@@ -2223,6 +2558,12 @@ impl McpErasedTool {
                 return Err(tool_error_for_service_error(&original_err));
             }
         };
+        if !self.binding_is_current(client).await {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                "MCP server changed during reconnect",
+            ));
+        }
         let service_id = mcp_service.service().service_id;
         call.begin_send();
         match send_tool_call(&mcp_service, params, Some(timeout_duration), |request_id| {
@@ -5062,10 +5403,23 @@ impl McpClient {
         &self,
         mcp_state: Arc<Mutex<McpState>>,
     ) -> Result<Vec<McpToolRegistration>, McpError> {
+        let inherited_epoch = {
+            let state = mcp_state.lock().await;
+            if state
+                .owned_clients
+                .get(&self.server_name)
+                .is_some_and(|client| std::ptr::eq(client.as_ref(), self))
+            {
+                None
+            } else {
+                state.shared_epoch(&self.server_name)
+            }
+        };
         let request = self.begin_outbound_request();
         let _ensure_init_timer =
             xai_grok_telemetry::instrumentation::timer("mcp_ensure_initialized");
         let mcp_service = self.ensure_initialized().await?;
+        let catalog_revision = self.catalog_revision();
 
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
@@ -5120,6 +5474,8 @@ impl McpClient {
                     mcp_state: Arc::clone(&mcp_state),
                     schema,
                     meta,
+                    inherited_epoch,
+                    catalog_revision: Some(catalog_revision),
                 };
                 match mcp_tool.into_registration() {
                     Ok(mut registration) => {

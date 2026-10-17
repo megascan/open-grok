@@ -5973,3 +5973,103 @@ async fn prefix_stable_after_tool_result_pruning() {
         idx2 += 1;
     }
 }
+
+#[tokio::test]
+async fn tool_result_commit_runs_only_after_actor_append() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let h = TestHarness::new();
+    let committed = Arc::new(AtomicBool::new(false));
+    let flag = committed.clone();
+    h.handle
+        .push_tool_result_with_commit(
+            ConversationItem::tool_result("mail", "body"),
+            Box::new(move || flag.store(true, Ordering::SeqCst)),
+        )
+        .unwrap();
+    let conversation = h.handle.get_conversation().await;
+    assert!(committed.load(Ordering::SeqCst));
+    assert_eq!(conversation.len(), 1);
+    assert!(
+        matches!(&conversation[0], ConversationItem::ToolResult(result) if result.content.as_ref() == "body")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tool_result_commit_survives_producer_cancellation_after_enqueue() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (persistence, _persistence_rx) = MockChatPersistence::new();
+    let mut actor = ChatStateActor {
+        state: super::state::ChatState::new(vec![], test_config()),
+        pruning_config: crate::types::PruningConfig::default(),
+        persistence: Box::new(persistence),
+        cmd_rx,
+        event_tx,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+    };
+    let producer = crate::handle::ChatStateHandle::new(cmd_tx);
+    let committed = Arc::new(AtomicBool::new(false));
+    let flag = committed.clone();
+    producer
+        .push_tool_result_with_commit(
+            ConversationItem::tool_result("mail", "body"),
+            Box::new(move || flag.store(true, Ordering::SeqCst)),
+        )
+        .unwrap();
+    drop(producer);
+    assert!(!committed.load(Ordering::SeqCst));
+    let command = actor
+        .cmd_rx
+        .try_recv()
+        .expect("queued append survives producer");
+    actor.handle_command(command).await;
+    assert!(committed.load(Ordering::SeqCst));
+    assert!(
+        matches!(&actor.state.conversation[..], [ConversationItem::ToolResult(result)] if result.content.as_ref() == "body")
+    );
+}
+
+#[test]
+fn tool_result_commit_callback_is_dropped_when_chat_mailbox_closes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct DropProbe(Arc<AtomicBool>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = crate::handle::ChatStateHandle::new(tx);
+    let probe = DropProbe(dropped.clone());
+    handle
+        .push_tool_result_with_commit(
+            ConversationItem::tool_result("mail", "body"),
+            Box::new(move || drop(probe)),
+        )
+        .unwrap();
+    assert!(!dropped.load(Ordering::SeqCst));
+    drop(rx);
+    assert!(dropped.load(Ordering::SeqCst));
+    let dropped_again = Arc::new(AtomicBool::new(false));
+    let probe = DropProbe(dropped_again.clone());
+    assert!(
+        handle
+            .push_tool_result_with_commit(
+                ConversationItem::tool_result("mail2", "body"),
+                Box::new(move || drop(probe))
+            )
+            .is_err()
+    );
+    assert!(dropped_again.load(Ordering::SeqCst));
+}

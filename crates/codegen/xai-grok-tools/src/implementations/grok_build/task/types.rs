@@ -448,6 +448,79 @@ pub struct WaitAgentMessagesOutput {
     pub timed_out: bool,
 }
 
+/// Runtime-only lease for a mailbox batch. Dropping it releases the batch;
+/// committing it removes the batch after its result enters the conversation.
+pub struct MailboxReceipt(Option<Box<dyn FnOnce(bool) + Send + 'static>>);
+
+impl MailboxReceipt {
+    #[doc(hidden)]
+    pub fn new(settle: impl FnOnce(bool) + Send + 'static) -> Self {
+        Self(Some(Box::new(settle)))
+    }
+
+    pub fn commit(mut self) {
+        if let Some(settle) = self.0.take() {
+            settle(true);
+        }
+    }
+}
+
+impl fmt::Debug for MailboxReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MailboxReceipt(..)")
+    }
+}
+
+impl Drop for MailboxReceipt {
+    fn drop(&mut self) {
+        if let Some(settle) = self.0.take() {
+            settle(false);
+        }
+    }
+}
+
+/// Per-invocation handoff, deliberately excluded from the serialized tool output.
+#[derive(Debug, Clone, Default)]
+pub struct MailboxReceiptSlot(Arc<std::sync::Mutex<Option<MailboxReceipt>>>);
+
+impl MailboxReceiptSlot {
+    pub fn put(&self, receipt: MailboxReceipt) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(receipt);
+    }
+
+    pub fn take(&self) -> Option<MailboxReceipt> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentMailboxDelivery {
+    pub output: WaitAgentMessagesOutput,
+    pub receipt: Option<MailboxReceipt>,
+}
+
+impl From<WaitAgentMessagesOutput> for AgentMailboxDelivery {
+    fn from(output: WaitAgentMessagesOutput) -> Self {
+        Self {
+            output,
+            receipt: None,
+        }
+    }
+}
+
+impl std::ops::Deref for AgentMailboxDelivery {
+    type Target = WaitAgentMessagesOutput;
+    fn deref(&self) -> &Self::Target {
+        &self.output
+    }
+}
+
 /// Spawn command envelope owned by the coordinator mailbox.
 #[derive(Educe)]
 #[educe(Debug)]
@@ -874,7 +947,7 @@ pub struct AgentMailboxWaitRequest {
     pub identity: AgentMailboxIdentity,
     pub timeout_ms: u64,
     #[educe(Debug(ignore))]
-    pub respond_to: oneshot::Sender<WaitAgentMessagesOutput>,
+    pub respond_to: oneshot::Sender<AgentMailboxDelivery>,
 }
 
 #[derive(Educe)]

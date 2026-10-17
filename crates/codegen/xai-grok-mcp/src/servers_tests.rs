@@ -1,5 +1,6 @@
 use super::*;
 use rmcp::ServiceExt;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// A single undecodable line on an MCP stdio server's stdout must NOT
@@ -1248,7 +1249,7 @@ fn test_shared_mcp_pool_snapshot_shares_arc_clients() {
     let pool_client = pool.get_client("github").expect("should find client");
 
     // Must point to the same allocation (shared transport)
-    assert!(Arc::ptr_eq(&client, pool_client));
+    assert!(Arc::ptr_eq(&client, &pool_client));
 }
 
 #[test]
@@ -1280,7 +1281,7 @@ fn test_shared_mcp_pool_server_names() {
 }
 
 #[test]
-fn test_shared_mcp_pool_snapshot_independent_of_state_mutations() {
+fn test_shared_mcp_pool_snapshot_does_not_retain_removed_clients() {
     let mut state = McpState::new(vec![make_stdio_server("srv", "/bin/srv")]);
     state
         .owned_clients
@@ -1292,9 +1293,9 @@ fn test_shared_mcp_pool_snapshot_independent_of_state_mutations() {
     state.owned_clients.clear();
     state.configs.clear();
 
-    // Pool retains original data
+    // Snapshot names/config remain diagnostic, but do not retain the transport.
     assert_eq!(pool.server_names().count(), 1);
-    assert!(pool.get_client("srv").is_some());
+    assert!(pool.get_client("srv").is_none());
     assert_eq!(pool.configs().len(), 1);
 }
 
@@ -1335,7 +1336,7 @@ fn test_shared_mcp_pool_clone_shares_arcs() {
     // Both clones share the same Arc<McpClient>
     let c1 = pool.get_client("svc").unwrap();
     let c2 = pool2.get_client("svc").unwrap();
-    assert!(Arc::ptr_eq(c1, c2));
+    assert!(Arc::ptr_eq(&c1, &c2));
 }
 
 // ── owned/shared split behavioral tests ─────────────────────────
@@ -1399,14 +1400,14 @@ fn test_import_shared_clients_skips_config_collisions() {
     // Child has a config entry named "github" — importing a shared
     // client with the same name must be skipped.
     let mut state = McpState::new(vec![make_stdio_server("github", "/bin/gh")]);
-    let mut pool_clients = HashMap::new();
-    pool_clients.insert("github".to_string(), make_test_client("github"));
-    pool_clients.insert("linear".to_string(), make_test_client("linear"));
-    let pool = SharedMcpPool {
-        clients: pool_clients,
-        configs: vec![],
-        meta_config_map: McpMetaConfigMap::new(),
-    };
+    let mut parent = McpState::new(vec![]);
+    parent
+        .owned_clients
+        .insert("github".to_string(), make_test_client("github"));
+    parent
+        .owned_clients
+        .insert("linear".to_string(), make_test_client("linear"));
+    let pool = SharedMcpPool::from_state(&parent);
 
     state.import_shared_clients(&pool);
 
@@ -1489,8 +1490,11 @@ fn test_from_state_captures_both_owned_and_shared() {
 
     let pool = SharedMcpPool::from_state(&state);
 
-    assert!(Arc::ptr_eq(pool.get_client("owned-srv").unwrap(), &owned));
-    assert!(Arc::ptr_eq(pool.get_client("shared-srv").unwrap(), &shared));
+    assert!(Arc::ptr_eq(&pool.get_client("owned-srv").unwrap(), &owned));
+    assert!(Arc::ptr_eq(
+        &pool.get_client("shared-srv").unwrap(),
+        &shared
+    ));
     assert_eq!(pool.server_names().count(), 2);
 }
 
@@ -1555,7 +1559,139 @@ fn test_retain_clients_preserves_arc_identity() {
 
     pool.retain_clients(|name| name == "keep");
 
-    assert!(Arc::ptr_eq(pool.get_client("keep").unwrap(), &client));
+    assert!(Arc::ptr_eq(&pool.get_client("keep").unwrap(), &client));
+}
+
+#[test]
+fn inherited_pool_rebinds_after_remove_and_replacement() {
+    let mut parent = McpState::new(vec![]);
+    let pool = SharedMcpPool::from_state(&parent);
+    let mut child = McpState::new(vec![]);
+    child.import_shared_clients(&pool);
+    assert!(child.shared_clients.is_empty());
+
+    let first = make_test_client("srv");
+    let first_weak = Arc::downgrade(&first);
+    parent.owned_clients.insert("srv".into(), first.clone());
+    assert_eq!(child.sync_shared_clients(), vec!["srv"]);
+    let epoch = child.shared_epoch("srv").unwrap();
+    assert!(child.mark_shared_catalog_ready("srv", epoch, first.catalog_revision()));
+    let binding = child.capture_catalog_binding("srv", "read").unwrap();
+    assert!(child.validate_catalog_binding(&binding));
+
+    parent.owned_clients.remove("srv");
+    assert!(!child.validate_catalog_binding(&binding));
+    assert!(child.admitted_client("srv", Some("read"), None).is_none());
+    let replacement = make_test_client("srv");
+    parent
+        .owned_clients
+        .insert("srv".into(), replacement.clone());
+    assert!(!child.validate_catalog_binding(&binding));
+    assert_eq!(child.sync_shared_clients(), vec!["srv"]);
+    drop(first);
+    assert!(first_weak.upgrade().is_none());
+    let replacement_epoch = child.shared_epoch("srv").unwrap();
+    assert_ne!(epoch, replacement_epoch);
+    assert!(child.admitted_client("srv", Some("read"), None).is_none());
+    assert!(child.mark_shared_catalog_ready(
+        "srv",
+        replacement_epoch,
+        replacement.catalog_revision()
+    ));
+    let fresh = child.capture_catalog_binding("srv", "read").unwrap();
+    assert!(child.validate_catalog_binding(&fresh));
+    assert!(!child.validate_catalog_binding(&binding));
+    replacement.notify_catalog_changed();
+    assert!(!child.validate_catalog_binding(&fresh));
+}
+
+#[test]
+fn inherited_pool_preserves_parent_and_child_tool_masks() {
+    let mut parent = McpState::new(vec![]);
+    let client = make_test_client("srv");
+    parent.owned_clients.insert("srv".into(), client.clone());
+    let pool = SharedMcpPool::from_state(&parent);
+    let mut child = McpState::new(vec![]);
+    child
+        .disabled_tools
+        .insert("srv".into(), HashSet::from(["child_only".into()]));
+    child.import_shared_clients(&pool);
+    let epoch = child.shared_epoch("srv").unwrap();
+    assert!(child.mark_shared_catalog_ready("srv", epoch, client.catalog_revision()));
+    let before = child.capture_catalog_binding("srv", "parent_only").unwrap();
+    assert!(child.capture_catalog_binding("srv", "child_only").is_none());
+    parent
+        .owned_clients
+        .set_disabled_tools("srv", HashSet::from(["parent_only".into()]));
+    assert!(!child.validate_catalog_binding(&before));
+    child.sync_shared_clients();
+    let epoch = child.shared_epoch("srv").unwrap();
+    assert!(child.mark_shared_catalog_ready("srv", epoch, client.catalog_revision()));
+    assert!(
+        child
+            .capture_catalog_binding("srv", "parent_only")
+            .is_none()
+    );
+    assert!(child.capture_catalog_binding("srv", "child_only").is_none());
+    assert!(child.capture_catalog_binding("srv", "allowed").is_some());
+    parent
+        .owned_clients
+        .set_disabled_tools("srv", HashSet::new());
+    child.sync_shared_clients();
+    let epoch = child.shared_epoch("srv").unwrap();
+    assert!(child.mark_shared_catalog_ready("srv", epoch, client.catalog_revision()));
+    assert!(
+        child
+            .capture_catalog_binding("srv", "parent_only")
+            .is_some()
+    );
+    assert!(child.capture_catalog_binding("srv", "child_only").is_none());
+}
+
+#[test]
+fn inherited_pool_enforces_filters_and_local_ownership() {
+    let mut parent = McpState::new(vec![]);
+    for name in ["allowed", "excluded", "local"] {
+        parent
+            .owned_clients
+            .insert(name.into(), make_test_client(name));
+    }
+    let mut pool = SharedMcpPool::from_state(&parent);
+    pool.restrict_to(["allowed".into(), "local".into()]);
+    let mut child = McpState::new(vec![make_stdio_server("local", "/local")]);
+    child.import_shared_clients(&pool);
+    assert!(child.shared_clients.contains_key("allowed"));
+    assert!(!child.shared_clients.contains_key("excluded"));
+    assert!(!child.shared_clients.contains_key("local"));
+    parent
+        .owned_clients
+        .insert("new".into(), make_test_client("new"));
+    child.sync_shared_clients();
+    assert!(!child.shared_clients.contains_key("new"));
+}
+
+#[test]
+fn local_override_takes_precedence_before_inherited_pool_reconciliation() {
+    let mut parent = McpState::new(vec![]);
+    parent
+        .owned_clients
+        .insert("srv".into(), make_test_client("srv"));
+    parent
+        .owned_clients
+        .set_disabled_tools("srv", HashSet::from(["read".into()]));
+    let pool = SharedMcpPool::from_state(&parent);
+    let mut child = McpState::new(vec![]);
+    child.import_shared_clients(&pool);
+    let local = make_test_client("srv");
+    child.owned_clients.insert("srv".into(), local.clone());
+    assert!(child.shared_clients.contains_key("srv"));
+    let binding = child.capture_catalog_binding("srv", "read").unwrap();
+    assert!(!binding.inherited);
+    assert!(child.validate_catalog_binding(&binding));
+    assert!(Arc::ptr_eq(
+        &child.admitted_client("srv", Some("read"), None).unwrap(),
+        &local
+    ));
 }
 
 fn make_mcp_tool(server_name: &str, name: &str) -> McpTool {
@@ -1913,6 +2049,7 @@ struct FakeMcpOptions {
     discover: DiscoverBehavior,
     init_unauthorized: bool,
     first_init_gate: Option<Arc<tokio::sync::Semaphore>>,
+    first_call_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -2062,6 +2199,11 @@ async fn fake_handle_post(
             state.handles.call_params.lock().push(req["params"].clone());
             state.handles.call_bodies.lock().push(req.clone());
             let n = state.handles.calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0
+                && let Some(gate) = &state.options.first_call_gate
+            {
+                gate.acquire().await.unwrap().forget();
+            }
             let input_required = |result: serde_json::Value| {
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -2299,6 +2441,54 @@ fn fake_echo_tool() -> McpErasedTool {
             None,
         ),
     }
+}
+
+#[tokio::test]
+async fn catalog_change_during_failed_call_blocks_recovery_retry() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (url, handles) = spawn_fake_mcp_with(
+        CallToolBehavior::ErrorThenOk { code: -32603 },
+        FakeMcpOptions {
+            first_call_gate: Some(gate.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = fake_http_client(&url, 5);
+    client
+        .ensure_initialized()
+        .await
+        .expect("initial handshake");
+    let mut tool = fake_echo_tool();
+    tool.tool.catalog_revision = Some(client.catalog_revision());
+    let running_client = client.clone();
+    let running = tokio::spawn(async move {
+        let mut reconnected = false;
+        let mut timed_out = false;
+        let result = tool
+            .try_call_tool(
+                &running_client,
+                &serde_json::json!({}),
+                &mut reconnected,
+                &mut timed_out,
+                &xai_grok_session_events::EventWriter::noop(),
+            )
+            .await;
+        (result, reconnected)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while handles.calls.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first call reaches server");
+    client.notify_catalog_changed();
+    gate.add_permits(1);
+    let (result, reconnected) = running.await.unwrap();
+    assert!(result.is_err());
+    assert!(!reconnected);
+    assert_eq!(handles.calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

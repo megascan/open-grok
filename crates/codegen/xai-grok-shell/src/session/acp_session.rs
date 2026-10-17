@@ -704,6 +704,8 @@ mod managed_gateway_error_tests {
 /// Data carried from prepare_tool_call → dispatch_tool → finalize.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedToolCall {
+    /// Exact MCP catalog used for hooks and permission; checked at dispatch.
+    mcp_binding: Option<xai_grok_tools::types::resources::McpCatalogBinding>,
     mcp_request_meta: Option<serde_json::Map<String, serde_json::Value>>,
     /// The model's tool call ID (for tool_result matching).
     call_id: String,

@@ -35,12 +35,12 @@ use super::coordinator_state::{
 };
 use super::types::ActiveAgentMessageOutcome;
 use super::types::{
-    AgentMailboxIdentity, AgentMailboxMessage, AgentMessageDeliveryStatus, AgentMessageSendOutput,
-    AgentRosterEntry, HandedOffForegroundSubagent, ListAgentsOutput, SpawnedSubagentRef,
-    SubagentCancelOutcome, SubagentCancelTarget, SubagentDescribeOutcome, SubagentEvent,
-    SubagentOutstandingReply, SubagentRegistryCounts, SubagentRequest, SubagentResult,
-    SubagentResumeLookup, SubagentResumeSource, SubagentValidateTypeOutcome,
-    WaitAgentMessagesOutput,
+    AgentMailboxDelivery, AgentMailboxIdentity, AgentMailboxMessage, AgentMessageDeliveryStatus,
+    AgentMessageSendOutput, AgentRosterEntry, HandedOffForegroundSubagent, ListAgentsOutput,
+    MailboxReceipt, SpawnedSubagentRef, SubagentCancelOutcome, SubagentCancelTarget,
+    SubagentDescribeOutcome, SubagentEvent, SubagentOutstandingReply, SubagentRegistryCounts,
+    SubagentRequest, SubagentResult, SubagentResumeLookup, SubagentResumeSource,
+    SubagentValidateTypeOutcome, WaitAgentMessagesOutput,
 };
 use active_message::{ActiveChildGeneration, ActiveMessageFuture, ActiveMessageLifecycle};
 
@@ -81,6 +81,11 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     drain_waiters: HashMap<PromptScope, Vec<oneshot::Sender<SubagentOutstandingReply>>>,
     mailboxes: HashMap<MailboxKey, VecDeque<AgentMailboxMessage>>,
     mailbox_waiters: HashMap<MailboxKey, AgentMailboxWaiter>,
+    mailbox_reservations: HashMap<MailboxKey, MailboxReservation>,
+    mailbox_barriers: HashSet<MailboxKey>,
+    pending_native_completions: HashMap<MailboxKey, SubagentRequest>,
+    mailbox_settlement_tx: mpsc::UnboundedSender<MailboxSettlement>,
+    mailbox_settlement_rx: mpsc::UnboundedReceiver<MailboxSettlement>,
     native_names: HashMap<MailboxKey, String>,
     native_records: HashMap<MailboxKey, super::types::NativeAgentRecord>,
     native_loaded: HashSet<String>,
@@ -186,6 +191,17 @@ struct MailboxKey {
     agent_id: String,
 }
 
+struct MailboxReservation {
+    generation: uuid::Uuid,
+    message_ids: Vec<String>,
+}
+
+struct MailboxSettlement {
+    key: MailboxKey,
+    generation: uuid::Uuid,
+    committed: bool,
+}
+
 impl From<&AgentMailboxIdentity> for MailboxKey {
     fn from(identity: &AgentMailboxIdentity) -> Self {
         Self {
@@ -240,6 +256,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         config: CoordinatorConfig,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+        let (mailbox_settlement_tx, mailbox_settlement_rx) = mpsc::unbounded_channel();
         Self {
             commands,
             active_message_ingress,
@@ -260,6 +277,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             drain_waiters: HashMap::new(),
             mailboxes: HashMap::new(),
             mailbox_waiters: HashMap::new(),
+            mailbox_reservations: HashMap::new(),
+            mailbox_barriers: HashSet::new(),
+            pending_native_completions: HashMap::new(),
+            mailbox_settlement_tx,
+            mailbox_settlement_rx,
             native_names: HashMap::new(),
             native_records: HashMap::new(),
             native_loaded: HashSet::new(),
@@ -308,6 +330,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             tokio::select! {
                 biased;
                 Some(event) = self.internal_rx.recv() => self.handle_internal(event),
+                Some(settlement) = self.mailbox_settlement_rx.recv() => self.settle_mailbox(settlement),
                 Some(completion) = self.active_messages.next(), if !self.active_messages.is_empty() => {
                     self.finish_active_message(completion);
                 }
@@ -477,6 +500,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     .retain(|completion| completion.parent_session_id != parent_session_id);
                 self.mailboxes
                     .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.mailbox_reservations
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.mailbox_barriers
+                    .retain(|key| key.team_scope_id != parent_session_id);
+                self.pending_native_completions
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
                 self.native_names
                     .retain(|key, _| key.team_scope_id != parent_session_id);
                 self.native_records
@@ -492,10 +521,13 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     .map(|(_, waiter)| waiter)
                     .collect();
                 for waiter in closed_waiters {
-                    let _ = waiter.respond_to.send(WaitAgentMessagesOutput {
-                        messages: Vec::new(),
-                        timed_out: true,
-                    });
+                    let _ = waiter.respond_to.send(
+                        WaitAgentMessagesOutput {
+                            messages: Vec::new(),
+                            timed_out: true,
+                        }
+                        .into(),
+                    );
                 }
                 self.teardown_session_children(&parent_session_id);
                 // Only the delete path (responder present) holds spawn
@@ -758,6 +790,30 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         let target = self.resolve_message_target(identity, target)?;
         message.to_agent_id = target.clone();
+        let key = MailboxKey {
+            team_scope_id: identity.team_scope_id.clone(),
+            agent_id: target.clone(),
+        };
+        // A completed recipient may still have a batch in flight. A newer
+        // wake must not overtake that batch, including during finalization.
+        if self.mailbox_barriers.contains(&key)
+            || (self.completed.contains_key(&target)
+                && self
+                    .mailboxes
+                    .get(&key)
+                    .is_some_and(|mailbox| mailbox.iter().any(|message| message.native.is_none())))
+        {
+            self.enqueue_agent_message(key.clone(), message.clone())?;
+            self.service_mailbox_waiter(&key);
+            self.wake_completed_mailbox(&key);
+            self.runner
+                .on_agent_message(&message, AgentMessageDeliveryStatus::Queued);
+            return Ok(AgentMessageSendOutput {
+                message_id: message.message_id,
+                target_agent_id: target,
+                status: AgentMessageDeliveryStatus::Queued,
+            });
+        }
 
         if target != identity.team_scope_id
             && self
@@ -794,10 +850,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             };
         }
 
-        let key = MailboxKey {
-            team_scope_id: identity.team_scope_id.clone(),
-            agent_id: target.clone(),
-        };
         // Delivery preference: a blocked `wait_agent` waiter first. Then
         // steering messages are pushed into the recipient session live (a
         // running turn consumes them at an interjection boundary; an idle
@@ -805,17 +857,20 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         // recipient cannot receive yet — passive mail that nobody polls is
         // how urgent peer messages rot unread. Follow-up tasks are passive
         // by design and always queue for `wait_agent`.
-        let delivered_to_waiter = self.mailbox_waiters.remove(&key).is_some_and(|waiter| {
-            waiter
-                .respond_to
-                .send(WaitAgentMessagesOutput {
-                    messages: vec![message.clone()],
-                    timed_out: false,
-                })
-                .is_ok()
-        });
-        let status = if delivered_to_waiter {
-            AgentMessageDeliveryStatus::Delivered
+        if self
+            .mailbox_waiters
+            .get(&key)
+            .is_some_and(|waiter| waiter.respond_to.is_closed())
+        {
+            self.mailbox_waiters.remove(&key);
+        }
+        let status = if self.mailbox_waiters.contains_key(&key)
+            || self.mailbox_reservations.contains_key(&key)
+        {
+            // Keep the original until a conversation append commits its receipt.
+            self.enqueue_agent_message(key.clone(), message.clone())?;
+            self.service_mailbox_waiter(&key);
+            AgentMessageDeliveryStatus::Queued
         } else if message.kind.steers_recipient() {
             let delivered = if target == identity.team_scope_id {
                 self.runner.deliver_root_followup(&target, &message)
@@ -852,6 +907,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     /// preserving FIFO order among steering messages. Follow-up tasks (and
     /// anything the control refuses) stay queued for `wait_agent`.
     fn flush_mailbox_to_started_child(&mut self, key: &MailboxKey) {
+        if self.mailbox_barriers.contains(key) {
+            return;
+        }
         let Some(mailbox) = self.mailboxes.remove(key) else {
             return;
         };
@@ -912,48 +970,26 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         &mut self,
         identity: AgentMailboxIdentity,
         timeout_ms: u64,
-        respond_to: oneshot::Sender<WaitAgentMessagesOutput>,
+        respond_to: oneshot::Sender<AgentMailboxDelivery>,
     ) {
-        const MAX_DRAIN_MESSAGES: usize = 20;
         let key = MailboxKey::from(&identity);
-        if let Some(mailbox) = self.mailboxes.get_mut(&key)
-            && mailbox.iter().any(|message| message.native.is_none())
+        if !self.mailbox_reservations.contains_key(&key)
+            && self
+                .mailboxes
+                .get(&key)
+                .is_some_and(|mailbox| mailbox.iter().any(|message| message.native.is_none()))
         {
-            // Keep the originals until the receiver accepts the response. A
-            // cancelled tool can drop its receiver before this event is
-            // processed, and removing the messages first would lose them.
-            let selected: Vec<_> = mailbox
-                .iter()
-                .enumerate()
-                .filter(|(_, message)| message.native.is_none())
-                .take(MAX_DRAIN_MESSAGES)
-                .map(|(index, message)| (index, message.clone()))
-                .collect();
-            let messages = selected
-                .iter()
-                .map(|(_, message)| message.clone())
-                .collect();
-            if respond_to
-                .send(WaitAgentMessagesOutput {
-                    messages,
-                    timed_out: false,
-                })
-                .is_ok()
-            {
-                for (index, _) in selected.into_iter().rev() {
-                    mailbox.remove(index);
-                }
-                if mailbox.is_empty() {
-                    self.mailboxes.remove(&key);
-                }
-            }
+            self.deliver_mailbox_batch(key, respond_to);
             return;
         }
         if timeout_ms == 0 {
-            let _ = respond_to.send(WaitAgentMessagesOutput {
-                messages: Vec::new(),
-                timed_out: true,
-            });
+            let _ = respond_to.send(
+                WaitAgentMessagesOutput {
+                    messages: Vec::new(),
+                    timed_out: true,
+                }
+                .into(),
+            );
             return;
         }
         if let Some(previous) = self.mailbox_waiters.insert(
@@ -964,10 +1000,152 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 respond_to,
             },
         ) {
-            let _ = previous.respond_to.send(WaitAgentMessagesOutput {
-                messages: Vec::new(),
-                timed_out: false,
+            let _ = previous.respond_to.send(
+                WaitAgentMessagesOutput {
+                    messages: Vec::new(),
+                    timed_out: false,
+                }
+                .into(),
+            );
+        }
+    }
+
+    fn deliver_mailbox_batch(
+        &mut self,
+        key: MailboxKey,
+        respond_to: oneshot::Sender<AgentMailboxDelivery>,
+    ) {
+        const MAX_DRAIN_MESSAGES: usize = 20;
+        let messages: Vec<_> = self
+            .mailboxes
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|message| message.native.is_none())
+            .take(MAX_DRAIN_MESSAGES)
+            .cloned()
+            .collect();
+        debug_assert!(!messages.is_empty());
+        let generation = uuid::Uuid::now_v7();
+        let message_ids = messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect();
+        self.mailbox_barriers.insert(key.clone());
+        self.mailbox_reservations.insert(
+            key.clone(),
+            MailboxReservation {
+                generation,
+                message_ids,
+            },
+        );
+        let tx = self.mailbox_settlement_tx.clone();
+        let receipt = MailboxReceipt::new(move |committed| {
+            let _ = tx.send(MailboxSettlement {
+                key,
+                generation,
+                committed,
             });
+        });
+        // If the receiver was closed, send returns the delivery and dropping it
+        // releases the reservation. Success is not an acknowledgement.
+        let _ = respond_to.send(AgentMailboxDelivery {
+            output: WaitAgentMessagesOutput {
+                messages,
+                timed_out: false,
+            },
+            receipt: Some(receipt),
+        });
+    }
+
+    fn service_mailbox_waiter(&mut self, key: &MailboxKey) {
+        if self.mailbox_reservations.contains_key(key)
+            || !self
+                .mailboxes
+                .get(key)
+                .is_some_and(|mailbox| mailbox.iter().any(|message| message.native.is_none()))
+        {
+            return;
+        }
+        if let Some(waiter) = self.mailbox_waiters.remove(key) {
+            if waiter.deadline <= tokio::time::Instant::now() {
+                let _ = waiter.respond_to.send(
+                    WaitAgentMessagesOutput {
+                        messages: Vec::new(),
+                        timed_out: true,
+                    }
+                    .into(),
+                );
+            } else {
+                self.deliver_mailbox_batch(key.clone(), waiter.respond_to);
+            }
+        }
+    }
+
+    fn settle_mailbox(&mut self, settlement: MailboxSettlement) {
+        let Some(reservation) = self.mailbox_reservations.get(&settlement.key) else {
+            return;
+        };
+        if reservation.generation != settlement.generation {
+            return;
+        }
+        let reservation = self.mailbox_reservations.remove(&settlement.key).unwrap();
+        if settlement.committed {
+            if let Some(mailbox) = self.mailboxes.get_mut(&settlement.key) {
+                for id in reservation.message_ids {
+                    if let Some(index) = mailbox.iter().position(|message| message.message_id == id)
+                    {
+                        mailbox.remove(index);
+                    }
+                }
+                if mailbox.is_empty() {
+                    self.mailboxes.remove(&settlement.key);
+                }
+            }
+        }
+        if !self
+            .mailboxes
+            .get(&settlement.key)
+            .is_some_and(|mailbox| mailbox.iter().any(|message| message.native.is_none()))
+        {
+            self.mailbox_barriers.remove(&settlement.key);
+        }
+        if !self.mailbox_barriers.contains(&settlement.key) {
+            if let Some(request) = self.pending_native_completions.remove(&settlement.key) {
+                self.finish_native_completion(&request);
+            }
+        }
+        self.service_mailbox_waiter(&settlement.key);
+        self.wake_completed_mailbox(&settlement.key);
+    }
+
+    /// Wake only for steering mail, using a synthetic prompt so admission is
+    /// never mistaken for acceptance of a mailbox entry. The old identity and
+    /// all queued entries remain intact until `wait_agent` commits them.
+    fn wake_completed_mailbox(&mut self, key: &MailboxKey) {
+        if self.mailbox_reservations.contains_key(key)
+            || key.agent_id == key.team_scope_id
+            || !self.completed.contains_key(&key.agent_id)
+        {
+            return;
+        }
+        let message = self.mailboxes.get(key).and_then(|mailbox| {
+            mailbox
+                .iter()
+                .find(|message| message.native.is_none() && message.kind.triggers_turn())
+                .cloned()
+        });
+        if let Some(message) = message {
+            let _ = self.wake_completed_child(
+                &key.agent_id,
+                &key.team_scope_id,
+                "Agent messages are queued. Call wait_agent to receive them.".to_owned(),
+                message.message_id,
+                WakeSource::Agent {
+                    agent_id: message.from_agent_id,
+                    kind: message.kind,
+                },
+            );
         }
     }
 
@@ -1849,10 +2027,13 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             .collect();
         for key in expired_mailboxes {
             if let Some(waiter) = self.mailbox_waiters.remove(&key) {
-                let _ = waiter.respond_to.send(WaitAgentMessagesOutput {
-                    messages: Vec::new(),
-                    timed_out: true,
-                });
+                let _ = waiter.respond_to.send(
+                    WaitAgentMessagesOutput {
+                        messages: Vec::new(),
+                        timed_out: true,
+                    }
+                    .into(),
+                );
             }
         }
     }

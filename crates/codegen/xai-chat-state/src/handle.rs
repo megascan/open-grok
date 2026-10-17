@@ -104,6 +104,18 @@ impl ChatStateHandle {
         let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult { item });
     }
 
+    /// Append a tool result and run its commit only after actor acceptance.
+    /// Dropping an undelivered callback releases its owned resources.
+    pub fn push_tool_result_with_commit(
+        &self,
+        item: ConversationItem,
+        commit: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), ChatStateMailboxClosed> {
+        self.cmd_tx
+            .send(ChatStateCommand::PushToolResultWithCommit { item, commit })
+            .map_err(|_| ChatStateMailboxClosed)
+    }
+
     pub fn push_model_output(&self, item: ConversationItem) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushModelOutput { item });
     }

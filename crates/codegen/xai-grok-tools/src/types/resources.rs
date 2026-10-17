@@ -1001,6 +1001,19 @@ pub struct CompletionTracker {
 impl ResourceType for CompletionTracker {
     const ID: &'static str = "";
 }
+/// Identity of an MCP catalog observed before hooks and permission approval.
+/// This is an opaque, process-local call capability, not persisted or sent to
+/// the model. The MCP host validates it again at final dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCatalogBinding {
+    pub server: String,
+    pub tool: String,
+    pub pool_id: u64,
+    pub epoch: u64,
+    pub inherited: bool,
+    pub revision: u64,
+}
+
 /// Metadata for a single MCP resource, returned by [`McpResourceProvider::list_resources`].
 #[derive(Debug, Clone)]
 pub struct McpResourceInfo {

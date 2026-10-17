@@ -174,6 +174,10 @@ impl ChatStateActor {
             ChatStateCommand::PushToolResult { item } => {
                 self.push_message(item);
             }
+            ChatStateCommand::PushToolResultWithCommit { item, commit } => {
+                self.push_message(item);
+                commit();
+            }
             ChatStateCommand::PushModelOutput { item } => {
                 self.push_model_output(item);
             }

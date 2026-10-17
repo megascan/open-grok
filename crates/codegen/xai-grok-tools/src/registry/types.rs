@@ -1854,6 +1854,9 @@ impl FinalizedToolset {
         if let Some(metadata) = parent_ctx.get::<xai_tool_runtime::McpCallMetadata>() {
             ctx.extensions.insert((*metadata).clone());
         }
+        if let Some(binding) = parent_ctx.get::<crate::types::resources::McpCatalogBinding>() {
+            ctx.extensions.insert((*binding).clone());
+        }
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         if let Some(cancellation) = parent_ctx.get::<xai_tool_runtime::Cancellation>() {

@@ -147,6 +147,12 @@ needs no special case — its tool call returns immediately and holds no wait.
 - The shared coordinator serializes lifecycle and mailbox routing; child runs and host callbacks remain on the existing `spawn_local` / `LocalSet` path.
 - Uses `LocalRef` into `MvpAgent` (LocalSet / `!Send` pattern — do not move across threads).
 - Builds `SubagentSpawnContext` from parent session (MCP pool, client hooks, tool snapshot, cwd, auth, models, …).
+- Children follow the parent's live owned MCP pool. Removing or replacing a
+  server, or changing the parent's disabled-tool policy, immediately invalidates
+  new inherited admissions; child catalog reconciliation retains the child's
+  stricter masks. Calls already admitted can finish on the old client. Local
+  MCP preparation binds a call to its pool entry and catalog revision, so an
+  approval or retry cannot silently switch to a replacement or changed catalog.
 
 ### Completion path (high level)
 
@@ -252,9 +258,20 @@ the root). This is intentionally separate from task polling's
   with `wait_agent` at a stopping point.
 - `wait_agent` drains only the caller's inbox and supports a capped blocking
   wait; a blocked waiter takes precedence over live delivery for both kinds.
+  Ordinary mailbox batches remain reserved in FIFO order, including against the
+  mailbox capacity limit, until the chat actor appends the complete tool result
+  to its in-process conversation. Dropped deliveries, a closed chat actor, and
+  hook replacements release the reservation for retry; a newer message cannot
+  overtake the reserved batch. This is an in-process guarantee, not durable
+  delivery across a crash or proof that the model acted on the messages.
 
-Finished children reject new mail and must be continued through `resume_from`,
-which creates a new child ID. Every accepted message emits a persisted
+Completed children can be woken in place by steering messages. If a reserved
+ordinary batch remains queued, the wake carries only a mailbox nudge and the
+original entries remain available to that same identity; passive follow-ups
+alone do not trigger a wake. A resumed model using Codex native-v2 `wait_agent`
+cannot drain this ordinary backlog because that tool reports native activity;
+the entries remain queued and require the ordinary mailbox tool to be read.
+Explicit `resume_from` normally creates a new child ID. Every accepted message emits a persisted
 `SubagentMessage` update on the root session; the pager renders a bounded
 preview. Model delivery uses an explicit `<agent_message>` envelope and treats
 peer content as untrusted input, never user consent or permission.

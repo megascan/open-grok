@@ -13,9 +13,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::types::{
-    ActiveAgentMessageOutcome, ActiveAgentMessageRequest, AgentListRequest, AgentMailboxIdentity,
-    AgentMailboxMessage, AgentMailboxWaitRequest, AgentMessageRequest, AgentMessageSendOutput,
-    HandedOffForegroundSubagent, ListAgentsOutput, SpawnedSubagentRef,
+    ActiveAgentMessageOutcome, ActiveAgentMessageRequest, AgentListRequest, AgentMailboxDelivery,
+    AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxWaitRequest, AgentMessageRequest,
+    AgentMessageSendOutput, HandedOffForegroundSubagent, ListAgentsOutput, SpawnedSubagentRef,
     SubagentActiveMessageRequest, SubagentCancelOutcome, SubagentCancelRequest,
     SubagentCancelTarget, SubagentDescribeOutcome, SubagentDescribeRequest, SubagentEvent,
     SubagentEventSender, SubagentHandOffForegroundRequest, SubagentInspectRequest,
@@ -104,12 +104,13 @@ pub trait SubagentBackend: Send + Sync + 'static {
         &self,
         identity: AgentMailboxIdentity,
         timeout_ms: u64,
-    ) -> WaitAgentMessagesOutput {
+    ) -> AgentMailboxDelivery {
         let _ = (identity, timeout_ms);
         WaitAgentMessagesOutput {
             messages: Vec::new(),
             timed_out: true,
         }
+        .into()
     }
 
     /// Validate a subagent type synchronously before spawning.
@@ -760,7 +761,7 @@ impl SubagentBackend for ChannelBackend {
         &self,
         identity: AgentMailboxIdentity,
         timeout_ms: u64,
-    ) -> WaitAgentMessagesOutput {
+    ) -> AgentMailboxDelivery {
         let (respond_to, response_rx) = oneshot::channel();
         if self
             .tx
@@ -774,11 +775,15 @@ impl SubagentBackend for ChannelBackend {
             return WaitAgentMessagesOutput {
                 messages: Vec::new(),
                 timed_out: true,
-            };
+            }
+            .into();
         }
-        response_rx.await.unwrap_or(WaitAgentMessagesOutput {
-            messages: Vec::new(),
-            timed_out: true,
+        response_rx.await.unwrap_or_else(|_| {
+            WaitAgentMessagesOutput {
+                messages: Vec::new(),
+                timed_out: true,
+            }
+            .into()
         })
     }
 

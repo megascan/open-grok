@@ -1823,6 +1823,9 @@ pub(super) async fn run_session_with_completion(
                                 if let Some(def) = tool_def {
                                     let meta = mcp_state.mcp_tool_meta.get(&qualified).cloned();
                                     let schema = def.function.parameters.clone();
+                                    let inherited_epoch = mcp_state.shared_epoch(&server_name);
+                                    let catalog_revision = mcp_state.get_client(&server_name)
+                                        .map(|client| client.catalog_revision());
                                     let mcp_tool = crate::session::mcp_servers::McpTool::new(
                                         tool_name.clone(),
                                         def.function.description.clone().unwrap_or_default(),
@@ -1830,7 +1833,8 @@ pub(super) async fn run_session_with_completion(
                                         session.mcp_state.clone(),
                                         schema,
                                         meta,
-                                    );
+                                    ).with_inherited_epoch(inherited_epoch)
+                                        .with_catalog_revision(catalog_revision);
                                     if let Ok(reg) = mcp_tool.into_registration() {
                                         mcp_state
                                             .disabled_tool_registrations
@@ -1851,6 +1855,8 @@ pub(super) async fn run_session_with_completion(
                                 .get(&server_name)
                                 .map(|s| s.iter().cloned().collect())
                                 .unwrap_or_default();
+                            let disabled_for_pool = mcp_state.disabled_tools.get(&server_name).cloned().unwrap_or_default();
+                            mcp_state.owned_clients.set_disabled_tools(&server_name, disabled_for_pool);
                             drop(mcp_state);
 
                             session.refresh_mcp_snapshot_and_schedule_reminder().await;
@@ -1900,11 +1906,8 @@ pub(super) async fn run_session_with_completion(
                         }
                         SessionCommand::SnapshotMcpPool { respond_to } => {
                             let mcp_state = session.mcp_state.lock().await;
-                            let pool = if mcp_state.owned_clients.is_empty() && mcp_state.shared_clients.is_empty() {
-                                None
-                            } else {
-                                Some(crate::session::mcp_servers::SharedMcpPool::from_state(&mcp_state))
-                            };
+                            // Even an empty pool must stay live for servers added later.
+                            let pool = Some(crate::session::mcp_servers::SharedMcpPool::from_state(&mcp_state));
                             let _ = respond_to.send(pool);
                         }
                         SessionCommand::SnapshotClientHooks { respond_to } => {

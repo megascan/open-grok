@@ -378,7 +378,19 @@ impl SessionActor {
         tool_call_id: &acp::ToolCallId,
         input: &UseToolInput,
         model_id: &str,
-    ) -> Result<Result<(ToolInput, Value, McpFileSource), ToolLoop>, acp::Error> {
+        captured_binding: Option<xai_grok_tools::types::resources::McpCatalogBinding>,
+    ) -> Result<
+        Result<
+            (
+                ToolInput,
+                Value,
+                McpFileSource,
+                Option<xai_grok_tools::types::resources::McpCatalogBinding>,
+            ),
+            ToolLoop,
+        >,
+        acp::Error,
+    > {
         let Some(path) = input.source_path() else {
             return Err(acp::Error::internal_error().data("expected file-backed invocation"));
         };
@@ -452,9 +464,8 @@ impl SessionActor {
         {
             return Ok(Err(blocked));
         }
+        let target_was_known = matches!(input, UseToolInput::ArgumentsFile { .. });
         let input = input.clone();
-        let projection_toolset = self.tool_bridge_handle().toolset();
-        let wire_name = call.function.name.clone();
         let load_start = tokio::time::Instant::now();
         let loaded = tokio::time::timeout(remaining, async {
             let bytes = fs
@@ -486,18 +497,14 @@ impl SessionActor {
                     }
                     UseToolInput::Inline(_) => Err("expected file-backed invocation".to_owned()),
                 }?;
-                let effective = UseToolInput::Inline(invocation);
-                let model_arguments = projection_toolset
-                    .model_mcp_arguments(&wire_name, &effective)
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>((effective, model_arguments))
+                Ok::<_, String>(UseToolInput::Inline(invocation))
             }))
             .await
             .map_err(|_| "MCP source parsing worker failed".to_owned())?
         })
         .await;
         source.operation_remaining = remaining.saturating_sub(load_start.elapsed());
-        let (effective, model_arguments) = match loaded {
+        let effective = match loaded {
             Ok(Ok(loaded)) => loaded,
             Ok(Err(error)) => return self.reject_mcp_file(call, tool_call_id, &error).await,
             Err(_) => {
@@ -506,9 +513,80 @@ impl SessionActor {
                     .await;
             }
         };
+        let projection_start = tokio::time::Instant::now();
         let target_name = effective
             .target_name()
             .ok_or_else(acp::Error::internal_error)?;
+        // Arguments files have a known target before file I/O; invocation
+        // files reveal it only after parsing. Bind before projection, schema
+        // validation, hooks, or approval can observe a replacement.
+        let binding =
+            if let Some(binding) = captured_binding {
+                let qualified = format!("{}__{}", binding.server, binding.tool);
+                if qualified != target_name
+                    || !self
+                        .mcp_state
+                        .lock()
+                        .await
+                        .validate_catalog_binding(&binding)
+                {
+                    return self
+                        .reject_mcp_file(
+                            call,
+                            tool_call_id,
+                            "MCP tool changed while reading the source file; discover it and retry",
+                        )
+                        .await;
+                }
+                Some(binding)
+            } else {
+                match self.capture_prepared_mcp_binding(target_name).await {
+                    Ok(None) => None,
+                    Ok(Some(binding)) if !target_was_known => Some(binding),
+                    Ok(Some(_)) => return self
+                        .reject_mcp_file(
+                            call,
+                            tool_call_id,
+                            "MCP tool changed while reading the source file; discover it and retry",
+                        )
+                        .await,
+                    Err(()) => return self
+                        .reject_mcp_file(
+                            call,
+                            tool_call_id,
+                            "MCP tool is unavailable or its catalog changed; discover it and retry",
+                        )
+                        .await,
+                }
+            };
+        let projection_toolset = self.tool_bridge_handle().toolset();
+        let wire_name = call.function.name.clone();
+        let projection_input = effective.clone();
+        let remaining = source
+            .operation_remaining
+            .saturating_sub(projection_start.elapsed());
+        let projection = tokio::time::timeout(remaining, async {
+            tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+                projection_toolset
+                    .model_mcp_arguments(&wire_name, &projection_input)
+                    .map_err(|error| error.to_string())
+            }))
+            .await
+            .map_err(|_| "MCP source projection worker failed".to_owned())?
+        })
+        .await;
+        source.operation_remaining = source
+            .operation_remaining
+            .saturating_sub(projection_start.elapsed());
+        let model_arguments = match projection {
+            Ok(Ok(arguments)) => arguments,
+            Ok(Err(error)) => return self.reject_mcp_file(call, tool_call_id, &error).await,
+            Err(_) => {
+                return self
+                    .reject_mcp_file(call, tool_call_id, "MCP source file operation timed out")
+                    .await;
+            }
+        };
         if validate_mcp_target(Some(&resources), target_name)
             .await
             .is_err()
@@ -533,7 +611,12 @@ impl SessionActor {
                 )
                 .await;
         }
-        Ok(Ok((ToolInput::UseTool(effective), model_arguments, source)))
+        Ok(Ok((
+            ToolInput::UseTool(effective),
+            model_arguments,
+            source,
+            binding,
+        )))
     }
 
     async fn authorize_mcp_source(

@@ -844,11 +844,9 @@ pub async fn call_mcp_tool(
             server_name.to_string()
         };
 
-        Arc::clone(
-            state
-                .get_client(&target)
-                .ok_or_else(|| format!("server '{}' not found", target))?,
-        )
+        state
+            .admitted_client(&target, Some(tool_name), None)
+            .ok_or_else(|| format!("server '{}' is unavailable or its catalog changed", target))?
     };
 
     let tool_timeout_sec = client.tool_timeout_for(tool_name);
@@ -1212,11 +1210,14 @@ pub(crate) async fn read_mcp_resource(
 ) -> Result<McpReadResourceResponse, String> {
     let client = {
         let state = mcp_state.lock().await;
-        Arc::clone(
-            state
-                .get_client(server_name)
-                .ok_or_else(|| format!("server '{}' not found", server_name))?,
-        )
+        state
+            .admitted_client(server_name, None, None)
+            .ok_or_else(|| {
+                format!(
+                    "server '{}' is unavailable or its catalog changed",
+                    server_name
+                )
+            })?
     };
 
     let _request = client.begin_outbound_request();
@@ -1303,22 +1304,32 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
         &self,
         server: Option<String>,
     ) -> Result<Vec<xai_grok_tools::types::resources::McpResourceInfo>, String> {
-        let clients: Vec<(String, Arc<McpClient>)> = {
+        let names: Vec<String> = {
             let state = self.0.lock().await;
             match &server {
-                Some(name) => match state.get_client(name) {
-                    Some(c) => vec![(name.clone(), Arc::clone(c))],
-                    None => return Err(format!("MCP server '{name}' not found")),
-                },
+                Some(name) => vec![name.clone()],
                 None => state
                     .all_clients()
-                    .map(|(name, client)| (name.to_string(), Arc::clone(client)))
+                    .map(|(name, _)| name.to_string())
                     .collect(),
             }
         };
 
         let mut resources = Vec::new();
-        for (server_name, client) in clients {
+        for server_name in names {
+            // Admit each target immediately before its request, rather than
+            // keeping clients for later servers while earlier RPCs are pending.
+            let client = self
+                .0
+                .lock()
+                .await
+                .admitted_client(&server_name, None, None);
+            let Some(client) = client else {
+                if server.is_some() {
+                    return Err(format!("MCP server '{server_name}' unavailable"));
+                }
+                continue;
+            };
             let _request = client.begin_outbound_request();
             let mcp_service = match client.ensure_initialized().await {
                 Ok(s) => s,
@@ -1368,11 +1379,9 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
     ) -> Result<xai_grok_tools::types::resources::McpResourceReadResult, String> {
         let client = {
             let state = self.0.lock().await;
-            Arc::clone(
-                state
-                    .get_client(&server)
-                    .ok_or_else(|| format!("MCP server '{server}' not found"))?,
-            )
+            state
+                .admitted_client(&server, None, None)
+                .ok_or_else(|| format!("MCP server '{server}' unavailable"))?
         };
 
         let _request = client.begin_outbound_request();

@@ -88,6 +88,12 @@ pub enum ChatStateCommand {
         item: ConversationItem,
     },
 
+    /// The callback owns any delivery lease until the actor appends the item.
+    PushToolResultWithCommit {
+        item: ConversationItem,
+        commit: Box<dyn FnOnce() + Send + 'static>,
+    },
+
     PushModelOutput {
         item: ConversationItem,
     },

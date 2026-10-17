@@ -2300,7 +2300,7 @@ fn filter_pool_by_inheritance(
         McpInheritance::None => None,
         McpInheritance::Named(names) => {
             let before = pool.server_names().count();
-            pool.retain_clients(|name| names.iter().any(|n| n == name));
+            pool.restrict_to(names.iter().cloned());
             tracing::debug!(
                 before,
                 after = pool.server_names().count(),
@@ -2311,7 +2311,7 @@ fn filter_pool_by_inheritance(
         }
         McpInheritance::Except(names) => {
             let before = pool.server_names().count();
-            pool.retain_clients(|name| !names.iter().any(|n| n == name));
+            pool.exclude_names(names.iter().cloned());
             tracing::debug!(
                 before,
                 after = pool.server_names().count(),

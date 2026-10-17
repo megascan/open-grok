@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 use super::coordinator::active_message::{ActiveChildGeneration, ActiveMessageLifecycle};
 use super::types::ActiveAgentMessageDelivery;
 use super::types::{
-    ActiveSubagentSummary, AgentMailboxMessage, AgentMessageDeliveryStatus,
+    ActiveSubagentSummary, AgentMailboxDelivery, AgentMailboxMessage, AgentMessageDeliveryStatus,
     SubagentCompletionSummary, SubagentDescribeOutcome, SubagentInspection, SubagentRequest,
     SubagentResult, SubagentResumeLookup, SubagentSnapshot, SubagentSnapshotStatus,
-    SubagentValidateTypeOutcome, WaitAgentMessagesOutput,
+    SubagentValidateTypeOutcome,
 };
 
 /// Cap on retained completed-subagent entries before the oldest are evicted.
@@ -492,7 +492,7 @@ pub(super) struct BlockingWaiter {
 
 pub(super) struct AgentMailboxWaiter {
     pub(super) deadline: tokio::time::Instant,
-    pub(super) respond_to: oneshot::Sender<WaitAgentMessagesOutput>,
+    pub(super) respond_to: oneshot::Sender<AgentMailboxDelivery>,
 }
 
 pub(super) struct BufferedCompletion {

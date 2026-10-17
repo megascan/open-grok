@@ -535,6 +535,25 @@ pub(super) struct BridgeToolSuccess<'a> {
     pub model_output_override: Option<String>,
 }
 impl SessionActor {
+    /// Bind a local MCP invocation to the exact catalog visible during
+    /// preparation. Managed gateway targets do not use a local binding.
+    pub(super) async fn capture_prepared_mcp_binding(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<xai_grok_tools::types::resources::McpCatalogBinding>, ()> {
+        let Some((server, tool)) = parse_mcp_tool_name(tool_name) else {
+            return Ok(None);
+        };
+        let state = self.mcp_state.lock().await;
+        if !state.has_local_server(&server) {
+            return Ok(None);
+        }
+        state
+            .capture_catalog_binding(&server, &tool)
+            .map(Some)
+            .ok_or(())
+    }
+
     /// Merge the canonical `x.ai/tool` identity envelope into a tool-call
     /// event's `_meta`, resolving the tool from the live toolset by wire name.
     pub(super) fn stamp_tool_meta(
@@ -975,7 +994,9 @@ impl SessionActor {
                     let latest_slot = std::sync::Arc::new(parking_lot::Mutex::new(
                         xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
                     ));
+                    let mailbox_receipt_slot = xai_grok_tools::implementations::grok_build::task::types::MailboxReceiptSlot::default();
                     let run_tool = || {
+                        let mailbox_receipt_slot = mailbox_receipt_slot.clone();
                         let prepared = Arc::clone(&prepared);
                         let workspace_ops = workspace_ops.clone();
                         let sandbox_transport = sandbox_transport.clone();
@@ -1017,6 +1038,7 @@ impl SessionActor {
                                     slot,
                                     Some(sandbox_transport),
                                     delivery_scope,
+                                    Some(mailbox_receipt_slot),
                                 )
                                 .await
                             };
@@ -1137,7 +1159,7 @@ impl SessionActor {
                             ),
                         })),
                     );
-                    (idx, result, duration_ms, projection)
+                    (idx, result, duration_ms, projection, mailbox_receipt_slot)
                 }
             })
             .collect();
@@ -1153,6 +1175,7 @@ impl SessionActor {
             Result<ToolRunResult, xai_tool_runtime::ToolError>,
             u64,
             crate::session::telemetry::ToolCallProjection,
+            xai_grok_tools::implementations::grok_build::task::types::MailboxReceiptSlot,
         )>();
         let drainer = tokio::spawn(async move {
             while let Some(item) = dispatch_stream.next().await {
@@ -1162,7 +1185,10 @@ impl SessionActor {
             }
         });
         let _drainer_guard = crate::util::AbortOnDrop(drainer);
-        while let Some((idx, result, duration_ms, projection)) = dispatch_rx.recv().await {
+        while let Some((idx, result, duration_ms, projection, mailbox_receipt_slot)) =
+            dispatch_rx.recv().await
+        {
+            let mailbox_receipt = mailbox_receipt_slot.take();
             let prepared = approved_slots[idx]
                 .take()
                 .expect("dispatch index should match an approved slot exactly once");
@@ -1239,18 +1265,21 @@ impl SessionActor {
                             (replacement, scrollback)
                         };
                     let bridge_result = self
-                        .handle_bridge_tool_success(BridgeToolSuccess {
-                            tool_call_id: &prepared.tool_call_id,
-                            call_id: &prepared.call_id,
-                            requested_tool_name: &prepared.tool_name,
-                            effective_tool_name: &effective_tool_name,
-                            drained,
-                            concatenated_json_count: prepared.concatenated_json_count,
-                            coercion_note: prepared.coercion_note.as_deref(),
-                            model_id: prepared.model_id.as_deref().unwrap_or(""),
-                            tool_parsed_args: prepared.authored_arguments(),
-                            model_output_override,
-                        })
+                        .handle_bridge_tool_success_with_mailbox_receipt(
+                            BridgeToolSuccess {
+                                tool_call_id: &prepared.tool_call_id,
+                                call_id: &prepared.call_id,
+                                requested_tool_name: &prepared.tool_name,
+                                effective_tool_name: &effective_tool_name,
+                                drained,
+                                concatenated_json_count: prepared.concatenated_json_count,
+                                coercion_note: prepared.coercion_note.as_deref(),
+                                model_id: prepared.model_id.as_deref().unwrap_or(""),
+                                tool_parsed_args: prepared.authored_arguments(),
+                                model_output_override,
+                            },
+                            mailbox_receipt,
+                        )
                         .await;
                     if let Some(scrollback) = deferred_hook_scrollback {
                         self.emit_post_tool_use_scrollback(scrollback).await;
@@ -1265,6 +1294,7 @@ impl SessionActor {
                     ToolLoop::Continue
                 }
                 Err(err) => {
+                    drop(mailbox_receipt);
                     let err: anyhow::Error = err.into();
                     let err_followups = self
                         .handle_tool_error(
@@ -2305,6 +2335,25 @@ impl SessionActor {
             deferred_followups.extend(followups);
             return Ok(Err(ToolLoop::NonExistingTool));
         }
+        // Capture before `try_parse`, which may consult an asynchronously
+        // refreshed tool catalog. Wrapper targets are bound once known below.
+        let mut mcp_binding = if wrapper_parse.is_none() {
+            match self.capture_prepared_mcp_binding(&call.function.name).await {
+                Ok(binding) => binding,
+                Err(()) => {
+                    self.handle_tool_not_executed(
+                        &call.id,
+                        &tool_call_id,
+                        "MCP tool is unavailable or its catalog changed; discover it and retry"
+                            .to_owned(),
+                    )
+                    .await?;
+                    return Ok(Err(ToolLoop::NonExistingTool));
+                }
+            }
+        } else {
+            None
+        };
         let args_str = crate::session::helpers::tool_input_parsing::normalize_empty_arguments(
             &call.function.arguments,
         );
@@ -2390,18 +2439,42 @@ impl SessionActor {
                 return Ok(Err(ToolLoop::ToolParsingError));
             }
         };
+        if let ToolInput::UseTool(input) = &tool_input
+            && let Some(target) = input.target_name()
+        {
+            mcp_binding = match self.capture_prepared_mcp_binding(target).await {
+                Ok(binding) => binding,
+                Err(()) => {
+                    self.handle_tool_not_executed(
+                        &call.id,
+                        &tool_call_id,
+                        "MCP tool is unavailable or its catalog changed; discover it and retry"
+                            .to_owned(),
+                    )
+                    .await?;
+                    return Ok(Err(ToolLoop::NonExistingTool));
+                }
+            };
+        }
         let mut mcp_preparation = mcp_file_input::McpFilePreparation::Ordinary;
         if let ToolInput::UseTool(input) = &tool_input
             && input.source_path().is_some()
         {
-            let (effective, arguments, source) = match self
-                .resolve_mcp_file(&call, &tool_call_id, input, model_id_str)
+            let (effective, arguments, source, file_binding) = match self
+                .resolve_mcp_file(
+                    &call,
+                    &tool_call_id,
+                    input,
+                    model_id_str,
+                    mcp_binding.clone(),
+                )
                 .await?
             {
                 Ok(loaded) => loaded,
                 Err(blocked) => return Ok(Err(blocked)),
             };
             tool_input = effective;
+            mcp_binding = file_binding;
             mcp_preparation = mcp_file_input::McpFilePreparation::Resolved {
                 source,
                 authored: std::mem::replace(&mut raw_input, arguments),
@@ -3035,6 +3108,7 @@ impl SessionActor {
         };
         let invocation_id = xai_grok_telemetry::events::InvocationId::generate();
         let prepared = PreparedToolCall {
+            mcp_binding,
             mcp_request_meta: codex_catalog_policy::confirmation_metadata(
                 &codex_catalog_metadata,
                 &access_kind,
@@ -3913,6 +3987,17 @@ impl SessionActor {
         &self,
         args: BridgeToolSuccess<'_>,
     ) -> Result<Vec<ConversationItem>, acp::Error> {
+        self.handle_bridge_tool_success_with_mailbox_receipt(args, None)
+            .await
+    }
+
+    async fn handle_bridge_tool_success_with_mailbox_receipt(
+        &self,
+        args: BridgeToolSuccess<'_>,
+        mailbox_receipt: Option<
+            xai_grok_tools::implementations::grok_build::task::types::MailboxReceipt,
+        >,
+    ) -> Result<Vec<ConversationItem>, acp::Error> {
         use crate::session::acp_conversion::{acp_plan_update, acp_tool_update, maybe_rewrite};
         let BridgeToolSuccess {
             tool_call_id,
@@ -3927,6 +4012,14 @@ impl SessionActor {
             model_output_override,
         } = args;
         let (mut result, mut tool_layer_images) = drained.into_parts();
+        // Only the complete, original mailbox payload can settle the lease.
+        // Hooks and the normal output pipeline still run unchanged.
+        let mailbox_payload = match &result.output {
+            ToolsToolOutput::WaitAgentMessages(output) if !output.messages.is_empty() => {
+                serde_json::to_string_pretty(&output.messages).ok()
+            }
+            _ => None,
+        };
         let consumed_ids =
             xai_grok_tools::reminders::task_completion::consumed_completion_ids(&result.output);
         if !consumed_ids.is_empty() {
@@ -4028,7 +4121,7 @@ impl SessionActor {
             result.prompt_text
         };
         let mut inline_images: Vec<ContentPart> = Vec::new();
-        let (prompt_text, inline_images, extracted_images) = if output_replaced {
+        let (prompt_text, mut inline_images, mut extracted_images) = if output_replaced {
             (
                 maybe_rewrite(path_rewriter.as_ref(), prompt_text),
                 Vec::new(),
@@ -4130,8 +4223,20 @@ impl SessionActor {
             }
             (prompt_text, inline_images, extracted_images)
         };
-        let prompt_text =
+        let mut prompt_text =
             mcp_argument_coercion::append_coercion_reminder(prompt_text, coercion_note);
+        let mailbox_visible = !output_replaced
+            && mailbox_payload
+                .as_ref()
+                .is_some_and(|payload| prompt_text.contains(payload));
+        if mailbox_receipt.is_some() && !mailbox_visible {
+            // A replaced or transformed output may expose only part of a batch.
+            // Do not put any of it into the model conversation before rollback.
+            prompt_text =
+                "Agent messages could not be delivered; call wait_agent again.".to_owned();
+            inline_images.clear();
+            extracted_images.clear();
+        }
         let tool_chat = if inline_images.is_empty() {
             ConversationItem::tool_result(call_id.to_string(), prompt_text)
         } else {
@@ -4142,7 +4247,13 @@ impl SessionActor {
             )
         };
         if records_model_tool_results() {
-            self.chat_state_handle.push_tool_result(tool_chat);
+            if let Some(receipt) = mailbox_receipt.filter(|_| mailbox_visible) {
+                let _ = self
+                    .chat_state_handle
+                    .push_tool_result_with_commit(tool_chat, Box::new(move || receipt.commit()));
+            } else {
+                self.chat_state_handle.push_tool_result(tool_chat);
+            }
         }
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
@@ -4819,6 +4930,10 @@ fn execute_tool_call_parts(
         ))],
     )
 }
+#[cfg(test)]
+#[path = "mailbox_delivery_tests.rs"]
+mod mailbox_delivery_tests;
+
 #[cfg(test)]
 mod execute_tool_call_parts_tests {
     use super::execute_tool_call_parts;

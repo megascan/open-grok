@@ -55,12 +55,12 @@ impl SessionActor {
     /// must not publish the old result over its successor.
     async fn refresh_changed_mcp_catalog(&self, server: &str) {
         loop {
-            let (client, generation) = {
+            let (client, generation, shared_epoch) = {
                 let state = self.mcp_state.lock().await;
                 let Some(client) = state.get_client(server).cloned() else {
                     return;
                 };
-                (client, state.generation())
+                (client, state.generation(), state.shared_epoch(server))
             };
             let budget = std::time::Duration::from_secs(
                 client
@@ -92,6 +92,7 @@ impl SessionActor {
             if !client.is_current_service(&service).await
                 || client.catalog_revision() != revision
                 || state.generation() != generation
+                || state.shared_epoch(server) != shared_epoch
                 || !state
                     .get_client(server)
                     .is_some_and(|current| std::sync::Arc::ptr_eq(current, &client))
@@ -135,6 +136,13 @@ impl SessionActor {
                 self.register_mcp_tool(server, registration, &mut state, &mut ui_tools)
                     .await;
             }
+            if let Some(epoch) = shared_epoch
+                && !state.mark_shared_catalog_ready(server, epoch, revision)
+            {
+                // Parent changed while listing or registering. The live-pool
+                // listener will reconcile the newest publication.
+                return;
+            }
             drop(state);
             self.refresh_mcp_snapshot_and_schedule_reminder().await;
             self.emit_mcp_tools_changed_notifications(ui_tools);
@@ -142,9 +150,68 @@ impl SessionActor {
         }
     }
 
-    /// Observe revisions of inherited clients without owning their transports
-    /// or their parent session's status and liveness event channel.
+    /// Observe both parent pool replacements and per-client catalog revisions.
+    /// The manager owns and replaces its per-client listeners on each pool
+    /// update, so child exit and replacement release all obsolete listeners.
     pub(super) async fn start_shared_mcp_catalog_listeners(
+        self: &std::sync::Arc<Self>,
+    ) -> Vec<tokio_util::task::AbortOnDropHandle<()>> {
+        let pool = self.mcp_state.lock().await.inherited_pool();
+        let Some(pool) = pool else {
+            return self.shared_client_revision_listeners().await;
+        };
+        let Some(mut changes) = pool.subscribe() else {
+            self.reconcile_shared_mcp_pool().await;
+            return Vec::new();
+        };
+        let actor = std::sync::Arc::downgrade(self);
+        vec![tokio_util::task::AbortOnDropHandle::new(
+            tokio::task::spawn_local(async move {
+                let mut listeners = Vec::new();
+                loop {
+                    let Some(session) = actor.upgrade() else {
+                        break;
+                    };
+                    let changed = session.sync_shared_mcp_clients().await;
+                    listeners.clear();
+                    listeners = session.shared_client_revision_listeners().await;
+                    let interrupted = {
+                        let refresh = async {
+                            futures::future::join_all(changed.into_iter().map(|server| {
+                                let session = &session;
+                                async move {
+                                    session.refresh_inherited_catalog_until_ready(&server).await;
+                                }
+                            }))
+                            .await;
+                            session.refresh_mcp_snapshot_and_schedule_reminder().await;
+                        };
+                        tokio::pin!(refresh);
+                        tokio::select! {
+                            result = changes.changed() => Some(result.is_err()),
+                            _ = &mut refresh => None,
+                        }
+                    };
+                    // Never keep the session alive while waiting for the next
+                    // parent event; the task is owned by that session.
+                    drop(session);
+                    let closed = match interrupted {
+                        Some(closed) => closed,
+                        None => changes.changed().await.is_err(),
+                    };
+                    if closed {
+                        if let Some(session) = actor.upgrade() {
+                            session.reconcile_shared_mcp_pool().await;
+                        }
+                        break;
+                    }
+                }
+                drop(listeners);
+            }),
+        )]
+    }
+
+    async fn shared_client_revision_listeners(
         self: &std::sync::Arc<Self>,
     ) -> Vec<tokio_util::task::AbortOnDropHandle<()>> {
         let subscriptions: Vec<_> = {
@@ -163,11 +230,70 @@ impl SessionActor {
                 tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_local(async move {
                     while changes.changed().await.is_ok() {
                         let Some(actor) = actor.upgrade() else { break };
-                        actor.refresh_changed_mcp_catalog(&server).await;
+                        actor.refresh_inherited_catalog_until_ready(&server).await;
                     }
                 }))
             })
             .collect()
+    }
+
+    async fn refresh_inherited_catalog_until_ready(&self, server: &str) {
+        let mut delay = std::time::Duration::from_millis(250);
+        loop {
+            self.refresh_changed_mcp_catalog(server).await;
+            let pending = {
+                let state = self.mcp_state.lock().await;
+                state.shared_epoch(server).is_some() && !state.shared_catalog_ready(server)
+            };
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+        }
+    }
+
+    async fn sync_shared_mcp_clients(&self) -> Vec<String> {
+        let mut state = self.mcp_state.lock().await;
+        let changed = state.sync_shared_clients();
+        let mut removed = std::collections::HashMap::new();
+        for server in &changed {
+            if state.owned_clients.contains_key(server) {
+                continue;
+            }
+            let prefix = format!(
+                "{}{}",
+                server,
+                crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+            );
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .unregister_tools_by_prefix(&prefix);
+            state
+                .mcp_tool_meta
+                .retain(|name, _| !name.starts_with(&prefix));
+            state
+                .mcp_tool_icons
+                .retain(|name, _| !name.starts_with(&prefix));
+            state
+                .disabled_tool_registrations
+                .retain(|name, _| !name.starts_with(&prefix));
+            if state.get_client(server).is_none() {
+                removed.insert(server.clone(), Vec::new());
+            }
+        }
+        drop(state);
+        self.emit_mcp_tools_changed_notifications(removed);
+        changed
+    }
+
+    async fn reconcile_shared_mcp_pool(&self) {
+        let changed = self.sync_shared_mcp_clients().await;
+        for server in changed {
+            self.refresh_changed_mcp_catalog(&server).await;
+        }
+        self.refresh_mcp_snapshot_and_schedule_reminder().await;
     }
 
     /// Register tools from shared (inherited) MCP clients on this session's ToolBridge.
@@ -316,12 +442,26 @@ impl SessionActor {
                 server_name
             ));
         }
+        client
+            .ensure_initialized()
+            .await
+            .map_err(|e| format!("Failed to initialize after auth: {}", e))?;
+        let revision = client.catalog_revision();
         let mcp_state_arc = self.mcp_state.clone();
         let registrations = client
             .get_tool_registrations(mcp_state_arc)
             .await
             .map_err(|e| format!("Failed to get tools after auth: {}", e))?;
         let mut mcp_state = self.mcp_state.lock().await;
+        if client.catalog_revision() != revision
+            || !mcp_state
+                .get_client(server_name)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &client))
+        {
+            return Err(format!(
+                "MCP server '{server_name}' changed during authentication"
+            ));
+        }
         mcp_state.auth_required.remove(server_name);
         mcp_state.clear_init_failed(server_name);
         let mut ui_tools: std::collections::HashMap<
@@ -350,7 +490,7 @@ impl SessionActor {
         server_name: &str,
         discovery: McpOauthDiscovery,
     ) -> Result<std::sync::Arc<crate::session::mcp_servers::McpClient>, String> {
-        let (server_config, meta_config, event_tx) = {
+        let (server_config, meta_config, event_tx, generation, previous_client) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
                 .configs
@@ -366,7 +506,13 @@ impl SessionActor {
             }
             let meta_config = mcp_state.meta_config_map.get(server_name).cloned();
             let event_tx = mcp_state.client_event_tx();
-            (server_config, meta_config, event_tx)
+            (
+                server_config,
+                meta_config,
+                event_tx,
+                mcp_state.generation(),
+                mcp_state.owned_clients.get(server_name).cloned(),
+            )
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
@@ -412,6 +558,18 @@ impl SessionActor {
         let arc = std::sync::Arc::new(new_client);
         {
             let mut mcp_state = self.mcp_state.lock().await;
+            let current = mcp_state.owned_clients.get(server_name);
+            let same_client = match (previous_client.as_ref(), current) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => std::sync::Arc::ptr_eq(previous, current),
+                _ => false,
+            };
+            if mcp_state.generation() != generation || !same_client {
+                arc.set_liveness_handle(None);
+                return Err(format!(
+                    "MCP server '{server_name}' changed during OAuth setup"
+                ));
+            }
             mcp_state
                 .owned_clients
                 .insert(server_name.to_string(), arc.clone());
@@ -480,10 +638,14 @@ impl SessionActor {
                     .saturating_add(5),
             );
             let mcp_state_arc = self.mcp_state.clone();
-            let registrations = match tokio::time::timeout(
-                init_budget,
-                client.get_tool_registrations(mcp_state_arc),
-            )
+            let registrations = match tokio::time::timeout(init_budget, async {
+                client.ensure_initialized().await?;
+                let revision = client.catalog_revision();
+                client
+                    .get_tool_registrations(mcp_state_arc)
+                    .await
+                    .map(|registrations| (revision, registrations))
+            })
             .await
             .unwrap_or_else(|_| {
                 Err(crate::session::mcp_servers::McpError::Timeout {
@@ -501,7 +663,15 @@ impl SessionActor {
                     continue;
                 }
             };
+            let (revision, registrations) = registrations;
             let mut mcp_state = self.mcp_state.lock().await;
+            if client.catalog_revision() != revision
+                || !mcp_state
+                    .get_client(server_name)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &client))
+            {
+                continue;
+            }
             mcp_state.auth_required.remove(server_name);
             let mut ui_tools: std::collections::HashMap<
                 String,
@@ -1159,7 +1329,7 @@ impl SessionActor {
     /// SIGKILLs the spawned child — and returns an explicit error so
     /// the auto-restart loop can emit `Reason::Disabled`.
     pub(crate) async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        let (server_config, meta_config, event_tx) = {
+        let (server_config, meta_config, event_tx, generation, previous_client) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
                 .configs
@@ -1171,7 +1341,13 @@ impl SessionActor {
                 .ok_or_else(|| format!("no stdio config entry for server '{server}'"))?;
             let meta_config = mcp_state.meta_config_map.get(server).cloned();
             let event_tx = mcp_state.client_event_tx();
-            (server_config, meta_config, event_tx)
+            (
+                server_config,
+                meta_config,
+                event_tx,
+                mcp_state.generation(),
+                mcp_state.owned_clients.get(server).cloned(),
+            )
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
@@ -1242,6 +1418,16 @@ impl SessionActor {
         }
         {
             let mut mcp_state = self.mcp_state.lock().await;
+            let current = mcp_state.owned_clients.get(server);
+            let same_client = match (previous_client.as_ref(), current) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => std::sync::Arc::ptr_eq(previous, current),
+                _ => false,
+            };
+            if mcp_state.generation() != generation || !same_client {
+                arc_client.set_liveness_handle(None);
+                return Err(format!("server '{server}' changed during respawn"));
+            }
             mcp_state
                 .owned_clients
                 .insert(server.to_string(), arc_client);
@@ -1325,9 +1511,17 @@ impl SessionActor {
             mcp_state.set_event_writer(self.events.writer());
             if mcp_state.disabled_tools.is_empty() {
                 let cwd = std::path::Path::new(&self.session_info.cwd);
-                let dt = crate::util::config::get_all_mcp_disabled_tools(cwd);
+                let mut dt = crate::util::config::get_all_mcp_disabled_tools(cwd);
                 if !dt.is_empty() {
                     tracing::info!(servers = dt.len(), "Loaded disabled_tools from config");
+                    // Inherited servers use the parent's live mask; keeping a
+                    // second spawn-time copy would prevent later re-enabling.
+                    dt.retain(|name, _| !mcp_state.inherits_name(name));
+                    for (name, disabled) in &dt {
+                        mcp_state
+                            .owned_clients
+                            .set_disabled_tools(name, disabled.clone());
+                    }
                     mcp_state.disabled_tools = dt;
                 }
             }
@@ -1548,6 +1742,7 @@ impl SessionActor {
             let st = self.mcp_state.lock().await;
             st.shared_clients
                 .iter()
+                .filter(|_| st.inherited_pool().is_none())
                 .map(|(n, c)| (n.clone(), std::sync::Arc::clone(c)))
                 .collect()
         };

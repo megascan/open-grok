@@ -52,6 +52,9 @@ pub(super) async fn dispatch_tool(
             })?;
             let mut extensions = xai_tool_runtime::TypedExtensions::new();
             extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
+            if let Some(binding) = &prepared.mcp_binding {
+                extensions.insert(binding.clone());
+            }
             let call_id: &str =
                 if xai_grok_sampling_types::conversation::decode_codex_function_call_id(
                     &prepared.call_id,
@@ -104,6 +107,7 @@ pub(super) async fn dispatch_tool(
         xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
         None,
         None,
+        None,
     )
     .await
 }
@@ -116,6 +120,9 @@ pub(super) async fn dispatch_observed(
     slot: xai_grok_tools::types::source_summary::SourceSummarySlot,
     sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
     delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
+    mailbox_receipt_slot: Option<
+        xai_grok_tools::implementations::grok_build::task::types::MailboxReceiptSlot,
+    >,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
     let mut ctx = xai_tool_runtime::ToolCallContext::new(
         xai_tool_protocol::ToolCallId::new(prepared.tool_call_id.0.as_ref())
@@ -123,6 +130,12 @@ pub(super) async fn dispatch_observed(
     );
     ctx.insert(origin);
     ctx.insert(slot);
+    if let Some(binding) = &prepared.mcp_binding {
+        ctx.insert(binding.clone());
+    }
+    if let Some(slot) = mailbox_receipt_slot {
+        ctx.insert(slot);
+    }
     if let Some(plan_file) = &prepared.plan_file {
         ctx.insert(plan_file.clone());
     }
@@ -217,6 +230,7 @@ where
             xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
             sandbox_transport,
             delivery_scope,
+            None,
         )
         .await;
     };
@@ -228,6 +242,9 @@ where
         "dispatch_code_mode_nested_tool_streaming"
     );
     let mut extensions = xai_tool_runtime::TypedExtensions::new();
+    if let Some(binding) = &prepared.mcp_binding {
+        extensions.insert(binding.clone());
+    }
     if let Some(plan_file) = &prepared.plan_file {
         extensions.insert(plan_file.clone());
     }
@@ -812,6 +829,7 @@ mod tests {
 
     fn nested_prepared_call() -> PreparedToolCall {
         PreparedToolCall {
+            mcp_binding: None,
             plan_file: None,
             mcp_request_meta: None,
             call_id: "model-call-1".to_string(),
