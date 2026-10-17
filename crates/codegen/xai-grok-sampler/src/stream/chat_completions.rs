@@ -532,6 +532,9 @@ mod tests {
                         assert_eq!(text, "done");
                         saw_text = true;
                     }
+                    SamplingChannel::Narration => {
+                        panic!("chat completions never emits narration tokens")
+                    }
                 }
             }
         }

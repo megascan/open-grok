@@ -19,6 +19,9 @@ use crate::types::RequestId;
 pub enum SamplingChannel {
     Text,
     Reasoning,
+    /// A progress update the model wrote for the user between tool calls.
+    /// The deltas stream on `Reasoning`. The finished block is re-emitted whole on this channel.
+    Narration,
 }
 
 /// Why the in-flight request was stripped. What to do about it (e.g. persist

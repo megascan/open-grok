@@ -571,6 +571,40 @@ async fn channel_tokens_accumulate_into_streaming_capture() {
         })
         .await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn narration_is_visible_without_double_capture() {
+    use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+            *actor.current_prompt_id.lock().unwrap() = Some("prompt-narration".into());
+            let request_id = RequestId::random();
+            own_request(&actor, &request_id);
+            for channel in [SamplingChannel::Reasoning, SamplingChannel::Narration] {
+                actor
+                    .handle_sampling_event(SamplingEvent::ChannelToken {
+                        request_id: request_id.clone(),
+                        channel,
+                        text: "Working on the fix.".into(),
+                        chunk_index: 0,
+                    })
+                    .await;
+            }
+            let capture = actor.streaming_turn_capture.lock().clone();
+            assert_eq!(capture.reasoning_text, "Working on the fix.");
+            assert!(capture.response_text.is_empty());
+            let mut displayed = false;
+            while let Ok(event) = fixture.event_rx.try_recv() {
+                if let SessionEvent::Notification(SessionNotification::Acp(notification)) = event {
+                    displayed |= extract_text(&notification).as_deref()
+                        == Some("\n\nWorking on the fix.\n\n");
+                }
+            }
+            assert!(displayed, "narration must be sent to the client");
+        })
+        .await;
+}
 /// A same-prompt `StreamStarted` restart (a doomloop retry) must accumulate a
 /// second generation through the real `handle_sampling_event` path rather than
 /// wipe the first — guards the `if cap.prompt_id != prompt_id` branch in the

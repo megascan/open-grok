@@ -4028,6 +4028,22 @@ impl SessionActor {
                     });
                     self.send_thought_chunk(text, chunk_index).await;
                 }
+                SamplingChannel::Narration => {
+                    // The reasoning deltas were already captured. This complete
+                    // block is displayed as narration without recording it twice.
+                    self.emit_event(crate::session::events::Event::PhaseChanged {
+                        phase: crate::session::events::Phase::StreamingText,
+                    });
+                    self.send_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(format!(
+                                "\n\n{text}\n\n"
+                            ))),
+                        )),
+                        Some(chunk_index),
+                    )
+                    .await;
+                }
             },
             SamplingEvent::ToolCallDelta {
                 request_id,
