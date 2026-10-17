@@ -20,12 +20,18 @@ pub(crate) fn parse_existing_config_toml(s: &str) -> Result<TomlValue, toml::de:
 }
 /// Settings-save body. Caller must hold [`ConfigWriteGuard`].
 /// Re-resolve `dest` before publish. A retarget must not merge A onto B.
-async fn save_config_locked(
+async fn save_config_locked<A>(
     guard: ConfigWriteGuard,
     slot: &Path,
     dest: BoundDest,
-    config: &Config,
-) -> Result<()> {
+    before: &Config,
+    after: &Config,
+    explicit_fields: &[&str],
+    after_write: A,
+) -> Result<()>
+where
+    A: FnOnce() + Send + 'static,
+{
     let dest = require_same_user_config_dest(slot, &dest)?;
     let mut root: TomlValue = match tokio::fs::read_to_string(dest.as_path()).await {
         Ok(s) => match parse_existing_config_toml(&s) {
@@ -50,43 +56,15 @@ async fn save_config_locked(
     if !matches!(root, TomlValue::Table(_)) {
         root = TomlValue::Table(TomlMap::new());
     }
-    let table = root.as_table_mut().expect("root must be a table");
-    merge_section(table, "cli", &config.cli);
-    merge_section(table, "models", &config.models);
-    // `merge_section` deliberately preserves absent serialized fields so
-    // unmodeled future keys survive a settings write. These two fields are
-    // modeled `Option`s with an explicit Settings clear action, so `None` is a
-    // tombstone rather than "leave the old value alone".
-    if let Some(TomlValue::Table(models)) = table.get_mut("models") {
-        if config.models.recap.is_none() {
-            models.remove("recap");
-        }
-        if config.models.memory.is_none() {
-            models.remove("memory");
-        }
-    }
-    merge_section(table, "ui", &config.ui);
-    merge_section(table, "harness", &config.harness);
-    merge_section(table, "session", &config.session);
-    merge_ask_user_question_section(table, &config.ask_user_question);
-    merge_perplexity_web_search_section(table, &config.perplexity_web_search);
-    merge_toolset_subsection(table, "web_search_source", &config.web_search_source);
-    merge_toolset_subsection(table, "x_search", &config.x_search);
-    if config.privacy == super::mcp::PrivacyConfig::default() {
-        table.remove("privacy");
-    } else {
-        merge_section(table, "privacy", &config.privacy);
-    }
-
-    if config.skills == SkillsConfig::default() {
-        table.remove("skills");
-    } else {
-        merge_section(table, "skills", &config.skills);
-    }
+    apply_config_changes(&mut root, before, after, explicit_fields)?;
     let toml_str = toml::to_string_pretty(&root)?;
     let dest = require_same_user_config_dest(slot, &dest)?;
     guard
-        .run_blocking(move || atomic_write_resolved_string(&dest, &toml_str))
+        .run_blocking(move || {
+            atomic_write_resolved_string(&dest, &toml_str)?;
+            after_write();
+            Ok::<(), std::io::Error>(())
+        })
         .await
         .map_err(|e| anyhow::anyhow!("config write task failed: {e}"))??;
     Ok(())
@@ -267,6 +245,7 @@ pub(crate) fn atomic_write_resolved_string(dest: &BoundDest, content: &str) -> s
 /// deliberately NOT merged wholesale — it carries runtime-only structs
 /// (`web_search` sampler etc.) whose serialized defaults must never land in
 /// the user file — so only this settings-writable sub-table round-trips.
+#[cfg(test)]
 fn merge_ask_user_question_section(
     table: &mut TomlMap<String, TomlValue>,
     ask: &crate::tools::config::AskUserQuestionToolConfig,
@@ -285,6 +264,7 @@ fn merge_ask_user_question_section(
     }
 }
 
+#[cfg(test)]
 fn merge_perplexity_web_search_section(
     table: &mut TomlMap<String, TomlValue>,
     perplexity: &crate::tools::config::PerplexityWebSearchToolConfig,
@@ -294,6 +274,7 @@ fn merge_perplexity_web_search_section(
 
 /// Merge a serializable value into `[toolset.<key>]`, recovering from a
 /// non-table `toolset` scalar the same way `merge_section` does.
+#[cfg(test)]
 fn merge_toolset_subsection<T: serde::Serialize>(
     table: &mut TomlMap<String, TomlValue>,
     key: &str,
@@ -330,6 +311,7 @@ fn merge_toml_tables(
         }
     }
 }
+#[cfg(test)]
 fn merge_section<T: serde::Serialize>(
     table: &mut TomlMap<String, TomlValue>,
     key: &str,
@@ -352,18 +334,273 @@ fn merge_section<T: serde::Serialize>(
         }
     }
 }
+
+/// A read-time fallback must not turn a malformed section into write-time
+/// defaults. Do not include serde's error text: it may contain a secret.
+fn validate_writable_sections(root: &TomlValue) -> Result<()> {
+    fn validate<T: serde::de::DeserializeOwned>(root: &TomlValue, path: &[&str]) -> Result<()> {
+        let mut value = root;
+        for part in path {
+            let Some(table) = value.as_table() else {
+                anyhow::bail!("cannot save settings: [{}] must be a table", path.join("."));
+            };
+            let Some(next) = table.get(*part) else {
+                return Ok(());
+            };
+            value = next;
+        }
+        let _: T = value.clone().try_into().map_err(|_| {
+            anyhow::anyhow!("cannot save settings: invalid [{}] section", path.join("."))
+        })?;
+        Ok(())
+    }
+
+    validate::<crate::agent::config::CliConfig>(root, &["cli"])?;
+    validate::<crate::agent::config::ModelsConfig>(root, &["models"])?;
+    validate::<crate::agent::config::UiConfig>(root, &["ui"])?;
+    validate::<crate::agent::config::HarnessConfig>(root, &["harness"])?;
+    validate::<crate::agent::config::SessionConfig>(root, &["session"])?;
+    validate::<SkillsConfig>(root, &["skills"])?;
+    validate::<super::mcp::PrivacyConfig>(root, &["privacy"])?;
+    validate::<crate::tools::config::AskUserQuestionToolConfig>(
+        root,
+        &["toolset", "ask_user_question"],
+    )?;
+    validate::<crate::tools::config::PerplexityWebSearchToolConfig>(
+        root,
+        &["toolset", "perplexity_web_search"],
+    )?;
+    validate::<crate::tools::config::WebSearchSourceConfig>(
+        root,
+        &["toolset", "web_search_source"],
+    )?;
+    validate::<crate::tools::config::XSearchToolConfig>(root, &["toolset", "x_search"])?;
+    Ok(())
+}
+
+/// Serialize only the sections writable through `update_config`.
+fn writable_config_snapshot(config: &Config) -> Result<TomlValue> {
+    let mut root = TomlMap::new();
+    root.insert("cli".into(), TomlValue::try_from(&config.cli)?);
+    root.insert("models".into(), TomlValue::try_from(&config.models)?);
+    root.insert("ui".into(), TomlValue::try_from(&config.ui)?);
+    root.insert("harness".into(), TomlValue::try_from(&config.harness)?);
+    root.insert("session".into(), TomlValue::try_from(&config.session)?);
+    root.insert("skills".into(), TomlValue::try_from(&config.skills)?);
+    root.insert("privacy".into(), TomlValue::try_from(&config.privacy)?);
+    let mut toolset = TomlMap::new();
+    toolset.insert(
+        "ask_user_question".into(),
+        TomlValue::try_from(&config.ask_user_question)?,
+    );
+    toolset.insert(
+        "perplexity_web_search".into(),
+        TomlValue::try_from(&config.perplexity_web_search)?,
+    );
+    toolset.insert(
+        "web_search_source".into(),
+        TomlValue::try_from(&config.web_search_source)?,
+    );
+    toolset.insert("x_search".into(), TomlValue::try_from(&config.x_search)?);
+    root.insert("toolset".into(), TomlValue::Table(toolset));
+    Ok(TomlValue::Table(root))
+}
+
+fn collect_config_changes(
+    before: Option<&TomlValue>,
+    after: Option<&TomlValue>,
+    path: &mut Vec<String>,
+    changes: &mut Vec<(Vec<String>, Option<TomlValue>)>,
+) {
+    if before == after {
+        return;
+    }
+    let before_table = before.and_then(TomlValue::as_table);
+    let after_table = after.and_then(TomlValue::as_table);
+    if (before.is_none() || before_table.is_some()) && (after.is_none() || after_table.is_some()) {
+        let keys: std::collections::BTreeSet<_> = before_table
+            .into_iter()
+            .flat_map(|table| table.keys())
+            .chain(after_table.into_iter().flat_map(|table| table.keys()))
+            .collect();
+        for key in keys {
+            path.push(key.clone());
+            collect_config_changes(
+                before_table.and_then(|table| table.get(key)),
+                after_table.and_then(|table| table.get(key)),
+                path,
+                changes,
+            );
+            path.pop();
+        }
+    } else {
+        changes.push((path.clone(), after.cloned()));
+    }
+}
+
+fn set_raw_config_path(root: &mut TomlValue, path: &[String], value: Option<TomlValue>) {
+    let Some((key, parents)) = path.split_last() else {
+        return;
+    };
+    let mut current = root;
+    for part in parents {
+        if value.is_none() {
+            let Some(next) = current.as_table_mut().and_then(|table| table.get_mut(part)) else {
+                return;
+            };
+            current = next;
+        } else {
+            if !current.is_table() {
+                *current = TomlValue::Table(TomlMap::new());
+            }
+            current = current
+                .as_table_mut()
+                .expect("table just created")
+                .entry(part.clone())
+                .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+        }
+    }
+    if let Some(table) = current.as_table_mut() {
+        if let Some(value) = value {
+            table.insert(key.clone(), value);
+        } else {
+            table.remove(key);
+        }
+    }
+}
+
+fn apply_config_changes(
+    raw: &mut TomlValue,
+    before: &Config,
+    after: &Config,
+    explicit_fields: &[&str],
+) -> Result<()> {
+    let before = writable_config_snapshot(before)?;
+    let after = writable_config_snapshot(after)?;
+    let mut changes = Vec::new();
+    collect_config_changes(Some(&before), Some(&after), &mut Vec::new(), &mut changes);
+    for (path, value) in changes {
+        let value = preserve_unchanged_array_entries(raw, &before, &path, value);
+        set_raw_config_path(raw, &path, value);
+    }
+    for field in explicit_fields {
+        let path: Vec<String> = field.split('.').map(str::to_owned).collect();
+        let value = path
+            .iter()
+            .try_fold(&after, |value, part| value.get(part))
+            .cloned();
+        let value = preserve_unchanged_array_entries(raw, &before, &path, value);
+        set_raw_config_path(raw, &path, value);
+    }
+    Ok(())
+}
+
+/// An edited list may contain unchanged values that originated as `$VAR`.
+/// Retain their original spelling, matching each original occurrence at most
+/// once; new entries use the caller's value. Non-string or reshaped arrays do
+/// not have this correspondence and are replaced normally.
+fn preserve_unchanged_array_entries(
+    raw: &TomlValue,
+    before: &TomlValue,
+    path: &[String],
+    value: Option<TomlValue>,
+) -> Option<TomlValue> {
+    let Some(TomlValue::Array(new)) = value.as_ref() else {
+        return value;
+    };
+    let raw_array = path
+        .iter()
+        .try_fold(raw, |value, part| value.get(part))
+        .and_then(TomlValue::as_array);
+    let old_array = path
+        .iter()
+        .try_fold(before, |value, part| value.get(part))
+        .and_then(TomlValue::as_array);
+    let (Some(raw_array), Some(old_array)) = (raw_array, old_array) else {
+        return value;
+    };
+    if raw_array.len() != old_array.len()
+        || raw_array.iter().any(|item| !item.is_str())
+        || old_array.iter().any(|item| !item.is_str())
+        || new.iter().any(|item| !item.is_str())
+    {
+        return value;
+    }
+    let mut used = vec![false; old_array.len()];
+    Some(TomlValue::Array(
+        new.iter()
+            .map(|item| {
+                if let Some(index) = old_array
+                    .iter()
+                    .enumerate()
+                    .position(|(index, old)| !used[index] && old == item)
+                {
+                    used[index] = true;
+                    raw_array[index].clone()
+                } else {
+                    item.clone()
+                }
+            })
+            .collect(),
+    ))
+}
 /// Update settings with a read-modify-write, preserving unrelated fields.
 pub async fn update_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
+    update_config_fields_and_then(&[], f, || {}).await
+}
+
+/// Publish a setting and update its process-local cache while the same write
+/// guard is still held. Cancelled waits cannot reorder the cache after a later
+/// writer, and a failed write never applies the callback.
+pub(crate) async fn update_config_and_then<F, A>(f: F, after_write: A) -> Result<()>
+where
+    F: FnOnce(&mut Config),
+    A: FnOnce() + Send + 'static,
+{
+    update_config_fields_and_then(&[], f, after_write).await
+}
+
+/// Persist an explicitly selected field even when it equals the typed default.
+pub(crate) async fn update_config_fields<F>(fields: &[&str], f: F) -> Result<()>
+where
+    F: FnOnce(&mut Config),
+{
+    update_config_fields_and_then(fields, f, || {}).await
+}
+
+async fn update_config_fields_and_then<F, A>(fields: &[&str], f: F, after_write: A) -> Result<()>
+where
+    F: FnOnce(&mut Config),
+    A: FnOnce() + Send + 'static,
+{
     let guard = lock_config_writes().await?;
     let path = user_config_path();
-    let dest = bind_user_config_dest(&path)?;
-    let root: TomlValue = crate::config::load_config_file(dest.as_path())?;
-    let mut cfg = load_config_from_toml(&root);
+    update_config_fields_at(&path, guard, fields, f, after_write).await
+}
+
+async fn update_config_fields_at<F, A>(
+    path: &Path,
+    guard: ConfigWriteGuard,
+    fields: &[&str],
+    f: F,
+    after_write: A,
+) -> Result<()>
+where
+    F: FnOnce(&mut Config),
+    A: FnOnce() + Send + 'static,
+{
+    let dest = bind_user_config_dest(path)?;
+    // Expand environment references for typed parsing, but never apply version
+    // patches to the base that a settings write will modify.
+    let root = xai_grok_config::load_toml_file(dest.as_path())?;
+    validate_writable_sections(&root)?;
+    let before = load_config_from_toml(&root);
+    let mut cfg = before.clone();
     f(&mut cfg);
-    save_config_locked(guard, &path, dest, &cfg).await
+    save_config_locked(guard, path, dest, &before, &cfg, fields, after_write).await
 }
 
 fn parse_user_config_root(contents: &str, path: &std::path::Path) -> Result<TomlValue> {
@@ -501,6 +738,251 @@ pub(crate) fn persist_custom_model_delete_at(path: &std::path::Path, key: &str) 
 }
 #[cfg(test)]
 mod tests {
+    async fn config_guard_for_test(home: &std::path::Path) -> super::ConfigWriteGuard {
+        let save = super::SAVE_LOCK.lock().await;
+        let flock = super::acquire_init_lock(home).unwrap();
+        super::ConfigWriteGuard {
+            _save: save,
+            _flock: flock,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_write_preserves_env_references_and_version_scoped_values() {
+        let _env = xai_grok_test_support::EnvGuard::set("OG_CONFIG_TEST_TOKEN", "test-secret");
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ui]\ncompact_mode = false\n[models.extra_headers]\nAuthorization = 'Bearer $OG_CONFIG_TEST_TOKEN'\n\n[[version_overrides]]\nminimum_version = '0.0.0'\n[version_overrides.ui]\ncompact_mode = true\n",
+        )
+        .unwrap();
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| {
+                cfg.ui.show_timestamps = Some(true);
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("test-secret"));
+        let root: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            root["models"]["extra_headers"]["Authorization"].as_str(),
+            Some("Bearer $OG_CONFIG_TEST_TOKEN")
+        );
+        assert_eq!(root["ui"]["compact_mode"].as_bool(), Some(false));
+        assert_eq!(root["ui"]["show_timestamps"].as_bool(), Some(true));
+        assert_eq!(
+            root["version_overrides"][0]["ui"]["compact_mode"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_write_preserves_env_backed_model_list_entries() {
+        let _env = xai_grok_test_support::EnvGuard::set("OG_CONFIG_TEST_MODEL", "vendor/model-a");
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[models]\nopenrouter_enabled_models = ['$OG_CONFIG_TEST_MODEL', 'vendor/remove']\nopencode_go_enabled_models = ['$OG_CONFIG_TEST_MODEL']\n",
+        )
+        .unwrap();
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| {
+                cfg.models.openrouter_enabled_models =
+                    vec!["vendor/model-a".into(), "vendor/model-b".into()];
+                cfg.models
+                    .opencode_go_enabled_models
+                    .push("vendor/model-c".into());
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("vendor/model-a"));
+        let root: toml::Value = toml::from_str(&saved).unwrap();
+        let router = root["models"]["openrouter_enabled_models"]
+            .as_array()
+            .unwrap();
+        let go = root["models"]["opencode_go_enabled_models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            router
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["$OG_CONFIG_TEST_MODEL", "vendor/model-b"]
+        );
+        assert_eq!(
+            go.iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["$OG_CONFIG_TEST_MODEL", "vendor/model-c"]
+        );
+
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| cfg.models.openrouter_enabled_models = vec!["vendor/model-b".into()],
+            || {},
+        )
+        .await
+        .unwrap();
+        let root: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["models"]["openrouter_enabled_models"][0].as_str(),
+            Some("vendor/model-b")
+        );
+        assert_eq!(
+            root["models"]["openrouter_enabled_models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_write_failure_keeps_live_caches_unchanged() {
+        use super::super::settings_writes as settings;
+        struct Restore((u8, u64, u8));
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                settings::restore_setting_cache_snapshot(self.0);
+            }
+        }
+        let _restore = Restore(settings::setting_cache_snapshot());
+        settings::set_follow_up_steer_cache(false);
+        settings::set_stream_tool_calls_preference(false);
+        let before = settings::setting_cache_snapshot();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let invalid = "[models]\ndefault_reasoning_effort = 'invalid'\n";
+        std::fs::write(&path, invalid).unwrap();
+
+        let result = super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| cfg.ui.follow_up_behavior = Some("steer".into()),
+            || settings::set_follow_up_steer_cache(true),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(settings::setting_cache_snapshot(), before);
+        let result = super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| cfg.ui.stream_tool_calls = Some(true),
+            || settings::set_stream_tool_calls_preference(true),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(settings::setting_cache_snapshot(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+
+        std::fs::write(
+            &path,
+            "[ui]\nfollow_up_behavior = 'queue'\nstream_tool_calls = false\n",
+        )
+        .unwrap();
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| cfg.ui.follow_up_behavior = Some("steer".into()),
+            || settings::set_follow_up_steer_cache(true),
+        )
+        .await
+        .unwrap();
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &[],
+            |cfg| cfg.ui.stream_tool_calls = Some(true),
+            || settings::set_stream_tool_calls_preference(true),
+        )
+        .await
+        .unwrap();
+        let after = settings::setting_cache_snapshot();
+        assert_ne!(after.0, before.0);
+        assert_ne!(after.2, before.2);
+        let root: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["ui"]["follow_up_behavior"].as_str(), Some("steer"));
+        assert_eq!(root["ui"]["stream_tool_calls"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn settings_write_rejects_invalid_typed_sections_without_changing_file() {
+        for original in [
+            "[models]\ndefault_reasoning_effort = 'invalid'\nrecap = 'foo'\nmemory = 'bar'\n",
+            "[ui]\ncode_mode = 'unknown'\ncompact_mode = true\n",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("config.toml");
+            std::fs::write(&path, original).unwrap();
+            let error = super::update_config_fields_at(
+                &path,
+                config_guard_for_test(home.path()).await,
+                &[],
+                |cfg| cfg.ui.show_timestamps = Some(true),
+                || {},
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("invalid ["));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_write_applies_explicit_clears_and_default_values() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[models]\nrecap = 'foo'\nmemory = 'bar'\nopencode_go_enabled_models = ['model']\n[ui]\ndouble_click_action = 'word_select'\nselection_highlight_duration_ms = 0\n").unwrap();
+        super::update_config_fields_at(
+            &path,
+            config_guard_for_test(home.path()).await,
+            &["ui.compact_mode"],
+            |cfg| {
+                cfg.models.recap = None;
+                cfg.models.opencode_go_enabled_models.clear();
+                cfg.ui.keep_text_selection = Some("hold".into());
+                cfg.ui.double_click_action = None;
+                cfg.ui.selection_highlight_duration_ms = None;
+                cfg.ui.compact_mode = false;
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        let root: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["models"].get("recap").is_none());
+        assert!(root["models"].get("opencode_go_enabled_models").is_none());
+        assert_eq!(root["models"]["memory"].as_str(), Some("bar"));
+        assert!(root["ui"].get("double_click_action").is_none());
+        assert!(root["ui"].get("selection_highlight_duration_ms").is_none());
+        assert_eq!(root["ui"]["keep_text_selection"].as_str(), Some("hold"));
+        assert_eq!(root["ui"]["compact_mode"].as_bool(), Some(false));
+    }
+
     #[test]
     fn codex_context_save_replaces_the_previous_override_coordinate() {
         let mut root: toml::Value =

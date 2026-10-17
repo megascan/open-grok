@@ -1,6 +1,7 @@
 use super::mcp::user_config_path;
 use super::persist::{
     atomic_write_string, lock_config_writes, read_to_string_or_empty, update_config,
+    update_config_and_then, update_config_fields,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -233,7 +234,10 @@ pub async fn set_local_feature_flag(key: &'static str, value: bool) -> Result<()
 // ---------------------------------------------------------------------------
 
 pub async fn set_perplexity_web_search_enabled(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.perplexity_web_search.enabled = value).await
+    update_config_fields(&["toolset.perplexity_web_search.enabled"], |cfg| {
+        cfg.perplexity_web_search.enabled = value
+    })
+    .await
 }
 
 /// Persist `[toolset.web_search_source].<target>` via `update_config`.
@@ -246,11 +250,14 @@ pub async fn set_web_search_source(
 
 /// Persist `[toolset.x_search].enabled` via `update_config`.
 pub async fn set_x_search_enabled(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.x_search.enabled = value).await
+    update_config_fields(&["toolset.x_search.enabled"], |cfg| {
+        cfg.x_search.enabled = value
+    })
+    .await
 }
 
 // Settings helpers — typed disk-write wrappers for each setting.
-// All route through `update_config` → `merge_section` → `save_config`.
+// Typed updates are applied as field changes to the raw config.
 // ---------------------------------------------------------------------------
 
 // Process-wide cache for `[ui].follow_up_behavior == "steer"`.
@@ -332,7 +339,7 @@ pub async fn follow_up_steer_enabled() -> bool {
 
 /// Persist `[ui].compact_mode` via `update_config`.
 pub async fn set_compact_mode(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.ui.compact_mode = value).await
+    update_config_fields(&["ui.compact_mode"], |cfg| cfg.ui.compact_mode = value).await
 }
 
 /// Persist `[ui].show_timestamps` via `update_config`. `UiConfig::show_timestamps`
@@ -431,9 +438,12 @@ pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
 
 /// Persist `[ui].follow_up_behavior` (`"queue"` | `"steer"`).
 pub async fn set_follow_up_behavior(value: String) -> Result<()> {
-    // Keep the hot-path cache in sync before the disk write returns.
-    set_follow_up_steer_cache(value == "steer");
-    update_config(|cfg| cfg.ui.follow_up_behavior = Some(value)).await
+    let steer = value == "steer";
+    update_config_and_then(
+        |cfg| cfg.ui.follow_up_behavior = Some(value),
+        move || set_follow_up_steer_cache(steer),
+    )
+    .await
 }
 
 /// Persist `[ui].enter_steers` via `update_config`.
@@ -547,7 +557,10 @@ pub async fn set_default_model(value: String) -> Result<()> {
 /// Runtime clients apply the same selection through the ACP extension after
 /// this write succeeds, so they can own rollback if live application fails.
 pub async fn set_kimi_endpoint(endpoint: crate::kimi_models::KimiApiEndpoint) -> Result<()> {
-    update_config(|cfg| cfg.models.kimi_endpoint = endpoint).await
+    update_config_fields(&["models.kimi_endpoint"], |cfg| {
+        cfg.models.kimi_endpoint = endpoint
+    })
+    .await
 }
 
 /// String boundary for Settings clients. Only canonical `platform` and `code`
@@ -644,7 +657,7 @@ pub async fn set_fork_secondary_model(value: String) -> Result<()> {
             MAX_DEFAULT_MODEL_LEN
         );
     }
-    update_config(|cfg| {
+    update_config_fields(&["ui.fork_secondary_model"], |cfg| {
         cfg.ui.fork_secondary_model = if value.is_empty() {
             crate::models::default_model().to_string()
         } else {
@@ -663,7 +676,10 @@ const MAX_THOUGHTS_WIDTH_SHELL_MAX: i64 = 500;
 /// Defensively clamps to `[40, 500]` at the shell boundary.
 pub async fn set_max_thoughts_width(value: i64) -> Result<()> {
     let clamped = value.clamp(MAX_THOUGHTS_WIDTH_SHELL_MIN, MAX_THOUGHTS_WIDTH_SHELL_MAX) as u16;
-    update_config(|cfg| cfg.ui.max_thoughts_width = clamped).await
+    update_config_fields(&["ui.max_thoughts_width"], |cfg| {
+        cfg.ui.max_thoughts_width = clamped
+    })
+    .await
 }
 
 /// Persist `[ui].scroll_speed` via `update_config`.
@@ -737,6 +753,22 @@ const STREAM_TOOL_CALLS_ON: u8 = 1;
 
 static STREAM_TOOL_CALLS_PREFERENCE: AtomicU8 = AtomicU8::new(STREAM_TOOL_CALLS_UNSET);
 
+#[cfg(test)]
+pub(super) fn setting_cache_snapshot() -> (u8, u64, u8) {
+    (
+        FOLLOW_UP_STEER_CACHE.load(Ordering::Relaxed),
+        FOLLOW_UP_STEER_MTIME_NS.load(Ordering::Relaxed),
+        STREAM_TOOL_CALLS_PREFERENCE.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn restore_setting_cache_snapshot(snapshot: (u8, u64, u8)) {
+    FOLLOW_UP_STEER_CACHE.store(snapshot.0, Ordering::Relaxed);
+    FOLLOW_UP_STEER_MTIME_NS.store(snapshot.1, Ordering::Relaxed);
+    STREAM_TOOL_CALLS_PREFERENCE.store(snapshot.2, Ordering::Relaxed);
+}
+
 /// Live user preference for requesting incremental tool-call argument
 /// streaming. Defaults ON. `[ui].stream_tool_calls` wins; `[models].stream_tool_calls`
 /// is a fallback when the UI field is unset.
@@ -794,8 +826,11 @@ fn parse_env_bool(name: &str) -> Option<bool> {
 
 /// Persist `[ui].stream_tool_calls` and update the live preference.
 pub async fn set_stream_tool_calls(value: bool) -> Result<()> {
-    set_stream_tool_calls_preference(value);
-    update_config(|cfg| cfg.ui.stream_tool_calls = Some(value)).await
+    update_config_and_then(
+        |cfg| cfg.ui.stream_tool_calls = Some(value),
+        move || set_stream_tool_calls_preference(value),
+    )
+    .await
 }
 
 /// Persist `[ui].prompt_suggestions` via `update_config`.
