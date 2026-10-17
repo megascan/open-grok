@@ -3417,6 +3417,64 @@ fn undo_stack_depth_capped() {
 }
 
 #[test]
+fn undo_history_is_bounded_by_bytes_across_stack_and_redo() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 96;
+    for i in 0..10 {
+        ta.set_text(&format!("{i}{}", "x".repeat(30)));
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+    while ta.undo() {
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+    while ta.redo() {
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+}
+
+#[test]
+fn oversized_deleted_paste_does_not_remain_in_undo_history() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 64;
+    ta.set_text(&"large paste".repeat(100));
+    ta.set_text("");
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.redo.is_empty());
+    assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+}
+
+#[test]
+fn oversized_group_can_cancel_but_is_not_retained_after_commit() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 64;
+    let paste = "large paste".repeat(100);
+    ta.set_text(&paste);
+    ta.begin_undo_group();
+    ta.set_text("");
+    ta.cancel_undo_group();
+    assert_eq!(ta.text(), paste);
+    ta.begin_undo_group();
+    ta.set_text("");
+    ta.end_undo_group();
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.group_checkpoint.is_none());
+}
+
+#[test]
+fn oversized_element_display_is_counted_in_undo_history() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 128;
+    ta.insert_element(
+        "x",
+        ElementKind(1),
+        Some(Line::from("large display".repeat(100))),
+    );
+    ta.set_text("");
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+}
+
+#[test]
 fn undo_set_text_restores_previous() {
     let mut ta = TextArea::new();
     ta.insert_str("hello");

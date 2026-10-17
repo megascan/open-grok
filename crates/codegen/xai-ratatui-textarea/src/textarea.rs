@@ -286,6 +286,29 @@ struct UndoEntry {
     elements: Vec<TextElement>,
 }
 
+impl UndoEntry {
+    fn memory_bytes(&self) -> usize {
+        let mut bytes = self.text.capacity().saturating_add(
+            self.elements
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TextElement>()),
+        );
+        for element in &self.elements {
+            if let Some(line) = &element.display {
+                bytes = bytes.saturating_add(
+                    line.spans
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ratatui::text::Span<'static>>()),
+                );
+                for span in &line.spans {
+                    bytes = bytes.saturating_add(span.content.len());
+                }
+            }
+        }
+        bytes
+    }
+}
+
 /// What kind of mutation is being performed. Used for batching consecutive
 /// same-kind operations into a single undo step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +331,7 @@ struct UndoState {
     stack: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
     max_depth: usize,
+    max_bytes: usize,
     /// The kind of the last mutation that was checkpointed.
     last_kind: Option<MutationKind>,
     /// Cursor position *after* the last mutation completed.
@@ -330,11 +354,61 @@ impl Default for UndoState {
             stack: Vec::new(),
             redo: Vec::new(),
             max_depth: 100,
+            max_bytes: 1024 * 1024,
             last_kind: None,
             last_cursor: 0,
             last_insert_ws: false,
             group_depth: 0,
             group_checkpoint: None,
+        }
+    }
+}
+
+impl UndoState {
+    fn retained_bytes(&self) -> usize {
+        self.stack
+            .iter()
+            .chain(&self.redo)
+            .fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_bytes())
+            })
+    }
+
+    fn push_stack(&mut self, entry: UndoEntry) {
+        if entry.memory_bytes() > self.max_bytes {
+            // No older state may remain reachable across a missing checkpoint.
+            self.stack.clear();
+            return;
+        }
+        self.stack.push(entry);
+        while self.stack.len() > self.max_depth {
+            self.stack.remove(0);
+        }
+        while self.retained_bytes() > self.max_bytes {
+            if !self.stack.is_empty() {
+                self.stack.remove(0);
+            } else if !self.redo.is_empty() {
+                self.redo.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn push_redo(&mut self, entry: UndoEntry) {
+        if entry.memory_bytes() > self.max_bytes {
+            self.redo.clear();
+            return;
+        }
+        self.redo.push(entry);
+        while self.retained_bytes() > self.max_bytes {
+            if !self.redo.is_empty() {
+                self.redo.remove(0);
+            } else if !self.stack.is_empty() {
+                self.stack.remove(0);
+            } else {
+                break;
+            }
         }
     }
 }
@@ -2183,14 +2257,11 @@ impl TextArea {
             }
         };
 
+        self.undo.redo.clear();
         if should_push {
             let entry = self.snapshot();
-            self.undo.stack.push(entry);
-            if self.undo.stack.len() > self.undo.max_depth {
-                self.undo.stack.remove(0);
-            }
+            self.undo.push_stack(entry);
         }
-        self.undo.redo.clear();
         self.undo.last_kind = Some(kind);
     }
 
@@ -2221,7 +2292,7 @@ impl TextArea {
         if let Some(entry) = self.undo.stack.pop() {
             self.scroll_override = None;
             let current = self.snapshot();
-            self.undo.redo.push(current);
+            self.undo.push_redo(current);
             self.restore(entry);
             // Reset batching — next mutation starts a fresh group.
             self.undo.last_kind = None;
@@ -2237,7 +2308,7 @@ impl TextArea {
         if let Some(entry) = self.undo.redo.pop() {
             self.scroll_override = None;
             let current = self.snapshot();
-            self.undo.stack.push(current);
+            self.undo.push_stack(current);
             self.restore(entry);
             // Reset batching — next mutation starts a fresh group.
             self.undo.last_kind = None;
@@ -2287,11 +2358,8 @@ impl TextArea {
                     || checkpoint.cursor != self.cursor()
                     || checkpoint.elements.len() != self.elements.len();
                 if changed {
-                    self.undo.stack.push(checkpoint);
-                    if self.undo.stack.len() > self.undo.max_depth {
-                        self.undo.stack.remove(0);
-                    }
                     self.undo.redo.clear();
+                    self.undo.push_stack(checkpoint);
                 }
             }
             // Reset batching state so the next mutation starts fresh.
