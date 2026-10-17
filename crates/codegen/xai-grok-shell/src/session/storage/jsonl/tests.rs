@@ -2696,6 +2696,43 @@ async fn usage_json_rewrites_session_and_appends_turns() {
 }
 
 #[tokio::test]
+async fn concurrent_usage_turns_preserve_every_writer() {
+    use crate::session::usage_file::UsageSummary;
+    let temp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(12));
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let adapter = adapter.clone();
+        let info = info.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let live = UsageSummary { input_tokens: 1, model_calls: 1, ..Default::default() };
+            barrier.wait().await;
+            adapter.record_usage_turn(&info, 1, "now".into(), &live, None, (None, None)).await.unwrap()
+        }));
+    }
+    let mut written = Vec::new();
+    for task in tasks { written.push(task.await.unwrap().1.unwrap()); }
+    written.sort_unstable();
+    written.dedup();
+    assert_eq!(written.len(), 12);
+    let usage = adapter.read_usage(&info).await.unwrap().unwrap();
+    assert_eq!(usage.turns.len(), 12);
+    assert_eq!(usage.session.input_tokens, 12);
+    assert_eq!(usage.session.turn_count, 12);
+
+    let current = UsageSummary { input_tokens: 2, model_calls: 2, ..Default::default() };
+    let previous = UsageSummary { input_tokens: 1, model_calls: 1, ..Default::default() };
+    adapter.record_usage_turn(&info, 1, "later".into(), &current, Some(&previous), (Some(1), Some(written[0]))).await.unwrap();
+    let usage = adapter.read_usage(&info).await.unwrap().unwrap();
+    assert_eq!(usage.turns.len(), 12);
+    assert_eq!(usage.session.input_tokens, 13);
+}
+
+#[tokio::test]
 async fn corrupt_usage_json_does_not_read_as_missing() {
     let temp_dir = TempDir::new().unwrap();
     let info = create_test_info();
@@ -2704,6 +2741,8 @@ async fn corrupt_usage_json_does_not_read_as_missing() {
     let path = adapter.session_dir(&info).join("usage.json");
     std::fs::write(&path, "{not-json").unwrap();
     let err = adapter.read_usage(&info).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let err = adapter.record_usage_turn(&info, 1, "now".into(), &Default::default(), None, (None, None)).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
 }

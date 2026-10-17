@@ -1525,6 +1525,54 @@ impl StorageAdapter for JsonlStorageAdapter {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         super::write_bytes_atomic_async(&self.usage_file(info), json).await
     }
+    async fn record_usage_turn(
+        &self,
+        info: &Info,
+        turn_number: u32,
+        ended_at: String,
+        live: &crate::session::usage_file::UsageSummary,
+        prev_live: Option<&crate::session::usage_file::UsageSummary>,
+        cursor: (Option<u32>, Option<u32>),
+    ) -> io::Result<(Option<u32>, Option<u32>)> {
+        let path = self.usage_file(info);
+        let session_id = info.id.to_string();
+        let live = live.clone();
+        let prev_live = prev_live.cloned();
+        tokio::task::spawn_blocking(move || {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "usage path has no parent")
+            })?;
+            std::fs::create_dir_all(parent)?;
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(parent.join("usage.json.lock"))?;
+            lock.lock_exclusive()?;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let mut file = if bytes.iter().all(u8::is_ascii_whitespace) {
+                crate::session::usage_file::SessionUsageFile::new(&session_id)
+            } else {
+                serde_json::from_slice::<crate::session::usage_file::SessionUsageFile>(&bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            };
+            file.session_id = session_id;
+            file.restore_apply_cursor(cursor.0, cursor.1);
+            file.apply_turn(turn_number, ended_at, &live, prev_live.as_ref());
+            let cursor = file.apply_cursor();
+            let json = serde_json::to_vec_pretty(&file)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            super::write_bytes_atomic(&path, &json)?;
+            Ok(cursor)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     async fn write_announcement_state(
         &self,
         info: &Info,

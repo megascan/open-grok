@@ -1298,6 +1298,17 @@ pub trait StorageAdapter: Send + Sync {
         usage: &crate::session::usage_file::SessionUsageFile,
     ) -> io::Result<()>;
 
+    /// Apply a turn to the latest usage on disk in one cross-process transaction.
+    async fn record_usage_turn(
+        &self,
+        info: &Info,
+        turn_number: u32,
+        ended_at: String,
+        live: &crate::session::usage_file::UsageSummary,
+        prev_live: Option<&crate::session::usage_file::UsageSummary>,
+        cursor: (Option<u32>, Option<u32>),
+    ) -> io::Result<(Option<u32>, Option<u32>)>;
+
     async fn write_announcement_state(
         &self,
         info: &Info,
