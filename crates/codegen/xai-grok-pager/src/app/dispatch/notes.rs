@@ -277,6 +277,7 @@ pub(super) fn dispatch_submit_feedback_modal(
         modal.mark_draft_submit_pending();
     } else {
         agent.feedback_modal = None;
+        agent.promote_pending_elicitation();
     }
     if let Some(notice) = dropped {
         agent.scrollback.push_block(RenderBlock::system(notice));

@@ -13,7 +13,6 @@ pub(crate) fn handle_mcp_elicit(
     ext: xai_acp_lib::AcpArgs<acp::ExtRequest>,
     app: &mut AppView,
 ) -> bool {
-    use crate::views::elicitation_view::ElicitationViewState;
     use xai_grok_tools::mcp_elicitation::McpElicitExtRequest;
 
     let ext_req: McpElicitExtRequest = match serde_json::from_str(ext.request.params.get()) {
@@ -49,37 +48,10 @@ pub(crate) fn handle_mcp_elicit(
         return false;
     };
 
-    let waiting = agent
-        .elicitation_view
-        .as_ref()
-        .is_some_and(|ev| ev.is_url_waiting());
-    if waiting {
-        if let Some((_, old_tx)) = agent.pending_elicitation.take() {
-            cancel_elicitation_request(old_tx);
-        }
-        agent.pending_elicitation = Some((ext_req, ext.response_tx));
-        return is_active;
-    }
-
-    if let Some((_, old_tx)) = agent.pending_elicitation.take() {
-        cancel_elicitation_request(old_tx);
-    }
-
-    if let Some(mut old) =
-        agent.take_unanswered_elicitation(crate::app::agent_view::UnansweredElicitation::Superseded)
-    {
-        if let Some(old_tx) = old.take_response_tx() {
-            cancel_elicitation_request(old_tx);
-        }
-        agent.restore_elicitation_prompt(old.stashed_prompt);
-    }
-
-    let stashed = agent.stash_prompt_for_elicitation();
-    agent.elicitation_view = Some(ElicitationViewState::from_request(
-        ext_req,
-        stashed,
-        Some(ext.response_tx),
-    ));
+    agent
+        .pending_elicitation
+        .push_back((ext_req, ext.response_tx));
+    agent.promote_pending_elicitation();
     agent.last_active_at = Some(std::time::Instant::now());
 
     tracing::info!(
@@ -157,7 +129,7 @@ pub(crate) fn handle_ask_user_question(
                 .expect("Cancelled serialization should not fail");
             old_tx.send(Ok(acp::ExtResponse::new(raw.into()))).ok();
         }
-        agent.restore_card_prompt(old_qv.stashed_prompt);
+        agent.restore_question_prompt(old_qv.stashed_prompt, old_qv.stashed_prompt_origin);
 
         // Local question displaced by an ACP ask, so surface why it vanished.
         // Any directive it carried is dropped; the user re-issues the command after answering.
@@ -186,13 +158,25 @@ pub(crate) fn handle_ask_user_question(
     }
 
     // Stash the composer so it comes back when this question closes.
-    agent.question_view = Some(QuestionViewState::with_response_tx(
+    use crate::views::question_view::QuestionPromptOrigin;
+    let origin = if let Some(permission) = agent.permission_queue.front() {
+        QuestionPromptOrigin::Permission(permission.id)
+    } else if let Some(plan) = agent.plan_approval_view.as_ref() {
+        QuestionPromptOrigin::Plan(plan.tool_call_id.clone())
+    } else if agent.elicitation_view.is_some() {
+        QuestionPromptOrigin::Elicitation
+    } else {
+        QuestionPromptOrigin::Session
+    };
+    let mut question = QuestionViewState::with_response_tx(
         ext_req.tool_call_id,
         ext_req.questions,
         agent.prompt.stash(),
         Some(ext.response_tx),
         ext_req.mode,
-    ));
+    );
+    question.stashed_prompt_origin = origin;
+    agent.question_view = Some(question);
 
     // Clear prompt for question interaction.
     agent.prompt.set_text("");
@@ -286,7 +270,23 @@ pub(super) fn handle_exit_plan_mode(
         return false;
     };
 
-    if let Some(mut old) = agent.plan_approval_view.take() {
+    // A plan review can take the composer while a question is still open.
+    // Keep that question's in-progress input separate from plan feedback.
+    if agent.question_view.is_some()
+        && agent.plan_approval_view.is_none()
+        && agent.permission_queue.is_empty()
+    {
+        let needs_parking = agent
+            .question_view
+            .as_ref()
+            .is_some_and(|q| q.parked_prompt.is_none());
+        if needs_parking {
+            let input = agent.prompt.stash();
+            agent.question_view.as_mut().unwrap().parked_prompt = Some(input);
+        }
+    }
+
+    let replacement_draft = if let Some(mut old) = agent.plan_approval_view.take() {
         tracing::warn!(
             old_tool_call_id = %old.tool_call_id,
             new_tool_call_id = %params.tool_call_id,
@@ -294,9 +294,24 @@ pub(super) fn handle_exit_plan_mode(
         );
         old.send_stale_cancel();
         agent.plan_next_comment_id = old.next_comment_id;
-        agent.prompt.restore(old.stashed_prompt);
         agent.line_viewer = None;
-    }
+        if !agent.permission_queue.is_empty()
+            && agent.question_view.as_ref().is_some_and(|q| {
+                q.parked_prompt.is_some()
+                    || matches!(
+                        &q.stashed_prompt_origin,
+                        crate::views::question_view::QuestionPromptOrigin::Plan(_)
+                    )
+            })
+        {
+            // Permission interrupted the old plan's feedback, not the new
+            // plan. Discard that stale input when the old plan is replaced.
+            agent.permission_stashed_prompt = None;
+        }
+        Some(old.stashed_prompt)
+    } else {
+        None
+    };
 
     // Dismiss competing overlays so plan approval owns the screen.
     // - active_modal: draw returns before line_viewer (plan never paints);
@@ -321,7 +336,28 @@ pub(super) fn handle_exit_plan_mode(
     // Permission open: session draft is `permission_stashed_prompt` (live is followup).
     // Otherwise: live composer is the session draft.
     let permission_still_open = !agent.permission_queue.is_empty();
-    let session_draft = if let Some(perm_draft) = agent.permission_stashed_prompt.take() {
+    let session_draft = if let Some(draft) = replacement_draft {
+        draft
+    } else if agent.question_view.is_some() && permission_still_open {
+        use crate::views::question_view::QuestionPromptOrigin;
+        let interrupted_question = agent.question_view.as_ref().is_some_and(|q| {
+            !matches!(
+                &q.stashed_prompt_origin,
+                QuestionPromptOrigin::Permission(_)
+            )
+        });
+        if interrupted_question {
+            // This stash belongs to the question that permission interrupted.
+            let input = agent.permission_stashed_prompt.take();
+            agent.question_view.as_mut().unwrap().parked_prompt = input;
+            crate::views::prompt_widget::StashedPrompt::default()
+        } else {
+            agent.permission_stashed_prompt.take().unwrap_or_default()
+        }
+    } else if agent.question_view.is_some() {
+        // The question owns the session draft until it closes.
+        crate::views::prompt_widget::StashedPrompt::default()
+    } else if let Some(perm_draft) = agent.permission_stashed_prompt.take() {
         let _permission_followup = agent.prompt.stash();
         perm_draft
     } else {
@@ -335,9 +371,11 @@ pub(super) fn handle_exit_plan_mode(
     if had_session_draft && !permission_still_open {
         agent.plan_freeform_prefill_deferred = false;
         agent.prompt.restore(session_draft.clone_for_live_prefill());
-    } else {
+    } else if !permission_still_open || agent.question_view.is_none() {
         agent.plan_freeform_prefill_deferred = permission_still_open;
         agent.prompt.set_text("");
+    } else {
+        agent.plan_freeform_prefill_deferred = true;
     }
 
     let state = PlanApprovalViewState::with_source(params, source, session_draft, ext.response_tx);

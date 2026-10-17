@@ -112,6 +112,7 @@ impl AgentView {
         match outcome {
             FeedbackModalOutcome::Cancel => {
                 self.feedback_modal = None;
+                self.promote_pending_elicitation();
                 InputOutcome::Changed
             }
             FeedbackModalOutcome::Submit => InputOutcome::Action(Action::SubmitFeedbackModal {
@@ -131,6 +132,7 @@ impl AgentView {
         }
         if outcome == FeedbackModalOutcome::Cancel {
             self.feedback_modal = None;
+            self.promote_pending_elicitation();
         }
         InputOutcome::Changed
     }

@@ -14,6 +14,28 @@ use crate::scrollback::blocks::SessionEvent;
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
 use std::time::Instant;
+
+/// Forking while an interaction is outstanding can detach its response from
+/// the original session. Wait until that session's cards have been resolved.
+fn fork_has_pending_interaction(agent: &AgentView) -> bool {
+    !agent.permission_queue.is_empty()
+        || agent.question_view.is_some()
+        || agent.plan_approval_view.is_some()
+        || agent.elicitation_view.is_some()
+        || !agent.pending_elicitation.is_empty()
+}
+
+fn refuse_pending_fork(app: &mut AppView, parent_id: AgentId) -> bool {
+    if app
+        .agents
+        .get(&parent_id)
+        .is_some_and(fork_has_pending_interaction)
+    {
+        app.show_toast("Finish the current approval or question before forking");
+        return true;
+    }
+    false
+}
 /// Top-level `/fork` dispatcher. Resolves the worktree decision: an
 /// explicit `--worktree` / `--no-worktree` flag short-circuits to
 /// [`dispatch_fork_resolved`]. When no flag is given and a persisted
@@ -48,6 +70,9 @@ pub(in crate::app::dispatch) fn dispatch_fork(
         app.show_toast("/fork only works inside a session");
         return vec![];
     };
+    if refuse_pending_fork(app, parent_id) {
+        return vec![];
+    }
     let (has_session, in_git_repo) = app
         .agents
         .get(&parent_id)
@@ -178,6 +203,9 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     let ActiveView::Agent(parent_id) = app.active_view else {
         return vec![];
     };
+    if refuse_pending_fork(app, parent_id) {
+        return vec![];
+    }
     let Some(parent) = app.agents.get(&parent_id) else {
         return vec![];
     };
@@ -366,6 +394,18 @@ pub(in crate::app::dispatch) fn dispatch_startup_fork_session(
     parent_cwd: Option<std::path::PathBuf>,
     new_session_id: Option<String>,
 ) -> Vec<Effect> {
+    let blocked = app.agents.values().any(|agent| {
+        agent
+            .session
+            .session_id
+            .as_ref()
+            .is_some_and(|sid| sid.0.as_ref() == parent_session_id)
+            && fork_has_pending_interaction(agent)
+    });
+    if blocked {
+        app.show_toast("Finish the current approval or question before forking");
+        return vec![];
+    }
     if !app.session_startup_allowed() {
         app.deferred_startup.session =
             Some(crate::app::session_startup::DeferredSessionStartup::Fork {

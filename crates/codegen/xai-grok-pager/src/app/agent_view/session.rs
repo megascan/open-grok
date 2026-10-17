@@ -323,7 +323,7 @@ impl AgentView {
             pending_feedback_trace_uploads: std::collections::VecDeque::new(),
             parked_feedback_trace_consents: std::collections::VecDeque::new(),
             elicitation_view: None,
-            pending_elicitation: None,
+            pending_elicitation: std::collections::VecDeque::new(),
             elicit_hits: Vec::new(),
             hit_question_scrollbar: Default::default(),
             hovered_question_item: None,

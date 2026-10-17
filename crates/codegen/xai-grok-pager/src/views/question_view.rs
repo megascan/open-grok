@@ -140,6 +140,15 @@ pub enum LocalQuestionKind {
 
 // ── State ──────────────────────────────────────────────────────────────
 
+/// Which input context owned the composer when a question stashed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QuestionPromptOrigin {
+    Session,
+    Permission(usize),
+    Plan(String),
+    Elicitation,
+}
+
 /// Complete state for the question view overlay. Created when an `x.ai/ask_user_question`
 /// ext-method request arrives; destroyed on submit, skip, or cancel. Not `Clone` because it owns a
 /// `oneshot::Sender` for the ACP response.
@@ -159,6 +168,9 @@ pub struct QuestionViewState {
     pub fullscreen: bool,
     /// Original prompt state, stashed on entry and restored on exit.
     pub stashed_prompt: StashedPrompt,
+    pub(crate) stashed_prompt_origin: QuestionPromptOrigin,
+    /// Question input temporarily parked while a plan review owns the composer.
+    pub(crate) parked_prompt: Option<StashedPrompt>,
 
     /// Cursor position per question (index into options + freeform row).
     pub per_question_cursor: Vec<usize>,
@@ -265,6 +277,8 @@ impl QuestionViewState {
             focus: QuestionFocus::Navigation,
             fullscreen: false,
             stashed_prompt,
+            stashed_prompt_origin: QuestionPromptOrigin::Session,
+            parked_prompt: None,
             per_question_cursor: vec![0; n],
             per_question_scroll: vec![0; n],
             per_question_freeform: vec![String::new(); n],

@@ -1404,7 +1404,7 @@ pub struct AgentView {
         crate::views::feedback_modal::ParkedFeedbackTraceConsent,
     )>,
     pub(crate) elicitation_view: Option<ElicitationViewState>,
-    pub(crate) pending_elicitation: Option<(
+    pub(crate) pending_elicitation: std::collections::VecDeque<(
         xai_grok_tools::mcp_elicitation::McpElicitExtRequest,
         tokio::sync::oneshot::Sender<xai_acp_lib::AcpResult<agent_client_protocol::ExtResponse>>,
     )>,

@@ -1072,7 +1072,7 @@ impl AgentView {
         }
         if let Some(qv) = self.question_view.take() {
             self.record_question_pause(&qv);
-            self.restore_card_prompt(qv.stashed_prompt);
+            self.restore_question_prompt(qv.stashed_prompt, qv.stashed_prompt_origin);
         }
         self.cleanup_question_state();
         crate::app::turn_completion::reopen_blocked_card_if_held(self);
@@ -1110,17 +1110,16 @@ impl AgentView {
             ) {
                 let _ = ev.take_response_tx();
                 self.restore_elicitation_prompt(ev.stashed_prompt);
+                self.promote_pending_elicitation();
             }
             return true;
         }
-        if self
+        if let Some(position) = self
             .pending_elicitation
-            .as_ref()
-            .is_some_and(|(req, _)| req.tool_call_id == tool_call_id)
+            .iter()
+            .position(|(req, _)| req.tool_call_id == tool_call_id)
         {
-            if let Some((_, tx)) = self.pending_elicitation.take() {
-                drop(tx);
-            }
+            self.pending_elicitation.remove(position);
             return true;
         }
         if self
@@ -1135,7 +1134,7 @@ impl AgentView {
             pav.send_stale_cancel();
             self.latest_inline_plan_content = None;
             self.plan_next_comment_id = pav.next_comment_id;
-            self.prompt.restore(pav.stashed_prompt);
+            self.restore_plan_prompt(pav.stashed_prompt);
             self.line_viewer = None;
             self.casual_commenting_range = None;
             self.casual_editing_comment_id = None;
@@ -1183,9 +1182,129 @@ impl AgentView {
         if self.permission_stashed_prompt.is_some() {
             self.permission_stashed_prompt = Some(stashed);
         } else if let Some(question_view) = self.question_view.as_mut() {
-            question_view.stashed_prompt = stashed;
+            use crate::views::question_view::QuestionPromptOrigin;
+            if matches!(
+                &question_view.stashed_prompt_origin,
+                QuestionPromptOrigin::Permission(_)
+            ) {
+                question_view.stashed_prompt = stashed;
+                question_view.stashed_prompt_origin =
+                    if let Some(plan) = self.plan_approval_view.as_ref() {
+                        QuestionPromptOrigin::Plan(plan.tool_call_id.clone())
+                    } else if self.elicitation_view.is_some() {
+                        QuestionPromptOrigin::Elicitation
+                    } else {
+                        QuestionPromptOrigin::Session
+                    };
+            } else {
+                // The permission parked the question's live input; the
+                // question already owns the earlier draft.
+                self.prompt.restore(stashed);
+            }
         } else {
             self.prompt.restore(stashed);
+        }
+    }
+    /// Return a question's composer to the context that owned it on entry.
+    pub(crate) fn restore_question_prompt(
+        &mut self,
+        stashed: crate::views::prompt_widget::StashedPrompt,
+        origin: crate::views::question_view::QuestionPromptOrigin,
+    ) {
+        use crate::views::question_view::QuestionPromptOrigin;
+        match origin {
+            QuestionPromptOrigin::Permission(id)
+                if self
+                    .permission_queue
+                    .front()
+                    .is_some_and(|permission| permission.id == id) =>
+            {
+                self.prompt.restore(stashed);
+            }
+            QuestionPromptOrigin::Permission(_) => {
+                // The permission has already closed; its followup is no longer active.
+            }
+            QuestionPromptOrigin::Plan(id)
+                if self
+                    .plan_approval_view
+                    .as_ref()
+                    .is_some_and(|plan| plan.tool_call_id == id) =>
+            {
+                if !self.permission_queue.is_empty() {
+                    self.permission_stashed_prompt = Some(stashed);
+                } else {
+                    self.prompt.restore(stashed);
+                }
+            }
+            QuestionPromptOrigin::Plan(_) | QuestionPromptOrigin::Elicitation => {
+                // The owning card has closed or still owns the actual session draft.
+            }
+            QuestionPromptOrigin::Session => {
+                if let Some(plan) = self.plan_approval_view.as_mut() {
+                    plan.stashed_prompt = stashed;
+                } else if !self.permission_queue.is_empty() {
+                    self.permission_stashed_prompt = Some(stashed);
+                } else {
+                    self.restore_card_prompt(stashed);
+                }
+            }
+        }
+    }
+
+    /// A plan's session draft must reach whichever interaction remains open.
+    pub(crate) fn restore_plan_prompt(
+        &mut self,
+        stashed: crate::views::prompt_widget::StashedPrompt,
+    ) {
+        use crate::views::question_view::QuestionPromptOrigin;
+        if let Some(question) = self.question_view.as_mut() {
+            let question_opened_during_plan = matches!(
+                &question.stashed_prompt_origin,
+                QuestionPromptOrigin::Plan(_)
+            );
+            match &question.stashed_prompt_origin {
+                QuestionPromptOrigin::Session | QuestionPromptOrigin::Elicitation => {}
+                QuestionPromptOrigin::Plan(_) => {
+                    question.stashed_prompt = stashed;
+                    question.stashed_prompt_origin = QuestionPromptOrigin::Session;
+                }
+                QuestionPromptOrigin::Permission(_) if !self.permission_queue.is_empty() => {
+                    self.permission_stashed_prompt = Some(stashed);
+                }
+                QuestionPromptOrigin::Permission(_) => {
+                    question.stashed_prompt = stashed;
+                    question.stashed_prompt_origin = QuestionPromptOrigin::Session;
+                }
+            }
+            if let Some(input) = question.parked_prompt.take() {
+                if self.permission_queue.is_empty() {
+                    self.prompt.restore(input);
+                } else {
+                    self.permission_stashed_prompt = Some(input);
+                }
+            } else if question_opened_during_plan {
+                // The plan owned the live composer throughout. Its feedback
+                // must not become freeform input for the waiting question.
+                if self.permission_queue.is_empty() {
+                    self.prompt.set_text("");
+                } else {
+                    self.permission_stashed_prompt = Some(Default::default());
+                }
+            }
+        } else if !self.permission_queue.is_empty() {
+            self.restore_permission_prompt(stashed);
+        } else {
+            self.restore_card_prompt(stashed);
+        }
+    }
+
+    fn restore_permission_prompt(&mut self, stashed: crate::views::prompt_widget::StashedPrompt) {
+        let existing_has_draft = self
+            .permission_stashed_prompt
+            .as_ref()
+            .is_some_and(|current| !current.is_effectively_empty());
+        if !stashed.is_effectively_empty() || !existing_has_draft {
+            self.permission_stashed_prompt = Some(stashed);
         }
     }
     /// Close out the bare `/feedback` pane: Enter sends the report, Esc drops it.
@@ -1209,7 +1328,7 @@ impl AgentView {
             return InputOutcome::Changed;
         }
         self.record_question_pause(&qv);
-        self.restore_card_prompt(qv.stashed_prompt);
+        self.restore_question_prompt(qv.stashed_prompt, qv.stashed_prompt_origin);
         self.cleanup_question_state();
         crate::app::turn_completion::reopen_blocked_card_if_held(self);
         if skipped {
@@ -1255,7 +1374,7 @@ impl AgentView {
             } else {
                 translate_local_submit(&qv, kind, skipped)
             };
-            self.prompt.restore(qv.stashed_prompt);
+            self.restore_question_prompt(qv.stashed_prompt, qv.stashed_prompt_origin);
             self.cleanup_question_state();
             if !answered_blocked_card {
                 crate::app::turn_completion::reopen_blocked_card_if_held(self);
@@ -1268,7 +1387,7 @@ impl AgentView {
             qv.build_accepted_response()
         };
         qv.send_ext_response(response);
-        self.prompt.restore(qv.stashed_prompt);
+        self.restore_question_prompt(qv.stashed_prompt, qv.stashed_prompt_origin);
         self.cleanup_question_state();
         let action = if skipped {
             "interview_skip"
@@ -1375,7 +1494,7 @@ impl AgentView {
         self.record_question_pause(&qv);
         let response = qv.build_accepted_response();
         qv.send_ext_response(response);
-        self.prompt.restore(qv.stashed_prompt);
+        self.restore_question_prompt(qv.stashed_prompt, qv.stashed_prompt_origin);
         self.cleanup_question_state();
         PeekAnswerOutcome::Submitted
     }

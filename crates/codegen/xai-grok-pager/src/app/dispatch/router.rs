@@ -1569,12 +1569,19 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             persist_mode,
         } => {
             let mut effects = dispatch_fork_resolved(app, worktree, directive);
-            apply_persist_worktree_mode(
-                &mut app.fork_worktree_mode,
-                &mut effects,
-                persist_mode,
-                "fork_worktree_mode",
-            );
+            if effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::ForkSession { .. } | Effect::CreateWorktreeSession { .. }
+                )
+            }) {
+                apply_persist_worktree_mode(
+                    &mut app.fork_worktree_mode,
+                    &mut effects,
+                    persist_mode,
+                    "fork_worktree_mode",
+                );
+            }
             effects
         }
         Action::NewSessionAnswered {

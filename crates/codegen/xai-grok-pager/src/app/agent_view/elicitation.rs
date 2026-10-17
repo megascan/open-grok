@@ -11,8 +11,6 @@ pub(crate) enum UnansweredElicitation {
     Cancelled,
     /// The server stopped waiting (its own timeout), or another window answered.
     ClosedElsewhere,
-    /// This window cancelled it to show a newer request.
-    Superseded,
 }
 
 impl AgentView {
@@ -294,13 +292,18 @@ impl AgentView {
 
     pub(crate) fn promote_pending_elicitation(&mut self) {
         use crate::views::elicitation_view::ElicitationViewState;
-        let Some((req, tx)) = self.pending_elicitation.take() else {
+        if self.elicitation_view.is_some() || self.feedback_modal.is_some() {
             return;
+        }
+        let (req, tx) = loop {
+            let Some((req, tx)) = self.pending_elicitation.pop_front() else {
+                return;
+            };
+            if !tx.is_closed() {
+                break (req, tx);
+            }
         };
         let stashed = self.stash_prompt_for_elicitation();
-        self.displace_feedback_modal(
-            crate::views::feedback_modal::FeedbackModalDisplacement::McpElicitation,
-        );
         self.elicitation_view = Some(ElicitationViewState::from_request(req, stashed, Some(tx)));
     }
 
@@ -420,9 +423,6 @@ impl AgentView {
             UnansweredElicitation::ClosedElsewhere => format!(
                 "MCP “{server}” request for input closed before it was answered here (it timed out or was answered elsewhere)."
             ),
-            UnansweredElicitation::Superseded => {
-                format!("Cancelled MCP “{server}” request for input to show a newer one.")
-            }
         };
         crate::app::mode_switch::push_block_behind_live_stream(
             &mut self.scrollback,
@@ -477,7 +477,19 @@ impl AgentView {
         stashed: Option<crate::views::prompt_widget::StashedPrompt>,
     ) {
         if let Some(stashed) = stashed {
-            self.restore_card_prompt(stashed);
+            use crate::views::question_view::QuestionPromptOrigin;
+            if let Some(question) = self.question_view.as_mut()
+                && question.stashed_prompt_origin == QuestionPromptOrigin::Elicitation
+            {
+                question.stashed_prompt = stashed;
+                question.stashed_prompt_origin = QuestionPromptOrigin::Session;
+            } else if let Some(plan) = self.plan_approval_view.as_mut() {
+                // A plan opened while this card held the session draft. Keep
+                // it on the plan, whose live composer may contain feedback.
+                plan.stashed_prompt = stashed;
+            } else {
+                self.restore_card_prompt(stashed);
+            }
         }
     }
 }
