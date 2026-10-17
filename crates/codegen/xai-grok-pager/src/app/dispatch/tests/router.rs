@@ -1,5 +1,29 @@
 //! Tests for the action router, model switching, slash commands, and other cross-cutting dispatch behavior.
 use super::*;
+
+#[test]
+fn plugin_partial_failure_keeps_error_and_reloads_successes() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, ModalMessage};
+    use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus, PluginsAction};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = Some(acp::SessionId::new("plugin-session"));
+    agent.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
+    let outcome = ActionOutcome {
+        status: OutcomeStatus::InternalError,
+        message: "first: updated\nsecond: update failed".into(),
+        requires_reload: true,
+        requires_restart: false,
+    };
+    let effects = crate::app::dispatch::router::dispatch_action_result(&mut app, id, Ok(outcome));
+    assert!(
+        matches!(effects.as_slice(), [Effect::PluginsAction { agent_id, action: PluginsAction::Reload, .. }] if *agent_id == id)
+    );
+    assert!(
+        matches!(app.agents[&id].extensions_modal.as_ref().unwrap().modal_message.as_ref(), Some(ModalMessage::Error(message)) if message.contains("update failed"))
+    );
+}
 #[test]
 fn auth_copy_dispatch_preserves_all_delivery_states() {
     for delivery in [

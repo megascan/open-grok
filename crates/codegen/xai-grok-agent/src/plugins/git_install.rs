@@ -645,6 +645,7 @@ pub fn cleanup_plugin_data(repo: &InstalledRepo, scope: super::discovery::Plugin
 /// 1. If `subdir` is specified, only look in that subdirectory
 /// 2. If root has plugin.json or convention components, it's a single plugin
 /// 3. Otherwise, scan immediate subdirectories for plugins
+#[cfg(test)]
 pub(super) fn discover_plugins_in_dir(
     root: &Path,
     subdir: Option<&str>,
@@ -803,17 +804,31 @@ pub enum UpdateStatus {
     LiveLocal,
 }
 
-/// Update an installed repo by fetching latest changes.
-///
-/// Update semantics (from design decision #6):
-/// - Branch installs: `git fetch` + fast-forward to remote branch head
-/// - Tag installs: pinned — no-op
-/// - Commit installs: pinned — no-op
-/// - Local installs: no-op (explicit update); [`super::local_refresh`] re-copies on session spawn / reload
-pub fn update_repo(
+/// Update an installed repo in an independent checkout, then publish its tree
+/// and registry record together. Network operations never hold the registry lock.
+pub fn update_registered_repo(
     repo_key: &str,
     repo: &InstalledRepo,
+    registry: &mut InstallRegistry,
     require_sha: bool,
+) -> Result<UpdateStatus, InstallError> {
+    update_registered_repo_with(
+        repo_key,
+        repo,
+        registry,
+        require_sha,
+        || {},
+        InstallRegistry::save_atomic,
+    )
+}
+
+fn update_registered_repo_with(
+    repo_key: &str,
+    repo: &InstalledRepo,
+    registry: &mut InstallRegistry,
+    require_sha: bool,
+    before_publish: impl FnOnce(),
+    save: impl FnOnce(&InstallRegistry) -> Result<(), InstallError>,
 ) -> Result<UpdateStatus, InstallError> {
     match &repo.kind {
         InstallKind::Local { .. } => Ok(UpdateStatus::LiveLocal),
@@ -838,19 +853,47 @@ pub fn update_repo(
             // An update pulls whatever the mutable ref now points at — the same
             // unpinned fetch the install gate refuses.
             ensure_pinned(require_sha, None, repo_key, url)?;
+            require_checkout_identity()?;
 
             let old_commit = Some(commit.clone());
 
-            // Git fetch + pull
-            let repo_path = &repo.path;
-            if !repo_path.is_dir() {
+            let identity =
+                super::install_registry::directory_identity(&repo.path).ok_or_else(|| {
+                    InstallError::InstallFailed {
+                        detail: format!(
+                            "repo directory not found or unsafe: {}",
+                            repo.path.display()
+                        ),
+                    }
+                })?;
+            let stage = StagingDir(create_staging_dir(registry)?);
+            #[cfg(windows)]
+            verify_readonly_cleanup(&stage.0)?;
+            copy_git_checkout(&repo.path, &stage.0).map_err(|source| InstallError::Io {
+                path: repo.path.clone(),
+                source,
+            })?;
+            let original = checkout_fingerprint(&stage.0)?;
+            if !super::install_registry::same_directory(&repo.path, &identity)
+                || checkout_fingerprint(&repo.path)? != original
+            {
                 return Err(InstallError::InstallFailed {
-                    detail: format!("repo directory not found: {}", repo_path.display()),
+                    detail: "plugin checkout changed while it was copied".into(),
                 });
             }
-
-            let mut cmd = xai_tty_utils::git_command();
-            cmd.args(["pull", "--ff-only"]).current_dir(repo_path);
+            let config = validate_git_checkout(&stage.0)?;
+            let git_config = StagedGitConfig::new(&stage.0, &config)?;
+            let mut cmd = staged_git_command(&stage.0)?;
+            git_config.isolate(&mut cmd);
+            cmd.args([
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                "pull",
+                "--ff-only",
+                "--no-recurse-submodules",
+            ]);
             let output = cmd.output().map_err(|e| InstallError::InstallFailed {
                 detail: format!("failed to run git pull: {e}"),
             })?;
@@ -865,11 +908,55 @@ pub fn update_repo(
                 });
             }
 
-            let new_commit = read_head_commit(repo_path);
+            // Filters were disabled for the pull. Do not publish files whose
+            // checkout requires a filter we deliberately did not execute.
+            git_config.validate_attributes(&stage.0)?;
+            git_config.restore()?;
+            if std::fs::symlink_metadata(stage.0.join(".gitmodules")).is_ok() {
+                return Err(InstallError::InstallFailed {
+                    detail: "Git submodules are unsupported for staged plugin updates".into(),
+                });
+            }
+
+            let new_commit = staged_head_commit(&stage.0)?;
             let changed = old_commit.as_deref() != new_commit.as_deref();
 
             // Re-discover plugins (new ones may have been added)
-            let plugins = discover_plugins_in_dir(repo_path, subdir.as_deref())?;
+            let plugins = discover_plugins_in_dir_as(&stage.0, subdir.as_deref(), &repo.path)?;
+
+            before_publish();
+            let validate_original = |path: &Path| {
+                if !super::install_registry::same_directory(path, &identity)
+                    || checkout_fingerprint(path)? != original
+                {
+                    return Err(InstallError::InstallFailed {
+                        detail: "plugin checkout changed during update".into(),
+                    });
+                }
+                Ok(())
+            };
+            if changed {
+                let mut updated = repo.clone();
+                if let InstallKind::Git { commit, .. } = &mut updated.kind {
+                    *commit = new_commit
+                        .clone()
+                        .ok_or_else(|| InstallError::InstallFailed {
+                            detail: "could not read updated plugin HEAD".into(),
+                        })?;
+                }
+                updated.updated_at = chrono::Utc::now().to_rfc3339();
+                updated.plugins = repo_plugin_map(&plugins);
+                registry.publish_staged_if_matches_checked(
+                    repo_key,
+                    repo,
+                    updated,
+                    &stage.0,
+                    validate_original,
+                    save,
+                )?;
+            } else {
+                registry.validate_selected(repo_key, repo, validate_original)?;
+            }
 
             Ok(UpdateStatus::Updated(UpdateResult {
                 repo_key: repo_key.to_string(),
@@ -880,6 +967,483 @@ pub fn update_repo(
             }))
         }
     }
+}
+
+/// Copy every regular file and symlink without following links or sharing Git
+/// objects. Reject Git layouts which may refer to another working tree.
+fn copy_git_checkout(source: &Path, dest: &Path) -> std::io::Result<()> {
+    fn copy(source: &Path, dest: &Path, rel: &Path) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(source)?;
+        if meta.file_type().is_symlink() {
+            if rel.starts_with(".git") || rel.file_name().is_some_and(|n| n == ".git") {
+                return Err(std::io::Error::other(
+                    "symlink in Git metadata is unsupported",
+                ));
+            }
+            let target = std::fs::read_link(source)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, dest)?;
+            #[cfg(not(unix))]
+            {
+                let _ = target;
+                return Err(std::io::Error::other(
+                    "symlinked checkout is unsupported on this platform",
+                ));
+            }
+        } else if meta.is_dir() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o200 == 0 {
+                    return Err(std::io::Error::other(
+                        "read-only checkout directories are unsupported",
+                    ));
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            if meta.permissions().readonly() {
+                return Err(std::io::Error::other(
+                    "read-only checkout directories are unsupported",
+                ));
+            }
+            if !rel.as_os_str().is_empty()
+                && rel.file_name().is_some_and(|n| n == ".git")
+                && rel != Path::new(".git")
+            {
+                return Err(std::io::Error::other("nested Git checkout is unsupported"));
+            }
+            std::fs::create_dir_all(dest)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                copy(
+                    &entry.path(),
+                    &dest.join(entry.file_name()),
+                    &rel.join(entry.file_name()),
+                )?;
+            }
+            std::fs::set_permissions(dest, meta.permissions())?;
+        } else if meta.is_file() {
+            #[cfg(not(any(unix, windows)))]
+            if meta.permissions().readonly() {
+                return Err(std::io::Error::other(
+                    "read-only checkout files are unsupported",
+                ));
+            }
+            if rel.file_name().is_some_and(|n| n == ".git") {
+                return Err(std::io::Error::other(
+                    "external Git directory or submodule is unsupported",
+                ));
+            }
+            if rel.starts_with(".git")
+                && rel
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().ends_with(".lock"))
+            {
+                return Err(std::io::Error::other("Git checkout has an active lock"));
+            }
+            std::fs::copy(source, dest)?;
+            std::fs::set_permissions(dest, meta.permissions())?;
+        } else {
+            return Err(std::io::Error::other(
+                "special file in plugin checkout is unsupported",
+            ));
+        }
+        Ok(())
+    }
+    copy(source, dest, Path::new(""))
+}
+
+// Rust's Windows remove_dir_all uses the ignore-readonly disposition on
+// supported filesystems. Verify it on this volume before staging a checkout,
+// so a committed transaction cannot strand its read-only Git objects.
+#[cfg(windows)]
+fn verify_readonly_cleanup(stage: &Path) -> Result<(), InstallError> {
+    let probe = stage.join(".open-grok-cleanup-probe");
+    let file = probe.join("readonly");
+    let run = || -> std::io::Result<()> {
+        std::fs::create_dir(&probe)?;
+        std::fs::write(&file, b"probe")?;
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions)?;
+        std::fs::remove_dir_all(&probe)
+    };
+    if let Err(source) = run() {
+        // Only this disposable probe is changed on failure.
+        if let Ok(metadata) = std::fs::metadata(&file) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(&file, permissions);
+        }
+        let _ = std::fs::remove_dir_all(&probe);
+        return Err(InstallError::Io {
+            path: probe,
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn require_checkout_identity() -> Result<(), InstallError> {
+    #[cfg(any(unix, windows))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(InstallError::InstallFailed {
+            detail: "staged Git updates require a filesystem with stable directory identity".into(),
+        })
+    }
+}
+
+/// Content and mode snapshot, including ignored files, Git metadata and links.
+fn checkout_fingerprint(root: &Path) -> Result<Vec<u8>, InstallError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    fn walk(path: &Path, rel: &Path, hash: &mut Sha256) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(path)?;
+        let name = rel
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("non-UTF-8 checkout path is unsupported"))?;
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            hash.update(meta.permissions().mode().to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        hash.update([u8::from(meta.permissions().readonly())]);
+        if meta.file_type().is_symlink() {
+            hash.update(b"l");
+            let target = std::fs::read_link(path)?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("non-UTF-8 symlink target is unsupported"))?;
+            hash.update((target.len() as u64).to_le_bytes());
+            hash.update(target.as_bytes());
+        } else if meta.is_dir() {
+            hash.update(b"d");
+            let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                walk(&entry.path(), &rel.join(entry.file_name()), hash)?;
+            }
+        } else if meta.is_file() {
+            hash.update(b"f");
+            hash.update(meta.len().to_le_bytes());
+            let mut file = std::fs::File::open(path)?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let count = file.read(&mut buf)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buf[..count]);
+            }
+        } else {
+            return Err(std::io::Error::other(
+                "special file in plugin checkout is unsupported",
+            ));
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    walk(root, Path::new(""), &mut hash).map_err(|source| InstallError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    Ok(hash.finalize().to_vec())
+}
+
+fn staged_git_command(stage: &Path) -> Result<std::process::Command, InstallError> {
+    let stage = std::fs::canonicalize(stage).map_err(|source| InstallError::Io {
+        path: stage.to_path_buf(),
+        source,
+    })?;
+    let mut cmd = xai_tty_utils::git_command_locking();
+    // Inherited Git environment can point even an otherwise independent copy at
+    // the original index, object database, config or working tree.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            cmd.env_remove(key);
+        }
+    }
+    // Match git_command's hermetic Git installation, without inheriting an
+    // unrelated GIT_EXEC_PATH from the surrounding process.
+    if let Some(path) = std::env::var_os("GIT_BIN_PATH") {
+        let path = PathBuf::from(path);
+        let path = if path.is_relative() {
+            std::env::current_dir().unwrap_or_default().join(path)
+        } else {
+            path
+        };
+        if path.file_name().is_some_and(|name| name == "git") {
+            if let Some(parent) = path.parent() {
+                cmd.env("GIT_EXEC_PATH", parent);
+            }
+        }
+    }
+    cmd.env("GIT_DIR", stage.join(".git"))
+        .env("GIT_WORK_TREE", &stage)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .current_dir(stage);
+    Ok(cmd)
+}
+
+fn validate_git_checkout(stage: &Path) -> Result<Vec<(String, String)>, InstallError> {
+    let git_dir = stage.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return Err(InstallError::InstallFailed {
+            detail: "plugin checkout must have an independent .git directory".into(),
+        });
+    }
+    for path in [
+        "commondir",
+        "worktrees",
+        "modules",
+        "config.worktree",
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+    ] {
+        if std::fs::symlink_metadata(git_dir.join(path)).is_ok() {
+            return Err(InstallError::InstallFailed {
+                detail: format!("unsupported Git metadata: {path}"),
+            });
+        }
+    }
+    if std::fs::symlink_metadata(stage.join(".gitmodules")).is_ok() {
+        return Err(InstallError::InstallFailed {
+            detail: "Git submodules are unsupported for staged plugin updates".into(),
+        });
+    }
+    if std::fs::symlink_metadata(git_dir.join("hooks")).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(InstallError::InstallFailed {
+            detail: "symlinked Git hooks are unsupported for staged plugin updates".into(),
+        });
+    }
+    if std::fs::symlink_metadata(git_dir.join("info/attributes"))
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(InstallError::InstallFailed {
+            detail: "symlinked Git attributes are unsupported for staged plugin updates".into(),
+        });
+    }
+    if let Ok(entries) = std::fs::read_dir(git_dir.join("hooks")) {
+        for entry in entries {
+            let entry = entry.map_err(|source| InstallError::Io {
+                path: git_dir.join("hooks"),
+                source,
+            })?;
+            if entry.file_name().to_string_lossy().ends_with(".sample") {
+                continue;
+            }
+            let meta =
+                std::fs::symlink_metadata(entry.path()).map_err(|source| InstallError::Io {
+                    path: entry.path(),
+                    source,
+                })?;
+            #[cfg(unix)]
+            let active = {
+                use std::os::unix::fs::PermissionsExt;
+                meta.is_file() && meta.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let active = meta.is_file();
+            if active {
+                return Err(InstallError::InstallFailed {
+                    detail: "active Git hooks are unsupported for staged plugin updates".into(),
+                });
+            }
+        }
+    }
+    let output = staged_git_command(stage)?
+        .args(["config", "--null", "--list", "--includes"])
+        .output()
+        .map_err(|source| InstallError::Io {
+            path: git_dir.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(InstallError::InstallFailed {
+            detail: "unable to inspect Git configuration for staged update".into(),
+        });
+    }
+    let mut config = Vec::new();
+    for item in output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let mut parts = item.splitn(2, |b| *b == b'\n');
+        let key = parts.next().unwrap_or_default();
+        let original_key = std::str::from_utf8(key).map_err(|_| InstallError::InstallFailed {
+            detail: "non-UTF-8 Git config key".into(),
+        })?;
+        let key = original_key.to_ascii_lowercase();
+        // A key without an explicit value means true in Git config.
+        let value = std::str::from_utf8(parts.next().unwrap_or(b"true")).map_err(|_| {
+            InstallError::InstallFailed {
+                detail: "non-UTF-8 Git config value".into(),
+            }
+        })?;
+        if key == "core.worktree"
+            || key == "core.hookspath"
+            || key == "core.fsmonitor"
+            || key == "core.attributesfile"
+            || key == "extensions.worktreeconfig"
+            || key.starts_with("include.")
+            || key.starts_with("includeif.")
+            || (key.starts_with("merge.") && key.ends_with(".driver"))
+            || (key.starts_with("diff.")
+                && (key.ends_with(".command") || key.ends_with(".textconv")))
+            || (key.starts_with("remote.") && key.ends_with(".uploadpack"))
+        {
+            return Err(InstallError::InstallFailed {
+                detail: format!("unsupported Git configuration for staged update: {key}"),
+            });
+        }
+        if !key.starts_with("filter.") {
+            config.push((original_key.to_owned(), value.to_owned()));
+        }
+    }
+    Ok(config)
+}
+
+/// Freeze the effective configuration for the network operation. This keeps
+/// auth and proxy settings while preventing a concurrently modified machine
+/// configuration from adding an executable filter during the checkout.
+struct StagedGitConfig {
+    local: PathBuf,
+    original: Vec<u8>,
+    empty_global: PathBuf,
+    config: Vec<(String, String)>,
+}
+
+impl StagedGitConfig {
+    fn new(stage: &Path, config: &[(String, String)]) -> Result<Self, InstallError> {
+        let local = stage.join(".git/config");
+        if !std::fs::symlink_metadata(&local)
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+        {
+            return Err(InstallError::InstallFailed {
+                detail: "Git config must be an independent regular file".into(),
+            });
+        }
+        let io_error = |source| InstallError::Io {
+            path: local.clone(),
+            source,
+        };
+        let original = std::fs::read(&local).map_err(io_error)?;
+        let empty_global = stage.join(".git/.open-grok-update-global");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&empty_global)
+            .map_err(|source| InstallError::Io {
+                path: empty_global.clone(),
+                source,
+            })?;
+        // The effective configuration may contain global credentials. Keep it
+        // in the child environment, never in a crash-orphaned staging tree.
+        std::fs::write(&local, b"").map_err(io_error)?;
+        Ok(Self {
+            local,
+            original,
+            empty_global,
+            config: config.to_vec(),
+        })
+    }
+
+    fn isolate(&self, command: &mut std::process::Command) {
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &self.empty_global);
+        command.env("GIT_CONFIG_COUNT", self.config.len().to_string());
+        for (i, (key, value)) in self.config.iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{i}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{i}"), value);
+        }
+    }
+
+    fn validate_attributes(&self, stage: &Path) -> Result<(), InstallError> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let fail = || InstallError::InstallFailed {
+            detail: "unable to inspect Git filter attributes for staged update".into(),
+        };
+        let mut files = staged_git_command(stage)?;
+        self.isolate(&mut files);
+        let files = files
+            .args(["ls-files", "-z"])
+            .output()
+            .map_err(|_| fail())?;
+        if !files.status.success() {
+            return Err(fail());
+        }
+        let mut attrs = staged_git_command(stage)?;
+        self.isolate(&mut attrs);
+        let mut attrs = attrs
+            .args(["check-attr", "-z", "--stdin", "filter"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| fail())?;
+        let mut stdin = attrs.stdin.take().ok_or_else(fail)?;
+        let input = files.stdout;
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let output = attrs.wait_with_output().map_err(|_| fail())?;
+        writer.join().map_err(|_| fail())?.map_err(|_| fail())?;
+        if !output.status.success() {
+            return Err(fail());
+        }
+        let fields: Vec<_> = output.stdout.split(|b| *b == 0).collect();
+        if fields
+            .chunks_exact(3)
+            .any(|triple| triple[2] != b"unspecified" && triple[2] != b"unset")
+        {
+            return Err(InstallError::InstallFailed {
+                detail: "Git filter attributes are unsupported for staged plugin updates".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn restore(self) -> Result<(), InstallError> {
+        std::fs::write(&self.local, self.original).map_err(|source| InstallError::Io {
+            path: self.local,
+            source,
+        })?;
+        std::fs::remove_file(&self.empty_global).map_err(|source| InstallError::Io {
+            path: self.empty_global,
+            source,
+        })?;
+        Ok(())
+    }
+}
+
+fn staged_head_commit(stage: &Path) -> Result<Option<String>, InstallError> {
+    let output = staged_git_command(stage)?
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|source| InstallError::Io {
+            path: stage.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(InstallError::InstallFailed {
+            detail: "could not read plugin HEAD".into(),
+        });
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
 }
 
 /// Recursively copy a directory tree.
@@ -1369,6 +1933,415 @@ mod tests {
         (tmp, sha)
     }
 
+    #[cfg(unix)]
+    fn update_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        InstallRegistry,
+        InstalledRepo,
+        String,
+    ) {
+        let (origin, _) = make_local_repo();
+        std::fs::write(origin.path().join("tracked.txt"), "original").unwrap();
+        std::fs::write(origin.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        run_git_test(origin.path(), &["add", "-A"]);
+        run_git_test(origin.path(), &["commit", "-m", "fixture", "--quiet"]);
+        let store = tempfile::tempdir().unwrap();
+        let mut registry = InstallRegistry::empty(store.path().to_path_buf());
+        let source = InstallSource::Git {
+            url: format!("file://{}", origin.path().display()),
+            git_ref: Some("main".into()),
+            git_sha: None,
+            subdir: None,
+        };
+        let result = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        let repo = registry.get_repo(&result.repo_key).unwrap().clone();
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"pinned-plugin","version":"2"}"#,
+        )
+        .unwrap();
+        run_git_test(origin.path(), &["add", "-A"]);
+        run_git_test(origin.path(), &["commit", "-m", "update", "--quiet"]);
+        (origin, store, registry, repo, result.repo_key)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_ignores_unused_filter_and_rejects_used_filter() {
+        if !git_available() {
+            return;
+        }
+        let (origin, store, mut registry, repo, key) = update_fixture();
+        let marker = store.path().join("filter-executed");
+        let filter = format!("touch '{}'", marker.display());
+        run_git_test(&repo.path, &["config", "filter.unsafe.smudge", &filter]);
+        assert!(matches!(
+            update_registered_repo(&key, &repo, &mut registry, false),
+            Ok(UpdateStatus::Updated(UpdateResult { changed: true, .. }))
+        ));
+        assert!(!marker.exists());
+        let current = registry.get_repo(&key).unwrap().clone();
+        let before = checkout_fingerprint(&current.path).unwrap();
+        std::fs::write(
+            origin.path().join(".gitattributes"),
+            "plugin.json filter=unsafe\n",
+        )
+        .unwrap();
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"pinned-plugin","version":"3"}"#,
+        )
+        .unwrap();
+        run_git_test(origin.path(), &["add", "-A"]);
+        run_git_test(origin.path(), &["commit", "-m", "add filter", "--quiet"]);
+        assert!(update_registered_repo(&key, &current, &mut registry, false).is_err());
+        assert!(!marker.exists());
+        assert_eq!(checkout_fingerprint(&current.path).unwrap(), before);
+    }
+
+    #[test]
+    fn staged_git_config_never_writes_inherited_credentials_to_checkout() {
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(stage.path().join(".git")).unwrap();
+        std::fs::write(stage.path().join(".git/config"), "[core]\n  bare = false\n").unwrap();
+        let config = vec![(
+            "http.https://example.com.extraheader".to_owned(),
+            "test-secret-value".to_owned(),
+        )];
+        let staged = StagedGitConfig::new(stage.path(), &config).unwrap();
+        // A crash here can leave both files behind.
+        assert!(
+            !std::fs::read_to_string(&staged.local)
+                .unwrap()
+                .contains("test-secret-value")
+        );
+        assert!(
+            !std::fs::read_to_string(&staged.empty_global)
+                .unwrap()
+                .contains("test-secret-value")
+        );
+        staged.restore().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(stage.path().join(".git/config")).unwrap(),
+            "[core]\n  bare = false\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_checkout_copies_readonly_loose_objects_and_cleans_up() {
+        if !git_available() {
+            return;
+        }
+        let (origin, _) = make_local_repo();
+        let objects = origin.path().join(".git/objects");
+        let object = std::fs::read_dir(&objects)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().len() == 2)
+            .find_map(|dir| std::fs::read_dir(dir.path()).ok()?.flatten().next())
+            .expect("fresh Git repository should contain a loose object")
+            .path();
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let stage = container.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        if verify_readonly_cleanup(&stage).is_err() {
+            return;
+        }
+        copy_git_checkout(origin.path(), &stage).unwrap();
+        let staged_object = stage.join(object.strip_prefix(origin.path()).unwrap());
+        assert!(
+            std::fs::metadata(staged_object)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        remove_repo_path(&stage).unwrap();
+        assert!(!stage.exists());
+        assert!(std::fs::metadata(object).unwrap().permissions().readonly());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_save_failure_rolls_back_and_retry_preserves_local_state() {
+        use std::os::unix::fs::PermissionsExt;
+        if !git_available() {
+            return;
+        }
+        let (_origin, _store, mut registry, repo, key) = update_fixture();
+        std::fs::write(repo.path.join("tracked.txt"), "staged edit").unwrap();
+        run_git_test(&repo.path, &["add", "tracked.txt"]);
+        std::fs::write(repo.path.join("ignored.txt"), "ignored contents").unwrap();
+        std::fs::write(repo.path.join("untracked"), "untracked contents").unwrap();
+        std::fs::set_permissions(
+            repo.path.join("untracked"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("tracked.txt", repo.path.join("local-link")).unwrap();
+        let before = checkout_fingerprint(&repo.path).unwrap();
+        let old_record = serde_json::to_value(&repo).unwrap();
+        let result = update_registered_repo_with(
+            &key,
+            &repo,
+            &mut registry,
+            false,
+            || {},
+            |_| {
+                Err(InstallError::InstallFailed {
+                    detail: "injected save failure".into(),
+                })
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(checkout_fingerprint(&repo.path).unwrap(), before);
+        let disk = InstallRegistry::try_load_from(registry.install_dir().to_path_buf()).unwrap();
+        assert_eq!(
+            serde_json::to_value(disk.get_repo(&key).unwrap()).unwrap(),
+            old_record
+        );
+
+        assert!(matches!(
+            update_registered_repo(&key, &repo, &mut registry, false),
+            Ok(UpdateStatus::Updated(UpdateResult { changed: true, .. }))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+            "staged edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("ignored.txt")).unwrap(),
+            "ignored contents"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("untracked")).unwrap(),
+            "untracked contents"
+        );
+        assert_eq!(
+            std::fs::metadata(repo.path.join("untracked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            std::fs::read_link(repo.path.join("local-link")).unwrap(),
+            PathBuf::from("tracked.txt")
+        );
+        let output = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&repo.path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "tracked.txt"
+        );
+        let disk = InstallRegistry::try_load_from(registry.install_dir().to_path_buf()).unwrap();
+        let updated = disk.get_repo(&key).unwrap();
+        assert!(
+            matches!(&updated.kind, InstallKind::Git { commit, url, git_ref, .. } if Some(commit) == read_head_commit(&repo.path).as_ref() && url.starts_with("file://") && git_ref.as_deref() == Some("main"))
+        );
+        assert_eq!(
+            updated.plugins["pinned-plugin"].version.as_deref(),
+            Some("2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_rejects_concurrent_edit_and_uninstall() {
+        if !git_available() {
+            return;
+        }
+        let (_origin, _store, mut registry, repo, key) = update_fixture();
+        let edit = repo.path.join("ignored.txt");
+        let result = update_registered_repo_with(
+            &key,
+            &repo,
+            &mut registry,
+            false,
+            || {
+                std::fs::write(&edit, "new edit").unwrap();
+            },
+            InstallRegistry::save_atomic,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&edit).unwrap(), "new edit");
+        assert_eq!(
+            serde_json::to_value(registry.get_repo(&key).unwrap()).unwrap(),
+            serde_json::to_value(&repo).unwrap()
+        );
+        let store = registry.install_dir().to_path_buf();
+        let result = update_registered_repo_with(
+            &key,
+            &repo,
+            &mut registry,
+            false,
+            || {
+                let mut remover = InstallRegistry::try_load_from(store.clone()).unwrap();
+                remover
+                    .uninstall_registered_if_matches(&key, &repo, || {})
+                    .unwrap();
+            },
+            InstallRegistry::save_atomic,
+        );
+        assert!(result.is_err());
+        assert!(!repo.path.exists());
+        assert!(
+            InstallRegistry::try_load_from(store)
+                .unwrap()
+                .get_repo(&key)
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_rejects_a_concurrent_winner_and_identical_tree_replacement() {
+        if !git_available() {
+            return;
+        }
+        let (_origin, _store, mut registry, repo, key) = update_fixture();
+        let store = registry.install_dir().to_path_buf();
+        let result = update_registered_repo_with(
+            &key,
+            &repo,
+            &mut registry,
+            false,
+            || {
+                let mut winner = InstallRegistry::try_load_from(store.clone()).unwrap();
+                assert!(matches!(
+                    update_registered_repo(&key, &repo, &mut winner, false),
+                    Ok(UpdateStatus::Updated(UpdateResult { changed: true, .. }))
+                ));
+            },
+            InstallRegistry::save_atomic,
+        );
+        assert!(result.is_err());
+        let disk = InstallRegistry::try_load_from(store.clone()).unwrap();
+        let current = disk.get_repo(&key).unwrap().clone();
+        assert!(
+            matches!(&current.kind, InstallKind::Git { commit, .. } if Some(commit) == read_head_commit(&repo.path).as_ref())
+        );
+
+        // Same bytes and registry record, but a different directory identity.
+        let moved_old = store.join("moved-old");
+        let replacement = store.join("replacement");
+        let result = update_registered_repo_with(
+            &key,
+            &current,
+            &mut registry,
+            false,
+            || {
+                copy_git_checkout(&current.path, &replacement).unwrap();
+                assert_eq!(
+                    checkout_fingerprint(&current.path).unwrap(),
+                    checkout_fingerprint(&replacement).unwrap()
+                );
+                std::fs::rename(&current.path, &moved_old).unwrap();
+                std::fs::rename(&replacement, &current.path).unwrap();
+            },
+            InstallRegistry::save_atomic,
+        );
+        assert!(result.is_err());
+        assert!(current.path.is_dir());
+        assert_eq!(
+            serde_json::to_value(
+                InstallRegistry::try_load_from(store)
+                    .unwrap()
+                    .get_repo(&key)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&current).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_missing_selected_subdir_keeps_original_checkout() {
+        if !git_available() {
+            return;
+        }
+        let origin = tempfile::tempdir().unwrap();
+        run_git_test(origin.path(), &["init", "--initial-branch=main", "--quiet"]);
+        std::fs::create_dir(origin.path().join("selected")).unwrap();
+        std::fs::write(
+            origin.path().join("selected/plugin.json"),
+            r#"{"name":"selected"}"#,
+        )
+        .unwrap();
+        run_git_test(origin.path(), &["add", "-A"]);
+        run_git_test(origin.path(), &["commit", "-m", "old", "--quiet"]);
+        let store = tempfile::tempdir().unwrap();
+        let mut registry = InstallRegistry::empty(store.path().to_path_buf());
+        let source = InstallSource::Git {
+            url: format!("file://{}", origin.path().display()),
+            git_ref: Some("main".into()),
+            git_sha: None,
+            subdir: Some("selected".into()),
+        };
+        let result = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        let repo = registry.get_repo(&result.repo_key).unwrap().clone();
+        let before = checkout_fingerprint(&repo.path).unwrap();
+        std::fs::remove_dir_all(origin.path().join("selected")).unwrap();
+        std::fs::write(origin.path().join("elsewhere"), "new").unwrap();
+        run_git_test(origin.path(), &["add", "-A"]);
+        run_git_test(
+            origin.path(),
+            &["commit", "-m", "remove selected", "--quiet"],
+        );
+        assert!(update_registered_repo(&result.repo_key, &repo, &mut registry, false).is_err());
+        assert_eq!(checkout_fingerprint(&repo.path).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(
+                InstallRegistry::try_load_from(store.path().to_path_buf())
+                    .unwrap()
+                    .get_repo(&result.repo_key)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&repo).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_update_refuses_readonly_and_external_git_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        if !git_available() {
+            return;
+        }
+        let (_origin, _store, mut registry, repo, key) = update_fixture();
+        let locked = repo.path.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("keep"), "original").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(update_registered_repo(&key, &repo, &mut registry, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(locked.join("keep")).unwrap(),
+            "original"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            repo.path.join(".git/objects/info/alternates"),
+            "/tmp/external\n",
+        )
+        .unwrap();
+        assert!(update_registered_repo(&key, &repo, &mut registry, false).is_err());
+        assert!(repo.path.join(".git/objects/info/alternates").exists());
+        assert_eq!(
+            serde_json::to_value(registry.get_repo(&key).unwrap()).unwrap(),
+            serde_json::to_value(&repo).unwrap()
+        );
+    }
+
     #[test]
     fn sha_git_args_terminate_options_before_operands() {
         assert_eq!(
@@ -1504,7 +2477,12 @@ mod tests {
             marketplace: None,
         };
 
-        match update_repo("acme-deadbeef", &repo, false).expect("update should succeed") {
+        let mut registry = InstallRegistry::empty(install.path().to_path_buf());
+        registry.insert("acme-deadbeef".into(), repo.clone());
+        registry.save().unwrap();
+        match update_registered_repo("acme-deadbeef", &repo, &mut registry, false)
+            .expect("update should succeed")
+        {
             UpdateStatus::Updated(result) => {
                 assert_eq!(result.plugins.len(), 1);
                 assert_eq!(result.plugins[0].name, "acme");
@@ -1568,7 +2546,10 @@ mod tests {
             marketplace: None,
         };
 
-        match update_repo("acme-deadbeef", &repo, false) {
+        let mut registry = InstallRegistry::empty(install.path().to_path_buf());
+        registry.insert("acme-deadbeef".into(), repo.clone());
+        registry.save().unwrap();
+        match update_registered_repo("acme-deadbeef", &repo, &mut registry, false) {
             Err(InstallError::InstallFailed { .. }) => {}
             Err(e) => panic!("expected InstallFailed, got {e:?}"),
             Ok(_) => panic!("expected InstallFailed when stored subdir is missing, got Ok"),
@@ -1694,8 +2675,9 @@ mod tests {
                 }
                 InstallKind::Local { .. } => panic!("expected Git"),
             }
+            let mut registry = InstallRegistry::empty(PathBuf::from("/unused"));
             assert!(matches!(
-                update_repo(&repo_key, &repo, true),
+                update_registered_repo(&repo_key, &repo, &mut registry, true),
                 Ok(UpdateStatus::Pinned { ref_name }) if ref_name == expected_pin
             ));
         }
@@ -1783,9 +2765,10 @@ mod tests {
             plugins: std::collections::HashMap::new(),
             marketplace: None,
         };
+        let mut registry = InstallRegistry::empty(PathBuf::from("/unused"));
         assert!(
             matches!(
-                update_repo("acme-deadbeef", &repo, true),
+                update_registered_repo("acme-deadbeef", &repo, &mut registry, true),
                 Err(InstallError::UnpinnedRemoteRefused { .. })
             ),
             "a mutable-ref update must be refused under the pin policy"

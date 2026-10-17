@@ -144,13 +144,10 @@ pub fn install_from_remote_url(
     }
 }
 
-pub fn update_from_marketplace_entry_transactional(
-    marketplace_root: &Path,
+fn validate_marketplace_update_paths(
     entry: &MarketplaceEntry,
-    mut provenance: MarketplaceProvenance,
-    registry: &mut InstallRegistry,
-    require_sha: bool,
-) -> Result<MarketplaceUpdateResult, InstallError> {
+    provenance: &MarketplaceProvenance,
+) -> Result<(MarketplaceRelativePath, Option<String>), InstallError> {
     let plugin_relative_path =
         MarketplaceRelativePath::parse(&entry.relative_path).map_err(|e| {
             InstallError::InstallFailed {
@@ -172,8 +169,6 @@ pub fn update_from_marketplace_entry_transactional(
             ),
         });
     }
-    provenance.plugin_subdir = plugin_relative_path.as_str().to_string();
-
     let remote_subdir = entry
         .remote_subdir
         .as_deref()
@@ -185,16 +180,61 @@ pub fn update_from_marketplace_entry_transactional(
                 })
         })
         .transpose()?;
+    Ok((plugin_relative_path, remote_subdir))
+}
 
+pub fn update_from_marketplace_entry_transactional(
+    marketplace_root: &Path,
+    entry: &MarketplaceEntry,
+    provenance: MarketplaceProvenance,
+    registry: &mut InstallRegistry,
+    require_sha: bool,
+) -> Result<MarketplaceUpdateResult, InstallError> {
+    // Validate and normalize before lookup, just as the selected-record path
+    // does. Invalid catalog paths must not be disguised as missing installs.
+    let (plugin_relative_path, _) = validate_marketplace_update_paths(entry, &provenance)?;
     let (repo_key, old_repo) = find_marketplace_repo(
         registry,
         &provenance.source_url_or_path,
-        &provenance.plugin_subdir,
+        plugin_relative_path.as_str(),
     )
     .map(|(key, repo)| (key.to_owned(), repo.clone()))
     .ok_or_else(|| InstallError::PluginNotFound {
         name: provenance.plugin_subdir.clone(),
     })?;
+    update_from_marketplace_entry_if_matches(
+        marketplace_root,
+        entry,
+        provenance,
+        registry,
+        require_sha,
+        &repo_key,
+        &old_repo,
+    )
+}
+
+/// Update the selected install only while its originally observed record remains current.
+pub fn update_from_marketplace_entry_if_matches(
+    marketplace_root: &Path,
+    entry: &MarketplaceEntry,
+    mut provenance: MarketplaceProvenance,
+    registry: &mut InstallRegistry,
+    require_sha: bool,
+    repo_key: &str,
+    old_repo: &InstalledRepo,
+) -> Result<MarketplaceUpdateResult, InstallError> {
+    let (plugin_relative_path, remote_subdir) =
+        validate_marketplace_update_paths(entry, &provenance)?;
+    provenance.plugin_subdir = plugin_relative_path.as_str().to_string();
+
+    if !old_repo.marketplace.as_ref().is_some_and(|old| {
+        old.plugin_subdir == provenance.plugin_subdir
+            && is_same_source_identity(&old.source_url_or_path, &provenance.source_url_or_path)
+    }) {
+        return Err(InstallError::InstallFailed {
+            detail: "selected marketplace provenance changed".into(),
+        });
+    }
 
     let remote_source = entry
         .remote_url
@@ -296,7 +336,7 @@ pub fn update_from_marketplace_entry_transactional(
         marketplace: Some(provenance),
     };
 
-    let result = registry.publish_staged(&repo_key, new_repo, &staging_path);
+    let result = registry.publish_staged_if_matches(repo_key, old_repo, new_repo, &staging_path);
     // A journalled transaction retains its stage for recovery if recovery itself
     // failed. Otherwise this is the unique directory created by this attempt.
     if !(staging_path.join(".open-grok-transaction").exists()
@@ -306,7 +346,7 @@ pub fn update_from_marketplace_entry_transactional(
     }
     result?;
     Ok(MarketplaceUpdateResult {
-        repo_key,
+        repo_key: repo_key.to_owned(),
         old_version,
         new_version,
         changed,
@@ -1070,6 +1110,91 @@ mod tests {
     }
 
     #[test]
+    fn transactional_update_normalizes_provenance_before_lookup() {
+        with_test_registry(|registry| {
+            let marketplace = tempfile::tempdir().unwrap();
+            write_plugin(marketplace.path(), "demo", "1.0.0", "old");
+            let repo_key = install_test_plugin(registry, marketplace.path(), "demo");
+            write_plugin(marketplace.path(), "demo", "2.0.0", "new");
+            let entry = crate::scan_marketplace(marketplace.path())
+                .entries
+                .into_iter()
+                .find(|p| p.relative_path == "plugins/demo")
+                .unwrap();
+            let result = update_from_marketplace_entry_transactional(
+                marketplace.path(),
+                &entry,
+                provenance(marketplace.path(), "./plugins/demo"),
+                registry,
+                false,
+            )
+            .unwrap();
+            assert_eq!(result.repo_key, repo_key);
+            assert_eq!(result.new_version.as_deref(), Some("2.0.0"));
+        });
+    }
+
+    #[test]
+    fn stale_marketplace_selection_cannot_replace_concurrent_winner() {
+        with_test_registry(|registry| {
+            let marketplace = tempfile::tempdir().unwrap();
+            write_plugin(marketplace.path(), "alpha", "1", "alpha-old");
+            write_plugin(marketplace.path(), "beta", "1", "beta-old");
+            let alpha = install_test_plugin(registry, marketplace.path(), "alpha");
+            let beta = install_test_plugin(registry, marketplace.path(), "beta");
+            let selected_beta = registry.get_repo(&beta).unwrap().clone();
+            write_plugin(marketplace.path(), "alpha", "2", "alpha-new");
+            write_plugin(marketplace.path(), "beta", "2", "beta-winner");
+            let entries = crate::scan_marketplace(marketplace.path()).entries;
+            let alpha_entry = entries
+                .iter()
+                .find(|p| p.relative_path == "plugins/alpha")
+                .unwrap();
+            let beta_entry = entries
+                .iter()
+                .find(|p| p.relative_path == "plugins/beta")
+                .unwrap();
+            let mut winner =
+                InstallRegistry::try_load_from(registry.install_dir().to_path_buf()).unwrap();
+            update_from_marketplace_entry_transactional(
+                marketplace.path(),
+                beta_entry,
+                provenance(marketplace.path(), "plugins/beta"),
+                &mut winner,
+                false,
+            )
+            .unwrap();
+            update_from_marketplace_entry_transactional(
+                marketplace.path(),
+                alpha_entry,
+                provenance(marketplace.path(), "plugins/alpha"),
+                registry,
+                false,
+            )
+            .unwrap();
+            assert!(registry.get_repo(&alpha).is_some());
+            write_plugin(marketplace.path(), "beta", "3", "beta-stale");
+            assert!(
+                update_from_marketplace_entry_if_matches(
+                    marketplace.path(),
+                    beta_entry,
+                    provenance(marketplace.path(), "plugins/beta"),
+                    registry,
+                    false,
+                    &beta,
+                    &selected_beta
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(registry.install_dir().join(beta).join("marker.txt"))
+                    .unwrap(),
+                "beta-winner"
+            );
+        });
+    }
+
+    #[test]
     fn transactional_git_kind_uses_normalized_operands() {
         let sha = "a".repeat(40);
         let padded_sha = format!(" {sha} ");
@@ -1096,8 +1221,9 @@ mod tests {
             }
             InstallKind::Local { .. } => panic!("expected Git"),
         }
+        let mut registry = InstallRegistry::empty(Path::new("/unused").to_path_buf());
         assert!(matches!(
-            git_install::update_repo("repo", &repo, true),
+            git_install::update_registered_repo("repo", &repo, &mut registry, true),
             Ok(git_install::UpdateStatus::Pinned { ref_name }) if ref_name == sha
         ));
     }

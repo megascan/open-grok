@@ -2038,6 +2038,11 @@ pub(super) fn dispatch_action_result(
             | OutcomeStatus::NotFound
             | OutcomeStatus::InternalError
             | OutcomeStatus::Unsupported => {
+                let reload_session = if outcome.requires_reload {
+                    agent.session.session_id.clone()
+                } else {
+                    None
+                };
                 if let Some(ref mut modal) = agent.extensions_modal {
                     modal.pending_action = None;
                     modal.pending_entry_index = None;
@@ -2045,7 +2050,14 @@ pub(super) fn dispatch_action_result(
                         crate::views::extensions_modal::ModalMessage::Error(outcome.message),
                     );
                 }
-                vec![]
+                reload_session
+                    .into_iter()
+                    .map(|session_id| Effect::PluginsAction {
+                        agent_id,
+                        session_id,
+                        action: xai_hooks_plugins_types::PluginsAction::Reload,
+                    })
+                    .collect()
             }
         },
     }

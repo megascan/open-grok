@@ -3,6 +3,189 @@ use super::*;
 pub(super) const MANAGED_HOOKS_ONLY_REFUSAL: &str =
     "Hooks outside managed policy are disabled by your organization.";
 
+fn plugin_update_action(plugin_id: Option<&str>) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::update_plugins;
+    plugin_update_action_with(plugin_id, update_plugins)
+}
+
+fn plugin_update_action_with(
+    plugin_id: Option<&str>,
+    update: impl FnOnce(
+        Option<&str>,
+    )
+        -> Result<Vec<crate::plugin::RepoUpdateOutcome>, crate::plugin::UpdateError>,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::RepoUpdateOutcome;
+    use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
+
+    let name = plugin_id.map(|id| id.rsplit('/').next().unwrap_or(id));
+    let outcomes = match update(name) {
+        Ok(outcomes) if !outcomes.is_empty() => outcomes,
+        Ok(_) => {
+            return ActionOutcome {
+                status: OutcomeStatus::NotFound,
+                message: "No installed plugins to update.".into(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+        Err(error) => {
+            return ActionOutcome {
+                status: OutcomeStatus::NotFound,
+                message: error.to_string(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
+    let mut messages = Vec::new();
+    let mut any_updated = false;
+    let mut any_failed = false;
+    for outcome in outcomes {
+        match outcome {
+            RepoUpdateOutcome::Updated { repo_key, .. } => {
+                any_updated = true;
+                messages.push(format!("{repo_key}: updated"));
+            }
+            RepoUpdateOutcome::AlreadyUpToDate { repo_key } => {
+                messages.push(format!("{repo_key}: already up to date"))
+            }
+            RepoUpdateOutcome::Pinned { repo_key, ref_name } => {
+                messages.push(format!("{repo_key}: pinned to {ref_name}"))
+            }
+            RepoUpdateOutcome::LiveLocal { repo_key } => {
+                messages.push(format!("{repo_key}: local install (already current)"))
+            }
+            RepoUpdateOutcome::Failed { repo_key, error } => {
+                any_failed = true;
+                messages.push(format!("{repo_key}: update failed: {error}"));
+            }
+        }
+    }
+    ActionOutcome {
+        status: if any_failed {
+            OutcomeStatus::InternalError
+        } else {
+            OutcomeStatus::Success
+        },
+        message: messages.join("\n"),
+        requires_reload: any_updated,
+        requires_restart: false,
+    }
+}
+
+#[cfg(test)]
+mod plugin_update_tests {
+    use super::*;
+    use crate::plugin::{PluginUpdateSelector, update_plugins_from_registry};
+    use xai_grok_agent::plugins::git_install::{InstallSource, install_and_register};
+    use xai_grok_agent::plugins::install_registry::{InstallKind, InstallRegistry};
+    use xai_hooks_plugins_types::OutcomeStatus;
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_update_persists_git_commit_and_reports_up_to_date_on_retry() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "--initial-branch=main", "--quiet"]);
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"demo","version":"1"}"#,
+        )
+        .unwrap();
+        git(origin.path(), &["add", "-A"]);
+        git(origin.path(), &["commit", "-m", "one", "--quiet"]);
+        let store = tempfile::tempdir().unwrap();
+        let mut registry = InstallRegistry::empty(store.path().to_path_buf());
+        let source = InstallSource::Git {
+            url: format!("file://{}", origin.path().display()),
+            git_ref: Some("main".into()),
+            git_sha: None,
+            subdir: None,
+        };
+        let installed = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        let old = registry.get_repo(&installed.repo_key).unwrap().clone();
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"demo","version":"2"}"#,
+        )
+        .unwrap();
+        git(origin.path(), &["add", "-A"]);
+        git(origin.path(), &["commit", "-m", "two", "--quiet"]);
+        let outcome = plugin_update_action_with(Some("demo"), |name| {
+            update_plugins_from_registry(
+                &mut registry,
+                name.map(|n| PluginUpdateSelector::PluginName(n.to_owned())),
+                false,
+            )
+        });
+        assert_eq!(outcome.status, OutcomeStatus::Success);
+        assert!(outcome.requires_reload);
+        let disk = InstallRegistry::try_load_from(store.path().to_path_buf()).unwrap();
+        let current = disk.get_repo(&installed.repo_key).unwrap();
+        assert!(
+            matches!((&old.kind, &current.kind), (InstallKind::Git { commit: old, .. }, InstallKind::Git { commit: new, .. }) if old != new)
+        );
+        assert_eq!(
+            current.plugins.get("demo").unwrap().version.as_deref(),
+            Some("2")
+        );
+        let outcome = plugin_update_action_with(Some("demo"), |name| {
+            update_plugins_from_registry(
+                &mut registry,
+                name.map(|n| PluginUpdateSelector::PluginName(n.to_owned())),
+                false,
+            )
+        });
+        assert_eq!(outcome.status, OutcomeStatus::Success);
+        assert!(!outcome.requires_reload);
+        assert!(outcome.message.contains("already up to date"));
+    }
+
+    #[test]
+    fn partial_failure_still_requests_reload() {
+        use crate::plugin::RepoUpdateOutcome;
+        let outcome = plugin_update_action_with(None, |_| {
+            Ok(vec![
+                RepoUpdateOutcome::Updated {
+                    repo_key: "a".into(),
+                    old_commit: None,
+                    new_commit: None,
+                },
+                RepoUpdateOutcome::Failed {
+                    repo_key: "b".into(),
+                    error: "failure".into(),
+                },
+            ])
+        });
+        assert_eq!(outcome.status, OutcomeStatus::InternalError);
+        assert!(outcome.requires_reload);
+    }
+}
+
 impl SessionActor {
     // ── Shared hook/plugin operation functions ────────────────────────
 
@@ -462,83 +645,7 @@ impl SessionActor {
                     }
                 }
             }
-            PluginsAction::Update { plugin_id } => {
-                let registry = xai_grok_agent::plugins::InstallRegistry::load();
-                let all_repos = registry.list();
-                if all_repos.is_empty() {
-                    return ActionOutcome {
-                        status: OutcomeStatus::NotFound,
-                        message: "No installed plugins to update.".into(),
-                        requires_reload: false,
-                        requires_restart: false,
-                    };
-                }
-
-                let repos_to_update: Vec<(
-                    String,
-                    xai_grok_agent::plugins::install_registry::InstalledRepo,
-                )> = if let Some(ref id) = plugin_id {
-                    let name = id.rsplit('/').next().unwrap_or(id);
-                    match registry.find_plugin(name) {
-                        Some((key, repo, _plugin)) => vec![(key.to_string(), repo.clone())],
-                        None => {
-                            return ActionOutcome {
-                                status: OutcomeStatus::NotFound,
-                                message: format!("Plugin \"{name}\" not found."),
-                                requires_reload: false,
-                                requires_restart: false,
-                            };
-                        }
-                    }
-                } else {
-                    all_repos
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v.clone()))
-                        .collect()
-                };
-
-                let mut messages = Vec::new();
-                let mut any_updated = false;
-                for (key, repo) in &repos_to_update {
-                    match xai_grok_agent::plugins::git_install::update_repo(
-                        key,
-                        repo,
-                        crate::plugin::marketplace_require_sha(),
-                    ) {
-                        Ok(status) => {
-                            use xai_grok_agent::plugins::git_install::UpdateStatus;
-                            match status {
-                                UpdateStatus::Updated(result) => {
-                                    if result.changed {
-                                        any_updated = true;
-                                        messages.push(format!("{key}: updated"));
-                                    } else {
-                                        messages.push(format!("{key}: already up to date"));
-                                    }
-                                }
-                                UpdateStatus::Pinned { ref_name } => {
-                                    messages.push(format!("{key}: pinned to {ref_name}"));
-                                }
-                                UpdateStatus::LiveLocal => {
-                                    messages.push(format!("{key}: local symlink (already live)"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            messages.push(format!("{key}: update failed: {e}"));
-                        }
-                    }
-                }
-                if let Err(e) = registry.save() {
-                    tracing::warn!("Failed to save install registry after update: {e}");
-                }
-                ActionOutcome {
-                    status: OutcomeStatus::Success,
-                    message: messages.join("\n"),
-                    requires_reload: any_updated,
-                    requires_restart: false,
-                }
-            }
+            PluginsAction::Update { plugin_id } => plugin_update_action(plugin_id.as_deref()),
             PluginsAction::Add { path } => {
                 if path.is_empty() {
                     return ActionOutcome {

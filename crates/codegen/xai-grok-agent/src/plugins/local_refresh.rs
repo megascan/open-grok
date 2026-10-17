@@ -5,14 +5,14 @@
 //! surface until the snapshot is re-copied. This module re-copies refreshable
 //! local installs (under-home or trusted) at session spawn and `/plugins reload`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::git_install::{
     StagingDir, copy_dir_recursive, create_staging_dir, discover_plugins_in_dir_as, repo_plugin_map,
 };
-use super::install_registry::{InstallError, InstallKind, InstallRegistry, RepoPlugin};
+use super::install_registry::{InstallError, InstallKind, InstallRegistry, InstalledRepo};
 use super::trust::TrustStore;
 
 /// Counts from a [`refresh_local_installs`] pass, for logging and tests.
@@ -43,7 +43,7 @@ struct RefreshTarget {
     source_path: PathBuf,
     subdir: Option<String>,
     dest: PathBuf,
-    expected: HashMap<String, RepoPlugin>,
+    expected: InstalledRepo,
 }
 
 /// Re-copy refreshable local installs from their live `source_path` into the
@@ -70,7 +70,7 @@ fn refresh_local_installs(
                 source_path: source_path.clone(),
                 subdir: subdir.clone(),
                 dest: repo.path.clone(),
-                expected: repo.plugins.clone(),
+                expected: repo.clone(),
             }),
             _ => None,
         })
@@ -191,7 +191,7 @@ fn recopy_local_install(
     source_path: &Path,
     subdir: Option<&str>,
     dest: &Path,
-    expected: &HashMap<String, RepoPlugin>,
+    expected: &InstalledRepo,
 ) -> Result<bool, InstallError> {
     let stage = StagingDir(create_staging_dir(registry)?);
     copy_dir_recursive(source_path, &stage.0).map_err(|source| InstallError::Io {
@@ -204,39 +204,43 @@ fn recopy_local_install(
         .map(|p| (p.name.as_str(), p.subdir.as_deref()))
         .collect();
     let expected_ids: BTreeSet<(&str, Option<&str>)> = expected
+        .plugins
         .iter()
         .map(|(name, rp)| (name.as_str(), rp.subdir.as_deref()))
         .collect();
     if discovered.is_empty() || discovered_ids != expected_ids {
         return Ok(false);
     }
-    let mut repo = registry
-        .get_repo(key)
-        .cloned()
-        .ok_or_else(|| InstallError::PluginNotFound {
-            name: key.to_string(),
-        })?;
+    let mut repo = expected.clone();
     repo.plugins = repo_plugin_map(&discovered);
     repo.updated_at = chrono::Utc::now().to_rfc3339();
     #[cfg(test)]
     if std::env::var_os("XAI_GROK_TEST_FAIL_REFRESH_PROMOTE").is_some() {
-        registry.publish_staged_with(key, repo, &stage.0, |_| {
-            Err(InstallError::InstallFailed {
-                detail: "test-injected refresh commit failure".into(),
-            })
-        })?;
+        registry.publish_staged_if_matches_checked(
+            key,
+            expected,
+            repo,
+            &stage.0,
+            |_| Ok(()),
+            |_| {
+                Err(InstallError::InstallFailed {
+                    detail: "test-injected refresh commit failure".into(),
+                })
+            },
+        )?;
         return Ok(true);
     }
-    registry.publish_staged(key, repo, &stage.0)?;
+    registry.publish_staged_if_matches(key, expected, repo, &stage.0)?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::git_install::{InstallResult, InstallSource, install_from_source};
-    use super::super::install_registry::InstalledRepo;
+    use super::super::install_registry::{InstalledRepo, RepoPlugin};
     use super::*;
     use serial_test::serial;
+    use std::collections::HashMap;
 
     /// RAII guard: sets an env var, restores the prior value (or unsets) on drop,
     /// so a test never leaves process-global env pointing at a dropped tempdir.
@@ -318,6 +322,73 @@ mod tests {
         );
         registry.save().unwrap();
         installed
+    }
+
+    #[test]
+    fn refresh_rejects_original_target_after_an_earlier_refresh_observes_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_a = tmp.path().join("source-a");
+        let source_b = tmp.path().join("source-b");
+        write_plugin_json(&source_a, "a");
+        write_plugin_json(&source_b, "b");
+        std::fs::write(source_b.join("content"), "old local").unwrap();
+        let mut refresh = InstallRegistry::empty(tmp.path().join("installed"));
+        let a = register_local_install(&mut refresh, &source_a, None);
+        let b = register_local_install(&mut refresh, &source_b, None);
+        let selected_a = refresh.get_repo(&a.repo_key).unwrap().clone();
+        let selected_b = refresh.get_repo(&b.repo_key).unwrap().clone();
+
+        let mut replacement =
+            InstallRegistry::try_load_from(refresh.install_dir().to_path_buf()).unwrap();
+        let stage = StagingDir(create_staging_dir(&replacement).unwrap());
+        write_plugin_json(&stage.0, "b");
+        std::fs::write(stage.0.join("content"), "new git").unwrap();
+        let mut git_repo = selected_b.clone();
+        git_repo.kind = InstallKind::Git {
+            url: "file:///new-origin".into(),
+            git_ref: Some("main".into()),
+            commit: "new-commit".into(),
+            subdir: None,
+        };
+        git_repo.updated_at = "new-owner".into();
+        replacement
+            .publish_staged_if_matches(&b.repo_key, &selected_b, git_repo, &stage.0)
+            .unwrap();
+
+        assert!(
+            recopy_local_install(
+                &mut refresh,
+                &a.repo_key,
+                &source_a,
+                None,
+                &a.repo_path,
+                &selected_a
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            &refresh.get_repo(&b.repo_key).unwrap().kind,
+            InstallKind::Git { .. }
+        ));
+        assert!(
+            recopy_local_install(
+                &mut refresh,
+                &b.repo_key,
+                &source_b,
+                None,
+                &b.repo_path,
+                &selected_b
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.repo_path.join("content")).unwrap(),
+            "new git"
+        );
+        let disk = InstallRegistry::try_load_from(refresh.install_dir().to_path_buf()).unwrap();
+        assert!(
+            matches!(&disk.get_repo(&b.repo_key).unwrap().kind, InstallKind::Git { commit, .. } if commit == "new-commit")
+        );
     }
 
     #[test]

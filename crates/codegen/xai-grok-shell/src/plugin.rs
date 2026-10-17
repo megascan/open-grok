@@ -216,22 +216,6 @@ impl std::fmt::Display for UpdateError {
     }
 }
 
-/// Apply an update result to the registry entry.
-fn apply_update_to_registry(
-    registry: &mut InstallRegistry,
-    repo_key: &str,
-    result: &git_install::UpdateResult,
-) {
-    let Some(entry) = registry.get_repo_mut(repo_key) else {
-        return;
-    };
-    if let InstallKind::Git { ref mut commit, .. } = entry.kind {
-        *commit = result.new_commit.clone().unwrap_or_default();
-    }
-    entry.updated_at = chrono::Utc::now().to_rfc3339();
-    entry.plugins = git_install::repo_plugin_map(&result.plugins);
-}
-
 struct MarketplaceSourceRoot {
     path: PathBuf,
     _lease: Option<SourceCacheLease>,
@@ -239,8 +223,10 @@ struct MarketplaceSourceRoot {
 
 fn update_marketplace_repo(
     registry: &mut InstallRegistry,
+    repo_key: &str,
     repo: &InstalledRepo,
     source_cache: &mut std::collections::HashMap<String, MarketplaceSourceRoot>,
+    require_sha: bool,
 ) -> Result<installer::MarketplaceUpdateResult, InstallError> {
     let provenance = repo
         .marketplace
@@ -273,13 +259,14 @@ fn update_marketplace_repo(
             name: provenance.plugin_subdir.clone(),
         })?;
 
-    let require_sha = crate::plugin::marketplace_require_sha();
-    installer::update_from_marketplace_entry_transactional(
+    installer::update_from_marketplace_entry_if_matches(
         &marketplace_root.path,
         &entry,
         provenance,
         registry,
         require_sha,
+        repo_key,
+        repo,
     )
 }
 
@@ -341,6 +328,14 @@ pub(crate) fn update_plugins_by_selector(
     selector: Option<PluginUpdateSelector>,
 ) -> Result<Vec<RepoUpdateOutcome>, UpdateError> {
     let mut registry = InstallRegistry::load();
+    update_plugins_from_registry(&mut registry, selector, marketplace_require_sha())
+}
+
+pub(crate) fn update_plugins_from_registry(
+    registry: &mut InstallRegistry,
+    selector: Option<PluginUpdateSelector>,
+    require_sha: bool,
+) -> Result<Vec<RepoUpdateOutcome>, UpdateError> {
     let repos_to_update: Vec<(String, InstalledRepo)> = match selector {
         Some(PluginUpdateSelector::PluginName(plugin_name)) => {
             match registry.find_plugin(&plugin_name) {
@@ -372,7 +367,8 @@ pub(crate) fn update_plugins_by_selector(
 
     for (repo_key, repo) in &repos_to_update {
         let outcome = if repo.marketplace.is_some() {
-            match update_marketplace_repo(&mut registry, repo, &mut source_cache) {
+            match update_marketplace_repo(registry, repo_key, repo, &mut source_cache, require_sha)
+            {
                 Ok(result) => {
                     if result.changed || result.reinstalled {
                         RepoUpdateOutcome::Updated {
@@ -392,28 +388,12 @@ pub(crate) fn update_plugins_by_selector(
                 },
             }
         } else {
-            // Ordinary git updates retain their existing in-place behavior;
-            // they are not serialized with staged install/uninstall swaps.
-            match git_install::update_repo(repo_key, repo, marketplace_require_sha()) {
-                Ok(UpdateStatus::Updated(result)) if result.changed => {
-                    apply_update_to_registry(&mut registry, repo_key, &result);
-                    match registry.save() {
-                        Ok(()) => RepoUpdateOutcome::Updated {
-                            repo_key: repo_key.clone(),
-                            old_commit: result.old_commit,
-                            new_commit: result.new_commit,
-                        },
-                        Err(e) => {
-                            registry = InstallRegistry::load();
-                            RepoUpdateOutcome::Failed {
-                                repo_key: repo_key.clone(),
-                                error: format!(
-                                    "updated plugin but failed to save its registry record: {e}"
-                                ),
-                            }
-                        }
-                    }
-                }
+            match git_install::update_registered_repo(repo_key, repo, registry, require_sha) {
+                Ok(UpdateStatus::Updated(result)) if result.changed => RepoUpdateOutcome::Updated {
+                    repo_key: repo_key.clone(),
+                    old_commit: result.old_commit,
+                    new_commit: result.new_commit,
+                },
                 Ok(UpdateStatus::Updated(_)) => RepoUpdateOutcome::AlreadyUpToDate {
                     repo_key: repo_key.clone(),
                 },
@@ -1482,7 +1462,9 @@ mod tests {
             plugins: HashMap::new(),
             marketplace: None,
         };
-        let status = git_install::update_repo("local", &repo, false).unwrap();
+        let mut registry = InstallRegistry::empty(PathBuf::from("/unused"));
+        let status =
+            git_install::update_registered_repo("local", &repo, &mut registry, false).unwrap();
         assert!(matches!(status, UpdateStatus::LiveLocal));
     }
 

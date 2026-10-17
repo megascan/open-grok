@@ -114,11 +114,19 @@ const TRANSACTION_MARKER: &str = ".open-grok-transaction";
 const BACKUP_MARKER: &str = ".open-grok-transaction-original";
 
 #[derive(Serialize, Deserialize)]
-struct DirectoryIdentity {
+pub(super) struct DirectoryIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    // Older Windows journals serialized an empty identity. They must remain
+    // readable, but cannot authorize recovery based on an unknown identity.
+    #[cfg(windows)]
+    #[serde(default)]
+    volume_serial: Option<u64>,
+    #[cfg(windows)]
+    #[serde(default)]
+    file_id: Option<[u8; 16]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -170,7 +178,7 @@ fn owned_tree(path: &Path, token: &str) -> bool {
         && std::fs::read_to_string(path.join(TRANSACTION_MARKER)).is_ok_and(|s| s == token)
 }
 
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+pub(super) fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return None;
@@ -183,13 +191,83 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
             inode: metadata.ino(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct FileIdInfo {
+            volume_serial_number: u64,
+            file_id: [u8; 16],
+        }
+        #[repr(C)]
+        struct FileAttributeTagInfo {
+            file_attributes: u32,
+            reparse_tag: u32,
+        }
+        unsafe extern "system" {
+            fn GetFileInformationByHandleEx(
+                handle: *mut core::ffi::c_void,
+                class: i32,
+                info: *mut core::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0x80)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(path)
+            .ok()?;
+        let mut tag = FileAttributeTagInfo {
+            file_attributes: 0,
+            reparse_tag: 0,
+        };
+        let mut id = FileIdInfo {
+            volume_serial_number: 0,
+            file_id: [0; 16],
+        };
+        // SAFETY: the handle remains open and both buffers have the layouts
+        // required by the corresponding Win32 information classes.
+        let valid = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                9,
+                (&raw mut tag).cast(),
+                std::mem::size_of::<FileAttributeTagInfo>() as u32,
+            ) != 0
+                && GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    18,
+                    (&raw mut id).cast(),
+                    std::mem::size_of::<FileIdInfo>() as u32,
+                ) != 0
+        };
+        if !valid
+            || tag.file_attributes & 0x400 != 0
+            || tag.file_attributes & 0x10 == 0
+            || !windows_file_id_is_usable(id.file_id)
+        {
+            return None;
+        }
+        Some(DirectoryIdentity {
+            volume_serial: Some(id.volume_serial_number),
+            file_id: Some(id.file_id),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Some(DirectoryIdentity {})
     }
 }
 
-fn same_directory(path: &Path, expected: &DirectoryIdentity) -> bool {
+// Windows reports all-zero IDs on filesystems that do not support FILE_ID_INFO.
+#[cfg(any(windows, test))]
+fn windows_file_id_is_usable(file_id: [u8; 16]) -> bool {
+    file_id != [0; 16]
+}
+
+pub(super) fn same_directory(path: &Path, expected: &DirectoryIdentity) -> bool {
     let Some(actual) = directory_identity(path) else {
         return false;
     };
@@ -197,7 +275,14 @@ fn same_directory(path: &Path, expected: &DirectoryIdentity) -> bool {
     {
         actual.device == expected.device && actual.inode == expected.inode
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        expected.volume_serial.is_some()
+            && expected.file_id.is_some()
+            && actual.volume_serial == expected.volume_serial
+            && actual.file_id == expected.file_id
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (actual, expected);
         true
@@ -541,7 +626,7 @@ impl InstallRegistry {
         Ok(())
     }
 
-    fn save_atomic(&self) -> Result<(), InstallError> {
+    pub(super) fn save_atomic(&self) -> Result<(), InstallError> {
         std::fs::create_dir_all(&self.install_dir).map_err(|e| InstallError::Io {
             path: self.install_dir.clone(),
             source: e,
@@ -586,6 +671,64 @@ impl InstallRegistry {
         stage: &Path,
     ) -> Result<(), InstallError> {
         self.publish_staged_with(repo_key, repo, stage, Self::save_atomic)
+    }
+
+    /// Publish only if the originally selected record is still current.
+    pub fn publish_staged_if_matches(
+        &mut self,
+        repo_key: &str,
+        expected: &InstalledRepo,
+        repo: InstalledRepo,
+        stage: &Path,
+    ) -> Result<(), InstallError> {
+        self.publish_staged_if_matches_checked(
+            repo_key,
+            expected,
+            repo,
+            stage,
+            |_| Ok(()),
+            Self::save_atomic,
+        )
+    }
+
+    /// Validate an unchanged result against the selected record under the same
+    /// lock used by publication and removal.
+    pub(super) fn validate_selected(
+        &self,
+        repo_key: &str,
+        expected: &InstalledRepo,
+        validate: impl FnOnce(&Path) -> Result<(), InstallError>,
+    ) -> Result<(), InstallError> {
+        let _lock = registry_lock(&self.install_dir)?;
+        let registry = Self::read_unlocked(self.install_dir.clone())?;
+        recover_transaction(&registry)?;
+        let registry = Self::read_unlocked(self.install_dir.clone())?;
+        if !same_repo(registry.get_repo(repo_key), expected) {
+            return Err(InstallError::InstallFailed {
+                detail: "plugin registry changed during update".into(),
+            });
+        }
+        validate(&expected.path)
+    }
+
+    pub(super) fn publish_staged_if_matches_checked(
+        &mut self,
+        repo_key: &str,
+        expected: &InstalledRepo,
+        repo: InstalledRepo,
+        stage: &Path,
+        validate: impl FnOnce(&Path) -> Result<(), InstallError>,
+        save: impl FnOnce(&Self) -> Result<(), InstallError>,
+    ) -> Result<(), InstallError> {
+        self.transact_staged_checked(
+            repo_key,
+            Some(expected),
+            Some(repo),
+            stage,
+            validate,
+            save,
+            || {},
+        )
     }
 
     /// Remove an unchanged registry entry and its tree under the install lock.
@@ -643,8 +786,21 @@ impl InstallRegistry {
         &mut self,
         repo_key: &str,
         prior: Option<&InstalledRepo>,
+        repo: Option<InstalledRepo>,
+        stage: &Path,
+        save: impl FnOnce(&Self) -> Result<(), InstallError>,
+        after_commit: impl FnOnce(),
+    ) -> Result<(), InstallError> {
+        self.transact_staged_checked(repo_key, prior, repo, stage, |_| Ok(()), save, after_commit)
+    }
+
+    fn transact_staged_checked(
+        &mut self,
+        repo_key: &str,
+        prior: Option<&InstalledRepo>,
         mut repo: Option<InstalledRepo>,
         stage: &Path,
+        validate: impl FnOnce(&Path) -> Result<(), InstallError>,
         save: impl FnOnce(&Self) -> Result<(), InstallError>,
         after_commit: impl FnOnce(),
     ) -> Result<(), InstallError> {
@@ -719,6 +875,7 @@ impl InstallRegistry {
                 ),
             });
         }
+        validate(&final_path)?;
         let suffix = stage_name.strip_prefix(".staging-").unwrap();
         let backup_name = format!(".backup-{suffix}");
         let backup = dir.join(&backup_name);
@@ -1016,6 +1173,29 @@ pub enum InstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_zero_file_id_is_not_an_identity() {
+        assert!(!windows_file_id_is_usable([0; 16]));
+        let mut id = [0; 16];
+        id[15] = 1;
+        assert!(windows_file_id_is_usable(id));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn directory_identity_distinguishes_identical_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("current");
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("same"), "same").unwrap();
+        let identity = directory_identity(&path).unwrap();
+        std::fs::rename(&path, old).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("same"), "same").unwrap();
+        assert!(!same_directory(&path, &identity));
+    }
 
     fn transaction_repo(dir: &Path, version: &str) -> InstalledRepo {
         InstalledRepo {
