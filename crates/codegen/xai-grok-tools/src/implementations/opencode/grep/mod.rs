@@ -332,7 +332,10 @@ impl xai_tool_runtime::Tool for GrepTool {
                 output_lines.push(format!("{}:", m.path));
             }
             let display_text = if m.line_text.len() > MAX_LINE_LENGTH {
-                format!("{}...", &m.line_text[..MAX_LINE_LENGTH])
+                format!(
+                    "{}...",
+                    crate::util::truncate::truncate_str(&m.line_text, MAX_LINE_LENGTH)
+                )
             } else {
                 m.line_text.clone()
             };
@@ -459,6 +462,45 @@ mod tests {
         assert!(!text.contains("b.txt"), "non-matching file listed: {text}");
         assert_eq!(output.match_count, 1);
         assert_eq!(output.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn grep_long_line_utf8_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("boundary.txt");
+        let mut lossy = vec![b'a'; 1999];
+        lossy.extend_from_slice(&[0xff, b'z']);
+        for (bytes, truncated, prefix_len) in [
+            (vec![b'a'; 2000], false, 2000),
+            (vec![b'a'; 2001], true, 2000),
+            (format!("{}🦀z", "a".repeat(1999)).into_bytes(), true, 1999),
+            (lossy, true, 1999),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let output = xai_tool_runtime::Tool::run(
+                &GrepTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                GrepInput {
+                    pattern: "a".into(),
+                    path: None,
+                    include: None,
+                },
+            )
+            .await
+            .unwrap();
+            let text = String::from_utf8(output.stdout).unwrap();
+            let expected = format!(
+                "Line 1: {}{}",
+                "a".repeat(prefix_len),
+                if truncated { "..." } else { "" }
+            );
+            assert!(text.contains(&expected), "unexpected output: {text}");
+            assert_eq!(output.match_count, 1);
+            assert_eq!(
+                output.file_matches[0].matches[0].content,
+                String::from_utf8_lossy(&bytes).as_ref()
+            );
+        }
     }
 
     // ── no_matches ───────────────────────────────────────────────────

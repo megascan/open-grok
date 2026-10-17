@@ -180,7 +180,7 @@ async fn max_output_bytes(resources: &SharedResources) -> Option<usize> {
 /// Number of leading whole lines of `content` (formatted output, `\n`-joined) whose cumulative length
 /// fits in `budget` bytes. Always at least 1 so a window whose first line alone is over budget still
 /// makes progress instead of returning an empty body.
-fn lines_within_byte_budget(content: &str, budget: usize) -> usize {
+pub(crate) fn lines_within_byte_budget(content: &str, budget: usize) -> usize {
     let mut used = 0usize;
     let mut kept = 0usize;
     for line in content.split_inclusive('\n') {
@@ -210,16 +210,26 @@ fn apply_byte_budget(
     let kept = lines_within_byte_budget(&extracted.content, budget);
     let start_line = resolve_read_start_line(file_content, offset);
     let mut bounded = extract_file_content_lines(file_content, offset, Some(kept), total_lines);
-    let end_line = start_line + kept - 1;
-    let next_offset = start_line + kept;
     let truncated_bytes = full_len.saturating_sub(bounded.content.len());
-    let marker = format!(
-        "\n... [{truncated_bytes} characters truncated; file has {total_lines} total lines; \
-         showing lines {start_line}-{end_line}; rerun with {offset_param}={next_offset}] ..."
-    );
+    let marker = byte_budget_marker(truncated_bytes, total_lines, start_line, kept, offset_param);
     bounded.content.push_str(&marker);
     bounded.content_concise.push_str(&marker);
     bounded
+}
+/// Describe a whole-line output cut using the caller's visible offset name.
+pub(crate) fn byte_budget_marker(
+    truncated_bytes: usize,
+    total_lines: usize,
+    start_line: usize,
+    kept: usize,
+    offset_param: &str,
+) -> String {
+    let end_line = start_line + kept - 1;
+    let next_offset = start_line + kept;
+    format!(
+        "\n... [{truncated_bytes} characters truncated; file has {total_lines} total lines; \
+         showing lines {start_line}-{end_line}; rerun with {offset_param}={next_offset}] ..."
+    )
 }
 /// Resolve negative offsets from the actual final line (1-indexed).
 pub(crate) fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
@@ -374,11 +384,18 @@ pub fn extract_file_content_lines(
         extracted_images,
     }
 }
-/// Core read-file logic shared by `ReadFileTool` and `ReadFileConciseTool`.
-///
-/// Always uses the padded `content` field. Concise post-processing
-/// (swapping in `content_concise`) is done by `ReadFileConciseTool` after this
-/// returns.
+/// The accepted text snapshot and selected window, for alternate renderers.
+/// Non-text and rejected results never produce a snapshot.
+pub(crate) struct ReadTextSnapshot {
+    pub content: String,
+    pub start_line: usize,
+    pub line_count: usize,
+    pub byte_budget: Option<usize>,
+    pub trailing_rules: String,
+}
+
+/// Core read-file logic shared by the standard and concise tools.
+/// Concise post-processing swaps `content_concise` into `content` afterward.
 pub(crate) async fn run_read_file(
     input: ReadFileInput,
     cwd_override: Option<std::path::PathBuf>,
@@ -387,6 +404,29 @@ pub(crate) async fn run_read_file(
     streamable_out: Option<&mut bool>,
     invoking_param_names: &crate::types::resources::InvokingToolParamNames,
     slot: Option<&crate::types::source_summary::SourceSummarySlot>,
+) -> Result<ReadFileOutput, xai_tool_runtime::ToolError> {
+    run_read_file_with_snapshot(
+        input,
+        cwd_override,
+        contract_version,
+        resources,
+        streamable_out,
+        invoking_param_names,
+        slot,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_read_file_with_snapshot(
+    input: ReadFileInput,
+    cwd_override: Option<std::path::PathBuf>,
+    contract_version: Option<&str>,
+    resources: SharedResources,
+    streamable_out: Option<&mut bool>,
+    invoking_param_names: &crate::types::resources::InvokingToolParamNames,
+    slot: Option<&crate::types::source_summary::SourceSummarySlot>,
+    snapshot_out: Option<&mut Option<ReadTextSnapshot>>,
 ) -> Result<ReadFileOutput, xai_tool_runtime::ToolError> {
     let (cwd, display_cwd, fs, hints_enabled, max_lines, whole_read_policy);
     {
@@ -609,7 +649,23 @@ pub(crate) async fn run_read_file(
             (extracted, stored_read_offset(input.offset), input.limit)
         }
     };
-    if windowed && let Some(budget) = max_output_bytes(&resources).await {
+    // Remember the window before applying the standard formatter's budget.
+    // Alternate renderers apply the same budget to their own output instead.
+    let snapshot_window = snapshot_out.as_ref().map(|_| {
+        let start_line = if windowed {
+            resolve_read_start_line(&file_content, input.offset)
+        } else {
+            1
+        };
+        let line_count = extracted.raw_output.split_inclusive('\n').count();
+        (start_line, line_count)
+    });
+    let byte_budget = if windowed {
+        max_output_bytes(&resources).await
+    } else {
+        None
+    };
+    if let Some(budget) = byte_budget {
         observed.note_byte_budget(budget, extracted.content.len());
         extracted = apply_byte_budget(
             extracted,
@@ -677,6 +733,7 @@ pub(crate) async fn run_read_file(
     let mut content_concise = Some(extracted.content_concise);
     let extracted_images = extracted.extracted_images;
     let lines_before_rules = observation::line_count(&content);
+    let rules_start = content.len();
     crate::implementations::cursor_rules_on_read::append_cursor_rules_for_read(
         cursor_rules_on_read_enabled(&resources).await,
         resources.clone(),
@@ -687,6 +744,15 @@ pub(crate) async fn run_read_file(
     )
     .await;
     let rule_lines = observation::line_count(&content).saturating_sub(lines_before_rules);
+    if let (Some(out), Some((start_line, line_count))) = (snapshot_out, snapshot_window) {
+        *out = Some(ReadTextSnapshot {
+            content: file_content,
+            start_line,
+            line_count,
+            byte_budget,
+            trailing_rules: content[rules_start..].to_owned(),
+        });
+    }
     observed.finish_success(
         observation::line_count(&extracted.raw_output).saturating_add(rule_lines),
         content.len(),
