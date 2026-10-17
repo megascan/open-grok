@@ -14,9 +14,18 @@ Every command below lists its aliases where it has them. A few commands only app
 
 Start a fresh session and clear the current conversation. Alias: `/clear`.
 
-### `/resume`
+### `/resume [id or name]`
 
-Open the session picker to reload a previous session from disk.
+Open the session picker to reload a previous session. Add an ID or title to
+filter the picker; a unique exact match opens directly when the available
+session list is complete. Otherwise, choose from the filtered results.
+Search matches every word you type, in any order, ignoring punctuation and
+case. For example, `/resume fix-login-bug` matches "Fix login bug".
+
+From the CLI, `open-grok --resume "Fix login bug"` also accepts a local title.
+A missing title reports the miss and suggests similar local titles without
+starting remote sign-in. Ambiguous titles list candidates newest first;
+use a session ID to choose one.
 
 ### `/dashboard`
 
@@ -392,6 +401,10 @@ Launch a saved workflow, or manage a running one by the session-unique display n
 /workflow stop review-changes-2
 /workflow save review-changes
 ```
+
+Pause and stop require the exact display name or full run ID. A shortened
+prefix such as `review` does not select `review-changes`; ambiguous names
+are refused.
 
 Project workflows live in `.opengrok/workflows/*.rhai`; user workflows live in `~/.opengrok/workflows/*.rhai`. A same-process pause/resume continues the original immutable script, args, and `agent_budget` cap from committed host-call results — to iterate, edit the returned script copy and launch it as a new run.
 
