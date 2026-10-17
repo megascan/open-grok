@@ -55,6 +55,7 @@ pub use process_scope::{ProcessScope, global_process_scope};
 /// How long a shell gets to forward a hangup to its jobs before it is killed.
 pub const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+pub mod cli_output;
 pub mod runtime;
 
 // ---------------------------------------------------------------------------
