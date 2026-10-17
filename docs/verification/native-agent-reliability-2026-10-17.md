@@ -66,6 +66,11 @@ Local logs and per-test JSON results are under
 
 ## Explicit limits and follow-up work
 
+This section records the limits at this wave's completion. The subsequent
+[second improvement wave](improvement-wave-2-2026-10-17.md) adds mailbox receipts,
+live MCP pool rebinding, and staged ordinary Git updates, with its own validation
+and remaining limits.
+
 - The protected plan-file backend is implemented for local Unix filesystems.
   Windows and unsupported/remote filesystems refuse this plan-edit capability.
   Linux and Windows runtime behavior were not exercised in this wave.
