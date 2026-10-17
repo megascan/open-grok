@@ -1,6 +1,6 @@
 # Codex context and persistent work
 
-Open Grok uses the Codex 0.153.1 model-catalog contract. GPT-6-astra appears by
+Open Grok advertises Codex compatibility version 0.164.0. GPT-6-astra appears by
 its public name. Live catalog entries control reasoning, tools, and service
 tiers. Ultra uses the model's advertised multi-agent effort; Max remains Max.
 Replacement and retirement notices appear in model descriptions without

@@ -28,10 +28,9 @@ use xai_tool_types::SubagentContextMode;
 
 pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
 pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "OPENGROK_CODEX_CLIENT_VERSION";
-/// Compatibility version of the pinned official Codex snapshot whose model
-/// catalog contract Open Grok implements. This is intentionally independent
-/// from Open Grok's own package version.
-pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.153.1";
+/// Codex compatibility version advertised to the backend. This is independent
+/// from Open Grok's package version and the source revisions recorded in the port docs.
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.164.0";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
@@ -1949,6 +1948,6 @@ mod tests {
             Some("0.145.0".to_owned())
         );
         assert_eq!(normalize_whole_semver("not-a-version"), None);
-        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.153.1");
+        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.164.0");
     }
 }

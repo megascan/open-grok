@@ -18,8 +18,10 @@ at `6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a`; this includes the
 
 The Responses Lite and asynchronous user-message contracts were refreshed
 against Codex commit `8e93b1a405e02f8797a04d747bb7d1654b839685`. The default
-model-catalog compatibility version is `0.153.1`, verified against the
-`rust-v0.153.1` release commit `985641272869835d01d025ed2a218fbbce35fa9f`.
+advertised Codex compatibility version is `0.164.0`. The model-catalog and
+behavior implementation was last refreshed against the `rust-v0.153.1`
+release commit `985641272869835d01d025ed2a218fbbce35fa9f`; the advertised version
+bump does not imply a new source import.
 
 ### 0.153.1 catalog and behavior refresh
 
