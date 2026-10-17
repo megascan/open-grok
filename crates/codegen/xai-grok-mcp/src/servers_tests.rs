@@ -1844,9 +1844,12 @@ async fn recover_and_retry_surfaces_original_error_when_recover_fails() {
     let ew = xai_grok_session_events::EventWriter::noop();
     let call = client.request_tracker.begin_request();
 
+    let source = watched_live_client("failed").await;
+    let failed_service = source.ensure_initialized().await.unwrap();
     let err = tool
         .recover_and_retry(
             &client,
+            &failed_service,
             &call,
             params,
             std::time::Duration::from_secs(1),
@@ -1909,6 +1912,7 @@ enum DiscoverBehavior {
 struct FakeMcpOptions {
     discover: DiscoverBehavior,
     init_unauthorized: bool,
+    first_init_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -1971,7 +1975,12 @@ async fn fake_handle_post(
     };
     match req["method"].as_str() {
         Some("initialize") => {
-            state.handles.inits.fetch_add(1, Ordering::Relaxed);
+            let init_index = state.handles.inits.fetch_add(1, Ordering::Relaxed);
+            if init_index == 0
+                && let Some(gate) = &state.options.first_init_gate
+            {
+                gate.acquire().await.unwrap().forget();
+            }
             *state.handles.init_version.lock() =
                 req["params"]["protocolVersion"].as_str().map(str::to_owned);
             *state.handles.init_capabilities.lock() = req
@@ -3440,6 +3449,7 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             info: McpClient::make_client_info("dead", true),
             server_name: "dead".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            catalog_revision: tokio::sync::watch::channel(0).0,
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
             request_tracker: Arc::default(),
             service_id: crate::elicitation::RequestTracker::default().next_service_id(),
@@ -3557,6 +3567,7 @@ async fn watched_live_client(name: &str) -> Arc<McpClient> {
         info: McpClient::make_client_info(name, true),
         server_name: name.to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        catalog_revision: tokio::sync::watch::channel(0).0,
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         request_tracker: Arc::default(),
         service_id: crate::elicitation::RequestTracker::default().next_service_id(),
@@ -3943,7 +3954,7 @@ async fn ensure_initialized_parked_caller_retries_after_notify() {
 
     // Simulate an in-flight handshake by another task: pretend
     // that task took the transport and entered Initializing.
-    *client.state.lock().await = ClientState::Initializing;
+    *client.state.lock().await = ClientState::Initializing(0);
 
     // Spawn the parker. It must observe Initializing and park on
     // `init_done` rather than fail-fast.
@@ -4008,7 +4019,7 @@ async fn ensure_initialized_inflight_wait_times_out_when_holder_silent() {
     let client = McpClient::new_http("test-server".to_string(), config, Some(&overrides), None);
 
     // Wedge the slot in Initializing with no live holder.
-    *client.state.lock().await = ClientState::Initializing;
+    *client.state.lock().await = ClientState::Initializing(0);
 
     let err = client.ensure_initialized().await.unwrap_err();
     let msg = err.to_string();
@@ -4052,7 +4063,7 @@ async fn ensure_initialized_drop_guard_restores_state_after_holder_aborted() {
     // Wait for the holder to enter Initializing.
     let started = std::time::Instant::now();
     loop {
-        if matches!(&*client.state.lock().await, ClientState::Initializing) {
+        if matches!(&*client.state.lock().await, ClientState::Initializing(_)) {
             break;
         }
         assert!(
@@ -4183,7 +4194,7 @@ fn state_label(s: &ClientState) -> &'static str {
     match s {
         ClientState::Empty => "Empty",
         ClientState::Pending(_) => "Pending",
-        ClientState::Initializing => "Initializing",
+        ClientState::Initializing(_) => "Initializing",
         ClientState::Ready { .. } => "Ready",
     }
 }
@@ -4240,7 +4251,7 @@ async fn is_healthy_pending_returns_false() {
 #[tokio::test]
 async fn is_healthy_initializing_returns_false() {
     let client = McpClient::stub("initializing");
-    *client.state.lock().await = ClientState::Initializing;
+    *client.state.lock().await = ClientState::Initializing(0);
     assert!(!client.is_healthy().await);
     assert_eq!(client.state_kind().await, ClientStateKind::Initializing);
 }
@@ -4392,13 +4403,20 @@ async fn client_handler_routes_tools_changed() {
         info: McpClient::make_client_info("test", true),
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+        catalog_revision: tokio::sync::watch::channel(0).0,
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         request_tracker: Arc::default(),
         service_id: crate::elicitation::RequestTracker::default().next_service_id(),
     };
+    let mut child_a = handler.catalog_revision.subscribe();
+    let mut child_b = handler.catalog_revision.subscribe();
     handler.emit(McpClientEvent::ToolsChanged {
         server: handler.server_name.clone(),
     });
+    child_a.changed().await.expect("first subscriber notified");
+    child_b.changed().await.expect("second subscriber notified");
+    assert_eq!(*child_a.borrow(), 1);
+    assert_eq!(*child_b.borrow(), 1);
     let ev = rx.recv().await.expect("event arrived");
     match ev {
         McpClientEvent::ToolsChanged { server } => assert_eq!(server, "test"),
@@ -4415,6 +4433,7 @@ async fn client_handler_no_dispatcher_is_silent() {
         info: McpClient::make_client_info("test", false),
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        catalog_revision: tokio::sync::watch::channel(0).0,
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         request_tracker: Arc::default(),
         service_id: crate::elicitation::RequestTracker::default().next_service_id(),
@@ -4433,6 +4452,7 @@ async fn client_handler_get_info_round_trips() {
         info: info.clone(),
         server_name: "test-srv".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        catalog_revision: tokio::sync::watch::channel(0).0,
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         request_tracker: Arc::default(),
         service_id: crate::elicitation::RequestTracker::default().next_service_id(),
@@ -5176,4 +5196,164 @@ async fn refused_connect_handshake_classifies_connect_phase() {
         err.is_connect_failure(),
         "a real refused-connect handshake must classify connect-phase: {err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_handshake_cannot_publish_over_replacement() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (url, handles) = spawn_fake_mcp_with(
+        CallToolBehavior::HangThenOk { hang_ms: 0 },
+        FakeMcpOptions {
+            first_init_gate: Some(gate.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = fake_http_client(&url, 5);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_event_tx(Some(tx));
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.ensure_initialized().await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while handles.inits.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first handshake reached the server");
+    assert!(client.reset_transport().await);
+    let replacement = client
+        .ensure_initialized()
+        .await
+        .expect("replacement handshake");
+    gate.add_permits(1);
+    let old_result = first
+        .await
+        .unwrap()
+        .expect("stale caller joins replacement");
+    assert!(Arc::ptr_eq(&old_result, &replacement));
+    assert!(client.is_current_service(&replacement).await);
+    assert_eq!(handles.inits.load(Ordering::Relaxed), 2);
+    let ready_count = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| matches!(event, McpClientEvent::Ready { .. }))
+        .count();
+    assert_eq!(ready_count, 1, "stale handshake must not emit Ready");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_recoveries_join_the_failed_service_generation() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 0 }).await;
+    let client = fake_http_client(&url, 5);
+    let old = client.ensure_initialized().await.unwrap();
+    let (a, b) = tokio::join!(client.recover_from(&old), client.recover_from(&old));
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert!(Arc::ptr_eq(&a, &b), "recoveries must join one service");
+    assert!(!Arc::ptr_eq(&a, &old));
+    assert_eq!(handles.inits.load(Ordering::Relaxed), 2);
+    // An old timeout must not invalidate a service already recovered by a
+    // different call, and the old Arc stays alive until its owner drops it.
+    assert!(client.reset_transport_if_service(&old).await);
+    let still_ready = client.ensure_initialized().await.unwrap();
+    assert!(Arc::ptr_eq(&a, &still_ready));
+    assert_eq!(handles.inits.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_timeout_rearms_watcher_for_the_next_connection() {
+    let (url, _) = spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 3000 }).await;
+    let client = fake_http_client(&url, 1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_event_tx(Some(tx));
+    client.ensure_initialized().await.unwrap();
+    assert!(
+        client
+            .arm_liveness_watcher(std::time::Duration::from_millis(10))
+            .await
+    );
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let err = tool
+        .try_call_tool(&client, &serde_json::json!({}), &mut false, &mut false, &ew)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"));
+    assert!(client.liveness_handle.lock().is_none());
+    let replacement = client.ensure_initialized().await.unwrap();
+    assert!(client.liveness_handle.lock().is_some());
+    while rx.try_recv().is_ok() {}
+    replacement.cancellation_token().cancel();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(McpClientEvent::TransportClosed { client_id, .. }) = rx.recv().await {
+                break client_id;
+            }
+        }
+    })
+    .await
+    .expect("replacement close must be observed");
+    assert_eq!(closed, client.client_id());
+}
+
+#[tokio::test]
+async fn cancelled_stale_handshake_guard_cannot_restore_over_new_attempt() {
+    let client = McpClient::stub("guard");
+    *client.state.lock().await = ClientState::Initializing(2);
+    let stale = InitGuard {
+        state: Arc::clone(&client.state),
+        init_done: Arc::clone(&client.init_done),
+        attempt_id: 1,
+        restore: None,
+        active: true,
+    };
+    drop(stale);
+    assert!(matches!(
+        &*client.state.lock().await,
+        ClientState::Initializing(2)
+    ));
+    let current = InitGuard {
+        state: Arc::clone(&client.state),
+        init_done: Arc::clone(&client.init_done),
+        attempt_id: 2,
+        restore: None,
+        active: true,
+    };
+    drop(current);
+    assert!(matches!(&*client.state.lock().await, ClientState::Empty));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_http_close_does_not_reset_a_healthy_connection() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 0 }).await;
+    let client = fake_http_client(&url, 5);
+    let service = client.ensure_initialized().await.unwrap();
+    let recovered = client.recover_if_closed().await.unwrap();
+    assert!(Arc::ptr_eq(&service, &recovered));
+    assert_eq!(handles.inits.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn cancelled_handshake_restores_after_a_contended_state_lock() {
+    let client = McpClient::stub("guard");
+    let mut state = client.state.lock().await;
+    *state = ClientState::Initializing(7);
+    let guard = InitGuard {
+        state: Arc::clone(&client.state),
+        init_done: Arc::clone(&client.init_done),
+        attempt_id: 7,
+        restore: None,
+        active: true,
+    };
+    drop(guard);
+    drop(state);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if matches!(&*client.state.lock().await, ClientState::Empty) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled attempt eventually restores state");
 }

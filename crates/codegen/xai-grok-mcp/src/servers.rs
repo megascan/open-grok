@@ -2080,7 +2080,7 @@ impl McpErasedTool {
             Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
                 if client.is_http() && !*reconnect_attempted {
-                    client.reset_transport().await;
+                    client.reset_transport_if_service(&mcp_service).await;
                     *reconnect_attempted = true;
                 }
                 Err(xai_tool_runtime::ToolError::custom(
@@ -2100,6 +2100,7 @@ impl McpErasedTool {
             {
                 self.recover_and_retry(
                     client,
+                    &mcp_service,
                     call,
                     params,
                     timeout_duration,
@@ -2182,6 +2183,7 @@ impl McpErasedTool {
     async fn recover_and_retry(
         &self,
         client: &Arc<McpClient>,
+        failed_service: &McpService,
         call: &crate::elicitation::RunningRequest,
         params: CallToolRequestParams,
         timeout_duration: std::time::Duration,
@@ -2203,7 +2205,7 @@ impl McpErasedTool {
             tool_name: self.tool.name.clone(),
             error: original_err.to_string(),
         });
-        let mcp_service = match client.recover().await {
+        let mcp_service = match client.recover_from(failed_service).await {
             Ok(service) => {
                 ew.emit(xai_grok_session_events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
@@ -3082,7 +3084,7 @@ enum ProbeVerdict {
 }
 
 /// Transport configuration before connection is established.
-enum PendingTransport {
+pub(crate) enum PendingTransport {
     Stdio(Box<SafeTokioChildProcess>),
     Http(HttpConfig),
     HttpAuth {
@@ -3118,7 +3120,7 @@ pub type McpService = Arc<RunningService<RoleClient, GrokClientHandler>>;
 /// and park on [`McpClient::init_done`] until the holder publishes a
 /// result, instead of failing fast with
 /// `"MCP client already initializing"` as in earlier versions.
-enum ClientState {
+pub(crate) enum ClientState {
     /// No transport configured. Reachable from:
     /// - [`McpClient::stub`] (test placeholder; `ensure_initialized`
     ///   returns a configuration error).
@@ -3134,7 +3136,7 @@ enum ClientState {
     /// attempt a parallel handshake. If the holder is cancelled or
     /// panics before publishing a result, an [`InitGuard`] restores the
     /// transport on a best-effort basis so other callers can retry.
-    Initializing,
+    Initializing(u64),
     /// Handshake completed; the service is reference-counted via `Arc`.
     Ready {
         service: McpService,
@@ -3287,61 +3289,55 @@ impl McpClientEvent {
     }
 }
 
-/// RAII guard that restores [`ClientState::Pending`] if the
-/// [`McpClient::ensure_initialized`] holder is dropped before publishing
-/// its handshake result (task cancellation, panic). Without this guard a
-/// cancellation mid-handshake would leave `state` stuck in
-/// [`ClientState::Initializing`] and every subsequent caller would block
-/// until the wait-timeout fallback fires, then return an error — the
-/// caller would have to call [`McpClient::reset_transport`]
-/// manually to recover.
-///
-/// On the success path the holder calls [`Self::disarm`] before storing
-/// `Ready`/`Empty` under the state lock, which converts the `Drop` into
-/// a no-op. The guard never restores on the success path.
-///
-/// Drop uses [`tokio::sync::Mutex::try_lock`] because `Drop` runs
-/// synchronously and we cannot block the runtime here. If the lock is
-/// contended (extremely rare — the only competing locker is another
-/// `ensure_initialized` caller which holds the lock for the duration of
-/// a match arm, microseconds), the restore is skipped and the
-/// inflight-wait timeout in `ensure_initialized` becomes the
-/// last-resort recovery path.
-struct InitGuard<'a> {
-    state: &'a Mutex<ClientState>,
-    init_done: &'a Notify,
-    /// `Some` until [`Self::disarm`] is called. Holds the restorable
-    /// transport (HTTP / HttpAuth) or `None` for Stdio (whose child
-    /// process is consumed by `client.serve` and cannot be reused).
+/// Restores only the handshake attempt that this guard owns. A consumed
+/// stdio transport becomes Empty; rebuildable transports return to Pending.
+struct InitGuard {
+    state: Arc<Mutex<ClientState>>,
+    init_done: Arc<Notify>,
+    attempt_id: u64,
     restore: Option<PendingTransport>,
+    active: bool,
 }
 
-impl InitGuard<'_> {
-    /// Mark the guard as having published a result. Subsequent `Drop`
-    /// becomes a no-op so it doesn't fight with the holder's own
-    /// state-store-under-the-lock or wake waiters twice.
+impl InitGuard {
     fn disarm(&mut self) {
-        self.restore = None;
+        self.active = false;
     }
 }
 
-impl Drop for InitGuard<'_> {
+impl Drop for InitGuard {
     fn drop(&mut self) {
-        let Some(restore) = self.restore.take() else {
+        if !self.active {
             return;
-        };
-        // Best-effort restore. `try_lock` cannot block the runtime from
-        // inside Drop; on contention the slot stays Initializing and the
-        // inflight-wait timeout becomes the recovery path.
-        if let Ok(mut guard) = self.state.try_lock()
-            && matches!(&*guard, ClientState::Initializing)
-        {
-            *guard = ClientState::Pending(restore);
         }
-        // Notify whether or not we managed to restore — parked waiters
-        // need to wake up and either retry against the restored
-        // transport or hit the wait-timeout error path.
-        self.init_done.notify_waiters();
+        let restore = self.restore.take();
+        let state = Arc::clone(&self.state);
+        let task_state = Arc::clone(&state);
+        let done = Arc::clone(&self.init_done);
+        let attempt_id = self.attempt_id;
+        // Drop cannot await. If a reader holds the mutex, finish restoration
+        // asynchronously rather than leaving Initializing permanently wedged.
+        if let Ok(mut guard) = state.try_lock() {
+            if matches!(&*guard, ClientState::Initializing(id) if *id == attempt_id) {
+                *guard = restore.map_or(ClientState::Empty, ClientState::Pending);
+                drop(guard);
+                done.notify_waiters();
+            }
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut guard = task_state.lock().await;
+                if matches!(&*guard, ClientState::Initializing(id) if *id == attempt_id) {
+                    *guard = restore.map_or(ClientState::Empty, ClientState::Pending);
+                    drop(guard);
+                    done.notify_waiters();
+                }
+            });
+        } else {
+            tracing::warn!(
+                attempt_id,
+                "cannot restore cancelled MCP handshake outside runtime"
+            );
+        };
     }
 }
 
@@ -3374,6 +3370,7 @@ fn restorable_transport(pending: &PendingTransport) -> Option<PendingTransport> 
 /// Monotonic source for [`McpClient::client_id`]. Process-global so every
 /// client instance — including test stubs — gets a unique identity.
 static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_HANDSHAKE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_client_id() -> u64 {
     NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3383,7 +3380,7 @@ pub struct McpClient {
     /// Unique identity of this client *instance*. See [`Self::client_id`].
     client_id: u64,
     server_name: McpServerName,
-    state: Mutex<ClientState>,
+    state: Arc<Mutex<ClientState>>,
     /// Wakes [`Self::ensure_initialized`] callers that observed
     /// [`ClientState::Initializing`] and parked. Notified after each
     /// handshake attempt finishes (success **or** failure) and `state`
@@ -3395,7 +3392,7 @@ pub struct McpClient {
     /// which leaked into model-visible tool results whenever the model's
     /// first tool dispatch raced the session actor's background
     /// `get_tool_registrations` handshake.
-    init_done: Notify,
+    init_done: Arc<Notify>,
     startup_timeout_sec: u64,
     tool_timeout_sec: u64,
     /// Per-tool timeout overrides in seconds. Looked up by tool name;
@@ -3450,6 +3447,8 @@ pub struct McpClient {
     /// `.await`, and the handler's `emit` path is short and
     /// allocation-free.
     notify_tx: SharedEventTx,
+    /// Revision stream for every session using this client, including children.
+    catalog_revision: tokio::sync::watch::Sender<u64>,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
     request_tracker: Arc<crate::elicitation::RequestTracker>,
     /// RAII handle for the per-client transport-liveness poller.
@@ -3467,6 +3466,7 @@ pub struct McpClient {
     /// internal `Arc` clone of this mutex (the same memory) so it
     /// can clear the slot before `break`.
     liveness_handle: Arc<parking_lot::Mutex<Option<crate::liveness::TransportLivenessHandle>>>,
+    liveness_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// Shared sender slot type — the same Arc lives on the [`McpClient`]
@@ -3576,8 +3576,8 @@ impl McpClient {
         Self {
             client_id: next_client_id(),
             server_name,
-            state: Mutex::new(ClientState::Pending(transport)),
-            init_done: Notify::new(),
+            state: Arc::new(Mutex::new(ClientState::Pending(transport))),
+            init_done: Arc::new(Notify::new()),
             startup_timeout_sec,
             tool_timeout_sec,
             tool_timeouts,
@@ -3589,9 +3589,11 @@ impl McpClient {
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            catalog_revision: tokio::sync::watch::channel(0).0,
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
             request_tracker: Arc::default(),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
+            liveness_enabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3824,6 +3826,7 @@ impl McpClient {
     /// from the `reconnect` snapshot taken at construction. Returns `false`
     /// for clients whose `reconnect` is `None` (e.g. Stdio — dead child
     /// processes can't be restarted from here).
+    #[cfg(test)]
     async fn reset_transport(&self) -> bool {
         let Some(t) = self.reconnect.as_ref().and_then(restorable_transport) else {
             return false;
@@ -3885,32 +3888,67 @@ impl McpClient {
     /// `Err` for a client with no restorable transport (e.g. Stdio — its child
     /// was consumed by the handshake).
     pub async fn recover(self: &Arc<Self>) -> Result<McpService, McpError> {
-        // Coalesce concurrent recoveries: reset only when Ready; if already
-        // non-Ready a recovery is in flight, so join its single-flight
-        // ensure_initialized instead of racing a reset.
-        if matches!(self.state_kind().await, ClientStateKind::Ready)
-            && !self.reset_transport().await
-        {
+        let current = {
+            let guard = self.state.lock().await;
+            match &*guard {
+                ClientState::Ready { service, .. } => Some(Arc::clone(service)),
+                _ => None,
+            }
+        };
+        if let Some(service) = current {
+            self.recover_from(&service).await
+        } else {
+            self.ensure_initialized().await
+        }
+    }
+
+    /// Recover a watcher-reported closure without resetting a replacement
+    /// that became healthy while the close notification was queued.
+    pub async fn recover_if_closed(self: &Arc<Self>) -> Result<McpService, McpError> {
+        let current = {
+            let guard = self.state.lock().await;
+            match &*guard {
+                ClientState::Ready { service, .. } if !service.is_transport_closed() => {
+                    return Ok(Arc::clone(service));
+                }
+                ClientState::Ready { service, .. } => Some(Arc::clone(service)),
+                _ => None,
+            }
+        };
+        if let Some(service) = current {
+            self.recover_from(&service).await
+        } else {
+            self.ensure_initialized().await
+        }
+    }
+
+    /// Invalidate only the service which failed. Other calls may already have
+    /// installed a replacement or claimed the handshake; join that attempt.
+    async fn reset_transport_if_service(&self, failed: &McpService) -> bool {
+        let mut guard = self.state.lock().await;
+        if !matches!(&*guard, ClientState::Ready { service, .. } if Arc::ptr_eq(service, failed)) {
+            return true;
+        }
+        let Some(transport) = self.reconnect.as_ref().and_then(restorable_transport) else {
+            return false;
+        };
+        // Dropping this state releases its Arc; in-flight calls retain their
+        // own service until they settle and may still send cancellation.
+        *guard = ClientState::Pending(transport);
+        self.clear_liveness_handle();
+        drop(guard);
+        self.init_done.notify_waiters();
+        true
+    }
+
+    async fn recover_from(self: &Arc<Self>, failed: &McpService) -> Result<McpService, McpError> {
+        if !self.reset_transport_if_service(failed).await {
             return Err(McpError::ClientError(format!(
                 "MCP client {} has no transport to recover",
                 self.server_name,
             )));
         }
-        let service = self.ensure_initialized().await?;
-        // Re-arm liveness so the next close is detected again. A `false` return
-        // with a wired sender is unexpected only for watched (non-ACP) clients.
-        if !self
-            .arm_liveness_watcher(crate::liveness::DEFAULT_POLL_INTERVAL)
-            .await
-            && !self.is_acp()
-            && self.event_tx_clone().is_some()
-        {
-            tracing::warn!(
-                server = %self.server_name,
-                "recovery: liveness watcher not re-armed despite a wired event sender",
-            );
-        }
-        Ok(service)
+        self.ensure_initialized().await
     }
 
     /// Replace [`Self::state`] under the lock and wake any
@@ -3928,6 +3966,7 @@ impl McpClient {
         {
             let mut guard = self.state.lock().await;
             *guard = new_state;
+            self.clear_liveness_handle();
         }
         self.init_done.notify_waiters();
     }
@@ -4064,13 +4103,9 @@ impl McpClient {
     /// ## Cancellation safety
     ///
     /// If the holder is dropped (parent task cancelled, panic) before
-    /// publishing a result, [`InitGuard`]'s `Drop` impl best-effort
-    /// restores the transport (so future callers can retry without an
-    /// explicit `reset_transport`) and wakes parked waiters. The
-    /// restore uses [`tokio::sync::Mutex::try_lock`] because `Drop` is
-    /// synchronous; on the rare contention case the slot stays
-    /// `Initializing` and the wait-timeout fallback below surfaces a
-    /// clear error rather than blocking forever.
+    /// publishing a result, [`InitGuard`] restores only its own attempt
+    /// and wakes parked waiters. Contended restoration is completed by
+    /// an asynchronous task; consumed stdio transports become Empty.
     pub async fn ensure_initialized(&self) -> Result<McpService, McpError> {
         // Bound how long a parked caller waits on `init_done` before
         // surfacing an error. `try_handshake` is itself bounded by
@@ -4087,202 +4122,227 @@ impl McpClient {
         // every arm of the inner match either diverges (return /
         // continue) or yields the transport — no `unreachable!()`
         // escape hatch needed.
-        let pending: PendingTransport = loop {
-            // Subscribe to `init_done` BEFORE inspecting `state` so a
-            // wake-up fired between our state check and the wait can't be
-            // lost. `tokio::sync::Notify` only delivers a permit to
-            // notify-futures that exist at the time of `notify_waiters`.
-            let notified = self.init_done.notified();
-            tokio::pin!(notified);
+        'initialization: loop {
+            let (pending, attempt_id): (PendingTransport, u64) = loop {
+                // Subscribe to `init_done` BEFORE inspecting `state` so a
+                // wake-up fired between our state check and the wait can't be
+                // lost. `tokio::sync::Notify` only delivers a permit to
+                // notify-futures that exist at the time of `notify_waiters`.
+                let notified = self.init_done.notified();
+                tokio::pin!(notified);
 
-            let mut guard = self.state.lock().await;
-            // Swap the current state for `Initializing` up front and
-            // match on the OWNED previous value. This avoids the
-            // `match-by-ref → mem::replace → re-match → unreachable!()`
-            // dance — the compiler can bind `ClientState::Pending(t)`
-            // directly from an owned value with no irrefutable-let
-            // hole. Non-Pending arms restore their original variant
-            // before falling through; the lock is held the entire
-            // window so the brief `Initializing` placeholder is
-            // invisible to other callers. Cost is one trivial unit-
-            // variant write per non-Pending call (plus an `Arc::clone`
-            // on the Ready path) — negligible.
-            match std::mem::replace(&mut *guard, ClientState::Initializing) {
-                ClientState::Ready {
-                    service,
-                    _connected,
-                } => {
-                    let ready = service.clone();
-                    *guard = ClientState::Ready {
+                let mut guard = self.state.lock().await;
+                // Swap the current state for `Initializing` up front and
+                // match on the OWNED previous value. This avoids the
+                // `match-by-ref → mem::replace → re-match → unreachable!()`
+                // dance — the compiler can bind `ClientState::Pending(t)`
+                // directly from an owned value with no irrefutable-let
+                // hole. Non-Pending arms restore their original variant
+                // before falling through; the lock is held the entire
+                // window so the brief `Initializing` placeholder is
+                // invisible to other callers. Cost is one trivial unit-
+                // variant write per non-Pending call (plus an `Arc::clone`
+                // on the Ready path) — negligible.
+                let attempt_id =
+                    NEXT_HANDSHAKE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match std::mem::replace(&mut *guard, ClientState::Initializing(attempt_id)) {
+                    ClientState::Ready {
                         service,
                         _connected,
+                    } => {
+                        let ready = service.clone();
+                        self.install_liveness(&ready, crate::liveness::DEFAULT_POLL_INTERVAL);
+                        *guard = ClientState::Ready {
+                            service,
+                            _connected,
+                        };
+                        return Ok(ready);
+                    }
+                    ClientState::Empty => {
+                        *guard = ClientState::Empty;
+                        return Err(McpError::ClientError(format!(
+                            "MCP client {} has no transport configured",
+                            self.server_name,
+                        )));
+                    }
+                    ClientState::Initializing(id) => {
+                        // Another caller already owns the slot. Restore the
+                        // placeholder we just swapped in (semantically a
+                        // no-op for the existing attempt id),
+                        // drop the lock, park on `init_done`.
+                        *guard = ClientState::Initializing(id);
+                        drop(guard);
+                        match tokio::time::timeout(inflight_wait, notified.as_mut()).await {
+                            Ok(()) => continue,
+                            Err(_) => {
+                                return Err(McpError::ClientError(format!(
+                                    "MCP client {} init still in progress after {}s",
+                                    self.server_name,
+                                    inflight_wait.as_secs(),
+                                )));
+                            }
+                        }
+                    }
+                    // The single arm that KEEPS the `Initializing`
+                    // placeholder we swapped in — this caller becomes the
+                    // single-flight handshake holder for the duration of
+                    // `try_handshake` below.
+                    ClientState::Pending(transport) => break (transport, attempt_id),
+                }
+            };
+
+            // Lock released. Run the handshake outside the lock so other
+            // callers can park on `init_done` instead of stalling on
+            // `state.lock()`.
+
+            // Clone the transport's restorable handle twice — once for
+            // the failure-path retry below, once for the drop guard.
+            // `PendingTransport` is intentionally not `Clone` (Stdio's
+            // `TokioChildProcess` is unique), so the helper returns
+            // `None` for Stdio (whose handshake failures cannot be
+            // recovered without a fresh spawn).
+            let restore = restorable_transport(&pending);
+            let restore_for_guard = restorable_transport(&pending);
+
+            // Drop guard: if `try_handshake` panics or is cancelled before
+            // we publish a result, restore `Pending(restore)` so other
+            // callers don't stall on `Initializing` forever. Disarm via
+            // `disarm()` immediately before storing the real result.
+            let mut init_guard = InitGuard {
+                state: Arc::clone(&self.state),
+                init_done: Arc::clone(&self.init_done),
+                attempt_id,
+                restore: restore_for_guard,
+                active: true,
+            };
+
+            let handshake_start = std::time::Instant::now();
+            let mut result = self.try_handshake(pending).await;
+
+            let handshake_elapsed = handshake_start.elapsed().as_micros() as u64;
+            tracing::info!(target: xai_grok_telemetry::instrumentation::TARGET, event = "timing", name = "mcp_try_handshake", elapsed_us = handshake_elapsed);
+            // On handshake failure, if we have an auth_manager, try
+            // refreshing the token and retrying once. Handles expired
+            // access tokens loaded from disk — the handshake fails at the
+            // transport layer before rmcp's transparent 401 refresh can
+            // kick in. We attempt refresh on any failure (not just auth
+            // errors) because the cost is low and error strings from
+            // different MCP servers are not reliable to match.
+            if result.is_err()
+                && let (Some(auth_mgr), Some(config)) = (&self.auth_manager, &self.http_config)
+            {
+                // Token refresh mutates shared credentials. Serialize it with
+                // external state replacement and skip it if this attempt has
+                // already been superseded.
+                let state_guard = self.state.lock().await;
+                if !matches!(&*state_guard, ClientState::Initializing(id) if *id == attempt_id) {
+                    init_guard.disarm();
+                    drop(state_guard);
+                    drop(result);
+                    continue 'initialization;
+                }
+                tracing::info!(
+                    server = %self.server_name,
+                    "Handshake failed, attempting token refresh and retry"
+                );
+                let refresh_ok = {
+                    let mut mgr = auth_mgr.lock().await;
+                    crate::oauth::ensure_oauth_ready(&self.server_name, &mut mgr)
+                        .await
+                        .hydrated
+                        && mgr.refresh_token().await.is_ok()
+                };
+                drop(state_guard);
+                if refresh_ok {
+                    let retry_transport = PendingTransport::HttpAuth {
+                        config: config.clone(),
+                        auth_manager: auth_mgr.clone(),
                     };
-                    return Ok(ready);
+                    result = self.try_handshake(retry_transport).await;
                 }
-                ClientState::Empty => {
-                    *guard = ClientState::Empty;
-                    return Err(McpError::ClientError(format!(
-                        "MCP client {} has no transport configured",
-                        self.server_name,
-                    )));
-                }
-                ClientState::Initializing => {
-                    // Another caller already owns the slot. Restore the
-                    // placeholder we just swapped in (semantically a
-                    // no-op since `Initializing` is a unit variant),
-                    // drop the lock, park on `init_done`.
-                    *guard = ClientState::Initializing;
+            }
+
+            // Disarm before publishing the result so the drop guard
+            // doesn't double-restore on the success path or fight with
+            // the failure-path assignment below.
+            // Snapshot the event sender before we commit Ready/Pending/Empty
+            // under the lock. We want to emit `HandshakeFailed` (on `Err`) or
+            // signal the dispatcher to set status=ready (on `Ok`) AFTER
+            // releasing the state lock, so a `state.lock().await` inside the
+            // dispatcher (should one ever exist — none today) can't deadlock.
+            //
+            // The snapshot reads through the SHARED `Arc<Mutex<...>>`
+            // slot. If the per-server task wired [`Self::set_event_tx`]
+            // BEFORE invoking `get_tool_registrations` (the pattern in
+            // `acp_session.rs`), this snapshot picks up the sender even
+            // for the very first handshake.
+            let event_tx = self.event_tx_clone();
+
+            let outcome = {
+                let mut guard = self.state.lock().await;
+                if !matches!(&*guard, ClientState::Initializing(id) if *id == attempt_id) {
+                    // Another operation superseded this attempt. Dropping an
+                    // uncommitted RunningService shuts down its transport; never
+                    // publish its result or emit a stale status event.
+                    init_guard.disarm();
                     drop(guard);
-                    match tokio::time::timeout(inflight_wait, notified.as_mut()).await {
-                        Ok(()) => continue,
-                        Err(_) => {
-                            return Err(McpError::ClientError(format!(
-                                "MCP client {} init still in progress after {}s",
-                                self.server_name,
-                                inflight_wait.as_secs(),
-                            )));
+                    drop(result);
+                    continue 'initialization;
+                }
+                init_guard.disarm();
+                let outcome = match result {
+                    Ok(service) => {
+                        let service = Arc::new(service);
+                        self.install_liveness(&service, crate::liveness::DEFAULT_POLL_INTERVAL);
+                        *guard = ClientState::Ready {
+                            service: service.clone(),
+                            _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+                        };
+                        tracing::info!(
+                            server = %self.server_name,
+                            "MCP server initialized successfully"
+                        );
+                        self.notify_catalog_changed();
+                        Ok(service)
+                    }
+                    Err(e) => {
+                        *guard = match restore {
+                            Some(transport) => ClientState::Pending(transport),
+                            None => ClientState::Empty,
+                        };
+                        tracing::warn!(
+                            server = %self.server_name,
+                            error = %e,
+                            "MCP server init failed"
+                        );
+                        Err(e)
+                    }
+                };
+                // Enqueue the event while this attempt still owns the state.
+                // Sending is synchronous and does not call back into the client.
+                if let Some(tx) = &event_tx {
+                    match &outcome {
+                        Ok(_) => {
+                            let _ = tx.send(McpClientEvent::Ready {
+                                server: self.server_name.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(McpClientEvent::HandshakeFailed {
+                                server: self.server_name.clone(),
+                                reason: e.to_string(),
+                            });
                         }
                     }
                 }
-                // The single arm that KEEPS the `Initializing`
-                // placeholder we swapped in — this caller becomes the
-                // single-flight handshake holder for the duration of
-                // `try_handshake` below.
-                ClientState::Pending(transport) => break transport,
-            }
-        };
-
-        // Lock released. Run the handshake outside the lock so other
-        // callers can park on `init_done` instead of stalling on
-        // `state.lock()`.
-
-        // Clone the transport's restorable handle twice — once for
-        // the failure-path retry below, once for the drop guard.
-        // `PendingTransport` is intentionally not `Clone` (Stdio's
-        // `TokioChildProcess` is unique), so the helper returns
-        // `None` for Stdio (whose handshake failures cannot be
-        // recovered without a fresh spawn).
-        let restore = restorable_transport(&pending);
-        let restore_for_guard = restorable_transport(&pending);
-
-        // Drop guard: if `try_handshake` panics or is cancelled before
-        // we publish a result, restore `Pending(restore)` so other
-        // callers don't stall on `Initializing` forever. Disarm via
-        // `disarm()` immediately before storing the real result.
-        let mut init_guard = InitGuard {
-            state: &self.state,
-            init_done: &self.init_done,
-            restore: restore_for_guard,
-        };
-
-        let handshake_start = std::time::Instant::now();
-        let mut result = self.try_handshake(pending).await;
-
-        let handshake_elapsed = handshake_start.elapsed().as_micros() as u64;
-        tracing::info!(target: xai_grok_telemetry::instrumentation::TARGET, event = "timing", name = "mcp_try_handshake", elapsed_us = handshake_elapsed);
-        // On handshake failure, if we have an auth_manager, try
-        // refreshing the token and retrying once. Handles expired
-        // access tokens loaded from disk — the handshake fails at the
-        // transport layer before rmcp's transparent 401 refresh can
-        // kick in. We attempt refresh on any failure (not just auth
-        // errors) because the cost is low and error strings from
-        // different MCP servers are not reliable to match.
-        if result.is_err()
-            && let (Some(auth_mgr), Some(config)) = (&self.auth_manager, &self.http_config)
-        {
-            tracing::info!(
-                server = %self.server_name,
-                "Handshake failed, attempting token refresh and retry"
-            );
-            let refresh_ok = {
-                let mut mgr = auth_mgr.lock().await;
-                crate::oauth::ensure_oauth_ready(&self.server_name, &mut mgr)
-                    .await
-                    .hydrated
-                    && mgr.refresh_token().await.is_ok()
+                outcome
             };
-            if refresh_ok {
-                let retry_transport = PendingTransport::HttpAuth {
-                    config: config.clone(),
-                    auth_manager: auth_mgr.clone(),
-                };
-                result = self.try_handshake(retry_transport).await;
-            }
+            // Wake parked callers AFTER releasing the state lock so they
+            // observe the freshly-stored Ready/Pending/Empty value.
+            self.init_done.notify_waiters();
+
+            return outcome;
         }
-
-        // Disarm before publishing the result so the drop guard
-        // doesn't double-restore on the success path or fight with
-        // the failure-path assignment below.
-        init_guard.disarm();
-
-        // Snapshot the event sender before we commit Ready/Pending/Empty
-        // under the lock. We want to emit `HandshakeFailed` (on `Err`) or
-        // signal the dispatcher to set status=ready (on `Ok`) AFTER
-        // releasing the state lock, so a `state.lock().await` inside the
-        // dispatcher (should one ever exist — none today) can't deadlock.
-        //
-        // The snapshot reads through the SHARED `Arc<Mutex<...>>`
-        // slot. If the per-server task wired [`Self::set_event_tx`]
-        // BEFORE invoking `get_tool_registrations` (the pattern in
-        // `acp_session.rs`), this snapshot picks up the sender even
-        // for the very first handshake.
-        let event_tx = self.event_tx_clone();
-
-        let outcome = {
-            let mut guard = self.state.lock().await;
-            match result {
-                Ok(service) => {
-                    let service = Arc::new(service);
-                    *guard = ClientState::Ready {
-                        service: service.clone(),
-                        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
-                    };
-                    tracing::info!(
-                        server = %self.server_name,
-                        "MCP server initialized successfully"
-                    );
-                    Ok(service)
-                }
-                Err(e) => {
-                    *guard = match restore {
-                        Some(transport) => ClientState::Pending(transport),
-                        None => ClientState::Empty,
-                    };
-                    tracing::warn!(
-                        server = %self.server_name,
-                        error = %e,
-                        "MCP server init failed"
-                    );
-                    Err(e)
-                }
-            }
-        };
-        // Wake parked callers AFTER releasing the state lock so they
-        // observe the freshly-stored Ready/Pending/Empty value.
-        self.init_done.notify_waiters();
-
-        // Notify the session-actor StatusDispatcher of the handshake
-        // outcome, AFTER releasing the state lock. Best-effort: if the
-        // receiver is gone (dispatcher torn down, subagent without
-        // wiring) the send fails silently. The dispatcher is the only
-        // path that turns these into ACP pushes — see the
-        // `client_event_tx` field on `McpState`.
-        if let Some(tx) = &event_tx {
-            match &outcome {
-                Ok(_) => {
-                    let _ = tx.send(McpClientEvent::Ready {
-                        server: self.server_name.clone(),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(McpClientEvent::HandshakeFailed {
-                        server: self.server_name.clone(),
-                        reason: e.to_string(),
-                    });
-                }
-            }
-        }
-        outcome
     }
     #[tracing::instrument(
         name = "mcp.serve",
@@ -4601,6 +4661,7 @@ impl McpClient {
             ),
             server_name: self.server_name.clone(),
             notify_tx: Arc::clone(&self.notify_tx),
+            catalog_revision: self.catalog_revision.clone(),
             elicitation_tx: Arc::clone(&self.elicitation_tx),
             request_tracker: Arc::clone(&self.request_tracker),
             service_id: self.request_tracker.next_service_id(),
@@ -4612,10 +4673,16 @@ impl McpClient {
     /// Mutates the shared slot synchronously. All previously-cloned
     /// references (the [`GrokClientHandler`] handed to
     /// `client.serve`, the [`crate::liveness::spawn_transport_liveness`]
-    /// task) read through the same Arc, so this is observed
-    /// session-wide on the next event.
+    /// handler) read through the same Arc. Watchers retain a sender, so
+    /// removing the sender also stops them and releases the channel.
     pub fn set_event_tx(&self, tx: Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>>) {
+        let detached = tx.is_none();
         *self.notify_tx.lock() = tx;
+        if detached {
+            self.liveness_enabled
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.clear_liveness_handle();
+        }
     }
 
     pub fn set_elicitation_tx(&self, tx: Option<crate::elicitation::ElicitationInbox>) {
@@ -4645,6 +4712,24 @@ impl McpClient {
         .await
     }
 
+    /// Subscribe to catalog changes without taking ownership of the client's
+    /// transport or status event sink. Each sharing session reconciles its own
+    /// tool registry when the revision advances.
+    pub fn subscribe_catalog_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.catalog_revision.subscribe()
+    }
+
+    /// Current revision, used to reject a list overtaken by a notification.
+    pub fn catalog_revision(&self) -> u64 {
+        *self.catalog_revision.borrow()
+    }
+
+    /// Signal that the current connection's catalog may need to be listed.
+    pub fn notify_catalog_changed(&self) {
+        self.catalog_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
     /// Snapshot the current event sender, if any.
     ///
     /// Used by [`crate::liveness::spawn_transport_liveness`] (which
@@ -4664,63 +4749,63 @@ impl McpClient {
     /// task uses an `Arc` clone of this same mutex so it can clear the
     /// slot from inside the task before exiting.
     pub fn set_liveness_handle(&self, handle: Option<crate::liveness::TransportLivenessHandle>) {
+        self.liveness_enabled
+            .store(handle.is_some(), std::sync::atomic::Ordering::Release);
         *self.liveness_handle.lock() = handle;
     }
 
-    /// Arm the per-client transport-liveness watcher.
-    ///
-    /// Idempotent and gated:
-    /// - Returns `false` for in-process SDK ([`Self::is_acp`]) clients: the
-    ///   watcher's only output is `TransportClosed`, which the dispatcher can't
-    ///   recover for ACP (not in `configs`), so it would evict the client. ACP
-    ///   recovers lazily via [`Self::reset_transport`] instead. Gated here so no
-    ///   caller can forget it.
-    /// - Returns `false` if there's no `notify_tx` wired (subagent
-    ///   snapshot or pre-dispatcher state) — nothing to do.
-    /// - Returns `false` if the client isn't `Ready` — armed pollers
-    ///   would just exit silently on their first poll, but skipping
-    ///   the spawn entirely is cheaper.
-    /// - Returns `false` if a live handle is already installed.
-    /// - Otherwise spawns the poller and stores the handle.
-    ///
-    /// **TOCTOU note**: the state check is performed before the
-    /// liveness lock is acquired. A concurrent re-handshake could move
-    /// the state to `Initializing` between the check and the spawn.
-    /// This is benign — the poller's first tick observes the
-    /// non-`Ready` state and exits silently without emitting. So the
-    /// worst case under TOCTOU is "the poller starts and immediately
-    /// stops"; it never produces a spurious `TransportClosed`.
-    ///
-    /// Lifecycle: when the watcher emits `TransportClosed` it clears
-    /// the slot itself; the next `arm_liveness_watcher` call can
-    /// install a fresh handle without a manual
-    /// [`Self::set_liveness_handle`] reset.
-    pub async fn arm_liveness_watcher(
-        self: &Arc<Self>,
-        poll_interval: std::time::Duration,
-    ) -> bool {
-        if self.is_acp() {
+    /// Cancel a watch during a transport transition while retaining the
+    /// owning session's intent to watch the next successful handshake.
+    fn clear_liveness_handle(&self) {
+        self.liveness_handle.lock().take();
+    }
+
+    /// Caller holds `state`, which serializes installing a watcher with
+    /// transport replacement. An old watcher only clears its own slot.
+    fn install_liveness(&self, service: &McpService, poll_interval: std::time::Duration) -> bool {
+        if self.is_acp()
+            || !self
+                .liveness_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return false;
         }
         let Some(event_tx) = self.event_tx_clone() else {
             return false;
         };
-        if !matches!(self.state_kind().await, ClientStateKind::Ready) {
-            return false;
-        }
         let mut slot = self.liveness_handle.lock();
-        if slot.is_some() {
+        if slot
+            .as_ref()
+            .is_some_and(|watcher| watcher.watches(service))
+        {
             return false;
         }
         let handle = crate::liveness::spawn_transport_liveness(
             self.server_name.clone(),
-            Arc::clone(self),
+            self.client_id,
+            Arc::clone(&self.state),
+            Arc::clone(service),
             poll_interval,
             event_tx,
             Arc::clone(&self.liveness_handle),
         );
         *slot = Some(handle);
         true
+    }
+
+    /// Enable watching on an owned Ready client. Subsequent handshakes
+    /// re-arm automatically, including after a timeout or token refresh.
+    pub async fn arm_liveness_watcher(&self, poll_interval: std::time::Duration) -> bool {
+        if self.is_acp() || self.event_tx_clone().is_none() {
+            return false;
+        }
+        let state = self.state.lock().await;
+        let ClientState::Ready { service, .. } = &*state else {
+            return false;
+        };
+        self.liveness_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.install_liveness(service, poll_interval)
     }
 
     /// One shared, cloneable HTTP client for a server's handshake: the probe
@@ -4783,6 +4868,12 @@ impl McpClient {
     /// `is_transport_closed()` returning `false`, and this method
     /// continues to report `true`. That is the desired semantics — a
     /// liveness probe would belong in a separate watcher, not here.
+    /// Whether a previously returned service is still this client's current connection.
+    pub async fn is_current_service(&self, expected: &McpService) -> bool {
+        let guard = self.state.lock().await;
+        matches!(&*guard, ClientState::Ready { service, .. } if Arc::ptr_eq(service, expected))
+    }
+
     pub async fn is_healthy(&self) -> bool {
         let guard = self.state.lock().await;
         match &*guard {
@@ -4817,6 +4908,23 @@ impl McpClient {
         }
     }
 
+    pub(crate) async fn liveness_for_service(
+        state: &Mutex<ClientState>,
+        expected: &McpService,
+    ) -> LivenessCheck {
+        let guard = state.lock().await;
+        match &*guard {
+            ClientState::Ready { service, .. } if Arc::ptr_eq(service, expected) => {
+                if service.is_transport_closed() {
+                    LivenessCheck::TransportClosed
+                } else {
+                    LivenessCheck::Healthy
+                }
+            }
+            _ => LivenessCheck::Transient,
+        }
+    }
+
     /// State-machine snapshot for diagnostics and downstream UI.
     ///
     /// Like [`Self::is_healthy`], this is a cheap state inspection
@@ -4828,7 +4936,7 @@ impl McpClient {
         match &*guard {
             ClientState::Empty => ClientStateKind::Empty,
             ClientState::Pending(_) => ClientStateKind::Pending,
-            ClientState::Initializing => ClientStateKind::Initializing,
+            ClientState::Initializing(_) => ClientStateKind::Initializing,
             ClientState::Ready { .. } => ClientStateKind::Ready,
         }
     }
@@ -5711,7 +5819,7 @@ impl McpClient {
             None,
             None,
         );
-        *client.state.get_mut() = ClientState::Empty;
+        *client.state.try_lock().expect("new client state") = ClientState::Empty;
         client.reconnect = None;
         client
     }
@@ -5762,6 +5870,7 @@ pub struct GrokClientHandler {
     /// post-handshake is supported without restarting the rmcp
     /// service loop.
     notify_tx: SharedEventTx,
+    catalog_revision: tokio::sync::watch::Sender<u64>,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
     request_tracker: Arc<crate::elicitation::RequestTracker>,
     service_id: crate::elicitation::ServiceId,
@@ -5775,6 +5884,10 @@ impl GrokClientHandler {
     /// nothing useful to do here. Splitting this out keeps the trait
     /// methods short.
     fn emit(&self, ev: McpClientEvent) {
+        if matches!(&ev, McpClientEvent::ToolsChanged { .. }) {
+            self.catalog_revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
         let sender = self.notify_tx.lock().clone();
         if let Some(tx) = sender {
             let _ = tx.send(ev);
