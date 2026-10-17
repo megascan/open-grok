@@ -57,6 +57,22 @@ fn apply_permission_mode_override(
     meta.insert("autoMode".into(), serde_json::Value::Bool(mode.is_auto()));
 }
 
+fn active_session_registration_warning(
+    result: std::io::Result<Option<PathBuf>>,
+) -> Option<String> {
+    match result {
+        Ok(Some(backup)) => Some(format!(
+            "Active session registry was corrupted; readable sessions were recovered. Backup: {}",
+            backup.display()
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(?error, "Failed to register active session");
+            Some(format!("Couldn't register active session: {error}"))
+        }
+    }
+}
+
 /// Kimi endpoint, credential, and live-catalog mutations share one critical
 /// section. Latest-request tokens are tracked independently so an unrelated
 /// credential write cannot supersede an endpoint selection (or vice versa).
@@ -2562,13 +2578,16 @@ pub(crate) fn execute(
         }
         Effect::RegisterActiveSession { session_id, cwd } => {
             crate::app::signal_handler::set_current_session_id(Some(session_id.clone()));
-            if let Err(e) = xai_grok_shell::active_sessions::register(xai_grok_shell::active_sessions::ActiveSession {
-                session_id,
+            let result = xai_grok_shell::active_sessions::register_reporting(xai_grok_shell::active_sessions::ActiveSession {
+                session_id: session_id.clone(),
                 pid: std::process::id(),
                 cwd,
                 opened_at: chrono::Utc::now(),
-            }) {
-                tracing::warn!(?e, "Failed to register active session");
+            });
+            if let Some(message) = active_session_registration_warning(result) {
+                tasks.spawn(async move {
+                    TaskResult::ActiveSessionRegistrationWarning { session_id, message }
+                });
             }
         }
         Effect::UnregisterActiveSession { session_id } => {
@@ -3066,20 +3085,22 @@ pub(crate) fn execute(
                             };
                         }
                         let result_obj = resp_value.get("result").unwrap_or(&resp_value);
-                        let new_session_id = result_obj
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&sid);
-                        let wt_path = result_obj
-                            .get("worktreePath")
-                            .and_then(|v| v.as_str())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| cwd.clone());
-                        let eff_cwd = result_obj
-                            .get("effectiveCwd")
-                            .and_then(|v| v.as_str())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| wt_path.clone());
+                        let (new_session_id, wt_path, eff_cwd) = match
+                            crate::app::session_startup::validate_worktree_resume_response(result_obj, &cwd)
+                        {
+                            Ok(paths) => paths,
+                            Err(e) => {
+                                return TaskResult::WorktreeSessionFailed {
+                                    agent_id,
+                                    error: worktree_resume_failure_message(
+                                        local_miss,
+                                        &sanitize_user_error(&e.to_string()),
+                                    ),
+                                    orphaned_worktree_root: None,
+                                    timed_out: false,
+                                };
+                            }
+                        };
                         let (code_restored, restore_summary, restore_degree) = parse_worktree_restore_payload(
                             result_obj,
                         );
@@ -8843,3 +8864,28 @@ mod kimi_serialization_invariant_tests {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod active_registry_warning_tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_registry_registration_creates_visible_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("active_sessions.json"), b"bad registry").unwrap();
+        let registration = xai_grok_shell::active_sessions::register_reporting_in(
+            root.path(),
+            xai_grok_shell::active_sessions::ActiveSession {
+                session_id: "warning-test".into(),
+                pid: std::process::id(),
+                cwd: "/tmp".into(),
+                opened_at: chrono::Utc::now(),
+            },
+        );
+        let warning = active_session_registration_warning(registration).unwrap();
+        assert!(warning.contains("corrupted"));
+        assert!(warning.contains("active_sessions.json.corrupt"));
+        assert_eq!(std::fs::read(root.path().join("active_sessions.json.corrupt")).unwrap(), b"bad registry");
+        assert!(active_session_registration_warning(Ok(None)).is_none());
+    }
+}

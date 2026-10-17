@@ -167,6 +167,7 @@ fn lifecycle_tracking_is_independent_of_wait_flag() {
     super::track_background_lifecycle(
         super::ExtEvent::TaskCompleted {
             task_id: "t1".into(),
+            will_wake: false,
         },
         &mut pending,
         &mut completed,
@@ -174,6 +175,7 @@ fn lifecycle_tracking_is_independent_of_wait_flag() {
     super::track_background_lifecycle(
         super::ExtEvent::SubagentFinished {
             subagent_id: "s1".into(),
+            will_wake: false,
         },
         &mut pending,
         &mut completed,
@@ -188,6 +190,7 @@ fn completion_before_backgrounded_never_rearms_pending() {
     super::track_background_lifecycle(
         super::ExtEvent::TaskCompleted {
             task_id: "t1".into(),
+            will_wake: false,
         },
         &mut pending,
         &mut completed,
@@ -217,6 +220,7 @@ fn duplicate_backgrounded_after_completion_stays_dead() {
     super::track_background_lifecycle(
         super::ExtEvent::TaskCompleted {
             task_id: "t1".into(),
+            will_wake: false,
         },
         &mut pending,
         &mut completed,
@@ -241,6 +245,7 @@ fn duplicate_subagent_spawn_after_finish_stays_dead() {
     super::track_background_lifecycle(
         super::ExtEvent::SubagentFinished {
             subagent_id: "s1".into(),
+            will_wake: false,
         },
         &mut pending,
         &mut completed,
@@ -293,6 +298,17 @@ fn numeric_task_id_is_decoded_tracked_and_reaped() {
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
     assert_eq!(params["taskId"], "4242");
     assert_eq!(params["sessionId"], "sess-1");
+}
+
+#[test]
+fn tagged_subagent_reaping_never_cancels_a_reused_id() {
+    let old = super::BackgroundWork::TaggedSubagent("reused".into(), "old".into());
+    let current = super::BackgroundWork::TaggedSubagent("reused".into(), "new".into());
+    assert!(!super::can_reap_by_unqualified_id(&old));
+    assert!(!super::can_reap_by_unqualified_id(&current));
+    assert!(super::can_reap_by_unqualified_id(
+        &super::BackgroundWork::Subagent("legacy".into())
+    ));
 }
 
 #[test]
@@ -397,7 +413,7 @@ fn headless_materialize_ctx_stays_non_chat() {
     use crate::app::session_startup::TitleResolution;
     for pinned in [false, true] {
         for restore_code in [false, true] {
-            let ctx = headless_materialize_ctx(pinned, restore_code);
+            let ctx = headless_materialize_ctx(pinned, restore_code, false);
             assert!(!ctx.chat_mode);
             assert!(
                 !ctx.has_worktree,
@@ -416,23 +432,117 @@ fn headless_materialize_ctx_stays_non_chat() {
     }
 }
 
+#[tokio::test]
+async fn worktree_resume_loads_child_in_effective_worktree_directory() {
+    use xai_acp_lib::AcpAgentMessage;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let root = temp.path().join("worktree");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let canonical_nested = std::fs::canonicalize(&nested).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = async {
+        let AcpAgentMessage::ExtMethod(request) = rx.recv().await.unwrap() else {
+            panic!("expected worktree request")
+        };
+        assert_eq!(
+            request.request.method.as_ref(),
+            "x.ai/git/worktree/resume_session"
+        );
+        let params: serde_json::Value = serde_json::from_str(request.request.params.get()).unwrap();
+        assert_eq!(params["sessionId"], "parent");
+        assert_eq!(params["sourceCwd"], source.to_str().unwrap());
+        assert_eq!(params["copyMode"], "dirty");
+        let body = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "child", "worktreePath": root, "effectiveCwd": nested,
+        }))
+        .unwrap();
+        request
+            .response_tx
+            .send(Ok(acp::ExtResponse::new(body.into())))
+            .unwrap();
+        let AcpAgentMessage::LoadSession(request) = rx.recv().await.unwrap() else {
+            panic!("expected child load")
+        };
+        assert_eq!(request.request.session_id.0.as_ref(), "child");
+        assert_eq!(
+            std::fs::canonicalize(&request.request.cwd).unwrap(),
+            canonical_nested
+        );
+        request
+            .response_tx
+            .send(Ok(acp::LoadSessionResponse::new()))
+            .unwrap();
+    };
+    let (opened, ()) = tokio::join!(
+        resume_in_worktree(&tx, &source, "parent", Some(true), None),
+        server
+    );
+    let opened = opened.unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&opened.cwd).unwrap(),
+        canonical_nested
+    );
+    assert_eq!(opened.session_id.0.as_ref(), "child");
+}
+
+#[tokio::test]
+async fn worktree_resume_rejects_cwd_outside_worktree_before_load() {
+    use xai_acp_lib::AcpAgentMessage;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("worktree");
+    let outside = temp.path().join("outside");
+    let source = temp.path().join("source");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = async {
+        let AcpAgentMessage::ExtMethod(request) = rx.recv().await.unwrap() else {
+            panic!("expected worktree request")
+        };
+        let body = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "child", "worktreePath": root, "effectiveCwd": outside,
+        }))
+        .unwrap();
+        request
+            .response_tx
+            .send(Ok(acp::ExtResponse::new(body.into())))
+            .unwrap();
+    };
+    let (opened, ()) = tokio::join!(
+        resume_in_worktree(&tx, &source, "parent", None, None),
+        server
+    );
+    assert!(
+        opened
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("outside the worktree")
+    );
+    assert!(rx.try_recv().is_err());
+}
+
 #[test]
 fn headless_remote_miss_restores_conversation_instead_of_deferring_worktree() {
     use crate::app::session_startup::{RemoteMissPlan, plan_remote_miss};
     for restore_code in [false, true] {
-        let ctx = headless_materialize_ctx(false, restore_code);
+        let ctx = headless_materialize_ctx(false, restore_code, false);
         assert!(!matches!(
             plan_remote_miss(ctx, true),
             RemoteMissPlan::DeferToWorktree { .. }
         ));
     }
-    let mut conv = headless_materialize_ctx(false, false);
+    let mut conv = headless_materialize_ctx(false, false, false);
     conv.allow_remote_restore = true;
     assert_eq!(
         plan_remote_miss(conv, true),
         RemoteMissPlan::RestoreConversation
     );
-    let mut code = headless_materialize_ctx(false, true);
+    let mut code = headless_materialize_ctx(false, true, false);
     code.allow_remote_restore = true;
     assert_eq!(
         plan_remote_miss(code, true),
@@ -741,4 +851,395 @@ async fn signalled_exit_bounds_a_log_flush_that_never_answers() {
     let started = tokio::time::Instant::now();
     super::flush_unified_log_at_exit(std::future::pending(), Some(129)).await;
     assert_eq!(super::SIGNAL_FLUSH_TIMEOUT, started.elapsed());
+}
+
+#[test]
+fn background_wait_tracks_exact_wake_across_both_event_orders() {
+    use super::{BackgroundWaitDecision, BackgroundWork, ExtEvent};
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    for subagent in [false, true] {
+        for terminal_first in [false, true] {
+            let mut pending = HashSet::new();
+            let mut completed = HashSet::new();
+            let (started, completion, prompt_id) = if subagent {
+                (
+                    ExtEvent::SubagentSpawned {
+                        subagent_id: "one".into(),
+                    },
+                    ExtEvent::SubagentFinished {
+                        subagent_id: "one".into(),
+                        will_wake: true,
+                    },
+                    "subagent-completed-one",
+                )
+            } else {
+                (
+                    ExtEvent::TaskBackgrounded {
+                        task_id: "one".into(),
+                        is_monitor: false,
+                    },
+                    ExtEvent::TaskCompleted {
+                        task_id: "one".into(),
+                        will_wake: true,
+                    },
+                    "task-completed-one",
+                )
+            };
+            super::track_background_lifecycle(started, &mut pending, &mut completed);
+            if terminal_first {
+                super::track_background_lifecycle(
+                    ExtEvent::TurnCompleted {
+                        prompt_id: prompt_id.into(),
+                    },
+                    &mut pending,
+                    &mut completed,
+                );
+            }
+            super::track_background_lifecycle(completion, &mut pending, &mut completed);
+            if terminal_first {
+                assert!(pending.is_empty());
+                continue;
+            }
+            assert!(pending.contains(&BackgroundWork::Followup(prompt_id.into())));
+            super::track_background_lifecycle(
+                ExtEvent::TurnCompleted {
+                    prompt_id: "task-completed-other".into(),
+                },
+                &mut pending,
+                &mut completed,
+            );
+            assert_eq!(
+                super::background_wait_decision(&pending, Duration::ZERO, Duration::from_secs(1)),
+                BackgroundWaitDecision::Wait
+            );
+            super::track_background_lifecycle(
+                ExtEvent::TurnCompleted {
+                    prompt_id: prompt_id.into(),
+                },
+                &mut pending,
+                &mut completed,
+            );
+            assert!(pending.is_empty());
+            // A repeated completion must never resurrect a finished wake.
+            let duplicate = if subagent {
+                ExtEvent::SubagentFinished {
+                    subagent_id: "one".into(),
+                    will_wake: true,
+                }
+            } else {
+                ExtEvent::TaskCompleted {
+                    task_id: "one".into(),
+                    will_wake: true,
+                }
+            };
+            super::track_background_lifecycle(duplicate, &mut pending, &mut completed);
+            assert!(pending.is_empty());
+        }
+    }
+}
+
+#[test]
+fn workflow_waits_for_exact_wake_and_ignores_stale_updates() {
+    use super::{BackgroundWork, ExtEvent, track_background_lifecycle};
+    let mut pending = HashSet::new();
+    let mut completed = HashSet::new();
+    track_background_lifecycle(
+        ExtEvent::WorkflowUpdated {
+            run_id: "run".into(),
+            revision: 1,
+            foreground: false,
+            status: "active".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.contains(&BackgroundWork::Workflow("run".into(), 1)));
+    track_background_lifecycle(
+        ExtEvent::WorkflowWakeDecision {
+            run_id: "run".into(),
+            revision: 3,
+            will_wake: true,
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert_eq!(
+        pending,
+        HashSet::from([BackgroundWork::Followup("workflow-completed-run-3".into())])
+    );
+    track_background_lifecycle(
+        ExtEvent::WakeResolved {
+            prompt_id: "workflow-completed-run-2".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert_eq!(pending.len(), 1);
+    track_background_lifecycle(
+        ExtEvent::WakeResolved {
+            prompt_id: "workflow-completed-run-3".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::WorkflowUpdated {
+            run_id: "run".into(),
+            revision: 1,
+            foreground: false,
+            status: "active".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.is_empty());
+    track_background_lifecycle(
+        ExtEvent::WorkflowUpdated {
+            run_id: "run".into(),
+            revision: 4,
+            foreground: false,
+            status: "active".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::WorkflowWakeDecision {
+            run_id: "run".into(),
+            revision: 5,
+            will_wake: false,
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn restored_terminal_workflow_is_not_background_work() {
+    use super::{ExtEvent, track_background_lifecycle};
+    let mut pending = HashSet::new();
+    let mut completed = HashSet::new();
+    track_background_lifecycle(
+        ExtEvent::WorkflowUpdated {
+            run_id: "restored".into(),
+            revision: 9,
+            foreground: false,
+            status: "complete".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn wake_resolution_before_completion_never_resurrects_followup() {
+    use super::{ExtEvent, track_background_lifecycle};
+    let mut pending = HashSet::new();
+    let mut completed = HashSet::new();
+    track_background_lifecycle(
+        ExtEvent::WakeResolved {
+            prompt_id: "subagent-completed-child".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::SubagentFinished {
+            subagent_id: "child".into(),
+            will_wake: true,
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn background_timeout_only_fails_when_work_is_still_pending() {
+    use super::{BackgroundWaitDecision, BackgroundWork};
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let timeout = Duration::from_secs(2);
+    assert!(super::background_wait_outcome(false).is_ok());
+    let error = super::background_wait_outcome(true).unwrap_err();
+    assert!(error.to_string().contains("background wait timed out"));
+    let mut pending = HashSet::new();
+    assert_eq!(
+        super::background_wait_decision(&pending, timeout, timeout),
+        BackgroundWaitDecision::Finished
+    );
+    pending.insert(BackgroundWork::Task("task".into()));
+    assert_eq!(
+        super::background_wait_decision(&pending, Duration::from_secs(1), timeout),
+        BackgroundWaitDecision::Wait
+    );
+    assert_eq!(
+        super::background_wait_decision(&pending, timeout, timeout),
+        BackgroundWaitDecision::TimedOut
+    );
+    pending.clear();
+    pending.insert(BackgroundWork::Followup("task-completed-task".into()));
+    assert_eq!(
+        super::background_wait_decision(&pending, timeout, timeout),
+        BackgroundWaitDecision::TimedOut
+    );
+}
+
+#[test]
+fn failed_background_delivery_cannot_be_cleared_by_a_later_terminal() {
+    use super::{BackgroundWork, ExtEvent, track_background_lifecycle};
+    let mut pending = HashSet::new();
+    let mut completed = HashSet::new();
+    track_background_lifecycle(
+        ExtEvent::TaggedSubagentStarted {
+            subagent_id: "swarm:1".into(),
+            generation: "g1".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::BackgroundDeliveryFailed {
+            error: "client stopped".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::TaggedSubagentFinished {
+            subagent_id: "swarm:1".into(),
+            generation: "g1".into(),
+            will_wake: false,
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert_eq!(pending.len(), 1);
+    assert!(pending.contains(&BackgroundWork::DeliveryFailure("client stopped".into())));
+    assert!(
+        super::background_delivery_outcome(&pending)
+            .unwrap_err()
+            .to_string()
+            .contains("client stopped")
+    );
+}
+
+#[test]
+fn headless_active_registry_recovery_is_visible_without_tracing() {
+    use std::path::PathBuf;
+    assert!(super::active_registration_warning(Ok(None)).is_none());
+    let notice =
+        super::active_registration_warning(Ok(Some(PathBuf::from("/tmp/registry.backup"))))
+            .unwrap();
+    assert!(notice.contains("/tmp/registry.backup"));
+    let warning =
+        super::active_registration_warning(Err(std::io::Error::other("disk failed"))).unwrap();
+    assert!(warning.contains("disk failed"));
+}
+
+#[test]
+fn tagged_subagent_lifecycles_handle_reordering_and_reused_ids() {
+    use super::{BackgroundWork, ExtEvent, track_background_lifecycle};
+    let mut pending = HashSet::new();
+    let mut completed = HashSet::new();
+    let mut track = |event| track_background_lifecycle(event, &mut pending, &mut completed);
+    // A wake can resolve before the corresponding finish arrives.
+    track(ExtEvent::TaggedWakeResolved {
+        prompt_id: "subagent-completed-reused".into(),
+        generation: "old".into(),
+    });
+    track(ExtEvent::TaggedSubagentFinished {
+        subagent_id: "reused".into(),
+        generation: "old".into(),
+        will_wake: true,
+    });
+    track(ExtEvent::TaggedSubagentStarted {
+        subagent_id: "reused".into(),
+        generation: "old".into(),
+    });
+    track(ExtEvent::TaggedSubagentStarted {
+        subagent_id: "reused".into(),
+        generation: "new".into(),
+    });
+    track(ExtEvent::TaggedSubagentFinished {
+        subagent_id: "reused".into(),
+        generation: "old".into(),
+        will_wake: false,
+    });
+    drop(track);
+    assert_eq!(
+        pending,
+        HashSet::from([BackgroundWork::TaggedSubagent(
+            "reused".into(),
+            "new".into()
+        )])
+    );
+
+    track_background_lifecycle(
+        ExtEvent::TaggedSubagentFinished {
+            subagent_id: "reused".into(),
+            generation: "new".into(),
+            will_wake: true,
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert_eq!(
+        pending,
+        HashSet::from([BackgroundWork::TaggedFollowup(
+            "subagent-completed-reused".into(),
+            "new".into()
+        )])
+    );
+    // Legacy turn completion and an old resolution cannot clear the new wake.
+    track_background_lifecycle(
+        ExtEvent::TurnCompleted {
+            prompt_id: "subagent-completed-reused".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    track_background_lifecycle(
+        ExtEvent::TaggedWakeResolved {
+            prompt_id: "subagent-completed-reused".into(),
+            generation: "old".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert_eq!(pending.len(), 1);
+    track_background_lifecycle(
+        ExtEvent::TaggedWakeResolved {
+            prompt_id: "subagent-completed-reused".into(),
+            generation: "new".into(),
+        },
+        &mut pending,
+        &mut completed,
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn delivery_wait_signal_starts_a_bounded_headless_handshake() {
+    use agent_client_protocol as acp;
+    use xai_acp_lib::{AcpArgs, AcpClientMessage};
+    let (reply, _response) = tokio::sync::oneshot::channel();
+    let params = serde_json::value::to_raw_value(&serde_json::json!({"prompt_id": "p"})).unwrap();
+    let signal = AcpClientMessage::ExtNotification(AcpArgs {
+        request: acp::ExtNotification::new("x.ai/background_delivery_waiting", params.into()),
+        response_tx: reply,
+    });
+    assert!(super::is_background_delivery_waiting(&signal));
+    assert_eq!(
+        super::delivery_wait_timeout(true, std::time::Duration::from_secs(7)),
+        std::time::Duration::from_secs(7)
+    );
+    assert_eq!(
+        super::delivery_wait_timeout(false, std::time::Duration::from_secs(600)),
+        std::time::Duration::from_secs(2)
+    );
 }

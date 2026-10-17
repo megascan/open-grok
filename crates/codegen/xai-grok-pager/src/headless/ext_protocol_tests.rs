@@ -5,6 +5,37 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::fmt::MakeWriter;
 
+#[test]
+fn workflow_and_wake_resolution_frames_decode() {
+    let start = make_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+        "sessionUpdate": "workflow_updated", "run_id": "wf", "revision": 7, "status": "active",
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&start), ExtEvent::WorkflowUpdated { run_id, revision: 7, foreground: false, status } if run_id == "wf" && status == "active")
+    );
+    let decision = make_raw_ext_notif(
+        "x.ai/workflow_wake_decision",
+        serde_json::json!({
+            "run_id": "wf", "revision": 8, "will_wake": true,
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&decision), ExtEvent::WorkflowWakeDecision { run_id, revision: 8, will_wake: true } if run_id == "wf")
+    );
+    let resolved = make_raw_ext_notif(
+        "x.ai/background_wake_resolved",
+        serde_json::json!({
+            "prompt_id": "workflow-completed-wf-8",
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&resolved), ExtEvent::WakeResolved { prompt_id } if prompt_id == "workflow-completed-wf-8")
+    );
+}
+
 #[derive(Clone, Default)]
 struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -109,7 +140,7 @@ fn headless_task_completed_numeric_task_id_is_coerced() {
     );
     assert!(matches!(
         handle_ext_notification(&notif),
-        ExtEvent::TaskCompleted { task_id } if task_id == "4242"
+        ExtEvent::TaskCompleted { task_id, .. } if task_id == "4242"
     ));
 }
 
@@ -140,7 +171,7 @@ fn headless_task_completed_parses_task_id() {
     );
     assert!(matches!(
         handle_ext_notification(&notif),
-        ExtEvent::TaskCompleted { task_id } if task_id == "task-abc"
+        ExtEvent::TaskCompleted { task_id, .. } if task_id == "task-abc"
     ));
 }
 
@@ -175,7 +206,7 @@ fn headless_subagent_spawned_and_finished_parse() {
     );
     assert!(matches!(
         handle_ext_notification(&finished),
-        ExtEvent::SubagentFinished { subagent_id } if subagent_id == "sub-1"
+        ExtEvent::SubagentFinished { subagent_id, .. } if subagent_id == "sub-1"
     ));
 }
 
@@ -637,4 +668,108 @@ fn headless_memory_flush_notifications_decode() {
         }
         _ => panic!("expected MemoryFlushCompleted"),
     }
+}
+
+#[test]
+fn background_wake_and_exact_terminal_are_decoded() {
+    let task = make_ext_notif(
+        "x.ai/task_completed",
+        serde_json::json!({
+            "sessionUpdate": "task_completed", "task_snapshot": {"task_id": "one"}, "will_wake": true,
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&task), ExtEvent::TaskCompleted { task_id, will_wake: true } if task_id == "one")
+    );
+    let child = make_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+            "sessionUpdate": "subagent_finished", "subagent_id": "child", "will_wake": true,
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&child), ExtEvent::SubagentFinished { subagent_id, will_wake: true } if subagent_id == "child")
+    );
+    let terminal = make_ext_notif(
+        "x.ai/session/update",
+        serde_json::json!({
+            "sessionUpdate": "turn_completed", "prompt_id": "task-completed-one", "stop_reason": "end_turn",
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&terminal), ExtEvent::TurnCompleted { prompt_id } if prompt_id == "task-completed-one")
+    );
+}
+
+#[test]
+fn tagged_subagent_lifecycle_and_wake_decode() {
+    let admitted = make_raw_ext_notif(
+        "x.ai/background_subagent_admitted",
+        serde_json::json!({
+            "subagent_id": "child", "generation": "g1"
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&admitted), ExtEvent::TaggedSubagentStarted { subagent_id, generation } if subagent_id == "child" && generation == "g1")
+    );
+    let spawned = make_raw_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+            "sessionId": "sess-1", "_meta": { "x.ai/background_generation": "g1" },
+            "update": { "sessionUpdate": "subagent_spawned", "subagent_id": "child" }
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&spawned), ExtEvent::TaggedSubagentStarted { subagent_id, generation } if subagent_id == "child" && generation == "g1")
+    );
+    let finished = make_raw_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+            "sessionId": "sess-1", "_meta": { "x.ai/background_generation": "g1" },
+            "update": { "sessionUpdate": "subagent_finished", "subagent_id": "child", "will_wake": true }
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&finished), ExtEvent::TaggedSubagentFinished { subagent_id, generation, will_wake: true } if subagent_id == "child" && generation == "g1")
+    );
+    let terminal = make_raw_ext_notif(
+        "x.ai/background_subagent_terminal",
+        serde_json::json!({
+            "subagent_id": "child", "generation": "g1", "will_wake": false
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&terminal), ExtEvent::TaggedSubagentFinished { subagent_id, generation, will_wake: false } if subagent_id == "child" && generation == "g1")
+    );
+    let resolved = make_raw_ext_notif(
+        "x.ai/background_wake_resolved",
+        serde_json::json!({
+            "prompt_id": "subagent-completed-child", "generation": "g1"
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&resolved), ExtEvent::TaggedWakeResolved { prompt_id, generation } if prompt_id == "subagent-completed-child" && generation == "g1")
+    );
+}
+
+#[test]
+fn background_delivery_failures_decode_from_child_and_cohort() {
+    let child = make_raw_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+            "sessionId": "sess-1",
+            "_meta": { "x.ai/background_generation": "g1", "x.ai/background_delivery_error": "client stopped" },
+            "update": { "sessionUpdate": "subagent_finished", "subagent_id": "child", "will_wake": false }
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&child), ExtEvent::BackgroundDeliveryFailed { error } if error == "client stopped")
+    );
+    let cohort = make_raw_ext_notif(
+        "x.ai/background_subagent_terminal",
+        serde_json::json!({"subagent_id": "swarm:1", "generation": "g2", "error": "timed out"}),
+    );
+    assert!(
+        matches!(handle_ext_notification(&cohort), ExtEvent::BackgroundDeliveryFailed { error } if error == "timed out")
+    );
 }

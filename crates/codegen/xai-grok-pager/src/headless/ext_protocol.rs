@@ -65,10 +65,54 @@ fn session_update_tag(params: &str) -> Option<String> {
 
 pub(crate) enum ExtEvent {
     None,
-    TaskBackgrounded { task_id: String, is_monitor: bool },
-    TaskCompleted { task_id: String },
-    SubagentSpawned { subagent_id: String },
-    SubagentFinished { subagent_id: String },
+    TaskBackgrounded {
+        task_id: String,
+        is_monitor: bool,
+    },
+    TaskCompleted {
+        task_id: String,
+        will_wake: bool,
+    },
+    TurnCompleted {
+        prompt_id: String,
+    },
+    SubagentSpawned {
+        subagent_id: String,
+    },
+    SubagentFinished {
+        subagent_id: String,
+        will_wake: bool,
+    },
+    TaggedSubagentStarted {
+        subagent_id: String,
+        generation: String,
+    },
+    TaggedSubagentFinished {
+        subagent_id: String,
+        generation: String,
+        will_wake: bool,
+    },
+    TaggedWakeResolved {
+        prompt_id: String,
+        generation: String,
+    },
+    BackgroundDeliveryFailed {
+        error: String,
+    },
+    WorkflowUpdated {
+        run_id: String,
+        revision: u64,
+        foreground: bool,
+        status: String,
+    },
+    WorkflowWakeDecision {
+        run_id: String,
+        revision: u64,
+        will_wake: bool,
+    },
+    WakeResolved {
+        prompt_id: String,
+    },
     MonitorEvent,
     Lifecycle(Lifecycle),
     Stream(Box<StreamEvent>),
@@ -85,6 +129,79 @@ pub(crate) fn handle_ext_notification(
     match method {
         "x.ai/task_backgrounded" => decode_task_backgrounded(method, params),
         "x.ai/task_completed" => decode_task_completed(method, params),
+        "x.ai/background_subagent_admitted" | "x.ai/background_subagent_terminal" => {
+            #[derive(serde::Deserialize)]
+            struct Lifecycle {
+                subagent_id: String,
+                generation: String,
+                #[serde(default)]
+                will_wake: bool,
+                #[serde(default)]
+                error: Option<String>,
+            }
+            match serde_json::from_str::<Lifecycle>(params) {
+                Ok(value) if method == "x.ai/background_subagent_admitted" => {
+                    ExtEvent::TaggedSubagentStarted {
+                        subagent_id: value.subagent_id,
+                        generation: value.generation,
+                    }
+                }
+                Ok(value) if value.error.is_some() => ExtEvent::BackgroundDeliveryFailed {
+                    error: value.error.expect("checked above"),
+                },
+                Ok(value) => ExtEvent::TaggedSubagentFinished {
+                    subagent_id: value.subagent_id,
+                    generation: value.generation,
+                    will_wake: value.will_wake,
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "malformed background subagent lifecycle");
+                    ExtEvent::None
+                }
+            }
+        }
+        "x.ai/workflow_wake_decision" => {
+            #[derive(serde::Deserialize)]
+            struct Decision {
+                run_id: String,
+                revision: u64,
+                will_wake: bool,
+            }
+            match serde_json::from_str::<Decision>(params) {
+                Ok(value) => ExtEvent::WorkflowWakeDecision {
+                    run_id: value.run_id,
+                    revision: value.revision,
+                    will_wake: value.will_wake,
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "malformed workflow wake decision");
+                    ExtEvent::None
+                }
+            }
+        }
+        "x.ai/background_wake_resolved" => {
+            #[derive(serde::Deserialize)]
+            struct Resolution {
+                prompt_id: String,
+                #[serde(default)]
+                generation: Option<String>,
+            }
+            match serde_json::from_str::<Resolution>(params) {
+                Ok(value) => match value.generation {
+                    Some(generation) => ExtEvent::TaggedWakeResolved {
+                        prompt_id: value.prompt_id,
+                        generation,
+                    },
+                    None => ExtEvent::WakeResolved {
+                        prompt_id: value.prompt_id,
+                    },
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "malformed background wake resolution");
+                    ExtEvent::None
+                }
+            }
+        }
         "x.ai/monitor_event" => ExtEvent::MonitorEvent,
         "x.ai/leader/version_mismatch" => {
             match crate::acp::version_mismatch_banner(params) {
@@ -158,6 +275,8 @@ fn decode_task_completed(method: &str, params: &str) -> ExtEvent {
     enum TaskDoneUpdate {
         TaskCompleted {
             task_snapshot: TaskSnapshotLite,
+            #[serde(default)]
+            will_wake: bool,
         },
         #[serde(other)]
         Other,
@@ -169,8 +288,12 @@ fn decode_task_completed(method: &str, params: &str) -> ExtEvent {
     }
     match serde_json::from_str::<TaskDoneEnvelope>(params) {
         Ok(env) => match env.update {
-            TaskDoneUpdate::TaskCompleted { task_snapshot } => ExtEvent::TaskCompleted {
+            TaskDoneUpdate::TaskCompleted {
+                task_snapshot,
+                will_wake,
+            } => ExtEvent::TaskCompleted {
                 task_id: task_snapshot.task_id,
+                will_wake,
             },
             TaskDoneUpdate::Other => {
                 tracing::error!(
@@ -199,6 +322,9 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "snake_case", tag = "sessionUpdate")]
     enum XaiUpdate {
+        TurnCompleted {
+            prompt_id: String,
+        },
         AutoCompactStarted {
             percentage: u8,
         },
@@ -227,6 +353,16 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         },
         SubagentFinished {
             subagent_id: String,
+            #[serde(default)]
+            will_wake: bool,
+        },
+        WorkflowUpdated {
+            run_id: String,
+            #[serde(default)]
+            revision: u64,
+            #[serde(default)]
+            foreground: bool,
+            status: String,
         },
         ResponseStarted {
             #[serde(default)]
@@ -265,6 +401,8 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
     #[derive(serde::Deserialize)]
     struct XaiNotif {
         update: XaiUpdate,
+        #[serde(default, rename = "_meta")]
+        meta: Option<serde_json::Value>,
     }
 
     let xai_notif = match serde_json::from_str::<XaiNotif>(params) {
@@ -279,7 +417,31 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         }
     };
 
+    let generation = xai_notif
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("x.ai/background_generation"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let delivery_error = xai_notif
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("x.ai/background_delivery_error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     match xai_notif.update {
+        XaiUpdate::TurnCompleted { prompt_id } => ExtEvent::TurnCompleted { prompt_id },
+        XaiUpdate::WorkflowUpdated {
+            run_id,
+            revision,
+            foreground,
+            status,
+        } => ExtEvent::WorkflowUpdated {
+            run_id,
+            revision,
+            foreground,
+            status,
+        },
         XaiUpdate::AutoCompactStarted { percentage } => {
             ExtEvent::Lifecycle(Lifecycle::CompactStarted { percentage })
         }
@@ -302,10 +464,32 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         XaiUpdate::MemoryFlushCompleted { result, path } => {
             ExtEvent::Lifecycle(Lifecycle::MemoryFlushCompleted { result, path })
         }
-        XaiUpdate::SubagentSpawned { subagent_id } => ExtEvent::SubagentSpawned { subagent_id },
-        XaiUpdate::SubagentFinished { subagent_id, .. } => {
-            ExtEvent::SubagentFinished { subagent_id }
+        XaiUpdate::SubagentSpawned { subagent_id } => match generation {
+            Some(generation) => ExtEvent::TaggedSubagentStarted {
+                subagent_id,
+                generation,
+            },
+            None => ExtEvent::SubagentSpawned { subagent_id },
+        },
+        XaiUpdate::SubagentFinished { .. } if delivery_error.is_some() => {
+            ExtEvent::BackgroundDeliveryFailed {
+                error: delivery_error.expect("checked above"),
+            }
         }
+        XaiUpdate::SubagentFinished {
+            subagent_id,
+            will_wake,
+        } => match generation {
+            Some(generation) => ExtEvent::TaggedSubagentFinished {
+                subagent_id,
+                generation,
+                will_wake,
+            },
+            None => ExtEvent::SubagentFinished {
+                subagent_id,
+                will_wake,
+            },
+        },
         XaiUpdate::ResponseStarted {
             message_id,
             model,

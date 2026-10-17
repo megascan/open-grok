@@ -1255,6 +1255,10 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent,
             app.cli_effort_token.as_deref(),
         );
+        // Hold queued sends until the deferred model switch has resolved.
+        if deferred.is_some() {
+            agent.session.model_switch_pending = true;
+        }
         match (code_restored, restore_summary.as_deref()) {
             (true, Some(s)) => {
                 agent
@@ -1335,7 +1339,6 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             });
         }
         if let Some(switch) = deferred {
-            agent.session.model_switch_pending = true;
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: hydrate_sid.clone(),
@@ -1740,4 +1743,116 @@ pub(in crate::app::dispatch) fn dispatch_pick_content_session_in_worktree(
     }
     invalidate_picker_fetch_on_dismiss(app);
     dispatch_new_worktree_session(app, Some(session_id), None, None, None, None, None)
+}
+
+#[cfg(test)]
+mod resume_queue_tests {
+    use super::*;
+    use crate::app::actions::{Action, TaskResult};
+    use crate::app::agent::{AgentId, DeferredModelSwitch};
+    use crate::app::dispatch::router::dispatch;
+    use crate::app::dispatch::tests::test_app_with_agent;
+
+    fn is_prompt_send(effect: &Effect) -> bool {
+        matches!(
+            effect,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )
+    }
+
+    #[test]
+    fn resume_queued_prompt_sends_once_after_load() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.loading_replay = true;
+        agent.prompt.set_text("queued during resume");
+        let submitted = dispatch(Action::SendPrompt("queued during resume".into()), &mut app);
+        assert!(!submitted.iter().any(is_prompt_send));
+        assert_eq!(app.agents[&id].session.pending_prompts.len(), 1);
+        assert!(app.agents[&id].prompt.text().is_empty());
+        let loaded = dispatch(
+            Action::TaskComplete(TaskResult::SessionLoaded {
+                agent_id: id,
+                session_id: "test-session".into(),
+                models: None,
+                code_restored: false,
+                restore_summary: None,
+                restore_degree: None,
+                running_prompt_id: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|effect| is_prompt_send(effect))
+                .count(),
+            1
+        );
+        assert!(app.agents[&id].session.pending_prompts.is_empty());
+    }
+
+    #[test]
+    fn resume_queues_prompt_once_until_model_switch_resolves() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let model_id = acp::ModelId::new("resume-target");
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.loading_replay = true;
+            agent.session.deferred_model_switch = Some(DeferredModelSwitch {
+                model_id: model_id.clone(),
+                effort: None,
+                prev_model_id: None,
+            });
+            agent.prompt.set_text("queued during resume");
+        }
+        let submitted = dispatch(Action::SendPrompt("queued during resume".into()), &mut app);
+        assert!(!submitted.iter().any(is_prompt_send));
+        assert_eq!(app.agents[&id].session.pending_prompts.len(), 1);
+        assert!(app.agents[&id].prompt.text().is_empty());
+
+        let loaded = dispatch(
+            Action::TaskComplete(TaskResult::SessionLoaded {
+                agent_id: id,
+                session_id: "test-session".into(),
+                models: None,
+                code_restored: false,
+                restore_summary: None,
+                restore_degree: None,
+                running_prompt_id: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|effect| matches!(effect, Effect::SwitchModel { .. }))
+        );
+        assert!(!loaded.iter().any(is_prompt_send));
+        assert_eq!(app.agents[&id].session.pending_prompts.len(), 1);
+
+        let switched = dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: id,
+                model_id,
+                effort: None,
+                service_tier: None,
+                result: Ok(()),
+                prev_model_id: None,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            switched
+                .iter()
+                .filter(|effect| is_prompt_send(effect))
+                .count(),
+            1
+        );
+        assert!(app.agents[&id].session.pending_prompts.is_empty());
+    }
 }

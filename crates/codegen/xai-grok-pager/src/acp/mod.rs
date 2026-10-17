@@ -166,6 +166,9 @@ pub struct ConnectFlags {
     /// CLI permission rules from --allow / --deny flags.
     /// Not supported in leader mode (agent config is set at leader startup).
     pub permission_rules: Vec<xai_grok_workspace::permission::types::PermissionRule>,
+    /// Session-wide CLI tool allowlist and denylist, also applied to nested tools.
+    pub tools: Option<Vec<String>>,
+    pub disallowed_tools: Option<Vec<String>>,
     /// Seed agent sessions with always-approve (YOLO) permission mode.
     pub default_yolo_mode: bool,
     /// Seed agent sessions with auto (classifier) permission mode.
@@ -209,6 +212,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
     if !flags.permission_rules.is_empty() {
         agent_config.cli_agent_overrides.permission_rules = flags.permission_rules.clone();
     }
+    apply_cli_tool_restrictions(&mut agent_config.cli_agent_overrides, &flags);
 
     apply_config_writes(&flags);
 
@@ -284,6 +288,10 @@ pub async fn connect_via_leader(
     use xai_grok_shell::leader::{
         ClientCapabilities, ClientMode, LeaderReconnector, ReconnectPolicy, connect_or_spawn,
     };
+
+    // An existing leader cannot enforce per-client tool restrictions. Returning
+    // an error here lets the TUI use its embedded-agent fallback safely.
+    validate_leader_tool_restrictions(&flags)?;
 
     // These flags are baked into the agent at startup.  In leader mode the
     // agent is already running, so per-client overrides cannot be applied.
@@ -404,6 +412,34 @@ pub async fn connect_via_leader(
         cancel_rewind_enabled,
         session_recap_available,
         auth_manager,
+    })
+}
+
+fn validate_leader_tool_restrictions(flags: &ConnectFlags) -> Result<()> {
+    if flags.tools.is_some() || flags.disallowed_tools.is_some() {
+        anyhow::bail!("--tools and --disallowed-tools require an embedded agent; use --no-leader");
+    }
+    Ok(())
+}
+
+fn apply_cli_tool_restrictions(
+    overrides: &mut xai_grok_shell::agent::config::CliAgentOverrides,
+    flags: &ConnectFlags,
+) {
+    overrides.tools = flags.tools.clone();
+    overrides.disallowed_tools = flags.disallowed_tools.clone();
+}
+
+/// Match headless CLI parsing: trim entries and treat an empty list as unset.
+pub(crate) fn parse_tool_list(input: Option<&str>) -> Option<Vec<String>> {
+    input.and_then(|input| {
+        let names: Vec<_> = input
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (!names.is_empty()).then_some(names)
     })
 }
 
@@ -880,6 +916,75 @@ pub fn select_eager_auth_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_tool_lists_match_headless_parsing() {
+        assert_eq!(
+            parse_tool_list(Some(" read_file, ,bash ")),
+            Some(vec!["read_file".into(), "bash".into()])
+        );
+        assert_eq!(parse_tool_list(Some(" , ")), None);
+        assert_eq!(parse_tool_list(None), None);
+    }
+
+    #[test]
+    fn leader_rejects_per_client_tool_restrictions() {
+        assert!(validate_leader_tool_restrictions(&ConnectFlags::default()).is_ok());
+        for flags in [
+            ConnectFlags {
+                tools: Some(vec!["read_file".into()]),
+                ..Default::default()
+            },
+            ConnectFlags {
+                disallowed_tools: Some(vec!["bash".into()]),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                validate_leader_tool_restrictions(&flags)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--no-leader")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_restrictions_reach_direct_and_nested_tool_registry() {
+        let flags = ConnectFlags {
+            tools: parse_tool_list(Some("read_file,run_terminal_cmd")),
+            disallowed_tools: parse_tool_list(Some("run_terminal_cmd")),
+            ..Default::default()
+        };
+        let mut overrides = xai_grok_shell::agent::config::CliAgentOverrides::default();
+        apply_cli_tool_restrictions(&mut overrides, &flags);
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        overrides.apply_to_definition(&mut definition);
+        let dir = tempfile::tempdir().unwrap();
+        let agent = xai_grok_agent::AgentBuilder::new(
+            dir.path().to_owned(),
+            std::sync::Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+            xai_grok_tools::notification::ToolNotificationHandle::noop(),
+        )
+        .from_definition(definition)
+        .build()
+        .await
+        .unwrap();
+        let definitions = agent.tool_definitions().await;
+        assert!(
+            definitions
+                .iter()
+                .any(|tool| tool.function.name == "read_file")
+        );
+        assert!(
+            !definitions
+                .iter()
+                .any(|tool| tool.function.name == "run_terminal_cmd")
+        );
+        // Both direct calls and Code Mode's nested calls resolve through this registry.
+        assert!(agent.tool_bridge().tool_kind("read_file").is_some());
+        assert!(agent.tool_bridge().tool_kind("run_terminal_cmd").is_none());
+    }
 
     #[test]
     fn is_session_update_ext_method_covers_both_carriers() {

@@ -315,6 +315,7 @@ async fn cmd_rm(
     force: bool,
     dry_run: bool,
 ) -> Result<()> {
+    let mut failed = false;
     for id_or_path in &ids {
         let resp: Result<RemoveResponse> = ext_call(
             tx,
@@ -336,8 +337,14 @@ async fn cmd_rm(
                     println!("  removed: {path}");
                 }
             }
-            Err(e) => eprintln!("  error removing {id_or_path}: {e}"),
+            Err(e) => {
+                failed = true;
+                eprintln!("  error removing {id_or_path}: {e}");
+            }
         }
+    }
+    if failed {
+        bail!("one or more worktrees could not be removed");
     }
     Ok(())
 }
@@ -396,6 +403,28 @@ async fn cmd_db(tx: &xai_acp_lib::AcpAgentTx, command: WorktreeDbCommand) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remove_errors_produce_failure_status() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+        tokio::spawn(async move {
+            let xai_acp_lib::AcpAgentMessage::ExtMethod(args) = rx.recv().await.unwrap() else {
+                panic!("expected extension request");
+            };
+            let reply = serde_json::value::to_raw_value(&serde_json::json!({
+                "result": null, "error": "worktree is in use by a running process"
+            }))
+            .unwrap();
+            args.response_tx
+                .send(Ok(acp::ExtResponse::new(std::sync::Arc::from(reply))))
+                .unwrap();
+        });
+        assert!(
+            cmd_rm(&tx, vec!["active".into()], true, false)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn create_sends_ref_and_prints_the_matching_subdirectory() {

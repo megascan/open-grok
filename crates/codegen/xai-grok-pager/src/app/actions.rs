@@ -3053,6 +3053,11 @@ impl std::fmt::Debug for SensitiveAuthUrl {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// Active-session registry recovery or registration failure for this session.
+    ActiveSessionRegistrationWarning {
+        session_id: acp::SessionId,
+        message: String,
+    },
     AgentsPluginRegistryLoaded {
         agent_id: AgentId,
         request_id: uuid::Uuid,

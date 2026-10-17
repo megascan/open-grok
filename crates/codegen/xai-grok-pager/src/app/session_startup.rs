@@ -147,6 +147,83 @@ pub fn fork_response_error(resp_json: &str) -> Option<String> {
         .filter(|e| !e.is_null())
         .map(|e| e.to_string())
 }
+/// Validate a worktree-resume response before loading the child session.
+///
+/// Session storage uses the paths returned by the shell, so preserve their
+/// spelling after checking their canonical locations and directory types.
+pub fn validate_worktree_resume_response(
+    result: &serde_json::Value,
+    source_cwd: &Path,
+) -> anyhow::Result<(String, PathBuf, PathBuf)> {
+    let field = |name: &str| -> anyhow::Result<&str> {
+        result
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Worktree resume response is missing {name}"))
+    };
+    let session_id = field("sessionId")?.to_owned();
+    let worktree = PathBuf::from(field("worktreePath")?);
+    let effective_cwd = PathBuf::from(field("effectiveCwd")?);
+    if !worktree.is_absolute() || !effective_cwd.is_absolute() {
+        anyhow::bail!("Worktree resume returned a relative path");
+    }
+    let canonical_dir = |path: &Path| -> anyhow::Result<PathBuf> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve {}: {e}", path.display()))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("{} is not a directory", path.display());
+        }
+        Ok(canonical)
+    };
+    let worktree_real = canonical_dir(&worktree)?;
+    let effective_real = canonical_dir(&effective_cwd)?;
+    let source_real = canonical_dir(source_cwd)?;
+    let source_root = git2::Repository::discover(&source_real)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .and_then(|root| std::fs::canonicalize(root).ok())
+        .unwrap_or(source_real);
+    if source_root.starts_with(&worktree_real) {
+        anyhow::bail!("Worktree resume returned a path overlapping the source checkout");
+    }
+    // A configured Open Grok home may place a worktree below the source
+    // checkout. Accept it only if it is a distinct, identifiable Git tree.
+    if worktree_real.starts_with(&source_root) {
+        let source_repo = git2::Repository::discover(&source_root)?;
+        let target_repo = git2::Repository::discover(&worktree_real)?;
+        let target_root = target_repo
+            .workdir()
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        let shared_git = match (
+            std::fs::canonicalize(target_repo.commondir()),
+            std::fs::canonicalize(source_repo.commondir()),
+        ) {
+            (Ok(target), Ok(source)) => target == source,
+            _ => false,
+        };
+        let marker_source =
+            std::fs::read_to_string(worktree_real.join(".git/grok-worktree-source"))
+                .ok()
+                .and_then(|s| std::fs::canonicalize(s.trim()).ok());
+        let expected_source =
+            std::fs::read_to_string(source_root.join(".git/grok-worktree-source"))
+                .ok()
+                .and_then(|s| std::fs::canonicalize(s.trim()).ok())
+                .unwrap_or_else(|| source_root.clone());
+        if target_root.as_deref() != Some(worktree_real.as_path())
+            || !(shared_git || marker_source.as_deref() == Some(expected_source.as_path()))
+        {
+            anyhow::bail!(
+                "Worktree resume returned an unrecognized directory inside the source checkout"
+            );
+        }
+    }
+    if !effective_real.starts_with(&worktree_real) {
+        anyhow::bail!("Worktree resume returned an effective cwd outside the worktree");
+    }
+    Ok((session_id, worktree, effective_cwd))
+}
 /// Pure interpretation of session-selection CLI flags (no I/O).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStartupIntent {
@@ -1302,6 +1379,75 @@ mod tests {
     use clap::Parser;
     fn parse(args: &[&str]) -> PagerArgs {
         PagerArgs::try_parse_from(args).unwrap()
+    }
+    #[test]
+    fn worktree_resume_response_requires_an_isolated_existing_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        crate::test_util::init_git_repo_on_branch(&source, "main");
+        let source_cwd = source.join("nested");
+        let sibling = source.join("other");
+        let target = tmp.path().join("worktree");
+        let target_cwd = target.join("nested");
+        for path in [&source_cwd, &sibling, &target_cwd] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let response = serde_json::json!({
+            "sessionId": "child",
+            "worktreePath": target,
+            "effectiveCwd": target_cwd,
+        });
+        let (id, root, cwd) = validate_worktree_resume_response(&response, &source_cwd).unwrap();
+        assert_eq!(id, "child");
+        assert_eq!(root, target);
+        assert_eq!(cwd, target_cwd);
+
+        for name in ["sessionId", "worktreePath", "effectiveCwd"] {
+            let mut invalid = response.clone();
+            invalid.as_object_mut().unwrap().remove(name);
+            assert!(validate_worktree_resume_response(&invalid, &source_cwd).is_err());
+        }
+        for path in [&source, &source_cwd, &sibling, tmp.path()] {
+            let mut invalid = response.clone();
+            invalid["worktreePath"] = serde_json::json!(path);
+            assert!(validate_worktree_resume_response(&invalid, &source_cwd).is_err());
+        }
+        let mut outside = response.clone();
+        outside["effectiveCwd"] = serde_json::json!(source_cwd);
+        assert!(validate_worktree_resume_response(&outside, &source_cwd).is_err());
+        outside["effectiveCwd"] = serde_json::json!("relative/path");
+        assert!(validate_worktree_resume_response(&outside, &source_cwd).is_err());
+        outside["effectiveCwd"] = serde_json::json!(target.join("missing"));
+        assert!(validate_worktree_resume_response(&outside, &source_cwd).is_err());
+        #[cfg(unix)]
+        {
+            let escape = target.join("escape");
+            std::os::unix::fs::symlink(&source_cwd, &escape).unwrap();
+            outside["effectiveCwd"] = serde_json::json!(escape);
+            assert!(validate_worktree_resume_response(&outside, &source_cwd).is_err());
+        }
+    }
+    #[test]
+    fn worktree_resume_response_accepts_managed_nested_worktree() {
+        let main = crate::test_util::TempGitRepo::init("nested-worktree");
+        let nested = main.path.join("nested");
+        let out = std::process::Command::new("git")
+            .current_dir(&main.path)
+            .args(["worktree", "add", "--detach"])
+            .arg(&nested)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result = serde_json::json!({
+            "sessionId": "child",
+            "worktreePath": nested,
+            "effectiveCwd": nested,
+        });
+        assert!(validate_worktree_resume_response(&result, &main.path).is_ok());
     }
     #[test]
     fn parent_session_is_worktree_detects_standalone_marker() {

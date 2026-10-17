@@ -1220,8 +1220,6 @@ pub(crate) async fn run(
     }
     let headless_only: &[(&str, bool)] = &[
         ("--agents", args.agents_json.is_some()),
-        ("--tools", args.cli_tools.is_some()),
-        ("--disallowed-tools", args.cli_disallowed_tools.is_some()),
         ("--max-turns", args.max_turns.is_some()),
     ];
     for &(flag, set) in headless_only {

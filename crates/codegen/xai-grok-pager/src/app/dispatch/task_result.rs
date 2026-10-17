@@ -2811,6 +2811,17 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         crate::app::workspace_sync::request(app);
     }
     match result {
+        TaskResult::ActiveSessionRegistrationWarning {
+            session_id,
+            message,
+        } => {
+            if let Some(agent) = find_agent_by_session_id(&mut app.agents, &session_id.0) {
+                agent.scrollback.push_block(RenderBlock::system(message));
+            } else {
+                app.show_toast(&message);
+            }
+            vec![]
+        }
         TaskResult::PerplexityWebSearchUpdated {
             enabled,
             api_key_configured,
@@ -6475,5 +6486,29 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::FeatureOverridePersisted { feature, result } => {
             settings::handle_feature_override_persisted(app, feature, result)
         }
+    }
+}
+
+#[cfg(test)]
+mod active_registry_warning_tests {
+    use super::*;
+    use crate::app::dispatch::tests::test_app_with_agent;
+
+    #[test]
+    fn recovered_registry_warning_is_visible_in_the_session() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let warning = "Active session registry was corrupted; backup saved";
+        dispatch_task_result(
+            TaskResult::ActiveSessionRegistrationWarning {
+                session_id: "test-session".into(),
+                message: warning.into(),
+            },
+            &mut app,
+        );
+        let scrollback = &app.agents[&id].scrollback;
+        assert!(scrollback.entries_in_range(0..scrollback.len()).iter().any(
+            |entry| matches!(&entry.block, RenderBlock::System(block) if block.text == warning)
+        ));
     }
 }

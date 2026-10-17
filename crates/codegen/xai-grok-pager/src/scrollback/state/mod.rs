@@ -2723,7 +2723,15 @@ mod tests {
         let mut state = ScrollbackState::new();
         let n = 400usize;
         for i in 0..n {
-            state.push_block(stub_block(&format!("entry {i}")));
+            let block = if i == 0 {
+                RenderBlock::agent_message(format!(
+                    "# Long reply\n\n{}",
+                    "wrapped text ".repeat(2_000)
+                ))
+            } else {
+                stub_block(&format!("entry {i}"))
+            };
+            state.push_block(block);
         }
         // Bottom-pinned viewport: the measurement window is near the tail.
         state.prepare_layout(80, 10);
@@ -2735,6 +2743,13 @@ mod tests {
         for (_, entry) in state.entries.iter() {
             entry.ensure_cached(78, &appearance, false, None);
         }
+        let first = &state.entries[0];
+        let original: Vec<_> = first
+            .cached_output_ref()
+            .lines
+            .iter()
+            .map(|line| line.content.clone())
+            .collect();
 
         let evicted = state.evict_offscreen_render_caches();
         assert!(
@@ -2758,6 +2773,19 @@ mod tests {
 
         // A second sweep with nothing re-rendered finds nothing to do.
         assert_eq!(state.evict_offscreen_render_caches(), 0);
+        let first = &state.entries[0];
+        assert!(!first.has_cached_output());
+        first.ensure_cached(78, &appearance, false, None);
+        let rebuilt: Vec<_> = first
+            .cached_output_ref()
+            .lines
+            .iter()
+            .map(|line| line.content.clone())
+            .collect();
+        assert_eq!(
+            rebuilt, original,
+            "evicted output must reconstruct identically"
+        );
     }
 
     #[test]
