@@ -316,6 +316,7 @@ pub(crate) struct AgentTask {
     pub(super) identity: TaskIdentity,
     pub(crate) handle: tokio::task::AbortHandle,
     pub(crate) started_at: std::time::Instant,
+    delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
 }
 
 pub(crate) fn elapsed_ms_saturating(start: std::time::Instant, now: std::time::Instant) -> u64 {
@@ -433,7 +434,17 @@ impl AgentTask {
             identity: TaskIdentity::new(()),
             handle,
             started_at: std::time::Instant::now(),
+            delivery_scope: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_delivery_scope(
+        mut self,
+        scope: xai_grok_tools::notification::BackgroundDeliveryScope,
+    ) -> Self {
+        self.delivery_scope = Some(scope);
+        self
     }
 
     pub(super) fn new_prompt(
@@ -444,6 +455,11 @@ impl AgentTask {
     ) -> Self {
         let started_at = std::time::Instant::now();
         let identity = TaskIdentity::new(());
+        let delivery_guard = session
+            .rebuild_spec
+            .tools_notification_handle
+            .begin_turn_delivery_for_mode(request.screen_mode.as_deref() == Some("headless"));
+        let delivery_scope = delivery_guard.scope();
         Self {
             prompt_id: request.prompt_id.clone(),
             epoch,
@@ -455,13 +471,18 @@ impl AgentTask {
                 identity,
                 completion_tx,
                 started_at,
+                delivery_guard,
             ))
             .abort_handle(),
             started_at,
+            delivery_scope: Some(delivery_scope),
         }
     }
 
     pub(super) fn abort(&self) {
+        if let Some(scope) = &self.delivery_scope {
+            scope.revoke();
+        }
         if !self.handle.is_finished() {
             self.handle.abort();
         }
@@ -504,9 +525,54 @@ async fn run_task(
     task_identity: TaskIdentity,
     completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     started_at: std::time::Instant,
+    delivery_guard: xai_grok_tools::notification::BackgroundDeliveryGuard,
 ) {
     let prompt_id = request.prompt_id.clone();
-    let result = session.handle_turn_input(request).await;
+    let headless = request.screen_mode.as_deref() == Some("headless");
+    let delivery_scope = delivery_guard.scope();
+    let mut result = session.handle_turn_input(request).await;
+    if headless {
+        // The headless client can start its configured timeout only once the
+        // model is done, even if a lifecycle receipt itself never arrives.
+        if let Ok(params) =
+            serde_json::value::to_raw_value(&serde_json::json!({ "prompt_id": &prompt_id }))
+        {
+            session
+                .notifications
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/background_delivery_waiting",
+                    params.into(),
+                ));
+        }
+    }
+    // A yielded cell can wait for the next active turn before it even
+    // invokes a tool. Headless has no next user turn, so fail and stop it
+    // rather than deadlock this turn's delivery barrier.
+    let unfinished_cell = headless
+        && session
+            .rebuild_spec
+            .code_mode_runtime
+            .current()
+            .has_live_cells();
+    if unfinished_cell {
+        if result.is_ok() {
+            result = Err(acp::Error::internal_error().data(
+                "Code Mode still has a yielded cell; wait for it to finish before ending a headless turn".to_owned(),
+            ));
+        }
+        let runtime = session.rebuild_spec.code_mode_runtime.current();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown()).await;
+    } else if let Err(error) = delivery_scope
+        .wait_bounded(std::time::Duration::from_secs(30))
+        .await
+    {
+        tracing::warn!(%error, "background lifecycle delivery failed before turn completion");
+        if result.is_ok() {
+            result = Err(acp::Error::internal_error()
+                .data(format!("background lifecycle delivery failed: {error}")));
+        }
+    }
     let elapsed_ms = elapsed_ms_saturating(started_at, std::time::Instant::now());
     let _ = completion_tx.send(TurnCompletionMsg {
         prompt_id,

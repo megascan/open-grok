@@ -578,8 +578,24 @@ impl xai_tool_runtime::Tool for TaskTool {
         // Coordinator stores the result for TaskOutputTool polling.
         // Both transport errors and coordinator rejections are logged so
         // late failures (worktree creation, etc.) remain visible.
+        // Even a foreground request can be auto-backgrounded after its wait budget.
+        let delivery_scope = ctx
+            .get::<crate::notification::BackgroundDeliveryScope>()
+            .map(|scope| (*scope).clone());
+        let start_handle = resources
+            .lock()
+            .await
+            .get::<crate::types::resources::NotificationHandle>()
+            .map(|handle| handle.0.with_delivery_scope(delivery_scope));
+        let start_reservation = start_handle
+            .map(|handle| handle.reserve_subagent_admission())
+            .transpose()
+            .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_unavailable", error))?;
         if let Some(options) = ctx.get::<NativeAgentSpawn>() {
-            let result = backend.backend().spawn(request).await?;
+            let result = backend
+                .backend()
+                .spawn_reserved(request, start_reservation)
+                .await?;
             if !result.success {
                 return Err(xai_tool_runtime::ToolError::custom(
                     "spawn_failed",
@@ -602,7 +618,11 @@ impl xai_tool_runtime::Tool for TaskTool {
             let bg_id = id.clone();
             let bg_type = subagent_type.clone();
             tokio::spawn(async move {
-                match bg_backend.backend().spawn(request).await {
+                match bg_backend
+                    .backend()
+                    .spawn_reserved(request, start_reservation)
+                    .await
+                {
                     Err(e) => {
                         tracing::error!(
                             subagent_id = %bg_id,
@@ -646,7 +666,10 @@ impl xai_tool_runtime::Tool for TaskTool {
         }
 
         // 5. Blocking mode (default): spawn via backend and await result
-        let result = backend.backend().spawn(request).await;
+        let result = backend
+            .backend()
+            .spawn_reserved(request, start_reservation)
+            .await;
         if let Some(forwarder) = cancellation_forwarder {
             forwarder.abort();
         }

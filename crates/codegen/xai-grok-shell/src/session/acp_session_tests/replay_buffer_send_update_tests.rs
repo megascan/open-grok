@@ -224,6 +224,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rate_limit_waits: Default::default(),
         code_mode_hook_followups: Default::default(),
+        hook_stop_latch: Default::default(),
         sampling_gate: None,
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),

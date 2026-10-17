@@ -184,6 +184,7 @@ pub(crate) async fn run_shell_child(
 ) -> ChildRunOutput<ShellCompletionData> {
     let grok_build::task::coordinator::ChildRunRequest {
         mut request,
+        admission_generation,
         cancellation: cancel_token,
         reporter,
         wake_origin,
@@ -485,56 +486,34 @@ pub(crate) async fn run_shell_child(
         return child_run_output(failure_result(&request, &message), completion_data, None);
     }
     let worktree_path = if let Some(ref source) = resume_source {
-        if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
-            && source.worktree_path.is_none()
-        {
-            tracing::info!(
-                subagent_id = %request.id,
-                "Ignoring isolation=worktree override: resumed source had no worktree"
-            );
-        }
         match source.worktree_path.as_deref() {
+            None if request
+                .runtime_overrides
+                .isolation
+                .is_some_and(|mode| mode != xai_tool_types::SubagentIsolationMode::None) =>
+            {
+                let message = "Cannot resume with worktree isolation: the original subagent has no isolated worktree";
+                return child_run_output(failure_result(&request, message), completion_data, None);
+            }
             None => None,
             Some(dest) => {
-                match resume_worktree_action(dest.is_dir(), source.snapshot_ref.as_deref()) {
-                    ResumeWorktreeAction::Reuse => Some(dest.to_path_buf()),
-                    ResumeWorktreeAction::Rehydrate => {
-                        let snapshot_ref = source.snapshot_ref.clone().unwrap_or_default();
-                        let source_repo = resolve_subagent_source_repo(&ctx);
-                        match crate::session::worktree::rehydrate_subagent_worktree(
-                            dest,
-                            &source_repo,
-                            &snapshot_ref,
-                            Some(source.subagent_id.as_str()),
-                        )
-                        .await
-                        {
-                            Ok(path) => {
-                                tracing::info!(
-                                    subagent_id = %request.id,
-                                    worktree_path = %path.display(),
-                                    snapshot_ref = %snapshot_ref,
-                                    "Rehydrated subagent worktree from snapshot for resume"
-                                );
-                                Some(path)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    subagent_id = %request.id,
-                                    error = %e,
-                                    "Failed to rehydrate subagent worktree, falling back to shared workspace"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    ResumeWorktreeAction::Shared => {
-                        tracing::warn!(
-                            subagent_id = %request.id,
-                            worktree = %dest.display(),
-                            "Resumed subagent worktree dir missing with no snapshot; using shared workspace"
+                let source_repo = resolve_subagent_source_repo(&ctx);
+                match prepare_resume_subagent_worktree(
+                    dest,
+                    &source_repo,
+                    &source.subagent_id,
+                    source.snapshot_ref.as_deref(),
+                )
+                .await
+                {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        let message = format!("Cannot resume isolated subagent worktree: {error}");
+                        return child_run_output(
+                            failure_result(&request, &message),
+                            completion_data,
+                            None,
                         );
-                        None
                     }
                 }
             }
@@ -587,25 +566,13 @@ pub(crate) async fn run_shell_child(
                 );
                 Some(report.worktree_path)
             }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    subagent_id = %request.id,
-                    error = %e,
-                    grove_worktree = grove_enabled,
-                    grove_gate_source,
-                    "Failed to create worktree (grove gate {grove_gate_source}), falling back to shared workspace"
-                );
-                None
+            Ok(Err(error)) => {
+                let message = format!("Cannot create isolated subagent worktree: {error}");
+                return child_run_output(failure_result(&request, &message), completion_data, None);
             }
-            Err(e) => {
-                tracing::warn!(
-                    subagent_id = %request.id,
-                    error = %e,
-                    grove_worktree = grove_enabled,
-                    grove_gate_source,
-                    "Worktree creation task panicked (grove gate {grove_gate_source}), falling back to shared workspace"
-                );
-                None
+            Err(error) => {
+                let message = format!("Isolated subagent worktree creation failed: {error}");
+                return child_run_output(failure_result(&request, &message), completion_data, None);
             }
         }
     } else {
@@ -1044,7 +1011,7 @@ pub(crate) async fn run_shell_child(
             .map(|m| format!("{m:?}")),
         depth: child_depth,
     };
-    emit_subagent_notification(
+    let _ = emit_subagent_notification_observed(
         gateway,
         &ctx.parent_session_id,
         SessionUpdate::SubagentSpawned {
@@ -1075,6 +1042,8 @@ pub(crate) async fn run_shell_child(
             workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         },
         ctx.parent_cmd_tx.as_ref(),
+        admission_generation.as_deref(),
+        None,
     );
     completion_data.spawned_notification_emitted = true;
     let early_gcs_ctx = GcsUploadContext {
@@ -2089,9 +2058,20 @@ pub(crate) async fn run_shell_child(
     ) {
         (Some(parent_tb), Some(parent_notif_handle)) => {
             if !request.surface_completion {
-                let reparented_task_ids: Vec<String> = parent_tb
-                    .list_tasks()
-                    .await
+                let tasks = match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    parent_tb.list_tasks(),
+                )
+                .await
+                {
+                    Ok(tasks) => tasks,
+                    Err(_) => {
+                        completion_data.background_delivery_error =
+                            Some("timed out listing child background tasks".to_owned());
+                        Vec::new()
+                    }
+                };
+                let reparented_task_ids: Vec<String> = tasks
                     .into_iter()
                     .filter(|t| {
                         !t.completed && t.owner_session_id.as_deref() == Some(&*child_session_id.0)
@@ -2107,14 +2087,39 @@ pub(crate) async fn run_shell_child(
                 }
             }
             let parent_backend_weak = std::sync::Arc::downgrade(parent_tb);
-            parent_tb
-                .reparent_notifications(
+            // Keep the child outstanding until every still-live task has been
+            // registered with the parent client. This scope is independent of
+            // whichever parent turn happens to be active at child completion.
+            let delivery_scope = xai_grok_tools::notification::BackgroundDeliveryScope::new();
+            let scoped_parent =
+                parent_notif_handle.with_delivery_scope(Some(delivery_scope.clone()));
+            let reparent = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                parent_tb.reparent_notifications(
                     &child_session_id.0,
                     &ctx.parent_session_id,
-                    parent_notif_handle.clone(),
+                    scoped_parent,
                     parent_backend_weak,
-                )
-                .await;
+                ),
+            )
+            .await;
+            match reparent {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => completion_data.background_delivery_error = Some(error),
+                Err(_) => {
+                    completion_data.background_delivery_error =
+                        Some("timed out reparenting child background tasks".to_owned());
+                }
+            }
+            if let Err(error) = delivery_scope
+                .wait_bounded(std::time::Duration::from_secs(30))
+                .await
+            {
+                tracing::error!(subagent_id = %request.id, %error, "could not deliver reparented task starts");
+                // Carry uncertainty on completion, so it cannot race behind
+                // that event and cause a successful headless exit.
+                completion_data.background_delivery_error = Some(error);
+            }
         }
         (Some(_), None) | (None, Some(_)) => {
             tracing::warn!(

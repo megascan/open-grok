@@ -14,6 +14,9 @@ use xai_grok_tools::computer::types::{
     BackgroundHandle, ComputerError, KillOutcome, KillSource, TaskKind, TaskSnapshot,
     TerminalBackend, TerminalRunRequest, TerminalRunResult,
 };
+use xai_grok_tools::notification::{
+    BashExecutionBackgrounded, BashNotificationBase, ToolNotificationHandle,
+};
 
 /// A snapshot's per-completion fields, grouped to avoid transposed positional args.
 #[derive(Clone)]
@@ -26,13 +29,17 @@ pub(super) struct SnapshotOutput {
 
 pub(super) struct TrackedTask {
     command: String,
+    raw_command: String,
+    tool_call_id: String,
+    pub(super) notification_handle: Option<ToolNotificationHandle>,
+    teardown_claimed: bool,
     display_command: Option<String>,
     cwd: String,
     output_file: PathBuf,
     start_time: std::time::SystemTime,
     /// Stamped once when the task completes, so repeated snapshots agree.
     end_time: Option<std::time::SystemTime>,
-    completed: bool,
+    pub(super) completed: bool,
     exit_code: Option<i32>,
     signal: Option<String>,
     last_output: String,
@@ -54,6 +61,10 @@ impl Default for TrackedTask {
     fn default() -> Self {
         Self {
             command: String::new(),
+            raw_command: String::new(),
+            tool_call_id: String::new(),
+            notification_handle: None,
+            teardown_claimed: false,
             display_command: None,
             cwd: String::new(),
             output_file: PathBuf::new(),
@@ -177,7 +188,11 @@ pub(super) fn parse_exit(
 pub struct AcpTerminalAdapter {
     gateway: GatewaySender,
     session_id: acp::SessionId,
+    /// Parent session runtime owns background watchers even when a child uses
+    /// this shared adapter and its runtime is subsequently shut down.
+    owner_runtime: tokio::runtime::Handle,
     tasks: TaskMap,
+    foreground: Arc<Mutex<HashMap<String, Option<String>>>>,
     sandbox_guard: Option<Arc<dyn AcpTerminalSandboxGuard>>,
 }
 
@@ -202,7 +217,9 @@ impl AcpTerminalAdapter {
         Self {
             gateway,
             session_id,
+            owner_runtime: tokio::runtime::Handle::current(),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            foreground: Arc::new(Mutex::new(HashMap::new())),
             sandbox_guard: None,
         }
     }
@@ -227,6 +244,9 @@ impl AcpTerminalAdapter {
                 "Workspace sandbox enforcement requires a local terminal; the ACP client terminal cannot enforce it",
             ));
         }
+        if request.notification_handle.is_delivery_revoked() {
+            return Err(ComputerError::io("originating turn was cancelled"));
+        }
         self.gateway
             .send(
                 acp::CreateTerminalRequest::new(self.session_id.clone(), command)
@@ -242,6 +262,113 @@ impl AcpTerminalAdapter {
     fn terminal_id(&self, task_id: &str) -> acp::TerminalId {
         acp::TerminalId::new(task_id)
     }
+
+    async fn kill_and_release(&self, id: &acp::TerminalId) -> bool {
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            self.gateway
+                .send(acp::KillTerminalRequest::new(
+                    self.session_id.clone(),
+                    id.clone(),
+                ))
+                .await?;
+            self.gateway
+                .send(acp::ReleaseTerminalRequest::new(
+                    self.session_id.clone(),
+                    id.clone(),
+                ))
+                .await?;
+            Ok::<_, acp::Error>(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::warn!(terminal_id = %id.0, %error, "ACP terminal cleanup was not confirmed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(terminal_id = %id.0, "ACP terminal cleanup timed out; termination is unconfirmed");
+                false
+            }
+        }
+    }
+
+    async fn kill_foreground_owned(&self, owner: Option<&str>) {
+        let ids = {
+            let foreground = self.foreground.lock().unwrap();
+            foreground
+                .iter()
+                .filter(|(_, task_owner)| {
+                    owner.is_none_or(|owner| task_owner.as_deref() == Some(owner))
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        futures::future::join_all(ids.into_iter().map(|id| async move {
+            if self.kill_and_release(&self.terminal_id(&id)).await {
+                self.foreground.lock().unwrap().remove(&id);
+            }
+        }))
+        .await;
+    }
+
+    async fn kill_background_for_teardown(&self, task_id: &str) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gateway.send(acp::KillTerminalRequest::new(
+                self.session_id.clone(),
+                self.terminal_id(task_id),
+            )),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {
+                if let Some(task) = self.tasks.lock().unwrap().get_mut(task_id) {
+                    task.explicitly_killed = true;
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(task_id, %error, "ACP background termination was not confirmed")
+            }
+            Err(_) => tracing::warn!(
+                task_id,
+                "ACP background termination timed out; termination is unconfirmed"
+            ),
+        }
+    }
+
+    fn claim_background_for_teardown(&self, owner: Option<&str>) -> Vec<String> {
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks
+            .iter_mut()
+            .filter_map(|(id, task)| {
+                if task.completed
+                    || !owner.is_none_or(|owner| task.owner_session_id.as_deref() == Some(owner))
+                {
+                    return None;
+                }
+                // Reparent uses this same lock and rejects claimed tasks, so a
+                // child sweep cannot kill work already transferred to the parent.
+                task.teardown_claimed = true;
+                task.kill_result_delivered = true;
+                task.block_waited = false;
+                Some(id.clone())
+            })
+            .collect()
+    }
+}
+
+struct ForegroundRegistration {
+    entries: Arc<Mutex<HashMap<String, Option<String>>>>,
+    id: String,
+    confirmed_exit: bool,
+}
+impl Drop for ForegroundRegistration {
+    fn drop(&mut self) {
+        if self.confirmed_exit {
+            self.entries.lock().unwrap().remove(&self.id);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -249,6 +376,30 @@ impl TerminalBackend for AcpTerminalAdapter {
     async fn run(&self, request: TerminalRunRequest) -> Result<TerminalRunResult, ComputerError> {
         let command = wrap_command(&request.command)?;
         let create_res = self.create_terminal(command, &request).await?;
+        let id = create_res.terminal_id.0.to_string();
+        let admitted = {
+            let mut foreground = self.foreground.lock().unwrap();
+            if request.notification_handle.is_delivery_revoked() {
+                false
+            } else {
+                foreground.insert(id.clone(), request.owner_session_id.clone());
+                true
+            }
+        };
+        if !admitted {
+            if !self.kill_and_release(&create_res.terminal_id).await {
+                self.foreground
+                    .lock()
+                    .unwrap()
+                    .insert(id, request.owner_session_id.clone());
+            }
+            return Err(ComputerError::io("originating turn was cancelled"));
+        }
+        let mut registration = ForegroundRegistration {
+            entries: self.foreground.clone(),
+            id,
+            confirmed_exit: false,
+        };
 
         let timed_out = match tokio::time::timeout(
             request.timeout,
@@ -259,19 +410,23 @@ impl TerminalBackend for AcpTerminalAdapter {
         )
         .await
         {
-            Ok(Ok(_)) => false,
+            Ok(Ok(_)) => {
+                registration.confirmed_exit = true;
+                false
+            }
             Ok(Err(e)) => {
                 release_terminal(&self.gateway, &self.session_id, &create_res.terminal_id).await;
                 return Err(ComputerError::io(e.to_string()));
             }
             Err(_) => {
-                let _ = self
+                let killed = self
                     .gateway
                     .send(acp::KillTerminalRequest::new(
                         self.session_id.clone(),
                         create_res.terminal_id.clone(),
                     ))
                     .await;
+                registration.confirmed_exit = killed.is_ok();
                 true
             }
         };
@@ -329,27 +484,44 @@ impl TerminalBackend for AcpTerminalAdapter {
         let task_id = create_res.terminal_id.0.to_string();
         let description = request.description;
 
-        {
+        let admitted = {
             let mut tasks = self.tasks.lock().unwrap();
-            tasks.insert(
-                task_id.clone(),
-                TrackedTask {
-                    command,
-                    display_command,
-                    cwd,
-                    output_file: output_file.clone(),
-                    kind: request.kind,
-                    owner_session_id: request.owner_session_id.clone(),
-                    description,
-                    output_byte_limit: request.output_byte_limit,
-                    ..Default::default()
-                },
-            );
+            if request.notification_handle.is_delivery_revoked() {
+                false
+            } else {
+                tasks.insert(
+                    task_id.clone(),
+                    TrackedTask {
+                        command,
+                        raw_command: request.command.clone(),
+                        tool_call_id: request.tool_call_id.clone(),
+                        notification_handle: Some(notification_handle.clone()),
+                        display_command,
+                        cwd,
+                        output_file: output_file.clone(),
+                        kind: request.kind,
+                        owner_session_id: request.owner_session_id.clone(),
+                        description,
+                        output_byte_limit: request.output_byte_limit,
+                        ..Default::default()
+                    },
+                );
+                true
+            }
+        };
+        if !admitted {
+            if !self.kill_and_release(&create_res.terminal_id).await {
+                self.foreground
+                    .lock()
+                    .unwrap()
+                    .insert(task_id, request.owner_session_id.clone());
+            }
+            return Err(ComputerError::io("originating turn was cancelled"));
         }
 
         let recorder = OutputRecorder::new(output_file.clone(), request.output_byte_limit);
         recorder.initialize().await;
-        tokio::spawn(watch_for_exit(
+        self.owner_runtime.spawn(watch_for_exit(
             self.gateway.clone(),
             self.session_id.clone(),
             task_id.clone(),
@@ -673,23 +845,126 @@ impl TerminalBackend for AcpTerminalAdapter {
     }
 
     async fn kill_all_background_tasks(&self) {
-        let task_ids: Vec<String> = {
-            let tasks = self.tasks.lock().unwrap();
-            tasks
+        let task_ids = self.claim_background_for_teardown(None);
+        futures::future::join_all(
+            task_ids
                 .iter()
-                .filter(|(_, t)| !t.completed)
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-        for task_id in task_ids {
-            self.kill_task_with_source(&task_id, KillSource::Teardown)
-                .await;
-        }
+                .map(|id| self.kill_background_for_teardown(id)),
+        )
+        .await;
+    }
+
+    async fn kill_all_background_tasks_by_owner(&self, owner: &str) {
+        let task_ids = self.claim_background_for_teardown(Some(owner));
+        futures::future::join_all(
+            task_ids
+                .iter()
+                .map(|id| self.kill_background_for_teardown(id)),
+        )
+        .await;
     }
 
     async fn kill_foreground_commands(&self) {
+        self.kill_foreground_owned(None).await;
         let session_id = self.session_id.0.to_string();
         crate::terminal::kill_and_release_all_for_session(&session_id).await;
+    }
+
+    async fn kill_foreground_commands_by_owner(&self, owner: &str) {
+        self.kill_foreground_owned(Some(owner)).await;
+    }
+
+    async fn reparent_notifications(
+        &self,
+        old_owner: &str,
+        new_owner: &str,
+        new_handle: ToolNotificationHandle,
+        backend_weak: std::sync::Weak<dyn TerminalBackend>,
+    ) -> Result<(), String> {
+        let mut monitors = Vec::new();
+        {
+            let mut tasks = self.tasks.lock().unwrap();
+            if tasks.values().any(|task| {
+                !task.completed
+                    && task.teardown_claimed
+                    && task.owner_session_id.as_deref() == Some(old_owner)
+            }) {
+                return Err("child background task teardown is already in progress".to_owned());
+            }
+            for (task_id, task) in tasks.iter_mut() {
+                if task.completed || task.owner_session_id.as_deref() != Some(old_owner) {
+                    continue;
+                }
+                task.owner_session_id = Some(new_owner.to_owned());
+                task.notification_handle = Some(new_handle.clone());
+                let monitor = task.kind == TaskKind::Monitor;
+                let monitor_description = monitor
+                    .then(|| {
+                        task.display_command
+                            .as_deref()
+                            .and_then(|s| s.strip_prefix("[monitor] "))
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_owned)
+                    })
+                    .flatten();
+                let description = task
+                    .description
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| monitor_description.clone());
+                let command = if monitor {
+                    task.raw_command.clone()
+                } else {
+                    task.display_command
+                        .clone()
+                        .unwrap_or_else(|| task.raw_command.clone())
+                };
+                // The exit watcher uses this same lock, so the parent always
+                // observes the synthetic start before the completion.
+                new_handle.send_backgrounded(BashExecutionBackgrounded {
+                    base: BashNotificationBase {
+                        tool_call_id: task.tool_call_id.clone(),
+                        command,
+                        output: Vec::new(),
+                        total_bytes: 0,
+                        truncated: false,
+                        cwd: PathBuf::from(&task.cwd),
+                    },
+                    output_file: task.output_file.clone(),
+                    task_id: task_id.clone(),
+                    monitor_description,
+                    description: description.clone(),
+                });
+                if monitor {
+                    let offset = std::fs::metadata(&task.output_file)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    monitors.push((
+                        task_id.clone(),
+                        description.unwrap_or_else(|| task.raw_command.clone()),
+                        task.output_file.clone(),
+                        offset,
+                    ));
+                }
+            }
+        }
+        for (task_id, description, output_file, offset) in monitors {
+            let handle = new_handle.clone();
+            let backend = backend_weak.clone();
+            tokio::spawn(async move {
+                xai_grok_tools::implementations::grok_build::monitor::tool::run_monitor_pipeline(
+                    &task_id,
+                    &description,
+                    backend,
+                    &handle,
+                    &output_file,
+                    Some("kill_command_or_subagent".to_owned()),
+                    offset,
+                )
+                .await;
+            });
+        }
+        Ok(())
     }
 }
 

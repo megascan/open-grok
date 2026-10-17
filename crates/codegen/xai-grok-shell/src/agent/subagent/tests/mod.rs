@@ -157,6 +157,7 @@ async fn usage_ack_precedes_terminal_presentation() {
     present_child_completion(
         ChildCompletion {
             request,
+            admission_generation: None,
             result: SubagentResult {
                 success: true,
                 subagent_id: "usage-order".to_string(),
@@ -297,20 +298,6 @@ fn subagent_max_turns_definition_wins_else_inherits_parent() {
     assert_eq!(super::resolve_subagent_max_turns(None, Some(5)), Some(5));
 }
 #[test]
-fn resume_worktree_action_covers_three_outcomes() {
-    use super::{ResumeWorktreeAction, resume_worktree_action};
-    assert_eq!(
-        resume_worktree_action(true, Some("refs/open-grok/subagents/x")),
-        ResumeWorktreeAction::Rehydrate
-    );
-    assert_eq!(
-        resume_worktree_action(false, Some("refs/open-grok/subagents/x")),
-        ResumeWorktreeAction::Rehydrate
-    );
-    assert_eq!(resume_worktree_action(true, None), ResumeWorktreeAction::Reuse);
-    assert_eq!(resume_worktree_action(false, None), ResumeWorktreeAction::Shared);
-}
-#[test]
 fn subagent_inherits_parent_lsp_via_context() {
     let parent: std::sync::Arc<dyn xai_grok_tools::implementations::lsp::LspBackend> = Arc::new(
         DummyLspDispatch,
@@ -419,11 +406,12 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
 /// proves the full Gap-1 contract on the subagent surface: goal active →
 /// gate false → this never runs (no prompt, not marked, so surfaces 2/3
 /// drain it); goal inactive → gate true → it runs (today's behavior).
-#[test]
-fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
+#[tokio::test]
+async fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
     let request = auto_wake_test_request("sa-1");
+    let (gateway, _gateway_rx) = test_gateway_with_receiver();
     let result = SubagentResult {
         success: true,
         subagent_id: "sa-1".into(),
@@ -438,6 +426,8 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         Some(&cmd_tx),
         "get_command_or_subagent_output",
         &None,
+        &gateway,
+        None,
     );
     match cmd_rx.try_recv().expect("expected synthetic Prompt") {
         SessionCommand::Prompt { prompt_id, verbatim, .. } => {
@@ -455,6 +445,7 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
     let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
     reservations.reserve("sa-closed".into());
     let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    let (gateway, _gateway_rx) = test_gateway_with_receiver();
     inject_subagent_completed_prompt(
         "sa-closed",
         &SubagentResult {
@@ -468,6 +459,8 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
         Some(&cmd_tx),
         "get_command_or_subagent_output",
         &Some(trace_tx),
+        &gateway,
+        None,
     );
     assert!(
             reservations.contains("sa-closed"),
@@ -476,6 +469,24 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
     reservations.release("sa-closed");
     assert!(!reservations.contains("sa-closed"));
     assert!(trace_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn removed_subagent_wake_emits_exact_resolution() {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (gateway, mut gateway_rx) = test_gateway_with_receiver();
+    assert!(inject_subagent_completed_prompt(
+        "removed", &SubagentResult { success: true, subagent_id: "removed".into(), child_session_id: "removed".into(), ..Default::default() },
+        &auto_wake_test_request("removed"), &None, Some(&cmd_tx),
+        "get_command_or_subagent_output", &None, &gateway, Some("generation-1"),
+    ));
+    let SessionCommand::Prompt { respond_to, .. } = cmd_rx.recv().await.unwrap() else { panic!("expected wake prompt") };
+    drop(respond_to);
+    let xai_acp_lib::AcpClientMessage::ExtNotification(event) = gateway_rx.recv().await.unwrap() else { panic!("expected resolution") };
+    assert_eq!(event.request.method.as_ref(), "x.ai/background_wake_resolved");
+    let body: serde_json::Value = serde_json::from_str(event.request.params.get()).unwrap();
+    assert_eq!(body["prompt_id"], "subagent-completed-removed");
+    assert_eq!(body["generation"], "generation-1");
 }
 #[test]
 fn initializing_snapshot_is_running() {
@@ -2211,6 +2222,7 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
     present_child_completion(
         ChildCompletion {
             request,
+            admission_generation: None,
             result,
             completion_data,
             disposition: CompletionDisposition {

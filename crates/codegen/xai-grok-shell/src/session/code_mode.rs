@@ -335,6 +335,10 @@ impl CodeModeRuntime {
         ))
     }
 
+    pub(crate) fn has_live_cells(&self) -> bool {
+        !self.known_cells.lock().is_empty()
+    }
+
     /// Best-effort termination of one live cell. Unknown / already-terminal
     /// cells are a no-op, so callers never need to pre-check liveness.
     pub(crate) async fn terminate_cell(self: &Arc<Self>, cell_id: &str) -> Result<(), String> {

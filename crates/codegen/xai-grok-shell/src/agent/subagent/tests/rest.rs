@@ -630,6 +630,8 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
     let wt = temp.path().join("subagent-glue-1");
     xai_fast_worktree::WorktreeBuilder::new(&repo, &wt)
         .standalone(true)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id("glue-1")
         .create()
         .unwrap();
     std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
@@ -653,7 +655,26 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
             &snapshot_ref,
             "completed"
         ));
+    // Production removal only removes clean, inactive managed worktrees.
+    // This isolated fixture can declare its test owner inactive after snapshot.
+    let reset = std::process::Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(&wt)
+        .status()
+        .unwrap();
+    assert!(reset.success());
+    let db = xai_grok_workspace::worktree::open_db().unwrap();
+    let mut record = db.get(wt.to_str().unwrap()).unwrap().unwrap();
+    record.creator_pid = None;
+    db.register(&record).unwrap();
     crate::session::worktree::remove_subagent_worktree(&wt).await.unwrap();
+    let snap = std::process::Command::new("git")
+        .args(["show", &format!("{ref_name}:tracked.txt")])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(snap.status.success());
+    assert_eq!(snap.stdout, b"edited");
     let data = std::fs::read_to_string(meta_dir.join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
     assert_eq!(reread.snapshot_ref.as_deref(), Some(ref_name));
@@ -662,6 +683,48 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
             "worktree dir should be removed after the sequence"
         );
 }
+/// The normal completion path retains a dirty, current-process worktree when
+/// conservative cleanup rejects it. A snapshot must not force rehydration on
+/// top of that retained worktree.
+#[tokio::test]
+async fn retained_dirty_snapshot_resumes_only_with_proven_identity() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+    let wt = temp.path().join("subagent-retained");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &wt)
+        .standalone(true)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id("retained-owner")
+        .create().unwrap();
+    std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
+    let snapshot = crate::session::worktree::snapshot_subagent_worktree(
+        &wt, &repo, "refs/open-grok/subagents/retained-owner",
+    ).await.unwrap();
+    assert!(crate::session::worktree::remove_subagent_worktree(&wt).await.is_err());
+    assert_eq!(super::super::prepare_resume_subagent_worktree(
+        &wt, &repo, "retained-owner", Some(&snapshot),
+    ).await.unwrap(), wt);
+    assert_eq!(std::fs::read_to_string(wt.join("tracked.txt")).unwrap(), "edited");
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &wt, &repo, "wrong-owner", Some(&snapshot),
+    ).await.is_err());
+    let missing = temp.path().join("missing");
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &missing, &repo, "retained-owner", None,
+    ).await.is_err());
+    let occupied = temp.path().join("unmanaged");
+    std::fs::create_dir(&occupied).unwrap();
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &occupied, &repo, "retained-owner", Some(&snapshot),
+    ).await.is_err());
+}
+
 #[test]
 fn subagent_session_metadata_roundtrip() {
     let meta = SubagentMeta {

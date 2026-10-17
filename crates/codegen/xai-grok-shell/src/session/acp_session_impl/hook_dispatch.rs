@@ -312,6 +312,7 @@ impl SessionActor {
                 subagent_type: self.subagent_type_label(),
             },
         );
+        let identity = self.hook_stop_identity();
         let registry = self.hook_registry.borrow().clone();
         let mut dispatch_result = if let Some(registry) = registry {
             let ctx = self.hook_run_ctx();
@@ -319,7 +320,14 @@ impl SessionActor {
         } else {
             xai_grok_hooks::dispatcher::PostToolUseResult::default()
         };
-        dispatch_result.merge(self.run_post_tool_use_client_hooks(&envelope).await);
+        if let (Some(identity), Some(stop)) =
+            (identity.as_ref(), dispatch_result.force_stop.as_ref())
+        {
+            self.record_hook_stop_for(identity, stop.clone());
+        }
+        if dispatch_result.force_stop.is_none() {
+            dispatch_result.merge(self.run_post_tool_use_client_hooks(&envelope).await);
+        }
 
         let mut results = std::mem::take(&mut dispatch_result.results);
         let delivery = plan_post_tool_use_delivery(
@@ -407,14 +415,22 @@ impl SessionActor {
         &self,
         payload: xai_grok_hooks::event::HookPayload,
         prompt_id: Option<&str>,
-    ) -> xai_grok_hooks::result::PromptDecision {
+    ) -> xai_grok_hooks::dispatcher::PromptGateResult {
         let event = xai_grok_hooks::event::HookEventName::UserPromptSubmit;
         if !self.may_have_hooks_for(event) {
-            return xai_grok_hooks::result::PromptDecision::Allow;
+            return xai_grok_hooks::dispatcher::PromptGateResult {
+                decision: xai_grok_hooks::result::PromptDecision::Allow,
+                force_stop: None,
+                results: Vec::new(),
+            };
         }
         let envelope = self.fire_hook(event, prompt_id.map(|s| s.to_string()), payload);
         let Some(registry) = self.hook_registry.borrow().clone() else {
-            return xai_grok_hooks::result::PromptDecision::Allow;
+            return xai_grok_hooks::dispatcher::PromptGateResult {
+                decision: xai_grok_hooks::result::PromptDecision::Allow,
+                force_stop: None,
+                results: Vec::new(),
+            };
         };
         let ctx = self.hook_run_ctx();
         let gate =
@@ -423,7 +439,7 @@ impl SessionActor {
             .await;
         self.emit_hook_executed_telemetry(&event.to_string(), None, &gate.results)
             .await;
-        gate.decision
+        gate
     }
 
     pub(super) async fn emit_hook_executed_telemetry(

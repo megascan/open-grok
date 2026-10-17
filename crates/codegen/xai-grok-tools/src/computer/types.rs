@@ -419,11 +419,18 @@ pub trait TerminalBackend: Send + Sync {
     /// without keeping the backend alive. See `run_monitor_pipeline`.
     async fn reparent_notifications(
         &self,
-        _old_owner_session_id: &str,
+        old_owner_session_id: &str,
         _new_owner_session_id: &str,
         _new_handle: crate::notification::types::ToolNotificationHandle,
         _backend_weak: std::sync::Weak<dyn TerminalBackend>,
-    ) {
+    ) -> Result<(), String> {
+        if self.list_tasks().await.into_iter().any(|task| {
+            !task.completed && task.owner_session_id.as_deref() == Some(old_owner_session_id)
+        }) {
+            Err("terminal backend does not support reparenting notifications".to_owned())
+        } else {
+            Ok(())
+        }
     }
 
     /// Move a foreground command to background by tool_call_id.

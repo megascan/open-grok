@@ -1404,6 +1404,38 @@ impl SessionActor {
         }
     }
 
+    /// Called at the end of each actual continuation round, before scheduling
+    /// another. `used_tool` covers this round only, including Code Mode calls.
+    /// The goal id prevents an old round from pausing a replacement goal.
+    pub(super) async fn pause_goal_after_no_tool_continuation(
+        &self,
+        expected_goal_id: &str,
+        used_tool: bool,
+    ) -> bool {
+        {
+            let mut tracker = self.goal_tracker.lock();
+            if !tracker
+                .snapshot()
+                .is_some_and(|goal| goal.goal_id == expected_goal_id)
+                || !tracker.record_goal_continuation(used_tool)
+            {
+                return false;
+            }
+        }
+        let message = "Goal paused after three continuations without a tool call. Use /goal resume to continue.";
+        let paused = self
+            .auto_pause_goal_if_matches_with_message(
+                expected_goal_id,
+                crate::session::goal_tracker::GoalPauseReason::NoProgress,
+                message.to_string(),
+            )
+            .await;
+        if paused {
+            self.send_slash_command_output(message).await;
+        }
+        paused
+    }
+
     pub(super) async fn run_goal_round_end(&self) -> GoalRoundDecision {
         use crate::session::goal_evaluator::GoalEvaluatorDecision;
         if !laziness_injection_active(

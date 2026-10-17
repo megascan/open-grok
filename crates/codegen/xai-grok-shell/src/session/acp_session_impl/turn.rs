@@ -839,10 +839,14 @@ impl SessionActor {
                     Some(prompt_id),
                 )
                 .await;
-            match (
-                self.should_enforce_prompt_block(&policy),
-                prompt_gate_verdict,
-            ) {
+            let decision = match prompt_gate_verdict.force_stop {
+                Some(stop) => xai_grok_hooks::result::PromptDecision::Block {
+                    reason: stop.reason,
+                    hook_name: stop.hook_name,
+                },
+                None => prompt_gate_verdict.decision,
+            };
+            match (self.should_enforce_prompt_block(&policy), decision) {
                 (true, xai_grok_hooks::result::PromptDecision::Block { reason, hook_name }) => {
                     Some((hook_name, reason))
                 }
@@ -1258,21 +1262,35 @@ impl SessionActor {
             let mut round_artifact = artifact_tracker;
             let mut swarm_rate_limit_attempt = 0u32;
             let mut stop_continuations_this_turn: u32 = 0;
+            let mut goal_continuation_round = matches!(
+                origin,
+                crate::session::PromptOrigin::GoalSummary
+                    | crate::session::PromptOrigin::GoalClassifierNudge
+            );
             let mut salvage =
                 super::length_salvage::LengthSalvage::new(self.length_salvage_budget());
+            let mut compaction_refills = AutoCompactionRefillGuard::default();
             loop {
+                let round_goal_id = self.goal_tracker.lock().snapshot().and_then(|goal| {
+                    (goal.status == crate::session::goal_tracker::GoalStatus::Active)
+                        .then(|| goal.goal_id.clone())
+                });
+                let tools_before_round = self.events.tool_count_this_turn();
+                let mut transport_calls_this_round = 0;
                 if self.goal_harness_enabled() {
                     let goal_loop_active = self.goal_tracker.lock().status()
                         == Some(crate::session::goal_tracker::GoalStatus::Active);
                     self.set_goal_loop_active_resource(goal_loop_active).await;
                 }
                 let round = self
-                    .process_conversation_turn_with_recovery(
+                    .process_conversation_turn_with_recovery_tracking(
                         prompt_id,
                         round_trace.take(),
                         round_artifact.take(),
                         json_schema.clone(),
                         &mut salvage,
+                        &mut compaction_refills,
+                        &mut transport_calls_this_round,
                     )
                     .await;
                 if is_rate_limited_turn_result(&round)
@@ -1325,6 +1343,18 @@ impl SessionActor {
                     .await;
                     break round;
                 }
+                let used_tool = self
+                    .events
+                    .tool_count_this_turn()
+                    .saturating_sub(tools_before_round)
+                    .saturating_sub(transport_calls_this_round)
+                    > 0;
+                // Real tool execution clears the streak even on a user round.
+                // Assess no-tool strikes after completion and budget evaluation.
+                if used_tool && let Some(goal_id) = round_goal_id.as_deref() {
+                    self.pause_goal_after_no_tool_continuation(goal_id, true)
+                        .await;
+                }
                 let goal_active = laziness_injection_active(
                     self.goal_harness_enabled(),
                     self.goal_tracker.lock().status(),
@@ -1345,8 +1375,18 @@ impl SessionActor {
                             self.run_goal_round_end_legacy().await
                         };
                         if let GoalRoundDecision::Continue(directive) = decision {
+                            if goal_continuation_round
+                                && !used_tool
+                                && let Some(goal_id) = round_goal_id.as_deref()
+                                && self
+                                    .pause_goal_after_no_tool_continuation(goal_id, false)
+                                    .await
+                            {
+                                break round;
+                            }
                             salvage.round_boundary();
                             self.inject_goal_continuation_message(directive).await;
+                            goal_continuation_round = true;
                             continue;
                         }
                     }
@@ -1358,6 +1398,7 @@ impl SessionActor {
                     StopGateDecision::AllowStop => break round,
                     StopGateDecision::KeepWorking { feedback } => {
                         stop_continuations_this_turn += 1;
+                        goal_continuation_round = false;
                         salvage.round_boundary();
                         self.chat_state_handle
                             .push_user_message(ConversationItem::stop_hook_feedback(feedback));
@@ -2022,6 +2063,7 @@ impl SessionActor {
     /// the turn with exponential backoff.
     ///
     /// Agents without `completion_requirement` bypass this entirely.
+    #[cfg(test)]
     #[tracing::instrument(
         name = "session.process_conversation_turn_with_recovery",
         skip_all,
@@ -2035,6 +2077,34 @@ impl SessionActor {
         artifact_tracker: Option<crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
         salvage: &mut super::length_salvage::LengthSalvage,
+    ) -> Result<TurnOutcome, acp::Error> {
+        self.process_conversation_turn_with_recovery_tracking(
+            req_id,
+            trace_gcs_config,
+            artifact_tracker,
+            json_schema,
+            salvage,
+            &mut AutoCompactionRefillGuard::default(),
+            &mut 0,
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "session.process_conversation_turn_with_recovery",
+        skip_all,
+        err,
+        fields(req_id = %req_id, session_id = %self.session_info.id.0)
+    )]
+    async fn process_conversation_turn_with_recovery_tracking(
+        self: &Arc<Self>,
+        req_id: &str,
+        trace_gcs_config: Option<crate::session::repo_changes::TraceExportConfig>,
+        artifact_tracker: Option<crate::upload::manifest::ArtifactTracker>,
+        json_schema: Option<serde_json::Value>,
+        salvage: &mut super::length_salvage::LengthSalvage,
+        compaction_refills: &mut AutoCompactionRefillGuard,
+        transport_calls: &mut u32,
     ) -> Result<TurnOutcome, acp::Error> {
         let _ = self.compaction.auto_compact_suppressed.compare_exchange(
             crate::session::compaction_config::SUPPRESS_TURN,
@@ -2053,6 +2123,8 @@ impl SessionActor {
                         artifact_tracker.as_ref(),
                         json_schema,
                         &mut *salvage,
+                        compaction_refills,
+                        transport_calls,
                     )
                     .await;
             }
@@ -2067,6 +2139,8 @@ impl SessionActor {
                         artifact_tracker.as_ref(),
                         json_schema,
                         &mut *salvage,
+                        compaction_refills,
+                        transport_calls,
                     )
                     .await;
             }
@@ -2080,12 +2154,17 @@ impl SessionActor {
                 artifact_tracker.as_ref(),
                 json_schema.clone(),
                 &mut *salvage,
+                compaction_refills,
+                transport_calls,
             )
             .await;
         if matches!(
             result,
-            Ok(TurnOutcome::MaxTurnsReached { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
-        ) {
+            Ok(TurnOutcome::MaxTurnsReached { .. })
+                | Ok(TurnOutcome::StationarityEnded { .. })
+                | Ok(TurnOutcome::Cancelled { .. })
+        ) || (result.is_err() && !compaction_refills.can_compact())
+        {
             return result;
         }
         if let Ok(TurnOutcome::Completed {
@@ -2149,12 +2228,17 @@ impl SessionActor {
                     artifact_tracker.as_ref(),
                     None,
                     &mut *salvage,
+                    compaction_refills,
+                    transport_calls,
                 )
                 .await;
             if matches!(
                 result,
-                Ok(TurnOutcome::MaxTurnsReached { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
-            ) {
+                Ok(TurnOutcome::MaxTurnsReached { .. })
+                    | Ok(TurnOutcome::StationarityEnded { .. })
+                    | Ok(TurnOutcome::Cancelled { .. })
+            ) || (result.is_err() && !compaction_refills.can_compact())
+            {
                 return result;
             }
             if let Ok(TurnOutcome::Completed {
@@ -2838,6 +2922,8 @@ impl SessionActor {
         artifact_tracker: Option<&crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
         salvage: &mut super::length_salvage::LengthSalvage,
+        compaction_refills: &mut AutoCompactionRefillGuard,
+        transport_calls: &mut u32,
     ) -> Result<TurnOutcome, acp::Error> {
         let conv_turn_start = std::time::Instant::now();
         let conv_turn_clock = DualClock::now();
@@ -3042,6 +3128,9 @@ impl SessionActor {
             );
         }
         loop {
+            if let Some(stop) = self.current_hook_stop() {
+                return Ok(hook_stop_outcome(stop));
+            }
             self.emit_event(crate::session::events::Event::LoopStarted { loop_index });
             loop_index += 1;
             if identical_tool_calls.run_len >= identical_tool_calls.hard_stop_threshold() {
@@ -3178,12 +3267,17 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none()
                 && !salvage.awaiting_continuation()
                 && !experimental_context
-                && let Some(trigger_info) = self.check_auto_compact_needed().await
-                && let Err(e) = self.run_compact_only(trigger_info).await
             {
-                tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
-                if Self::is_auth_compact_error(&e) {
-                    return Err(self.surface_compact_auth_failure(e).await);
+                if let Some(trigger_info) = self.check_auto_compact_needed().await {
+                    compaction_refills.record_compaction()?;
+                    if let Err(e) = self.run_compact_only(trigger_info).await {
+                        tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
+                        if Self::is_auth_compact_error(&e) {
+                            return Err(self.surface_compact_auth_failure(e).await);
+                        }
+                    }
+                } else {
+                    compaction_refills.observe_below_threshold();
                 }
             }
             let due_reminder = {
@@ -3312,7 +3406,7 @@ impl SessionActor {
                 crate::session::telemetry::requested_model_snapshot(request.model.as_deref());
             let model_timer = std::time::Instant::now();
             let (response, latency) = match self
-                .run_turn_via_sampler(
+                .run_turn_via_sampler_bounded(
                     request.clone(),
                     !codex_auth_retry_attempted,
                     &mut rate_limit_waits,
@@ -3323,6 +3417,7 @@ impl SessionActor {
                         enabled: transient_retry_enabled,
                     },
                     salvage.awaiting_continuation(),
+                    compaction_refills,
                 )
                 .await
             {
@@ -4179,8 +4274,13 @@ impl SessionActor {
                     },
                 )
                 .await;
+            let tools_before_step = self.events.tool_count_this_turn();
+            let transport_before_step = *transport_calls;
             let mut direct_tool_calls = Vec::new();
             for call in tool_calls {
+                if let Some(stop) = self.current_hook_stop() {
+                    return Ok(hook_stop_outcome(stop));
+                }
                 if let Some(patch_call) = base_tool_surface.freeform_apply_patch_call(&call) {
                     direct_tool_calls.push(patch_call);
                     continue;
@@ -4213,6 +4313,13 @@ impl SessionActor {
                         code_mode_transport,
                     )
                     .await;
+                    *transport_calls = transport_calls.saturating_add(1);
+                    // The completed transport is not an in-flight tool. Clear
+                    // it so a following direct dispatch is counted normally.
+                    self.events.tool_finished();
+                    if let Some(stop) = self.current_hook_stop() {
+                        return Ok(hook_stop_outcome(stop));
+                    }
                     continue;
                 }
                 direct_tool_calls.push(ToolCallResponse {
@@ -4228,6 +4335,9 @@ impl SessionActor {
                 let execute_tool_calls_result = self
                     .execute_tool_calls(direct_tool_calls, requested_model)
                     .await;
+                if let Some(stop) = self.current_hook_stop() {
+                    return Ok(hook_stop_outcome(stop));
+                }
                 match execute_tool_calls_result {
                     Ok(ToolLoop::PermissionReject { tool_name, reason }) => {
                         return Ok(TurnOutcome::Cancelled {
@@ -4242,6 +4352,7 @@ impl SessionActor {
                         });
                     }
                     Ok(ToolLoop::HookDenied { .. }) => {}
+                    Ok(ToolLoop::HookStop(stop)) => return Ok(hook_stop_outcome(stop)),
                     Ok(ToolLoop::Cancelled) => {
                         return Ok(TurnOutcome::Cancelled {
                             category: Some(
@@ -4251,12 +4362,30 @@ impl SessionActor {
                         });
                     }
                     Ok(ToolLoop::FollowupMessage(followup_message)) => {
+                        if self
+                            .events
+                            .tool_count_this_turn()
+                            .saturating_sub(tools_before_step)
+                            .saturating_sub(transport_calls.saturating_sub(transport_before_step))
+                            > 0
+                        {
+                            compaction_refills.note_tool_progress();
+                        }
                         self.add_followup_message_as_user_turn(&followup_message)
                             .await;
                         continue;
                     }
                     _ => {}
                 }
+            }
+            if self
+                .events
+                .tool_count_this_turn()
+                .saturating_sub(tools_before_step)
+                .saturating_sub(transport_calls.saturating_sub(transport_before_step))
+                > 0
+            {
+                compaction_refills.note_tool_progress();
             }
             let next_turn = tool_turn_count + 1;
             if let Some(limit) = self.max_turns
@@ -4274,6 +4403,7 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none()
                 && let Some(trigger_info) = self.check_preflight_overflow().await
             {
+                compaction_refills.record_compaction()?;
                 if let Err(e) = self.run_compact_only(trigger_info).await {
                     tracing::error!(error = %e, "Preflight overflow compaction failed");
                     if Self::is_auth_compact_error(&e) {
@@ -4285,6 +4415,89 @@ impl SessionActor {
         }
     }
 }
+
+fn hook_stop_outcome(stop: xai_grok_hooks::dispatcher::StopBlock) -> TurnOutcome {
+    TurnOutcome::Cancelled {
+        category: Some(crate::session::events::CancellationCategory::HookDenied),
+        context: Some(crate::session::commands::CancellationContext {
+            hook_name: Some(stop.hook_name),
+            reason: Some(stop.reason),
+            ..Default::default()
+        }),
+    }
+}
+
+const MAX_CONSECUTIVE_CONTEXT_REFILLS: u8 = 3;
+
+/// Counts compactions across threshold, preflight and provider-overflow paths.
+/// A successful sample alone is not progress: tool output may immediately
+/// refill the context. Reset only after a tool ran and the next threshold
+/// check confirms that the resulting history has room to continue.
+#[derive(Default)]
+pub(super) struct AutoCompactionRefillGuard {
+    consecutive: u8,
+    tool_progress: bool,
+}
+
+impl AutoCompactionRefillGuard {
+    fn can_compact(&self) -> bool {
+        self.consecutive < MAX_CONSECUTIVE_CONTEXT_REFILLS
+    }
+
+    pub(super) fn record_compaction(&mut self) -> Result<(), acp::Error> {
+        if !self.can_compact() {
+            return Err(compaction_refill_limit_error());
+        }
+        self.consecutive += 1;
+        self.tool_progress = false;
+        Ok(())
+    }
+
+    fn note_tool_progress(&mut self) {
+        self.tool_progress = true;
+    }
+
+    fn observe_below_threshold(&mut self) {
+        if self.tool_progress {
+            self.consecutive = 0;
+            self.tool_progress = false;
+        }
+    }
+}
+
+pub(super) fn compaction_refill_limit_error() -> acp::Error {
+    acp::Error::internal_error().data(
+        "Automatic compaction stopped after three consecutive context refills. Reduce the context or start a new session.",
+    )
+}
+
+#[cfg(test)]
+mod context_refill_tests {
+    use super::AutoCompactionRefillGuard;
+
+    #[test]
+    fn compaction_refills_are_bounded_across_paths_and_reset_after_progress() {
+        let mut guard = AutoCompactionRefillGuard::default();
+        // Pre-sample, provider overflow and preflight each use this guard.
+        for _ in 0..3 {
+            assert!(guard.can_compact());
+            guard.record_compaction().unwrap();
+            // A sample or tool call that immediately refills is not a reset.
+            guard.note_tool_progress();
+        }
+        assert!(!guard.can_compact());
+        assert!(guard.record_compaction().is_err());
+        guard.observe_below_threshold();
+        assert!(guard.can_compact());
+        for _ in 0..3 {
+            guard.record_compaction().unwrap();
+            // Seeing a low context without intervening work is insufficient.
+            guard.observe_below_threshold();
+        }
+        assert!(!guard.can_compact());
+    }
+}
+
 fn is_problematically_repeating_kind(kind: Option<ToolKind>) -> bool {
     matches!(kind, Some(ToolKind::Read | ToolKind::Plan))
 }

@@ -5,11 +5,13 @@ use crate::session::commands::{NotificationPriority, NotificationSource};
 use crate::session::persistence::{DurableAppendError, PersistenceHandle, PersistenceMsg};
 use crate::tools::task_completed_frame;
 use agent_client_protocol::{self as acp, Client as _};
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
+use xai_grok_tools::notification::BridgeToolNotification;
 use xai_grok_tools::notification::types::{ToolNotification, ToolNotificationHandle};
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 use xai_grok_workspace::session::file_state::FileStateTracker;
@@ -189,10 +191,105 @@ async fn handle_scheduled_task_removed(
 pub(crate) fn spawn_notification_bridge(
     config: NotificationBridgeConfig,
 ) -> ToolNotificationHandle {
-    let (handle, mut rx) = ToolNotificationHandle::acknowledged_channel();
+    let (handle, mut rx) = ToolNotificationHandle::bridge_channel();
     tokio::task::spawn_local(async move {
         let mut offsets: HashMap<String, usize> = HashMap::new();
-        while let Some(delivery) = rx.recv().await {
+        let mut start_deliveries: FuturesUnordered<StartDelivery> = FuturesUnordered::new();
+        let mut unscoped_failure = None;
+        loop {
+            let delivery = tokio::select! {
+                result = start_deliveries.next(), if !start_deliveries.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        unscoped_failure.get_or_insert(error);
+                    }
+                    continue;
+                }
+                delivery = rx.recv() => match delivery {
+                    Some(delivery) => delivery,
+                    None => break,
+                },
+            };
+            let (delivery, start_ack, scoped) = match delivery {
+                BridgeToolNotification::Notification(delivery, start_ack, scoped) => {
+                    (delivery, start_ack, scoped)
+                }
+                BridgeToolNotification::ExternalStart(receiver) => {
+                    start_deliveries.push(bounded_start_delivery(async move {
+                        receiver.await.map_err(|error| error.to_string())?
+                    }));
+                    continue;
+                }
+                BridgeToolNotification::SubagentAdmitted {
+                    id,
+                    generation,
+                    mut acknowledgement,
+                } => {
+                    let params = serde_json::value::to_raw_value(&serde_json::json!({
+                        "subagent_id": id, "generation": generation,
+                    }));
+                    match params {
+                        Ok(params) => {
+                            let receipt = config.gateway.forward_with_completion(
+                                agent_client_protocol::ExtNotification::new(
+                                    "x.ai/background_subagent_admitted",
+                                    params.into(),
+                                ),
+                            );
+                            tokio::task::spawn_local(async move {
+                                tokio::select! {
+                                    _ = acknowledgement.closed() => {}
+                                    result = bounded_start_delivery(async move {
+                                        receipt.await.map_err(|error| error.to_string())?
+                                            .map_err(|error| error.to_string())
+                                    }) => { let _ = acknowledgement.send(result); }
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            let _ = acknowledgement.send(Err(error.to_string()));
+                        }
+                    }
+                    continue;
+                }
+                BridgeToolNotification::SubagentAdmissionEnded {
+                    id,
+                    generation,
+                    error,
+                } => {
+                    if let Ok(params) = serde_json::value::to_raw_value(&serde_json::json!({
+                        "subagent_id": id, "generation": generation, "will_wake": false, "error": error,
+                    })) {
+                        config.gateway.forward_fire_and_forget(
+                            agent_client_protocol::ExtNotification::new(
+                                "x.ai/background_subagent_terminal",
+                                params.into(),
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                BridgeToolNotification::Barrier(mut acknowledgement) => {
+                    let mut pending = std::mem::take(&mut start_deliveries);
+                    let mut failure = unscoped_failure.take();
+                    // Reservations may be settled by messages later in this
+                    // same queue (for example, queued child admission). Keep
+                    // draining while the caller waits for its receipts.
+                    tokio::task::spawn_local(async move {
+                        tokio::select! {
+                            _ = acknowledgement.closed() => {}
+                            result = async {
+                                while let Some(result) = pending.next().await {
+                                    if let Err(error) = result {
+                                        failure.get_or_insert(error);
+                                    }
+                                }
+                                failure.map_or(Ok(()), Err)
+                            } => { let _ = acknowledgement.send(result); }
+                        }
+                    });
+                    continue;
+                }
+            };
             let acknowledgement = delivery.acknowledgement;
             match delivery.notification {
                 ToolNotification::ScheduledTaskRemoved(removed) => {
@@ -203,7 +300,23 @@ pub(crate) fn spawn_notification_bridge(
                     }
                 }
                 notification => {
-                    handle_notification(&config, notification, &mut offsets).await;
+                    if let Some(delivery) =
+                        handle_notification_observed(&config, notification, &mut offsets).await
+                    {
+                        if let Some(mut start_ack) = start_ack {
+                            tokio::task::spawn_local(async move {
+                                tokio::select! {
+                                    _ = start_ack.closed() => {}
+                                    result = bounded_start_delivery(delivery) => { let _ = start_ack.send(result); }
+                                }
+                            });
+                        } else if !scoped {
+                            start_deliveries.push(bounded_start_delivery(delivery));
+                        }
+                    } else if let Some(start_ack) = start_ack {
+                        let _ = start_ack
+                            .send(Err("background lifecycle delivery was not created".into()));
+                    }
                     if let Some(acknowledgement) = acknowledgement {
                         let _ = acknowledgement.send(Ok(()));
                     }
@@ -213,6 +326,16 @@ pub(crate) fn spawn_notification_bridge(
         tracing::debug!("Notification bridge task exiting (sender dropped)");
     });
     handle
+}
+type StartDelivery = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
+fn bounded_start_delivery(
+    delivery: impl std::future::Future<Output = Result<(), String>> + 'static,
+) -> StartDelivery {
+    Box::pin(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(30), delivery)
+            .await
+            .unwrap_or_else(|_| Err("background lifecycle delivery timed out".to_owned()))
+    })
 }
 /// Emit a `CurrentModeUpdate` for the given [`SessionMode`] — persisted to
 /// `updates.jsonl` so session replay re-applies the mode, and forwarded to
@@ -233,12 +356,21 @@ async fn emit_current_mode_update(
     ));
     config.gateway.forward_fire_and_forget(notification);
 }
-/// Handle a single notification by forwarding it to the appropriate shell system.
+#[cfg(test)]
 async fn handle_notification(
     config: &NotificationBridgeConfig,
     notification: ToolNotification,
     offsets: &mut HashMap<String, usize>,
 ) {
+    let _ = handle_notification_observed(config, notification, offsets).await;
+}
+
+/// Handle a notification and retain completion of background-start delivery.
+async fn handle_notification_observed(
+    config: &NotificationBridgeConfig,
+    notification: ToolNotification,
+    offsets: &mut HashMap<String, usize>,
+) -> Option<StartDelivery> {
     match notification {
         ToolNotification::BashOutputChunk(chunk) => {
             let (output, output_delta) = if config.incremental_bash_output {
@@ -342,13 +474,22 @@ async fn handle_notification(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
             let params = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-                .ok();
-            if let Some(params) = params {
-                let ext_notification =
-                    acp::ExtNotification::new("x.ai/task_backgrounded", params.into());
-                config.gateway.forward_fire_and_forget(ext_notification);
-            }
+                .and_then(|v| serde_json::value::to_raw_value(&v));
+            return Some(match params {
+                Ok(params) => {
+                    let ext_notification =
+                        acp::ExtNotification::new("x.ai/task_backgrounded", params.into());
+                    let receipt = config.gateway.forward_with_completion(ext_notification);
+                    Box::pin(async move {
+                        receipt
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                }
+                Err(error) => Box::pin(async move { Err(error.to_string()) }),
+            });
         }
         ToolNotification::FileWritten(written) => {
             let prompt_index = *config.prompt_index.lock().await;
@@ -500,6 +641,18 @@ async fn handle_notification(
                     })),
                 );
                 if will_wake {
+                    let (trace_response, trace_receiver) = tokio::sync::oneshot::channel();
+                    let wake_gateway = config.gateway.clone();
+                    let wake_prompt_id = prompt_id.clone();
+                    tokio::spawn(async move {
+                        if let Ok(response) = completion_rx.await {
+                            let _ = trace_response.send(response);
+                        }
+                        crate::session::workflow::notify::emit_wake_resolved(
+                            &wake_gateway,
+                            &wake_prompt_id,
+                        );
+                    });
                     if is_monitor {
                         let _ =
                             config
@@ -525,7 +678,7 @@ async fn handle_notification(
                             let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
                                 session_id: config.session_id.clone(),
                                 prompt_id,
-                                completion_rx,
+                                completion_rx: trace_receiver,
                                 before_session_copy_rx,
                             });
                         } else {
@@ -772,7 +925,7 @@ async fn handle_notification(
                     bridge_session = %my_session,
                     "Dropped cross-session monitor event: owner does not match this bridge's session"
                 );
-                return;
+                return None;
             }
             tracing::debug!(
                 task_id = %event.task_id,
@@ -804,7 +957,7 @@ async fn handle_notification(
                     task_id = %event.task_id,
                     "skipping model inject for monitor event: task already auto-woke via TaskCompleted"
                 );
-                return;
+                return None;
             }
             let prompt_id = format!("monitor-{}-{}", event.task_id, uuid::Uuid::now_v7());
             let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
@@ -855,6 +1008,7 @@ async fn handle_notification(
             }
         }
     }
+    None
 }
 #[cfg(test)]
 #[path = "notification_bridge_tests.rs"]

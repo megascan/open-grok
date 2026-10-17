@@ -221,6 +221,7 @@ async fn create_test_actor(
         status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rate_limit_waits: Default::default(),
         code_mode_hook_followups: Default::default(),
+        hook_stop_latch: Default::default(),
         sampling_gate: None,
         image_strip_rewrite_barrier: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
@@ -718,6 +719,7 @@ async fn create_test_actor_with_memory(
         status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rate_limit_waits: Default::default(),
         code_mode_hook_followups: Default::default(),
+        hook_stop_latch: Default::default(),
         sampling_gate: None,
         image_strip_rewrite_barrier: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
@@ -1180,7 +1182,7 @@ fn api_error_with_context_window(context_window: u64) -> xai_grok_sampler::Sampl
     xai_grok_sampler::SamplingErrorInfo {
         kind: xai_grok_sampler::SamplingErrorKind::Api,
         status_code: Some(400),
-        message: "prompt is too long".into(),
+        message: "request failed".into(),
         is_retryable: false,
         retry_after_secs: None,
         should_retry: None,
@@ -1224,6 +1226,96 @@ async fn test_compact_on_error_no_trigger_when_tokens_within_new_window() {
             let actor = create_test_actor(150_000, 1_000_000, 85, gateway_tx, persistence_tx).await;
             let err = api_error_with_context_window(200_000);
             assert!(!actor.should_compact_on_error(&err).await);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_compact_on_explicit_context_overflow_without_metadata() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(10_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            let mut err = api_error_with_context_window(100_000);
+            err.model_metadata = None;
+            err.error_code = Some(xai_grok_sampling_types::ApiErrorCode::parse(
+                "context_length_exceeded",
+            ));
+            assert!(actor.should_compact_on_error(&err).await);
+
+            err.error_code = None;
+            err.message = "maximum context length exceeded".into();
+            assert!(actor.should_compact_on_error(&err).await);
+
+            err.message = "request failed".into();
+            err.error_code = Some(xai_grok_sampling_types::ApiErrorCode::parse(
+                "request_too_large",
+            ));
+            assert!(
+                !actor.should_compact_on_error(&err).await,
+                "byte-size limits require a different remedy"
+            );
+            err.message = "request too large".into();
+            assert!(!actor.should_compact_on_error(&err).await);
+            err.model_metadata = api_error_with_context_window(1).model_metadata;
+            assert!(
+                !actor.should_compact_on_error(&err).await,
+                "byte-size errors must not become token overflows via metadata"
+            );
+            err.kind = xai_grok_sampler::SamplingErrorKind::Auth;
+            err.error_code = None;
+            err.message = "maximum context length exceeded".into();
+            assert!(
+                !actor.should_compact_on_error(&err).await,
+                "auth failures must not trigger compaction"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_post_tool_hook_context_counts_toward_compaction() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(84_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            assert!(actor.check_auto_compact_needed().await.is_none());
+            actor
+                .chat_state_handle
+                .push_model_output(ConversationItem::assistant_tool_calls(vec![
+                    xai_grok_sampling_types::ToolCall {
+                        id: "call-hook".into(),
+                        name: "test_tool".into(),
+                        arguments: "{}".into(),
+                    },
+                ]));
+            actor
+                .chat_state_handle
+                .push_tool_result(ConversationItem::tool_result("call-hook", "small result"));
+            let note = actor.wrap_hook_note(
+                xai_grok_hooks::event::HookEventName::PostToolUse,
+                super::reminders::HookNoteKind::Context,
+                "large-hook",
+                &"x".repeat(8_000),
+            );
+            actor.chat_state_handle.push_user_message(note);
+            let trigger = actor
+                .check_auto_compact_needed()
+                .await
+                .expect("hook context should trigger compaction");
+            assert!(trigger.tokens_used >= 86_000);
+            let oversized = actor.wrap_hook_note(
+                xai_grok_hooks::event::HookEventName::PostToolUse,
+                super::reminders::HookNoteKind::Feedback,
+                "large-feedback",
+                &"y".repeat(60_000),
+            );
+            actor.chat_state_handle.push_user_message(oversized);
+            assert!(actor.check_preflight_overflow().await.is_some());
         })
         .await;
 }
@@ -1491,6 +1583,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
+                hook_stop_latch: Default::default(),
                 sampling_gate: None,
                 image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -1608,8 +1701,7 @@ async fn test_idle_resume_noop_when_not_idle_enough() {
         })
         .await;
 }
-/// If the proxy hasn't been updated yet, model_metadata is None — must be
-/// a no-op for backwards compatibility.
+/// Missing metadata alone is not evidence of a context overflow.
 #[tokio::test(flavor = "current_thread")]
 async fn test_compact_on_error_noop_without_model_metadata() {
     let local = tokio::task::LocalSet::new();
@@ -1621,7 +1713,7 @@ async fn test_compact_on_error_noop_without_model_metadata() {
             let err = xai_grok_sampler::SamplingErrorInfo {
                 kind: xai_grok_sampler::SamplingErrorKind::Api,
                 status_code: Some(400),
-                message: "prompt is too long".into(),
+                message: "request failed".into(),
                 is_retryable: false,
                 retry_after_secs: None,
                 should_retry: None,
@@ -1790,4 +1882,185 @@ async fn compaction_at_tokens_fixed_and_disabled() {
             );
         })
         .await;
+}
+
+/// Exercise the real sampler/compaction loop with no server context metadata.
+/// Every foreground request overflows, while each summary request succeeds.
+#[test]
+fn repeated_provider_overflow_stops_before_a_fourth_compaction() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, async {
+                use xai_grok_test_support::scripted::SseEvent;
+                use xai_grok_test_support::{MockInferenceServer, MockModelEntry, ScriptedResponse};
+
+                let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                    .await
+                    .unwrap();
+                let summary = format!("Summary: the work is in progress. {}", "details ".repeat(100));
+                for _ in 0..3 {
+                    server.enqueue_response(
+                        "/v1/responses",
+                        ScriptedResponse::json(400, serde_json::json!({
+                            "error": {"type": "invalid_request_error", "code": "context_length_exceeded",
+                                      "message": "maximum context length exceeded"}
+                        })),
+                    );
+                    server.enqueue_response(
+                        "/v1/responses",
+                        ScriptedResponse::sse(vec![
+                            SseEvent::data(serde_json::json!({
+                                "type": "response.created", "sequence_number": 0,
+                                "response": {"id": "summary", "object": "response", "created_at": 1234567890,
+                                    "model": "test", "status": "in_progress", "output": []}
+                            }).to_string()),
+                            SseEvent::data(serde_json::json!({
+                                "type": "response.output_text.delta", "sequence_number": 1,
+                                "item_id": "summary", "output_index": 0, "content_index": 0,
+                                "delta": &summary
+                            }).to_string()),
+                            SseEvent::data(serde_json::json!({
+                                "type": "response.completed", "sequence_number": 2,
+                                "response": {"id": "summary", "object": "response", "created_at": 1234567890,
+                                    "model": "test", "status": "completed", "output": [{"type": "message",
+                                    "id": "msg", "role": "assistant", "status": "completed", "content": [{
+                                    "type": "output_text", "text": &summary, "annotations": []}]}],
+                                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                                        "input_tokens_details": {"cached_tokens": 0},
+                                        "output_tokens_details": {"reasoning_tokens": 0}}}
+                            }).to_string()),
+                            SseEvent::data("[DONE]"),
+                        ]),
+                    );
+                }
+                server.enqueue_response(
+                    "/v1/responses",
+                    ScriptedResponse::json(400, serde_json::json!({
+                        "error": {"type": "invalid_request_error", "code": "context_length_exceeded",
+                                  "message": "maximum context length exceeded"}
+                    })),
+                );
+                let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = gateway_rx.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+                let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::FlushAndAck { respond_to } = message {
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let retry_policy = xai_grok_sampler::RetryPolicy { max_retries: 0, ..Default::default() };
+                let sampler_config = xai_grok_sampler::SamplerConfig {
+                    base_url: server.url(), model: "test".to_string(),
+                    api_backend: xai_grok_sampler::ApiBackend::Responses,
+                    context_window: 256_000, max_retries: Some(0), idle_timeout_secs: Some(30),
+                    ..Default::default()
+                };
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                actor.sampler_handle = xai_grok_sampler::SamplerActor::spawn(sampler_config, retry_policy, event_tx);
+                let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                config.base_url = server.url();
+                config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                actor.chat_state_handle.update_sampling_config(config);
+                actor.chat_state_handle.replace_conversation(vec![
+                    ConversationItem::system("You are a helpful assistant."),
+                    ConversationItem::user("Work on this task."),
+                ]);
+                let actor = Arc::new(actor);
+                let drainer = actor.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        drainer.handle_sampling_event(event).await;
+                    }
+                });
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    actor.process_conversation_turn_with_recovery(
+                        "overflow-loop", None, None, None,
+                        &mut length_salvage::LengthSalvage::new(None),
+                    ),
+                ).await.expect("overflow loop must terminate");
+                let error = match outcome {
+                    Err(error) => error,
+                    Ok(_) => panic!("fourth overflow must terminate the turn"),
+                };
+                assert!(format!("{error:?}").contains("three consecutive context refills"));
+                assert_eq!(server.request_count_for("/v1/responses"), 7,
+                    "four foreground overflows and exactly three compaction requests");
+                assert_eq!(actor.chat_state_handle.get_sampling_config().await.unwrap().context_window.get(), 256_000,
+                    "a missing server window must not mutate the active route");
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn latched_hook_stop_cancels_real_turn_before_next_sample() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            use super::rate_limit_backoff_tests::{SessionKind, actor_under_test};
+            use xai_grok_test_support::{MockInferenceServer, MockModelEntry};
+
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .unwrap();
+            let (actor, _) = actor_under_test(
+                &server,
+                SessionKind::Main,
+                xai_grok_sampler::RetryPolicy {
+                    max_retries: 0,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+            *actor.current_prompt_id.lock().unwrap() = Some("hook-stop-turn".into());
+            let identity = actor.hook_stop_identity().unwrap();
+            assert!(actor.record_hook_stop_for(
+                &identity,
+                xai_grok_hooks::dispatcher::StopBlock {
+                    hook_name: "test/pre-tool".into(),
+                    reason: "stop now".into(),
+                }
+            ));
+            let outcome = actor
+                .process_conversation_turn_with_recovery(
+                    "hook-stop-turn",
+                    None,
+                    None,
+                    None,
+                    &mut length_salvage::LengthSalvage::new(None),
+                )
+                .await
+                .expect("hook stop is a cancellation");
+            match outcome {
+                TurnOutcome::Cancelled { category, context } => {
+                    assert_eq!(
+                        category,
+                        Some(crate::session::events::CancellationCategory::HookDenied)
+                    );
+                    let context = context.unwrap();
+                    assert_eq!(context.hook_name.as_deref(), Some("test/pre-tool"));
+                    assert_eq!(context.reason.as_deref(), Some("stop now"));
+                }
+                _ => panic!("expected hook cancellation"),
+            }
+            assert_eq!(server.request_count_for("/v1/responses"), 0);
+        })
+    });
 }

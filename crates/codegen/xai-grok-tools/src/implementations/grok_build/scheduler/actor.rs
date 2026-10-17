@@ -727,6 +727,7 @@ impl SchedulerActor {
             .send(SubagentEvent::Spawn(SubagentSpawnRequest {
                 request: Box::new(request),
                 result_tx,
+                admission_reservation: None,
             }))
             .is_err()
         {

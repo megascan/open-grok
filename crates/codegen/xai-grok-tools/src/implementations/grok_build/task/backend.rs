@@ -41,6 +41,18 @@ pub trait SubagentBackend: Send + Sync + 'static {
     /// and drops the receiver immediately.
     async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, ToolError>;
 
+    /// Transfer a lifecycle reservation with the spawn command when supported.
+    async fn spawn_reserved(
+        &self,
+        request: SubagentRequest,
+        reservation: Option<crate::notification::SubagentAdmissionReservation>,
+    ) -> Result<SubagentResult, ToolError> {
+        if let Some(reservation) = reservation {
+            reservation.reject();
+        }
+        self.spawn(request).await
+    }
+
     /// Query the current state of a subagent by ID.
     ///
     /// When `block` is true the backend waits (up to `timeout_ms`) for the
@@ -582,17 +594,29 @@ impl SubagentBackend for ChannelBackend {
             .map_err(|_| "Subagent coordinator dropped the response".to_owned())?
     }
 
-    async fn spawn(&self, mut request: SubagentRequest) -> Result<SubagentResult, ToolError> {
+    async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, ToolError> {
+        self.spawn_reserved(request, None).await
+    }
+
+    async fn spawn_reserved(
+        &self,
+        mut request: SubagentRequest,
+        mut reservation: Option<crate::notification::SubagentAdmissionReservation>,
+    ) -> Result<SubagentResult, ToolError> {
         if let Some(parent_session_id) = self.parent_session_id.as_deref() {
             request.parent_session_id = parent_session_id.to_owned();
         }
         let (respond_to, response_rx) = oneshot::channel();
         let cancel_on_receiver_drop = request.owner.cancel_on_receiver_drop();
         let cancel_token = request.cancel_token.clone();
+        if let Some(reservation) = &mut reservation {
+            reservation.mark_enqueued();
+        }
         self.tx
             .send(SubagentEvent::Spawn(SubagentSpawnRequest {
                 request: Box::new(request),
                 result_tx: respond_to,
+                admission_reservation: reservation,
             }))
             .map_err(|_| {
                 ToolError::custom(

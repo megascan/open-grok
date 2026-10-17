@@ -137,7 +137,16 @@ impl WorkflowManager {
     pub(crate) fn launch(
         &mut self,
         resolved: ResolvedWorkflow,
+        spec: LaunchSpec,
+    ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
+        self.launch_with_delivery(resolved, spec, None)
+    }
+
+    pub(crate) fn launch_with_delivery(
+        &mut self,
+        resolved: ResolvedWorkflow,
         mut spec: LaunchSpec,
+        delivery: Option<xai_grok_tools::notification::BackgroundStartReservation>,
     ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
         self.reap_terminal_runs();
         if self.active.len().saturating_add(self.retiring.len())
@@ -276,8 +285,22 @@ impl WorkflowManager {
             }
             return Err(LaunchError::Store(error.to_string()));
         }
-        self.notify
-            .emit(&state, self.tracker.lock().elapsed_ms(&run_id), 0);
+        let elapsed_ms = self.tracker.lock().elapsed_ms(&run_id);
+        if let Err(error) = self.notify.emit_start(&state, elapsed_ms, delivery) {
+            if spec.resume_run_id.is_some() {
+                if let Some(interrupted) = self.tracker.lock().interrupt(
+                    &run_id,
+                    "workflow start notification failed before resume; start a new run",
+                ) && let Err(persist_error) = self.store.persist_now(&interrupted)
+                {
+                    tracing::warn!(run_id = %run_id, %persist_error, "failed to persist interrupted workflow state");
+                }
+            } else {
+                self.tracker.lock().clear_run(&run_id);
+                self.store.remove(&run_id);
+            }
+            return Err(LaunchError::Store(error));
+        }
 
         let active = xai_grok_telemetry::activity::WORKFLOW_RUNS_ACTIVE.enter();
         let work = crate::session::handle::WorkGuard::new(self.active_work.clone());
@@ -513,18 +536,26 @@ impl WorkflowManager {
                     &watcher_agent_stats,
                 );
                 if !persisted {
+                    notify.wake_decision(&watcher_run_id, state.revision, false);
                     let _ = done_tx.send(());
                     let _ = outcome_tx.send(outcome);
                     return;
                 }
                 notify.broadcast(&state, elapsed, 0, true);
                 if state.status.is_completion_reportable() {
-                    let _ = session_cmd_tx.send(
-                        crate::session::commands::SessionCommand::WorkflowCompletionTurn {
-                            run_id: watcher_run_id.clone(),
-                            revision: state.revision,
-                        },
-                    );
+                    if session_cmd_tx
+                        .send(
+                            crate::session::commands::SessionCommand::WorkflowCompletionTurn {
+                                run_id: watcher_run_id.clone(),
+                                revision: state.revision,
+                            },
+                        )
+                        .is_err()
+                    {
+                        notify.wake_decision(&watcher_run_id, state.revision, false);
+                    }
+                } else {
+                    notify.wake_decision(&watcher_run_id, state.revision, false);
                 }
             }
             let _ = done_tx.send(());

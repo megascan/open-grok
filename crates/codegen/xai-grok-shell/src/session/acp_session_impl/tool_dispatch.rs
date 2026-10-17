@@ -103,6 +103,7 @@ pub(super) async fn dispatch_tool(
         origin,
         xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
         None,
+        None,
     )
     .await
 }
@@ -114,6 +115,7 @@ pub(super) async fn dispatch_observed(
     origin: xai_grok_tools::types::tool_call_origin::ToolCallOrigin,
     slot: xai_grok_tools::types::source_summary::SourceSummarySlot,
     sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
+    delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
     let mut ctx = xai_tool_runtime::ToolCallContext::new(
         xai_tool_protocol::ToolCallId::new(prepared.tool_call_id.0.as_ref())
@@ -121,6 +123,9 @@ pub(super) async fn dispatch_observed(
     );
     ctx.insert(origin);
     ctx.insert(slot);
+    if let Some(scope) = delivery_scope {
+        ctx.insert(scope);
+    }
     if let xai_grok_workspace::WorkspaceOps::Local { handle } = workspace_ops {
         let session = handle.session(session_id).ok_or_else(|| {
             xai_tool_runtime::ToolError::custom("session_not_found", "workspace session not found")
@@ -172,6 +177,7 @@ pub(super) async fn dispatch_code_mode_nested_tool_streaming<F, Fut>(
     cancellation_token: &tokio_util::sync::CancellationToken,
     progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
     sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
+    delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
     on_progress: F,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError>
 where
@@ -207,6 +213,7 @@ where
             origin,
             xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
             sandbox_transport,
+            delivery_scope,
         )
         .await;
     };
@@ -218,6 +225,9 @@ where
         "dispatch_code_mode_nested_tool_streaming"
     );
     let mut extensions = xai_tool_runtime::TypedExtensions::new();
+    if let Some(scope) = delivery_scope {
+        extensions.insert(scope);
+    }
     extensions.insert(xai_tool_runtime::WorkspaceViewerContext {
         stream_tool_progress: true,
     });
@@ -832,6 +842,7 @@ mod tests {
             &tokio_util::sync::CancellationToken::new(),
             &progress_sink,
             None,
+            None,
             |_| async {},
         )
         .await
@@ -857,6 +868,7 @@ mod tests {
             "no-such-session",
             &cancellation_token,
             &progress_sink,
+            None,
             None,
             |_| async {},
         )

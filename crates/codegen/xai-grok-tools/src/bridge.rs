@@ -565,7 +565,7 @@ impl ToolBridge {
         old_owner_session_id: &str,
         new_owner_session_id: &str,
         new_handle: crate::notification::types::ToolNotificationHandle,
-    ) {
+    ) -> Result<(), String> {
         if let Some(terminal) = &self.terminal {
             // Weak anchored by this bridge's backend `Arc` (lives as long as the session).
             let backend_weak = std::sync::Arc::downgrade(terminal);
@@ -576,7 +576,9 @@ impl ToolBridge {
                     new_handle,
                     backend_weak,
                 )
-                .await;
+                .await
+        } else {
+            Err("terminal backend is unavailable for reparenting".to_owned())
         }
     }
 
@@ -913,6 +915,42 @@ mod tests {
             is_backgrounded: false,
             output_total_bytes: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn default_reparent_succeeds_only_without_live_owned_tasks() {
+        let mut sibling = completed_task("sibling", Some("sibling"));
+        sibling.completed = false;
+        let completed = completed_task("completed", Some("child"));
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![sibling.clone(), completed],
+        });
+        assert!(
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    crate::notification::ToolNotificationHandle::noop(),
+                    Arc::downgrade(&backend)
+                )
+                .await
+                .is_ok()
+        );
+
+        let mut child = sibling;
+        child.owner_session_id = Some("child".into());
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal { tasks: vec![child] });
+        assert!(
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    crate::notification::ToolNotificationHandle::noop(),
+                    Arc::downgrade(&backend)
+                )
+                .await
+                .is_err()
+        );
     }
 
     /// Regression: subagents share the parent's terminal backend, so the

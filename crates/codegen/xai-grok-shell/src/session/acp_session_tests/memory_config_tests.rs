@@ -337,6 +337,7 @@ pub(super) async fn create_test_actor_with_memory(
         status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rate_limit_waits: Default::default(),
         code_mode_hook_followups: Default::default(),
+        hook_stop_latch: Default::default(),
         sampling_gate: None,
         image_strip_rewrite_barrier: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,

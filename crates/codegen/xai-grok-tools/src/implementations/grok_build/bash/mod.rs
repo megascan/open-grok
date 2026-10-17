@@ -2150,6 +2150,11 @@ impl xai_tool_runtime::Tool for BashTool {
             )
         };
 
+        let notification_handle = notification_handle.with_delivery_scope(
+            ctx.get::<crate::notification::BackgroundDeliveryScope>()
+                .map(|scope| (*scope).clone()),
+        );
+
         // Per-call streaming sink: when `execute` injected a
         // `PerCallNotificationSink`, fan the session handle out so this call's
         // chunks reach BOTH the session-wide side-channel and the per-call sink.
@@ -2270,6 +2275,16 @@ impl xai_tool_runtime::Tool for BashTool {
             .join("terminal")
             .join(format!("{}.log", tool_call_id.as_str()));
 
+        // Transfer a receipt and notification scope into a detached worker
+        // before the terminal backend can accept work. Dropping the tool
+        // future cannot lose a start which the backend is still creating.
+        let start_scope = notification_handle.child_delivery_scope();
+        let start_handle = notification_handle.with_delivery_scope(Some(start_scope.clone()));
+        let mut start_delivery = notification_handle
+            .reserve_delivery()
+            .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_unavailable", error))?;
+        start_delivery.mark_started();
+
         if input.is_background {
             // ─── Background execution ───
             // Force unbuffered Python stdout so output reaches files and
@@ -2295,7 +2310,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 timeout,
                 output_byte_limit,
                 output_file,
-                notification_handle: notification_handle.clone(),
+                notification_handle: start_handle.clone(),
                 tool_call_id: tool_call_id.as_str().to_owned(),
                 display_command: display_command.clone(),
                 auto_background_on_timeout: false,
@@ -2305,41 +2320,56 @@ impl xai_tool_runtime::Tool for BashTool {
                 description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             };
 
-            let handle = match backend.run_background(request).await {
-                Ok(h) => h,
-                Err(e) => {
-                    notification_handle.send_failed(BashExecutionFailed {
-                        tool_call_id: tool_call_id.as_str().to_owned(),
-                        command: input.command.clone(),
-                        cwd: cwd.clone(),
-                        error: e.to_string(),
-                    });
-                    let bash_err = BashError::from(e);
-                    return Err(bash_err.into());
-                }
-            };
-
+            let worker_handle = start_handle.clone();
+            let worker_command = input.command.clone();
+            let worker_description =
+                Some(input.description.clone()).filter(|d| !d.trim().is_empty());
+            let worker_cwd = cwd.clone();
+            let worker_call_id = tool_call_id.as_str().to_owned();
+            let worker_backend = backend.clone();
+            let handle = tokio::spawn(async move {
+                let result = match worker_backend.run_background(request).await {
+                    Ok(handle) => {
+                        worker_handle.send_backgrounded(BashExecutionBackgrounded {
+                            base: BashNotificationBase {
+                                tool_call_id: worker_call_id.clone(),
+                                command: worker_command.clone(),
+                                output: Vec::new(),
+                                total_bytes: 0,
+                                truncated: false,
+                                cwd: worker_cwd.clone(),
+                            },
+                            output_file: handle.output_file.clone(),
+                            task_id: handle.task_id.clone(),
+                            monitor_description: None,
+                            description: worker_description,
+                        });
+                        Ok(handle)
+                    }
+                    Err(error) => {
+                        worker_handle.send_failed(BashExecutionFailed {
+                            tool_call_id: worker_call_id,
+                            command: worker_command,
+                            cwd: worker_cwd,
+                            error: error.to_string(),
+                        });
+                        Err(xai_tool_runtime::ToolError::from(BashError::from(error)))
+                    }
+                };
+                let receipt = start_scope.wait_bounded(Duration::from_secs(30)).await;
+                start_delivery.resolve(receipt.clone());
+                receipt.map_err(|error| {
+                    xai_tool_runtime::ToolError::custom("delivery_failed", error)
+                })?;
+                result
+            })
+            .await
+            .map_err(|error| {
+                xai_tool_runtime::ToolError::custom("terminal_worker_failed", error.to_string())
+            })??;
             let task_id = handle.task_id;
             let bg_output_file = handle.output_file;
             let bg_pid = handle.pid;
-
-            // Send backgrounded notification
-            let base = BashNotificationBase {
-                tool_call_id: tool_call_id.as_str().to_owned(),
-                command: input.command.clone(),
-                output: Vec::new(),
-                total_bytes: 0,
-                truncated: false,
-                cwd: cwd.clone(),
-            };
-
-            notification_handle.send_backgrounded(BashExecutionBackgrounded {
-                base,
-                output_file: bg_output_file.clone(),
-                task_id: task_id.clone(),
-                monitor_description: None,
-                description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
-            });
 
             let retrieval_hint = Self::background_retrieval_hint(&resources, &task_id).await?;
 
@@ -2379,7 +2409,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 timeout,
                 output_byte_limit,
                 output_file: output_file.clone(),
-                notification_handle: notification_handle.clone(),
+                notification_handle: start_handle.clone(),
                 tool_call_id: tool_call_id.as_str().to_owned(),
                 display_command,
                 // Honour `auto_background_on_timeout` regardless of
@@ -2402,40 +2432,63 @@ impl xai_tool_runtime::Tool for BashTool {
                 description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             };
 
-            let result = match backend.run(request).await {
-                Ok(r) => r,
-                Err(e) => {
-                    notification_handle.send_failed(BashExecutionFailed {
-                        tool_call_id: tool_call_id.as_str().to_owned(),
-                        command: input.command.clone(),
-                        cwd: cwd.clone(),
-                        error: e.to_string(),
-                    });
-                    let bash_err = BashError::from(e);
-                    return Err(bash_err.into());
-                }
-            };
+            let worker_handle = start_handle.clone();
+            let worker_command = input.command.clone();
+            let worker_description =
+                Some(input.description.clone()).filter(|d| !d.trim().is_empty());
+            let worker_cwd = cwd.clone();
+            let worker_call_id = tool_call_id.as_str().to_owned();
+            let worker_output_file = output_file.clone();
+            let worker_backend = backend.clone();
+            let result = tokio::spawn(async move {
+                let result = match worker_backend.run(request).await {
+                    Ok(result) => {
+                        if matches!(
+                            result.signal.as_deref(),
+                            Some("auto_backgrounded" | "backgrounded")
+                        ) {
+                            worker_handle.send_backgrounded(BashExecutionBackgrounded {
+                                base: BashNotificationBase {
+                                    tool_call_id: worker_call_id.clone(),
+                                    command: worker_command.clone(),
+                                    output: result.combined_output.as_bytes().to_vec(),
+                                    total_bytes: result.total_bytes,
+                                    truncated: result.truncated,
+                                    cwd: worker_cwd.clone(),
+                                },
+                                output_file: worker_output_file,
+                                task_id: worker_call_id.clone(),
+                                monitor_description: None,
+                                description: worker_description,
+                            });
+                        }
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        worker_handle.send_failed(BashExecutionFailed {
+                            tool_call_id: worker_call_id,
+                            command: worker_command,
+                            cwd: worker_cwd,
+                            error: error.to_string(),
+                        });
+                        Err(xai_tool_runtime::ToolError::from(BashError::from(error)))
+                    }
+                };
+                let receipt = start_scope.wait_bounded(Duration::from_secs(30)).await;
+                start_delivery.resolve(receipt.clone());
+                receipt.map_err(|error| {
+                    xai_tool_runtime::ToolError::custom("delivery_failed", error)
+                })?;
+                result
+            })
+            .await
+            .map_err(|error| {
+                xai_tool_runtime::ToolError::custom("terminal_worker_failed", error.to_string())
+            })??;
 
             // ─── Backgrounded (user Ctrl+G or auto-timeout): return BackgroundTaskStarted ───
             let auto_backgrounded = result.signal.as_deref() == Some("auto_backgrounded");
             if auto_backgrounded || result.signal.as_deref() == Some("backgrounded") {
-                let base = BashNotificationBase {
-                    tool_call_id: tool_call_id.as_str().to_owned(),
-                    command: input.command.clone(),
-                    output: result.combined_output.as_bytes().to_vec(),
-                    total_bytes: result.total_bytes,
-                    truncated: result.truncated,
-                    cwd: cwd.clone(),
-                };
-
-                notification_handle.send_backgrounded(BashExecutionBackgrounded {
-                    base,
-                    output_file: output_file.clone(),
-                    task_id: tool_call_id.as_str().to_owned(),
-                    monitor_description: None,
-                    description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
-                });
-
                 let retrieval_hint =
                     Self::background_retrieval_hint(&resources, tool_call_id.as_str()).await?;
 
@@ -2857,6 +2910,139 @@ mod tests {
     }
 
     // ─── Test helpers ───
+
+    struct GatedTerminal {
+        real: Arc<crate::computer::local::LocalTerminalBackend>,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalBackend for GatedTerminal {
+        async fn run(
+            &self,
+            request: TerminalRunRequest,
+        ) -> Result<TerminalRunResult, ComputerError> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.real.run(request).await
+        }
+        async fn run_background(
+            &self,
+            request: TerminalRunRequest,
+        ) -> Result<BackgroundHandle, ComputerError> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.real.run_background(request).await
+        }
+        async fn get_task(&self, id: &str) -> Option<TaskSnapshot> {
+            self.real.get_task(id).await
+        }
+        async fn kill_task(&self, id: &str) -> KillOutcome {
+            self.real.kill_task(id).await
+        }
+        async fn wait_for_completion(
+            &self,
+            id: &str,
+            timeout: Option<Duration>,
+        ) -> Option<TaskSnapshot> {
+            self.real.wait_for_completion(id, timeout).await
+        }
+        async fn list_tasks(&self) -> Vec<TaskSnapshot> {
+            self.real.list_tasks().await
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_turn_rejects_delayed_bash_and_monitor_after_stop_sweep() {
+        for monitor in [false, true] {
+            let (mut resources, _tmp) = make_real_resources(None);
+            let real = Arc::new(crate::computer::local::LocalTerminalBackend::new());
+            let gate = Arc::new(GatedTerminal {
+                real: real.clone(),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            resources.insert(Terminal(gate.clone()));
+            let (handle, _receiver) = ToolNotificationHandle::bridge_channel();
+            resources.insert(NotificationHandle(handle.clone()));
+            let guard = handle.begin_turn_delivery();
+            let scope = guard.scope();
+            let mut ctx = test_ctx(resources.into_shared());
+            ctx.extensions.insert(scope.clone());
+            let call = tokio::spawn(async move {
+                if monitor {
+                    let input = crate::implementations::grok_build::monitor::types::MonitorInput {
+                        command: "sleep 30".into(),
+                        description: "test".into(),
+                        timeout_ms: None,
+                        persistent: true,
+                    };
+                    let _ = xai_tool_runtime::Tool::run(
+                        &crate::implementations::grok_build::monitor::tool::MonitorTool,
+                        ctx,
+                        input,
+                    )
+                    .await;
+                } else {
+                    let _ = xai_tool_runtime::Tool::run(&BashTool, ctx, make_bg_input("sleep 30"))
+                        .await;
+                }
+            });
+            gate.entered.acquire().await.unwrap().forget();
+            scope.revoke();
+            call.abort();
+            real.kill_foreground_commands().await;
+            real.kill_all_background_tasks().await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), scope.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                real.list_tasks().await.is_empty(),
+                "delayed request started after stop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_handoff_announces_background_start_once() {
+        let (mut resources, _tmp) = make_real_resources(None);
+        let terminal = resources.get::<Terminal>().unwrap().0.clone();
+        let (handle, mut events) = ToolNotificationHandle::channel();
+        resources.insert(NotificationHandle(handle.clone()));
+        let guard = handle.begin_turn_delivery();
+        let scope = guard.scope();
+        let mut ctx = crate::types::tool_metadata::test_ctx_with_call_id(
+            resources.into_shared(),
+            "handoff-test",
+        );
+        ctx.extensions.insert(scope);
+        let call = tokio::spawn(async move {
+            xai_tool_runtime::Tool::run(&BashTool, ctx, make_input("sleep 30")).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while terminal.get_task("handoff-test").await.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("foreground process started");
+        let handed_off = terminal.background_foreground_commands(None).await;
+        assert_eq!(handed_off.len(), 1);
+        call.await.unwrap().unwrap();
+        let mut starts = 0;
+        while let Ok(event) = events.try_recv() {
+            if let crate::notification::ToolNotification::BashExecutionBackgrounded(value) = event
+                && value.task_id == "handoff-test"
+            {
+                starts += 1;
+            }
+        }
+        assert_eq!(starts, 1, "foreground handoff must emit exactly one start");
+        let _ = terminal.kill_task("handoff-test").await;
+    }
 
     fn make_resources(mock: MockTerminal) -> Resources {
         make_resources_with_params(mock, BashParams::default())

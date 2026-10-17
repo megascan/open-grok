@@ -1105,10 +1105,18 @@ impl LocalTerminalActor {
                 self.notify_completion_waiters().await;
             }
             TerminalCommand::Run { request, reply } => {
-                self.handle_run(request, reply).await;
+                if request.notification_handle.is_delivery_revoked() {
+                    let _ = reply.send(Err(ComputerError::io("originating turn was cancelled")));
+                } else {
+                    self.handle_run(request, reply).await;
+                }
             }
             TerminalCommand::RunBackground { request, reply } => {
-                self.handle_run_background(request, reply).await;
+                if request.notification_handle.is_delivery_revoked() {
+                    let _ = reply.send(Err(ComputerError::io("originating turn was cancelled")));
+                } else {
+                    self.handle_run_background(request, reply).await;
+                }
             }
             TerminalCommand::GetTask { task_id, reply } => {
                 let snapshot = match self.resolve_task_key(&task_id) {
@@ -2989,12 +2997,11 @@ impl TerminalBackend for LocalTerminalBackend {
         new_owner_session_id: &str,
         new_handle: crate::notification::types::ToolNotificationHandle,
         backend_weak: std::sync::Weak<dyn crate::computer::types::TerminalBackend>,
-    ) {
+    ) -> Result<(), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         // `backend_weak` (anchored by the parent's `Arc`) drives re-spawned
         // pipelines without keeping the backend alive.
-        if self
-            .cmd_tx
+        self.cmd_tx
             .send(TerminalCommand::ReparentNotifications {
                 old_owner_session_id: old_owner_session_id.to_string(),
                 new_owner_session_id: new_owner_session_id.to_string(),
@@ -3003,14 +3010,13 @@ impl TerminalBackend for LocalTerminalBackend {
                 reply: reply_tx,
             })
             .await
-            .is_err()
-        {
-            return;
-        }
+            .map_err(|_| "terminal actor stopped before reparenting".to_owned())?;
         // Wait for the actor to process the reparent before returning,
         // so the caller can safely shut down the old session without
         // risking notification loss.
-        let _ = reply_rx.await;
+        reply_rx
+            .await
+            .map_err(|_| "terminal actor stopped during reparenting".to_owned())
     }
 
     async fn background_foreground_command(&self, tool_call_id: &str) -> bool {
@@ -6572,6 +6578,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reparent_reports_a_closed_actor_and_lost_reply() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let backend: std::sync::Arc<dyn crate::computer::types::TerminalBackend> =
+            std::sync::Arc::new(LocalTerminalBackend {
+                cmd_tx: tx,
+                cancel_token: CancellationToken::new(),
+            });
+        assert!(
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    ToolNotificationHandle::noop(),
+                    std::sync::Arc::downgrade(&backend)
+                )
+                .await
+                .is_err()
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let backend: std::sync::Arc<dyn crate::computer::types::TerminalBackend> =
+            std::sync::Arc::new(LocalTerminalBackend {
+                cmd_tx: tx,
+                cancel_token: CancellationToken::new(),
+            });
+        let caller = tokio::spawn(async move {
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    ToolNotificationHandle::noop(),
+                    std::sync::Arc::downgrade(&backend),
+                )
+                .await
+        });
+        // Receiving and dropping the command models an actor lost after enqueue.
+        drop(rx.recv().await.unwrap());
+        assert!(caller.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn reparent_notifications_changes_owner_and_sends_synthetic() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let new_handle = ToolNotificationHandle::from_sender(tx);
@@ -6597,7 +6645,8 @@ mod tests {
                 new_handle,
                 std::sync::Arc::downgrade(&backend),
             )
-            .await;
+            .await
+            .expect("reparent notifications");
 
         // Verify owner changed
         let snap = backend.get_task(&bg.task_id).await.unwrap();
@@ -6661,7 +6710,8 @@ mod tests {
                 new_handle,
                 std::sync::Arc::downgrade(&backend),
             )
-            .await;
+            .await
+            .expect("reparent notifications");
 
         // Child's owner should change
         let snap_child = backend.get_task(&bg_child.task_id).await.unwrap();

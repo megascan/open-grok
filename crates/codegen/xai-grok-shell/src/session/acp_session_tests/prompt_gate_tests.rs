@@ -126,6 +126,111 @@ fn blocked_user_prompt_cancels_turn_without_sampling() {
     });
 }
 
+#[test]
+fn force_stop_user_prompt_cancels_before_sampling_and_preserves_reason() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let _annotations = spawn_persistence_drain(persistence_rx);
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.hook_resolved_workspace_root = "/tmp".into();
+            let actor = Arc::new(actor);
+            *actor.hook_registry.borrow_mut() = Some(Arc::new(prompt_gate_registry(
+                r#"echo '{"continue":false,"stopReason":"prompt stopped"}'"#,
+            )));
+            let before = actor.chat_state_handle.get_conversation_len().await;
+            let result = Box::pin(actor.handle_prompt(
+                "p-force-stop",
+                text_prompt("must not enter conversation"),
+                PromptMode::Agent,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("force stop returns a cancellation before sampling");
+            assert_eq!(result.stop_reason, acp::StopReason::Cancelled);
+            match result.completion_kind {
+                PromptCompletionKind::Cancelled { category, context } => {
+                    assert_eq!(
+                        category,
+                        Some(crate::session::events::CancellationCategory::HookDenied)
+                    );
+                    let context = context.unwrap();
+                    assert_eq!(context.hook_name.as_deref(), Some("test/promptgate"));
+                    assert_eq!(context.reason.as_deref(), Some("prompt stopped"));
+                }
+                other => panic!("expected hook cancellation, got {other:?}"),
+            }
+            assert_eq!(actor.chat_state_handle.get_conversation_len().await, before);
+            assert!(actor.state.lock().await.hook_block_held());
+        })
+    });
+}
+
+#[test]
+fn synthetic_prompt_force_stop_remains_observe_only() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let annotations = spawn_persistence_drain(persistence_rx);
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.hook_resolved_workspace_root = "/tmp".into();
+            let actor = Arc::new(actor);
+            *actor.hook_registry.borrow_mut() = Some(Arc::new(prompt_gate_registry(
+                r#"echo '{"continue":false,"stopReason":"observe only"}'"#,
+            )));
+            let turn_actor = actor.clone();
+            let turn = tokio::task::spawn_local(async move {
+                Box::pin(turn_actor.handle_prompt(
+                    "task-completed-force",
+                    text_prompt("synthetic wake"),
+                    PromptMode::Agent,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            });
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if annotations.borrow().iter().any(|message| {
+                        message.contains("not enforced for this origin")
+                            && message.contains("observe only")
+                    }) {
+                        return true;
+                    }
+                    if turn.is_finished() {
+                        return false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(observed, "synthetic force stop must remain observe-only");
+            assert!(!actor.state.lock().await.hook_block_held());
+            turn.abort();
+        })
+    });
+}
+
 /// A hook's top-level `systemMessage` reaches the user verbatim on the rendered `HookAnnotation` channel, alongside the hook's decision.
 #[test]
 fn hook_system_message_reaches_user_as_annotation() {

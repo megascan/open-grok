@@ -700,6 +700,8 @@ pub struct GoalTracker {
     session_dir: PathBuf,
     active_since: Option<Instant>,
     planner_run: Option<GoalPlannerRunState>,
+    /// Consecutive completed goal continuation rounds without a tool call.
+    no_tool_continuations: u32,
 }
 
 #[derive(Debug)]
@@ -715,6 +717,7 @@ impl GoalTracker {
             session_dir,
             active_since: None,
             planner_run: None,
+            no_tool_continuations: 0,
         }
     }
 
@@ -787,7 +790,22 @@ impl GoalTracker {
             session_dir,
             active_since,
             planner_run: None,
+            no_tool_continuations: 0,
         }
+    }
+
+    /// Record one actual continuation round, not the initial user turn.
+    /// Tool calls reset the streak; only active goals can accrue strikes.
+    pub(crate) fn record_goal_continuation(&mut self, used_tool: bool) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        if used_tool {
+            self.no_tool_continuations = 0;
+        } else {
+            self.no_tool_continuations = self.no_tool_continuations.saturating_add(1);
+        }
+        self.no_tool_continuations >= 3
     }
 
     pub fn snapshot(&self) -> Option<&GoalOrchestration> {
@@ -944,6 +962,7 @@ impl GoalTracker {
         created_at: String,
         baseline_commit: Option<String>,
     ) {
+        self.no_tool_continuations = 0;
         let _ = std::fs::create_dir_all(self.goal_dir());
         // Replacing a still-active goal: same rescue-then-remove contract
         // as the terminal transitions (the prior goal's details path may
@@ -1095,6 +1114,7 @@ impl GoalTracker {
             && o.status.is_paused()
         {
             o.status = GoalStatus::Active;
+            self.no_tool_continuations = 0;
             o.pause_message = None;
             o.classifier_runs_attempted = 0;
             o.rounds_since_verify = 0;
@@ -1191,6 +1211,7 @@ impl GoalTracker {
         self.remove_scratch_root();
         self.orchestration = None;
         self.active_since = None;
+        self.no_tool_continuations = 0;
     }
 
     /// Best-effort scratch-root removal shared by every terminal
@@ -1483,6 +1504,29 @@ mod tests {
     }
 
     use super::make_base_orchestration;
+
+    #[test]
+    fn goal_continuation_no_tool_streak_pauses_at_three_and_resets() {
+        let mut t = make_tracker();
+        assert!(!t.record_goal_continuation(false));
+        activate_tracker(&mut t);
+        assert!(!t.record_goal_continuation(false));
+        assert!(!t.record_goal_continuation(false));
+        assert!(!t.record_goal_continuation(true));
+        assert!(!t.record_goal_continuation(false));
+        assert!(!t.record_goal_continuation(false));
+        assert!(t.record_goal_continuation(false));
+        assert!(t.pause(GoalPauseReason::NoProgress));
+        assert_eq!(t.status(), Some(GoalStatus::NoProgressPaused));
+        assert!(!t.record_goal_continuation(false));
+        assert!(t.resume());
+        assert!(!t.record_goal_continuation(false));
+        assert!(!t.record_goal_continuation(false));
+        assert!(t.record_goal_continuation(false));
+        t.clear();
+        activate_tracker(&mut t);
+        assert!(!t.record_goal_continuation(false));
+    }
 
     #[test]
     fn create_goal_activates_and_starts_timer() {

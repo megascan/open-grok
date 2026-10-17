@@ -1858,6 +1858,7 @@ pub(crate) async fn spawn_session_actor(
                     continue;
                 }
                 let input = req.input;
+                let delivery = req.delivery;
                 if let Err(detail) = input.validate() {
                     let _ = ack.send(WorkflowLaunchAck::Rejected {
                         code: "workflow_invalid_input",
@@ -1980,7 +1981,7 @@ pub(crate) async fn spawn_session_actor(
                 };
                 let launch_outcome = {
                     let mut mgr = manager.lock().await;
-                    let result = mgr.launch(resolved, spec);
+                    let result = mgr.launch_with_delivery(resolved, spec, delivery);
                     let script_path = result
                         .as_ref()
                         .ok()
@@ -2282,6 +2283,7 @@ pub(crate) async fn spawn_session_actor(
         pending_interjections: InterjectionBuffer::new(),
         pending_native_agent_messages: Default::default(),
         code_mode_hook_followups: std::cell::RefCell::new(Vec::new()),
+        hook_stop_latch: Default::default(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config
             .as_ref()

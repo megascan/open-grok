@@ -686,6 +686,7 @@ pub(crate) struct ShellCompletionData {
     goal_loop_active: Arc<std::sync::atomic::AtomicBool>,
     telemetry_tokens: u64,
     spawned_notification_emitted: bool,
+    background_delivery_error: Option<String>,
     persisted_output_dir: Option<PathBuf>,
 }
 impl ShellCompletionData {
@@ -699,6 +700,7 @@ impl ShellCompletionData {
             goal_loop_active: Arc::clone(&ctx.goal_loop_active),
             telemetry_tokens: 0,
             spawned_notification_emitted: false,
+            background_delivery_error: None,
             persisted_output_dir: None,
         }
     }
@@ -798,6 +800,7 @@ pub(crate) fn present_child_completion(
 ) {
     let ChildCompletion {
         request,
+        admission_generation,
         result,
         completion_data,
         disposition,
@@ -806,7 +809,7 @@ pub(crate) fn present_child_completion(
         .parent_cmd_tx
         .as_ref()
         .is_some_and(|tx| !tx.is_closed());
-    let will_wake = should_auto_wake_subagent(
+    let should_wake = should_auto_wake_subagent(
         disposition.backgrounded,
         result.cancelled,
         completion_data.auto_wake_enabled,
@@ -817,8 +820,23 @@ pub(crate) fn present_child_completion(
             .load(std::sync::atomic::Ordering::Relaxed),
         parent_channel_open,
     ) && disposition.should_surface;
-    if completion_data.spawned_notification_emitted || request.run_in_background {
-        emit_subagent_notification(
+    let will_wake = should_wake
+        && inject_subagent_completed_prompt(
+            &request.id,
+            &result,
+            &request,
+            &completion_data.task_completion_reservations,
+            completion_data.parent_cmd_tx.as_ref(),
+            &completion_data.task_output_tool_name,
+            &completion_data.synthetic_trace_tx,
+            gateway,
+            admission_generation.as_deref(),
+        );
+    if completion_data.spawned_notification_emitted
+        || request.run_in_background
+        || admission_generation.is_some()
+    {
+        let _ = emit_subagent_notification_observed(
             gateway,
             &request.parent_session_id,
             SessionUpdate::SubagentFinished {
@@ -834,17 +852,8 @@ pub(crate) fn present_child_completion(
                 will_wake,
             },
             completion_data.parent_cmd_tx.as_ref(),
-        );
-    }
-    if will_wake {
-        inject_subagent_completed_prompt(
-            &request.id,
-            &result,
-            &request,
-            &completion_data.task_completion_reservations,
-            completion_data.parent_cmd_tx.as_ref(),
-            &completion_data.task_output_tool_name,
-            &completion_data.synthetic_trace_tx,
+            admission_generation.as_deref(),
+            completion_data.background_delivery_error.as_deref(),
         );
     }
 }
@@ -2645,26 +2654,37 @@ fn resolve_subagent_max_turns(
         .map(|v| v as usize)
         .or(parent_max_turns)
 }
-/// What to do with a resumed subagent's isolated worktree directory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResumeWorktreeAction {
-    /// Directory on disk and no snapshot ref — reuse it as-is.
-    Reuse,
-    /// Directory gone but a snapshot ref exists — rehydrate from it.
-    Rehydrate,
-    /// Directory gone and no snapshot — fall back to the shared workspace.
-    Shared,
-}
-/// Decide how to recover a resumed subagent's worktree from its on-disk state
-/// and whether a durable snapshot is available. Pure so the three outcomes are
-/// unit-testable without git/async.
-fn resume_worktree_action(dir_exists: bool, snapshot_ref: Option<&str>) -> ResumeWorktreeAction {
-    if snapshot_ref.is_some() {
-        ResumeWorktreeAction::Rehydrate
-    } else if dir_exists {
-        ResumeWorktreeAction::Reuse
-    } else {
-        ResumeWorktreeAction::Shared
+/// Resolve a retained worktree or restore its snapshot; never run a resumed
+/// isolated child in the parent checkout when identity or restoration fails.
+async fn prepare_resume_subagent_worktree(
+    dest: &std::path::Path,
+    source_repo: &std::path::Path,
+    original_subagent_id: &str,
+    snapshot_ref: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(_) => {
+            xai_grok_workspace::worktree::validate_subagent_worktree_for_resume(
+                dest,
+                source_repo,
+                original_subagent_id,
+            )
+            .await?;
+            Ok(dest.to_path_buf())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let snapshot_ref = snapshot_ref.ok_or_else(|| {
+                anyhow::anyhow!("isolated worktree is missing and no snapshot is available")
+            })?;
+            crate::session::worktree::rehydrate_subagent_worktree(
+                dest,
+                source_repo,
+                snapshot_ref,
+                Some(original_subagent_id),
+            )
+            .await
+        }
+        Err(error) => Err(error.into()),
     }
 }
 /// The parent session's working directory — the source path for a subagent
@@ -2971,9 +2991,11 @@ fn inject_subagent_completed_prompt(
     synthetic_trace_tx: &Option<
         mpsc::UnboundedSender<crate::upload::turn::SyntheticTurnTraceRequest>,
     >,
-) {
+    gateway: &GatewaySender,
+    admission_generation: Option<&str>,
+) -> bool {
     let Some(cmd_tx) = parent_cmd_tx else {
-        return;
+        return false;
     };
     if let Some(reservations) = task_completion_reservations {
         reservations.reserve(subagent_id.to_string());
@@ -3022,17 +3044,32 @@ fn inject_subagent_completed_prompt(
         if let Some(reservations) = task_completion_reservations {
             reservations.release(subagent_id);
         }
-        return;
+        return false;
     }
+    let (trace_response, trace_receiver) = tokio::sync::oneshot::channel();
     if let Some(trace_tx) = synthetic_trace_tx {
         let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
             session_id: acp::SessionId::new(request.parent_session_id.clone()),
-            prompt_id,
-            completion_rx,
+            prompt_id: prompt_id.clone(),
+            completion_rx: trace_receiver,
             before_session_copy_rx: before_rx
                 .expect("before_rx set when synthetic_trace_tx is Some"),
         });
     }
+    let gateway = gateway.clone();
+    let generation = admission_generation.map(str::to_owned);
+    tokio::spawn(async move {
+        let response = completion_rx.await;
+        if let Ok(response) = response {
+            let _ = trace_response.send(response);
+        }
+        crate::session::workflow::notify::emit_wake_resolved_with_generation(
+            &gateway,
+            &prompt_id,
+            generation.as_deref(),
+        );
+    });
+    true
 }
 fn telemetry_owner_kind(
     request: &SubagentRequest,
@@ -3138,8 +3175,38 @@ pub(crate) fn emit_subagent_notification(
     update: SessionUpdate,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
 ) {
+    let _ = emit_subagent_notification_observed(
+        gateway,
+        parent_session_id,
+        update,
+        parent_cmd_tx,
+        None,
+        None,
+    );
+}
+
+fn emit_subagent_notification_observed(
+    gateway: &GatewaySender,
+    parent_session_id: &str,
+    update: SessionUpdate,
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    admission_generation: Option<&str>,
+    background_delivery_error: Option<&str>,
+) -> Option<tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<()>>> {
     let mut meta = None;
     crate::util::event_id::ensure_event_id_meta(parent_session_id, &mut meta);
+    if let Some(generation) = admission_generation {
+        meta.get_or_insert_with(Default::default).insert(
+            "x.ai/background_generation".into(),
+            serde_json::Value::String(generation.to_owned()),
+        );
+    }
+    if let Some(error) = background_delivery_error {
+        meta.get_or_insert_with(Default::default).insert(
+            "x.ai/background_delivery_error".into(),
+            serde_json::Value::String(error.to_owned()),
+        );
+    }
     let notification = SessionNotification {
         session_id: acp::SessionId::new(parent_session_id),
         update,
@@ -3156,8 +3223,9 @@ pub(crate) fn emit_subagent_notification(
     if let Some(params) = params {
         let ext_notification =
             acp::ExtNotification::new("x.ai/session_notification", params.into());
-        gateway.forward_fire_and_forget(ext_notification);
+        return Some(gateway.forward_with_completion(ext_notification));
     }
+    None
 }
 fn spawn_swarm_status_relay(
     mut status_rx: mpsc::UnboundedReceiver<SubagentStatusEvent>,

@@ -48,6 +48,13 @@ pub(super) struct PreparedAuxiliarySampling {
 
 const CLASSIFIER_REQUEST_TOKEN_RESERVE: u64 = 16_384;
 
+fn overflow_context_window(
+    reported: Option<u64>,
+    configured: Option<std::num::NonZeroU64>,
+) -> Option<std::num::NonZeroU64> {
+    reported.and_then(std::num::NonZeroU64::new).or(configured)
+}
+
 fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bool {
     input_tokens <= context_window.saturating_sub(CLASSIFIER_REQUEST_TOKEN_RESERVE)
 }
@@ -1808,6 +1815,7 @@ impl SessionActor {
             rate_limit_waits,
             transient,
             mid_salvage_continuation,
+            None,
         )
         .await
     }
@@ -1828,6 +1836,7 @@ impl SessionActor {
                 enabled: false,
             },
             false,
+            None,
         )
         .await
     }
@@ -1839,6 +1848,7 @@ impl SessionActor {
         rate_limit_waits: u32,
         transient: TransientRetryState,
         mid_salvage_continuation: bool,
+        compaction_refills: Option<&mut super::turn::AutoCompactionRefillGuard>,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
 
@@ -1910,16 +1920,28 @@ impl SessionActor {
         }
 
         if !mid_salvage_continuation && self.should_compact_on_error(&error).await {
-            let cw = error
+            let reported_window = error
                 .model_metadata
                 .as_ref()
                 .and_then(|m| m.context_window)
-                .expect("should_compact_on_error guarantees context_window");
+                .and_then(std::num::NonZeroU64::new);
+            let Some(cw) = overflow_context_window(
+                reported_window.map(std::num::NonZeroU64::get),
+                request_config.as_ref().map(|cfg| cfg.context_window),
+            ) else {
+                return Err(acp::Error::internal_error().data(
+                    "Context overflow cannot be recovered without an active context window",
+                ));
+            };
+            let cw = cw.get();
+            if let Some(guard) = compaction_refills {
+                guard.record_compaction()?;
+            }
             {
                 let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
                 let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
-                if let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await
-                    && let Some(new_cw) = std::num::NonZeroU64::new(cw)
+                if let Some(mut cfg) = request_config
+                    && let Some(new_cw) = reported_window
                     && self.compaction.context_window_override.is_none()
                 {
                     cfg.context_window = self.context_window_after_overflow(&cfg, new_cw);
@@ -2485,7 +2507,7 @@ impl SessionActor {
         outcome
     }
 
-    /// Drive one turn through the sampler, pacing a subagent's 429s via `budget`.
+    #[cfg(test)]
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
@@ -2493,6 +2515,27 @@ impl SessionActor {
         budget: &mut RateLimitWaitBudget,
         transient: TransientRetryState,
         mid_salvage_continuation: bool,
+    ) -> Result<SamplerTurnOutcome, acp::Error> {
+        self.run_turn_via_sampler_bounded(
+            request,
+            codex_auth_refresh_allowed,
+            budget,
+            transient,
+            mid_salvage_continuation,
+            &mut super::turn::AutoCompactionRefillGuard::default(),
+        )
+        .await
+    }
+
+    /// Drive one turn through the sampler, pacing a subagent's 429s via `budget`.
+    pub(super) async fn run_turn_via_sampler_bounded(
+        self: &Arc<Self>,
+        request: ConversationRequest,
+        codex_auth_refresh_allowed: bool,
+        budget: &mut RateLimitWaitBudget,
+        transient: TransientRetryState,
+        mid_salvage_continuation: bool,
+        compaction_refills: &mut super::turn::AutoCompactionRefillGuard,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
 
@@ -2506,6 +2549,7 @@ impl SessionActor {
                         transient,
                         mid_salvage_continuation,
                         codex_auth_refresh_allowed,
+                        compaction_refills,
                     )
                     .await
                 }
@@ -2529,6 +2573,7 @@ impl SessionActor {
                                 transient,
                                 mid_salvage_continuation,
                                 codex_auth_refresh_allowed,
+                                compaction_refills,
                             )
                             .await;
                     };
@@ -2679,6 +2724,7 @@ impl SessionActor {
         transient: TransientRetryState,
         mid_salvage_continuation: bool,
         codex_auth_refresh_allowed: bool,
+        compaction_refills: &mut super::turn::AutoCompactionRefillGuard,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         super::turn::record_failed_sample_on_turn_span(&tracing::Span::current(), info.kind);
         match self
@@ -2688,6 +2734,7 @@ impl SessionActor {
                 budget.attempts_used(),
                 transient,
                 mid_salvage_continuation,
+                Some(compaction_refills),
             )
             .await?
         {
@@ -3429,6 +3476,32 @@ mod configured_cutoff_tests {
             let inherited = super::resolve_configured_cutoff(seed.clone(), base.as_ref());
             assert_eq!(wire_echo, inherited, "seed={seed:?} base={base:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod overflow_window_tests {
+    use super::overflow_context_window;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn reported_window_wins_and_missing_or_zero_falls_back_to_active_route() {
+        let configured = NonZeroU64::new(100_000);
+        assert_eq!(
+            overflow_context_window(Some(50_000), configured)
+                .unwrap()
+                .get(),
+            50_000
+        );
+        assert_eq!(
+            overflow_context_window(None, configured).unwrap().get(),
+            100_000
+        );
+        assert_eq!(
+            overflow_context_window(Some(0), configured).unwrap().get(),
+            100_000
+        );
+        assert!(overflow_context_window(Some(0), None).is_none());
     }
 }
 

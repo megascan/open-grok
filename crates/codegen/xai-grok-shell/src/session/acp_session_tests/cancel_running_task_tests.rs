@@ -7,6 +7,75 @@ use xai_grok_paths::AbsPathBuf;
 use xai_grok_tools::implementations::grok_build::task::types::{
     HandedOffForegroundSubagent, SubagentEvent, SubagentHandOffForegroundRequest,
 };
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_revokes_claimed_turn_before_delayed_terminal_start() {
+    use xai_grok_tools::computer::types::{TaskKind, TerminalRunRequest as BackendRequest};
+    use xai_grok_tools::notification::ToolNotificationHandle;
+    use xai_grok_tools::types::resources::Terminal;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for rewind in [None, Some(None), Some(Some("running".to_owned()))] {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                let resources = bridge.shared_resources().await;
+                let terminal = resources.lock().await.get::<Terminal>().unwrap().0.clone();
+                let (handle, _rx) = ToolNotificationHandle::bridge_channel();
+                let guard = handle.begin_turn_delivery();
+                let scope = guard.scope();
+                let next_guard = handle.begin_turn_delivery();
+                let next_scope = next_guard.scope();
+                let task = running_task_stub("running").with_test_delivery_scope(scope.clone());
+                let (input, _response) =
+                    input_with_origin_rx("running", crate::session::PromptOrigin::User);
+                {
+                    let mut state = actor.state.lock().await;
+                    state.running_task = Some(task);
+                    state.pending_inputs.push_back(input);
+                    state.rewindable = false;
+                }
+                let temp = tempfile::TempDir::new().unwrap();
+                let request = BackendRequest {
+                    command: "sleep 30".into(),
+                    working_directory: temp.path().to_path_buf(),
+                    env: HashMap::new(),
+                    timeout: Duration::from_secs(30),
+                    output_byte_limit: 1024,
+                    output_file: temp.path().join("out"),
+                    notification_handle: handle.with_delivery_scope(Some(scope.clone())),
+                    tool_call_id: "late".into(),
+                    display_command: None,
+                    auto_background_on_timeout: false,
+                    foreground_block_budget: None,
+                    kind: TaskKind::Bash,
+                    owner_session_id: None,
+                    description: None,
+                };
+                let history = match rewind {
+                    None => crate::session::CancelHistoryDisposition::Keep,
+                    Some(prompt_id) => {
+                        crate::session::CancelHistoryDisposition::RewindIfNoOutput { prompt_id }
+                    }
+                };
+                let _ = actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        history,
+                        trigger: Some(crate::session::CancelTrigger::CtrlC),
+                        cancel_subagents: false,
+                        ..Default::default()
+                    })
+                    .await;
+                assert!(scope.is_revoked());
+                assert!(!next_scope.is_revoked());
+                assert!(terminal.run_background(request).await.is_err());
+                assert!(terminal.list_tasks().await.is_empty());
+            }
+        })
+        .await;
+}
 #[derive(Debug)]
 struct DummyTerminal;
 #[async_trait::async_trait]
@@ -292,6 +361,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
+                hook_stop_latch: Default::default(),
                 sampling_gate: None,
                 image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -836,6 +906,7 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
+                hook_stop_latch: Default::default(),
                 sampling_gate: None,
                 image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -1159,6 +1230,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
+                hook_stop_latch: Default::default(),
                 sampling_gate: None,
                 image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -2725,6 +2797,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
+                hook_stop_latch: Default::default(),
                 sampling_gate: None,
                 image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,

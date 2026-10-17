@@ -455,6 +455,8 @@ pub struct SubagentSpawnRequest {
     pub request: Box<SubagentRequest>,
     #[educe(Debug(ignore))]
     pub result_tx: oneshot::Sender<SubagentResult>,
+    /// Runtime-only, unique lifecycle receipt transferred with this command.
+    pub admission_reservation: Option<crate::notification::SubagentAdmissionReservation>,
 }
 
 impl std::ops::Deref for SubagentSpawnRequest {
@@ -475,6 +477,9 @@ impl SubagentSpawnRequest {
         build: impl FnOnce(&SubagentRequest) -> SubagentResult,
     ) -> Result<(), SubagentResult> {
         let result = build(&self.request);
+        if let Some(reservation) = self.admission_reservation {
+            reservation.reject();
+        }
         self.result_tx.send(result)
     }
 }

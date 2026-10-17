@@ -255,6 +255,14 @@ impl SessionActor {
             .trigger
             .as_ref()
             .map(crate::session::CancelTrigger::kind);
+        if kind == Some(crate::session::CancelKind::Teardown) {
+            self.rebuild_spec
+                .tools_notification_handle
+                .revoke_session_deliveries();
+            self.tool_context
+                .swarm_registry
+                .cancel_session(&self.session_id_string());
+        }
         let cancel_reason = super::turn_end_hooks::cancel_reason_for_options(&options);
         let crate::session::CancelOptions {
             cancel_subagents,
@@ -403,19 +411,36 @@ impl SessionActor {
             .running_task
             .as_ref()
             .map(|task| elapsed_ms_saturating(task.started_at, std::time::Instant::now()));
-        if cancel_subagents {
-            // Abort the producer first so it cannot enqueue more TaskTool work
-            // after the ParentSession sweep. Keep the task slot for prompt-id
-            // attribution below; cleanup will take+abort again (idempotent).
+        // Revoke the claimed producer before any terminal or subagent sweep.
+        // Keep the slot for exact prompt attribution and terminal bookkeeping.
+        if let CancelFinalization::Keep(lease) = &finalization {
+            let state = self.state.lock().await;
+            if state.finalization_binding_is_current(lease)
+                && let Some(task) = state.running_task.as_ref()
+                && let Some(epoch) = claimed_turn_epoch
             {
-                let state = self.state.lock().await;
-                if let Some(task) = state.running_task.as_ref()
-                    && let Some(epoch) = claimed_turn_epoch
-                {
-                    self.abort_turn_task(task, epoch);
-                    self.cancel_active_sampling_requests();
-                }
+                self.abort_turn_task(task, epoch);
+                self.cancel_active_sampling_requests();
             }
+        } else {
+            // The legacy rewind fallback may cancel the current task even when
+            // its rewind window has closed. Preserve its front-id guard before
+            // revoking that producer, just as the later bookkeeping does.
+            let state = self.state.lock().await;
+            let front = state
+                .pending_inputs
+                .front()
+                .map(|input| input.prompt_id.as_str());
+            if requested_prompt_id
+                .as_deref()
+                .is_none_or(|id| front == Some(id))
+                && let Some(task) = state.running_task.as_ref()
+            {
+                self.abort_turn_task(task, self.turn_report.epoch());
+                self.cancel_active_sampling_requests();
+            }
+        }
+        if cancel_subagents {
             // Then cancel every non-workflow session child (incl. prior turns)
             // and close spawn admission until the next turn opens it.
             self.cancel_all_session_subagents();
@@ -434,14 +459,11 @@ impl SessionActor {
             self.signals_handle().record_cancellation();
         }
 
-        // Kill all running foreground terminal processes before aborting the task.
+        // Kill foreground processes after revoking the claimed task's pending starts.
         // Each TerminalBackend implementation knows how to kill its own processes.
         // Background tasks are left alive for interactive sessions but killed
         // during subagent teardown (kill_background_tasks = true).
         //
-        // Note: a narrow TOCTOU window exists — the running task could spawn a
-        // new terminal between this call and the abort() below. In practice this
-        // is negligible; abort() drops the future and any child handle it owns.
         let send_now = matches!(trigger, Some(crate::session::CancelTrigger::SendNow));
         if !send_now {
             self.kill_foreground_commands_for_cancel().await;

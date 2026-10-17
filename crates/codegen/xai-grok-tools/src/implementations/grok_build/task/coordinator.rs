@@ -72,6 +72,8 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     /// sweep is a no-op (a cancelled entry frees no running slot).
     draining_queued: bool,
     pending: HashMap<String, PendingChild>,
+    /// Live admission generations, held until terminal presentation.
+    admitted_lifecycles: HashMap<String, crate::notification::AdmittedSubagent>,
     active: HashMap<String, ActiveChild<R::Control>>,
     completed: HashMap<String, CompletedChild>,
     completed_order: VecDeque<String>,
@@ -250,6 +252,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             draining_queued: false,
             config,
             pending: HashMap::new(),
+            admitted_lifecycles: HashMap::new(),
             active: HashMap::new(),
             completed: HashMap::new(),
             completed_order: VecDeque::new(),
@@ -1113,10 +1116,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             subagent_id: id.clone(),
             tx: self.internal_tx.clone(),
         };
+        let admission_generation = self
+            .admitted_lifecycles
+            .get(&id)
+            .map(|life| life.generation().to_owned());
         self.runs.push(TaggedFuture {
             subagent_id: id,
             future: Box::pin(
                 std::panic::AssertUnwindSafe(self.runner.run(ChildRunRequest {
+                    admission_generation,
                     request,
                     cancellation,
                     reporter,
@@ -1410,12 +1418,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         self.running_count_changed();
         let workflow_run_id = request.owner.workflow_run_id().map(str::to_owned);
         let parent_session_id = request.parent_session_id.clone();
+        let lifecycle = self.admitted_lifecycles.remove(id);
+        let admission_generation = lifecycle.as_ref().map(|life| life.generation().to_owned());
         self.runner.on_completed(ChildCompletion {
             request,
+            admission_generation,
             result: output.result,
             completion_data: output.completion_data,
             disposition,
         });
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.completed();
+        }
         if let Some(run_id) = workflow_run_id {
             self.resolve_workflow_cancel_waiters(&run_id);
         }

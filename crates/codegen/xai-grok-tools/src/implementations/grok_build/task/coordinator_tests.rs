@@ -369,6 +369,7 @@ impl ChildRunner for TestRunner {
                 cancellation,
                 reporter,
                 wake_origin: _,
+                admission_generation: _,
                 queued_for,
                 session_running,
             } = run;
@@ -3462,4 +3463,65 @@ async fn workflow_spawns_bypass_the_session_concurrent_limit() {
             .success
     );
     harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_admission_is_delivered_before_start_and_shutdown_is_terminal() {
+    use crate::notification::{BridgeToolNotification, ToolNotificationHandle};
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let filler = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("occupied", true)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("occupied"));
+    let (notifications, mut rx) = ToolNotificationHandle::bridge_channel();
+    let reservation = notifications.reserve_subagent_admission().unwrap();
+    let BridgeToolNotification::ExternalStart(receipt) = rx.recv().await.unwrap() else {
+        panic!("expected receipt")
+    };
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move {
+            backend
+                .spawn_reserved(request("queued-admission", false), Some(reservation))
+                .await
+        }
+    });
+    let BridgeToolNotification::SubagentAdmitted {
+        id,
+        generation,
+        acknowledgement,
+    } = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected admission")
+    };
+    assert_eq!(id, "queued-admission");
+    acknowledgement.send(Ok(())).unwrap();
+    assert_eq!(receipt.await.unwrap(), Ok(()));
+    await_queued(&harness.backend, 1).await;
+    assert!(
+        harness.started.try_recv().is_err(),
+        "queued child has not started"
+    );
+    harness.actor.abort();
+    let _ = harness.actor.await;
+    let BridgeToolNotification::SubagentAdmissionEnded {
+        id,
+        generation: terminal_generation,
+        error,
+    } = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected shutdown terminal")
+    };
+    assert_eq!(id, "queued-admission");
+    assert_eq!(terminal_generation, generation);
+    assert!(error.is_none());
+    filler.abort();
+    queued.abort();
 }

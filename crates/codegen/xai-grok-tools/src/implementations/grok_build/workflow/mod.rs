@@ -239,6 +239,7 @@ fn blank_to_none(v: Option<String>) -> Option<String> {
 #[derive(Debug)]
 pub struct WorkflowLaunchRequest {
     pub input: WorkflowToolInput,
+    pub delivery: Option<crate::notification::BackgroundStartReservation>,
 }
 
 #[derive(Debug)]
@@ -365,11 +366,14 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             ));
         }
 
-        let (depth, sender) = {
+        let (depth, sender, notification_handle) = {
             let res = resources.lock().await;
             let depth = res.get::<SubagentDepthCounter>().map(|d| d.0).unwrap_or(0);
             let sender = res.get::<WorkflowLaunchHandle>().map(|h| h.0.clone());
-            (depth, sender)
+            let notification_handle = res
+                .get::<crate::types::resources::NotificationHandle>()
+                .map(|h| h.0.clone());
+            (depth, sender, notification_handle)
         };
 
         // Workflows stay top-level-only regardless of configurable subagent depth.
@@ -389,9 +393,16 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             )
         })?;
 
+        let scope = ctx
+            .get::<crate::notification::BackgroundDeliveryScope>()
+            .map(|scope| (*scope).clone());
+        let delivery = notification_handle
+            .map(|handle| handle.with_delivery_scope(scope).reserve_delivery())
+            .transpose()
+            .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_unavailable", error))?;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<WorkflowLaunchAck>();
         sender
-            .send((WorkflowLaunchRequest { input }, ack_tx))
+            .send((WorkflowLaunchRequest { input, delivery }, ack_tx))
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom(
                     "workflow_channel_closed",

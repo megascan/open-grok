@@ -2728,10 +2728,8 @@ impl SessionActor {
             None
         }
     }
-    /// Returns true if the error response indicates tokens exceed the
-    /// model's context window. Inspects only the model-metadata
-    /// portion of the [`SamplingErrorInfo`] (the `context_window`
-    /// field) against the session's tracked token estimate.
+    /// Returns true for a provider-reported context overflow or when a
+    /// response's context-window metadata is below the tracked estimate.
     ///
     /// Called from `handle_sampling_failure` with the
     /// `SamplingErrorInfo` the sampler hands back.
@@ -2741,6 +2739,28 @@ impl SessionActor {
     ) -> bool {
         if self.compaction.is_suppressed() {
             return false;
+        }
+        let byte_limit = err.status_code == Some(413)
+            || err
+                .error_code
+                .as_ref()
+                .is_some_and(|code| code.is_byte_size_overflow());
+        if byte_limit
+            || !matches!(
+                err.kind,
+                xai_grok_sampler::SamplingErrorKind::Api
+                    | xai_grok_sampler::SamplingErrorKind::Http
+            )
+        {
+            return false;
+        }
+        if err
+            .error_code
+            .as_ref()
+            .is_some_and(|code| code.is_size_overflow())
+            || xai_grok_sampling_types::is_context_length_error(&err.message)
+        {
+            return true;
         }
         self.estimate_exceeds_error_context_window(err).await
     }
@@ -3409,6 +3429,7 @@ mod inline_auto_compact_flow_tests {
             transient_episode_start: Default::default(),
             rate_limit_waits: Default::default(),
             code_mode_hook_followups: Default::default(),
+            hook_stop_latch: Default::default(),
             sampling_gate: None,
             image_strip_rewrite_barrier: Default::default(),
             mcp_reminder_mode: McpReminderMode::Delta,
@@ -4673,7 +4694,7 @@ mod inline_auto_compact_flow_tests {
         xai_grok_sampler::SamplingErrorInfo {
             kind: xai_grok_sampler::SamplingErrorKind::Api,
             status_code: Some(400),
-            message: "prompt is too long".to_string(),
+            message: "request failed".to_string(),
             is_retryable: false,
             retry_after_secs: None,
             should_retry: None,
@@ -4722,8 +4743,7 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
-    /// If the proxy hasn't been updated yet, model_metadata is None — must be
-    /// a no-op for backwards compatibility.
+    /// Missing metadata alone is not evidence of a context overflow.
     #[tokio::test(flavor = "current_thread")]
     async fn test_compact_on_error_noop_without_model_metadata() {
         let local = tokio::task::LocalSet::new();
@@ -4736,7 +4756,7 @@ mod inline_auto_compact_flow_tests {
                 let err = xai_grok_sampler::SamplingErrorInfo {
                     kind: xai_grok_sampler::SamplingErrorKind::Api,
                     status_code: Some(400),
-                    message: "prompt is too long".to_string(),
+                    message: "request failed".to_string(),
                     is_retryable: false,
                     retry_after_secs: None,
                     should_retry: None,

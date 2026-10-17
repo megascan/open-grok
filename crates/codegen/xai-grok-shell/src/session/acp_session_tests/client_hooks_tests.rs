@@ -3,6 +3,21 @@ use super::*;
 
 const AGENT_SWARM_EXCLUSIVITY_ERROR: &str = "`agent_swarm` must be the only tool call in its batch. Inspect briefly, then make one exclusive agent_swarm call for independent work; use ordinary task calls for heterogeneous small work.";
 
+/// Direct nested dispatch bypasses AgentTask, which normally owns this scope.
+fn install_test_delivery_scope(
+    actor: &mut SessionActor,
+) -> (
+    xai_grok_tools::notification::BackgroundDeliveryGuard,
+    tokio::sync::mpsc::UnboundedReceiver<xai_grok_tools::notification::BridgeToolNotification>,
+) {
+    let (handle, receiver) = xai_grok_tools::notification::ToolNotificationHandle::bridge_channel();
+    let guard = handle.begin_turn_delivery();
+    Arc::get_mut(&mut actor.rebuild_spec)
+        .expect("test rebuild spec is uniquely owned")
+        .tools_notification_handle = handle;
+    (guard, receiver)
+}
+
 #[derive(Default)]
 struct RecordingPermissionClient {
     prompts: std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>>,
@@ -166,6 +181,335 @@ fn spawn_deny_responder(
         gateway_rx,
         move |_| serde_json::json!({ "decision": "deny", "systemMessage": reason }),
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pre_tool_use_force_stop_cancels_prepared_batch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, gateway_rx, _persistence_rx) = test_actor().await;
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::PreToolUse,
+                &["stop-second"],
+            );
+            spawn_run_responder(gateway_rx, |params| {
+                if params["toolUseId"] == "second" {
+                    serde_json::json!({"continue": false, "stopReason": "batch stopped"})
+                } else {
+                    serde_json::json!({})
+                }
+            });
+            let args = r#"{"todos":[{"id":"t1","content":"do","status":"completed"}]}"#;
+            let calls = vec![
+                batch_call("first", "todo_write", args),
+                batch_call("second", "todo_write", args),
+                batch_call("third", "todo_write", args),
+            ];
+            let result = actor.execute_tool_calls(calls, None).await.unwrap();
+            assert!(
+                matches!(result, ToolLoop::HookStop(ref stop) if stop.reason == "batch stopped")
+            );
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let first =
+                tool_result_for_call(&conversation, "first").expect("prepared call has a result");
+            assert!(first.contains("stopped by an earlier hook"), "{first}");
+            assert!(
+                tool_result_for_call(&conversation, "second")
+                    .unwrap()
+                    .contains("batch stopped")
+            );
+            assert!(
+                tool_result_for_call(&conversation, "third")
+                    .unwrap()
+                    .contains("cancelled")
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_tool_use_force_stop_ends_after_recording_tool_result() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, gateway_rx, _persistence_rx) = test_actor().await;
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+            actor
+                .agent
+                .borrow()
+                .tool_bridge()
+                .clone()
+                .register_mcp_tools(
+                    "mock_replacement_tool".into(),
+                    McpReplacementResultTool,
+                    Some(serde_json::json!({"type":"object"})),
+                )
+                .await
+                .unwrap();
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .unwrap();
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::PostToolUse,
+                &["stop-after"],
+            );
+            spawn_run_responder(
+                gateway_rx,
+                |_| serde_json::json!({"continue":false,"stopReason":"post stopped"}),
+            );
+            let result = actor
+                .execute_tool_calls(
+                    vec![batch_call("post", "mock_replacement_tool", "{}")],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, ToolLoop::HookStop(ref stop) if stop.reason == "post stopped")
+            );
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                tool_result_for_call(&conversation, "post")
+                    .unwrap()
+                    .contains("private-original-output")
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_tool_stop_latches_before_slow_client_callback_finishes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, mut gateway_rx, _persistence_rx) = test_actor().await;
+            *actor.current_prompt_id.lock().unwrap() = Some("prompt-a".into());
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::PostToolUse,
+                &["slow", "stop"],
+            );
+            tokio::task::spawn_local(async move {
+                let mut held = Vec::new();
+                while let Some(msg) = gateway_rx.recv().await {
+                    match msg {
+                        xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                            let params: serde_json::Value =
+                                serde_json::from_str(args.request.params.get()).unwrap();
+                            if params["hookCallbackId"] == "stop" {
+                                let response: Arc<serde_json::value::RawValue> =
+                                    serde_json::value::to_raw_value(
+                                        &serde_json::json!({"continue":false,"stopReason":"halt"}),
+                                    )
+                                    .unwrap()
+                                    .into();
+                                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(response)));
+                            } else {
+                                held.push(args.response_tx);
+                            }
+                        }
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let actor = std::rc::Rc::new(actor);
+            let pending = {
+                let actor = actor.clone();
+                tokio::task::spawn_local(async move {
+                    actor
+                        .run_post_tool_use_client_hooks(&post_tool_use_envelope(&actor))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while actor.current_hook_stop().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stop must latch while slow callback remains pending");
+            assert_eq!(actor.current_hook_stop().unwrap().reason, "halt");
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .expect("stop must not wait for the slow callback")
+                .unwrap();
+            assert_eq!(outcome.force_stop.unwrap().reason, "halt");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nested_hook_force_stop_cancels_cell_and_is_scoped_to_exact_turn() {
+    use xai_grok_code_mode_protocol::{
+        CellId, CodeModeNestedToolCall, CodeModeToolKind, ToolName, nested_tool_progress_channel,
+    };
+    for event in [
+        xai_grok_hooks::event::HookEventName::PreToolUse,
+        xai_grok_hooks::event::HookEventName::PostToolUse,
+    ] {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+                let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+                *actor.current_prompt_id.lock().unwrap() = Some("prompt-a".into());
+                *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+                actor
+                    .agent
+                    .borrow()
+                    .tool_bridge()
+                    .clone()
+                    .register_mcp_tools(
+                        "mock_replacement_tool".into(),
+                        McpReplacementResultTool,
+                        Some(serde_json::json!({"type":"object"})),
+                    )
+                    .await
+                    .unwrap();
+                actor
+                    .workspace_ops
+                    .bind_local_session(
+                        &actor.session_id_string(),
+                        actor.tool_context.cwd.as_path().to_path_buf(),
+                        actor.tool_context.hunk_tracker_handle.clone(),
+                        actor.agent.borrow().tool_bridge().toolset(),
+                        None,
+                    )
+                    .unwrap();
+                install_client_hook(&actor, event, &["force-stop"]);
+                let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = seen.clone();
+                spawn_run_responder(gateway_rx, move |_| {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!({"continue": false, "stopReason": "nested stopped"})
+                });
+                let invocation = || CodeModeNestedToolCall {
+                    cell_id: CellId::new("test-cell".into()),
+                    runtime_tool_call_id: "nested".into(),
+                    tool_name: ToolName::plain("mock_replacement_tool"),
+                    tool_kind: CodeModeToolKind::Function,
+                    input: Some(serde_json::json!({})),
+                };
+                let token = tokio_util::sync::CancellationToken::new();
+                let (progress, _) = nested_tool_progress_channel();
+                let _ = actor
+                    .dispatch_code_mode_nested_tool(invocation(), token.clone(), progress)
+                    .await;
+                assert!(
+                    token.is_cancelled(),
+                    "the cell must stop even if JavaScript catches the tool error"
+                );
+                assert_eq!(actor.current_hook_stop().unwrap().reason, "nested stopped");
+                assert!(actor.current_hook_stop_token().unwrap().is_cancelled());
+                let (progress, _) = nested_tool_progress_channel();
+                let later = actor
+                    .dispatch_code_mode_nested_tool(
+                        invocation(),
+                        tokio_util::sync::CancellationToken::new(),
+                        progress,
+                    )
+                    .await;
+                assert!(later.is_err());
+                assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let old_identity = actor.hook_stop_identity().unwrap();
+                actor.turn_report.start_next_turn();
+                assert!(actor.current_hook_stop().is_none());
+                assert!(!actor.current_hook_stop_token().unwrap().is_cancelled());
+                assert!(!actor.record_hook_stop_for(
+                    &old_identity,
+                    xai_grok_hooks::dispatcher::StopBlock {
+                        hook_name: "old".into(),
+                        reason: "late".into()
+                    }
+                ));
+                *actor.current_prompt_id.lock().unwrap() = Some("prompt-b".into());
+                assert!(actor.current_hook_stop().is_none());
+            })
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_tool_restrictions_block_direct_and_nested_calls() {
+    use xai_grok_code_mode_protocol::{
+        CellId, CodeModeNestedToolCall, CodeModeToolKind, ToolName, nested_tool_progress_channel,
+    };
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, gateway_rx, _persistence_rx) = test_actor().await;
+            *actor.current_prompt_id.lock().unwrap() = Some("restricted-turn".into());
+            let dir = tempfile::tempdir().unwrap();
+            let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+            crate::agent::config::CliAgentOverrides {
+                tools: Some(vec!["read_file".into()]),
+                disallowed_tools: Some(vec!["run_terminal_cmd".into()]),
+                ..Default::default()
+            }
+            .apply_to_definition(&mut definition);
+            *actor.agent.borrow_mut() = xai_grok_agent::AgentBuilder::new(
+                dir.path().to_owned(),
+                Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+                xai_grok_tools::notification::ToolNotificationHandle::noop(),
+            )
+            .from_definition(definition)
+            .build()
+            .await
+            .unwrap();
+            spawn_run_responder(gateway_rx, |_| serde_json::json!({}));
+            let (progress, _) = nested_tool_progress_channel();
+            let nested = actor
+                .dispatch_code_mode_nested_tool(
+                    CodeModeNestedToolCall {
+                        cell_id: CellId::new("restricted".into()),
+                        runtime_tool_call_id: "nested-denied".into(),
+                        tool_name: ToolName::plain("run_terminal_cmd"),
+                        tool_kind: CodeModeToolKind::Function,
+                        input: Some(serde_json::json!({"command":"echo forbidden"})),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                    progress,
+                )
+                .await;
+            assert!(nested.is_err(), "nested denied tool must not run");
+            let result = actor
+                .execute_tool_calls(
+                    vec![batch_call(
+                        "direct-denied",
+                        "run_terminal_cmd",
+                        r#"{"command":"echo forbidden"}"#,
+                    )],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(result, ToolLoop::Continue));
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let result =
+                tool_result_for_call(&conversation, "direct-denied").expect("denied call result");
+            assert!(
+                !result.contains("forbidden\n"),
+                "denied tool must not execute: {result}"
+            );
+            assert!(
+                actor
+                    .agent
+                    .borrow()
+                    .tool_bridge()
+                    .tool_kind("run_terminal_cmd")
+                    .is_none()
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -611,6 +955,8 @@ impl xai_tool_runtime::Tool for McpReplacementResultTool {
 async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_outer_result() {
     tokio::task::LocalSet::new().run_until(async {
         let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+        let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+        *actor.current_prompt_id.lock().unwrap() = Some("nested-test".into());
         *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
         actor.agent.borrow().tool_bridge().clone().register_mcp_tools(
             "mock_replacement_tool".into(),
@@ -667,6 +1013,103 @@ async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_ou
         assert!(!conversation.iter().any(|item| item.text_content().contains("private-original-output")));
         assert!(actor.code_mode_hook_followups.borrow().is_empty());
     }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delivered_nested_post_hook_notes_trigger_compaction_and_preflight() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+            let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+            *actor.current_prompt_id.lock().unwrap() = Some("compaction-hook-test".into());
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+            actor
+                .agent
+                .borrow()
+                .tool_bridge()
+                .clone()
+                .register_mcp_tools(
+                    "mock_replacement_tool".into(),
+                    McpReplacementResultTool,
+                    Some(serde_json::json!({"type": "object"})),
+                )
+                .await
+                .unwrap();
+            install_client_hook(
+                &actor,
+                xai_grok_hooks::event::HookEventName::PostToolUse,
+                &["large-post-hook"],
+            );
+            spawn_run_responder(gateway_rx, |_| {
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": "large-feedback-".repeat(500),
+                    "additionalContext": "large-context-".repeat(500),
+                })
+            });
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .unwrap();
+
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.context_window = std::num::NonZeroU64::new(1_500).unwrap();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.compaction.threshold_percent.set(85);
+            assert!(actor.check_auto_compact_needed().await.is_none());
+            assert!(actor.check_preflight_overflow().await.is_none());
+
+            let (progress, _receiver) = xai_grok_code_mode_protocol::nested_tool_progress_channel();
+            actor
+                .dispatch_code_mode_nested_tool(
+                    xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                        cell_id: xai_grok_code_mode_protocol::CellId::new("compact-cell".into()),
+                        runtime_tool_call_id: "compact-nested-call".into(),
+                        tool_name: xai_grok_code_mode_protocol::ToolName::plain(
+                            "mock_replacement_tool",
+                        ),
+                        tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                        input: Some(serde_json::json!({})),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                    progress,
+                )
+                .await
+                .unwrap();
+            actor
+                .chat_state_handle
+                .push_tool_result(ConversationItem::tool_result("outer-exec", "outer-result"));
+            let before = actor.chat_state_handle.get_estimated_total_tokens().await;
+            assert!(actor.check_auto_compact_needed().await.is_none());
+            assert!(actor.check_preflight_overflow().await.is_none());
+
+            actor.execute_tool_calls(Vec::new(), None).await.unwrap();
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                conversation
+                    .iter()
+                    .any(|item| item.text_content().contains("large-context-"))
+            );
+            assert!(
+                conversation
+                    .iter()
+                    .any(|item| item.text_content().contains("large-feedback-"))
+            );
+            let after = actor.chat_state_handle.get_estimated_total_tokens().await;
+            assert!(
+                after > before,
+                "delivered hook notes must increase the estimate"
+            );
+            assert!(actor.check_auto_compact_needed().await.is_some());
+            assert!(actor.check_preflight_overflow().await.is_some());
+        })
+        .await;
 }
 
 #[derive(Clone, Debug)]
@@ -726,6 +1169,8 @@ impl xai_tool_runtime::Tool for BlockingPathTool {
 async fn nested_and_normal_dispatch_share_file_locks_and_release_on_cancel() {
     tokio::task::LocalSet::new().run_until(async {
         let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+        let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+        *actor.current_prompt_id.lock().unwrap() = Some("nested-test".into());
         *actor.agent.borrow_mut() = test_agent_with_tools(vec![
             xai_grok_tools::registry::types::ToolConfig::from_id("Codex:apply_patch"),
         ]).await;
@@ -820,6 +1265,108 @@ async fn nested_and_normal_dispatch_share_file_locks_and_release_on_cancel() {
         patch.await.unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(patched_file).unwrap(), "created\n");
     }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hook_stop_prevents_normal_and_nested_tools_waiting_on_file_lock() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut actor, gateway_rx, _persistence_rx) = test_actor().await;
+            let (_delivery_guard, _delivery_rx) = install_test_delivery_scope(&mut actor);
+            *actor.current_prompt_id.lock().unwrap() = Some("lock-stop".into());
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let holder_release = Arc::new(tokio::sync::Notify::new());
+            actor
+                .agent
+                .borrow()
+                .tool_bridge()
+                .clone()
+                .register_mcp_tools(
+                    "blocking_path_tool".into(),
+                    BlockingPathTool {
+                        entered: entered_tx,
+                        normal_release: Arc::new(tokio::sync::Notify::new()),
+                        nested_release: holder_release.clone(),
+                    },
+                    Some(serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"label":{"type":"string"}}})),
+                )
+                .await
+                .unwrap();
+            spawn_run_responder(gateway_rx, |_| serde_json::json!({}));
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .unwrap();
+            let actor = std::rc::Rc::new(actor);
+            let nested = |label: &'static str| {
+                let actor = actor.clone();
+                tokio::task::spawn_local(async move {
+                    let (progress, _receiver) =
+                        xai_grok_code_mode_protocol::nested_tool_progress_channel();
+                    actor
+                        .dispatch_code_mode_nested_tool(
+                            xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                                cell_id: xai_grok_code_mode_protocol::CellId::new("lock-stop-cell".into()),
+                                runtime_tool_call_id: label.into(),
+                                tool_name: xai_grok_code_mode_protocol::ToolName::plain("blocking_path_tool"),
+                                tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                                input: Some(serde_json::json!({"path":"/tmp/stop-lock", "label":label})),
+                            },
+                            tokio_util::sync::CancellationToken::new(),
+                            progress,
+                        )
+                        .await
+                })
+            };
+            let holder = nested("nested-first");
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "nested-first"
+            );
+            let queued_nested = nested("queued-nested");
+            let queued_normal = {
+                let actor = actor.clone();
+                tokio::task::spawn_local(async move {
+                    actor
+                        .execute_tool_calls(
+                            vec![batch_call(
+                                "queued-normal",
+                                "blocking_path_tool",
+                                r#"{"path":"/tmp/stop-lock","label":"queued-normal"}"#,
+                            )],
+                            None,
+                        )
+                        .await
+                })
+            };
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv()).await.is_err());
+            assert!(!queued_nested.is_finished());
+            assert!(!queued_normal.is_finished());
+            let identity = actor.hook_stop_identity().unwrap();
+            assert!(actor.record_hook_stop_for(
+                &identity,
+                xai_grok_hooks::dispatcher::StopBlock {
+                    hook_name: "test-stop".into(),
+                    reason: "stop waiting tools".into(),
+                },
+            ));
+            holder_release.notify_one();
+            let _ = holder.await.unwrap();
+            assert!(queued_nested.await.unwrap().is_err());
+            let _ = queued_normal.await.unwrap();
+            assert!(entered_rx.try_recv().is_err(), "waiting tools must not run after the stop");
+        })
+        .await;
 }
 
 impl xai_grok_tools::types::tool_metadata::ToolMetadata for McpErrorResultTool {

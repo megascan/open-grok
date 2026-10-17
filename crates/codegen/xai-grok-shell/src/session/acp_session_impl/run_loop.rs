@@ -2385,21 +2385,23 @@ pub(super) async fn run_session(
                                 tracker.lock().is_unreported_completion(&run_id, revision)
                             };
                             if !should_wake {
+                                crate::session::workflow::notify::emit_workflow_wake_decision(&session.notifications.gateway, &run_id, revision, false);
                                 continue;
                             }
                             let prompt_id = format!("workflow-completed-{run_id}-{revision}");
                             let prompt_text = "A background workflow stopped or is blocked. Review the workflow completion reminder and report the result to the user. If it is blocked, the reminder states what it needs — resolve the blocker yourself when you can and resume the run; otherwise surface it to the user.";
-                            let (respond_to, _) = tokio::sync::oneshot::channel();
+                            let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
                             {
                                 let mut state = session.state.lock().await;
                                 let workflow_wake_queued = state.pending_inputs.iter().any(|item| {
                                     matches!(item.origin, super::PromptOrigin::WorkflowCompleted { .. })
                                 });
                                 if workflow_wake_queued {
+                                    crate::session::workflow::notify::emit_workflow_wake_decision(&session.notifications.gateway, &run_id, revision, false);
                                     continue;
                                 }
                                 state.pending_inputs.push_back(InputItem {
-                                    prompt_id,
+                                    prompt_id: prompt_id.clone(),
                                     prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt_text))],
                                     prompt_mode: crate::session::plan_mode::PromptMode::Agent,
                                     trace_gcs_config: None,
@@ -2422,6 +2424,12 @@ pub(super) async fn run_session(
                                     traceparent: None,
                                 });
                             }
+                            crate::session::workflow::notify::emit_workflow_wake_decision(&session.notifications.gateway, &run_id, revision, true);
+                            let gateway = session.notifications.gateway.clone();
+                            tokio::task::spawn_local(async move {
+                                let _ = completion_rx.await;
+                                crate::session::workflow::notify::emit_wake_resolved(&gateway, &prompt_id);
+                            });
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::TakeTurnMessages { respond_to } => {

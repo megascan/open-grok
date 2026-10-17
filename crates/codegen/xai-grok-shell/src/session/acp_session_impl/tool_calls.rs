@@ -644,9 +644,18 @@ impl SessionActor {
         final_result: &mut Option<ToolLoop>,
         requested_model: Option<&str>,
     ) -> Result<(), acp::Error> {
+        let delivery_scope = self
+            .rebuild_spec
+            .tools_notification_handle
+            .current_delivery_scope();
         let mut approved: Vec<PreparedToolCall> = Vec::new();
         let mut mcp_file_budget = mcp_file_input::McpFileBatchBudget::default();
         for call in tool_calls.into_iter() {
+            if final_result.is_none() {
+                if let Some(stop) = self.current_hook_stop() {
+                    *final_result = Some(ToolLoop::HookStop(stop));
+                }
+            }
             if final_result.is_some() {
                 let message = match &*final_result {
                     Some(ToolLoop::PermissionReject { .. }) => {
@@ -738,12 +747,22 @@ impl SessionActor {
                         ToolLoop::PermissionReject { .. }
                             | ToolLoop::Cancelled
                             | ToolLoop::FollowupMessage(_)
+                            | ToolLoop::HookStop(_)
                     ) && final_result.is_none()
                     {
                         *final_result = Some(tool_loop);
                     }
                 }
             }
+        }
+        if final_result.is_none() {
+            if let Some(stop) = self.current_hook_stop() {
+                *final_result = Some(ToolLoop::HookStop(stop));
+            }
+        }
+        if matches!(final_result, Some(ToolLoop::HookStop(_))) {
+            self.cancel_prepared_after_hook_stop(approved).await?;
+            return Ok(());
         }
         if approved.iter().any(|p| p.tool_name == "search_tool") {
             self.retry_auth_required_servers().await;
@@ -771,6 +790,11 @@ impl SessionActor {
         ) {
             self.promote_queued_as_interjections().await;
         }
+        if let Some(stop) = self.current_hook_stop() {
+            *final_result = Some(ToolLoop::HookStop(stop));
+            self.cancel_prepared_after_hook_stop(approved).await?;
+            return Ok(());
+        }
         let pending_interjections = self.pending_interjections.clone();
         let parent_interject = self.tool_context.parent_interject.clone();
         let native_agents_enabled = {
@@ -782,6 +806,7 @@ impl SessionActor {
         let session_cwd = self.session_info.cwd.clone();
         let turn = i64::try_from(self.current_turn_number.get()).ok();
         let display_cwd = self.display_cwd.get().cloned();
+        let hook_stop_token = self.current_hook_stop_token();
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -800,6 +825,8 @@ impl SessionActor {
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let session_cwd = session_cwd.clone();
                 let display_cwd = display_cwd.clone();
+                let hook_stop_token = hook_stop_token.clone();
+                let delivery_scope = delivery_scope.clone();
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, prepared.authored_arguments())
                         || (native_agents_enabled && prepared.tool_name == "wait_agent");
@@ -860,6 +887,8 @@ impl SessionActor {
                         let file_locks = file_locks.clone();
                         let latest_slot = std::sync::Arc::clone(&latest_slot);
                         let origin = origin.clone();
+                        let hook_stop_token = hook_stop_token.clone();
+                        let delivery_scope = delivery_scope.clone();
                         async move {
                             let slot =
                                 xai_grok_tools::types::source_summary::SourceSummarySlot::new();
@@ -870,6 +899,12 @@ impl SessionActor {
                                     prepared.is_read_only,
                                     prepared.is_edit,
                                 ).await;
+                                if hook_stop_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+                                    return Err(xai_tool_runtime::ToolError::new(
+                                        xai_tool_runtime::ToolErrorKind::Cancelled,
+                                        "Tool execution stopped by a hook".to_string(),
+                                    ));
+                                }
                                 dispatch_observed(
                                     &workspace_ops,
                                     &prepared,
@@ -877,6 +912,7 @@ impl SessionActor {
                                     origin,
                                     slot,
                                     Some(sandbox_transport),
+                                    delivery_scope,
                                 )
                                 .await
                             };
@@ -1089,6 +1125,11 @@ impl SessionActor {
                                     Some(duration_ms),
                                 )
                                 .await;
+                            if let Some(stop) = delivery.force_stop.clone() {
+                                if final_result.is_none() {
+                                    *final_result = Some(ToolLoop::HookStop(stop));
+                                }
+                            }
                             let replacement = delivery.model_output.take();
                             post_tool_use_delivery = Some(delivery);
                             (replacement, scrollback)
@@ -1165,6 +1206,7 @@ impl SessionActor {
                 ToolLoop::Cancelled => crate::session::events::ToolOutcome::PermissionCancelled,
                 ToolLoop::FollowupMessage(_) => crate::session::events::ToolOutcome::Followup,
                 ToolLoop::HookDenied { .. } => crate::session::events::ToolOutcome::HookDenied,
+                ToolLoop::HookStop(_) => crate::session::events::ToolOutcome::HookDenied,
                 ToolLoop::NonExistingTool | ToolLoop::ToolParsingError => {
                     crate::session::events::ToolOutcome::InvalidTool
                 }
@@ -1261,6 +1303,22 @@ impl SessionActor {
         Ok(())
     }
 
+    async fn cancel_prepared_after_hook_stop(
+        &self,
+        approved: Vec<PreparedToolCall>,
+    ) -> Result<(), acp::Error> {
+        for prepared in approved {
+            self.handle_tool_not_executed(
+                &prepared.call_id,
+                &prepared.tool_call_id,
+                "Tool execution stopped by an earlier hook".to_string(),
+            )
+            .await?;
+            self.events.tool_finished();
+        }
+        Ok(())
+    }
+
     /// Dispatch a tool invoked from an embedded Code Mode cell through the
     /// same parsing, plan-mode, hook, permission, auth-retry, and workspace
     /// path as a model-emitted function call. The result is returned to the
@@ -1273,12 +1331,49 @@ impl SessionActor {
         cancellation_token: tokio_util::sync::CancellationToken,
         progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> Result<serde_json::Value, String> {
-        MODEL_TOOL_RESULT_SINK
-            .scope(ModelToolResultSink::CodeMode, async move {
-                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token, progress)
-                    .await
+        // A yielded cell may keep an already-dispatched call alive after the
+        // model turn ends. Hold a parent receipt while that call can still
+        // register starts in its own independent scope.
+        let parent_scope = self
+            .rebuild_spec
+            .tools_notification_handle
+            .current_delivery_scope()
+            .ok_or_else(|| "Code Mode has no active delivery scope".to_owned())?;
+        // Interactive yielded cells may legitimately span turns; only
+        // headless needs to hold the prompt open for an in-flight nested call.
+        let mut delivery = if parent_scope.is_headless() {
+            Some(
+                self.rebuild_spec
+                    .tools_notification_handle
+                    .with_delivery_scope(Some(parent_scope.clone()))
+                    .reserve_delivery()?,
+            )
+        } else {
+            None
+        };
+        if let Some(delivery) = &mut delivery {
+            delivery.mark_started();
+        }
+        let nested_scope = parent_scope.child();
+        let result = MODEL_TOOL_RESULT_SINK
+            .scope(ModelToolResultSink::CodeMode, async {
+                self.dispatch_code_mode_nested_tool_inner(
+                    invocation,
+                    cancellation_token,
+                    progress,
+                    nested_scope.clone(),
+                )
+                .await
             })
-            .await
+            .await;
+        let receipt = nested_scope
+            .wait_bounded(std::time::Duration::from_secs(30))
+            .await;
+        if let Some(delivery) = delivery {
+            delivery.resolve(receipt.clone());
+        }
+        receipt?;
+        result
     }
 
     /// `notify()` emits an additional custom-tool output for the active exec
@@ -1296,9 +1391,18 @@ impl SessionActor {
         invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
         cancellation_token: tokio_util::sync::CancellationToken,
         progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
+        delivery_scope: xai_grok_tools::notification::BackgroundDeliveryScope,
     ) -> Result<serde_json::Value, String> {
         use xai_grok_code_mode_protocol::{CodeModeToolKind, PUBLIC_TOOL_NAME, WAIT_TOOL_NAME};
 
+        let identity = self
+            .hook_stop_identity()
+            .ok_or_else(|| "Code Mode has no active prompt".to_string())?;
+
+        if let Some(stop) = self.current_hook_stop() {
+            cancellation_token.cancel();
+            return Err(stop.reason);
+        }
         let tool_name = invocation.tool_name.name;
         if matches!(tool_name.as_str(), PUBLIC_TOOL_NAME | WAIT_TOOL_NAME) {
             return Err(format!("`{tool_name}` cannot invoke itself from Code Mode"));
@@ -1357,6 +1461,11 @@ impl SessionActor {
                     Err(ToolLoop::HookDenied { hook_name }) => {
                         return Err(format!("hook `{hook_name}` denied `{tool_name}`"));
                     }
+                    Err(ToolLoop::HookStop(stop)) => {
+                        self.record_hook_stop_for(&identity, stop.clone());
+                        cancellation_token.cancel();
+                        return Err(stop.reason);
+                    }
                     Err(ToolLoop::Cancelled) => {
                         return Err(format!("Code Mode tool `{tool_name}` was cancelled"));
                     }
@@ -1373,6 +1482,20 @@ impl SessionActor {
                 }
             }
         };
+
+        if self.hook_stop_identity().as_ref() != Some(&identity)
+            || self.current_hook_stop().is_some()
+        {
+            self.handle_tool_not_executed(
+                &prepared.call_id,
+                &prepared.tool_call_id,
+                "Tool execution stopped with its turn".to_string(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            cancellation_token.cancel();
+            return Err("Code Mode tool execution stopped with its turn".to_string());
+        }
 
         // Bind observations to the real task before dispatch yields: an
         // interjection during execution must not reattribute an older tool
@@ -1445,6 +1568,15 @@ impl SessionActor {
                 .file_dispatch_locks
                 .lock(lock_path.clone(), prepared.is_read_only, prepared.is_edit)
                 .await;
+            if self.hook_stop_identity().as_ref() != Some(&identity)
+                || self.current_hook_stop().is_some()
+            {
+                cancellation_token.cancel();
+                return Err(xai_tool_runtime::ToolError::new(
+                    xai_tool_runtime::ToolErrorKind::Cancelled,
+                    "Code Mode tool execution stopped with its turn".to_string(),
+                ));
+            }
             dispatch_code_mode_nested_tool_streaming(
                 &self.workspace_ops,
                 &prepared,
@@ -1452,6 +1584,7 @@ impl SessionActor {
                 &cancellation_token,
                 &progress,
                 Some(sandbox_transport.clone()),
+                Some(delivery_scope.clone()),
                 |update| self.send_update(acp::SessionUpdate::ToolCallUpdate(update), None),
             )
             .await
@@ -1574,6 +1707,10 @@ impl SessionActor {
                                     Some(duration_ms),
                                 )
                                 .await;
+                            if let Some(stop) = delivery.force_stop.clone() {
+                                self.record_hook_stop_for(&identity, stop);
+                                cancellation_token.cancel();
+                            }
                             (Some(delivery), scrollback, Vec::new())
                         };
                     let model_output_override = delivery
@@ -1740,11 +1877,17 @@ impl SessionActor {
     ) -> Result<Result<PreToolUseGate, ToolLoop>, acp::Error> {
         let mut envelope = self.make_pre_tool_use_envelope(resolved_tool_name, &call.id, raw_input);
         let mut gate = PreToolUseGate::default();
+        let identity = self.hook_stop_identity();
         let hook_registry_snapshot = self.hook_registry.borrow().clone();
         if let Some(registry) = hook_registry_snapshot {
             let ctx = self.hook_run_ctx();
             let pre_result =
                 xai_grok_hooks::dispatcher::dispatch_pre_tool_use(&registry, &envelope, &ctx).await;
+            if let (Some(identity), Some(stop)) =
+                (identity.as_ref(), pre_result.force_stop.as_ref())
+            {
+                self.record_hook_stop_for(identity, stop.clone());
+            }
             self.send_hook_execution(
                 "pre_tool_use",
                 Some(resolved_tool_name),
@@ -1758,6 +1901,11 @@ impl SessionActor {
                 &pre_result.results,
             )
             .await;
+            if let Some(stop) = pre_result.force_stop {
+                return Ok(Err(self
+                    .stop_tool_by_hook(&call.id, tool_call_id, resolved_tool_name, stop)
+                    .await?));
+            }
             match pre_result.decision {
                 HookDecision::Deny { reason, hook_name } => {
                     return Ok(Err(self

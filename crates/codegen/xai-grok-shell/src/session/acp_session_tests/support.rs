@@ -521,6 +521,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: Default::default(),
         code_mode_hook_followups: Default::default(),
+        hook_stop_latch: Default::default(),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::default(),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),

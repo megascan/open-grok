@@ -95,6 +95,8 @@ pub struct WakeOrigin {
 /// Input to one runtime-specific child run.
 pub struct ChildRunRequest<C> {
     pub request: SubagentRequest,
+    /// Opaque identity for a model-task admission, if lifecycle tracking is active.
+    pub admission_generation: Option<String>,
     pub cancellation: CancellationToken,
     pub reporter: ChildReporter<C>,
     /// Set when this run continues a finished non-workflow child in place.
@@ -126,6 +128,7 @@ pub struct CompletionDisposition {
 /// Terminal event delivered to the runtime adapter after state is committed.
 pub struct ChildCompletion<D> {
     pub request: SubagentRequest,
+    pub admission_generation: Option<String>,
     pub result: SubagentResult,
     pub completion_data: D,
     pub disposition: CompletionDisposition,

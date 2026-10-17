@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
-use xai_grok_workspace::session::git::find_git_root_from_path;
 pub use xai_grok_workspace::worktree::*;
 const WORKTREE_LOG: &str = "xai_worktree";
 impl From<ShellWorktreeType> for WorktreeType {
@@ -67,34 +66,15 @@ async fn create_worktree_for_resume(
     }
 }
 /// Best-effort cleanup of a worktree created during a failed resume flow.
-async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
-    let path = std::path::PathBuf::from(worktree_path);
-    let source = std::path::PathBuf::from(source_cwd);
-    let is_jj = find_git_root_from_path(&source)
-        .ok()
-        .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj());
-    if is_jj {
-        if let Err(error) = remove_jj_workspace(worktree_path).await {
-            tracing::warn!(error = %error, "failed to clean up jj workspace after failure");
-        }
-        return;
-    }
-    match tokio::task::spawn_blocking(move || {
-        xai_fast_worktree::remove_worktree(&path)?;
-        if let Ok(root) = find_git_root_from_path(&source) {
-            xai_fast_worktree::remove_stale_worktree_registration(&root, &path);
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "worktree cleanup failed; retaining remaining data")
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "worktree cleanup task failed; retaining remaining data")
-        }
+async fn cleanup_worktree_on_failure(worktree_path: &str) {
+    let request = RemoveWorktreeRequest {
+        worktree_path: Some(worktree_path.to_owned()),
+        id_or_path: None,
+        force: false,
+        dry_run: false,
+    };
+    if let Err(error) = remove_worktree(&request, &BackgroundCopyContext::new()).await {
+        tracing::warn!(error = %error, "worktree cleanup failed; retaining remaining data");
     }
 }
 
@@ -235,7 +215,7 @@ pub(crate) async fn resume_session_in_worktree(
     )
     .await?;
     let dest = wt_resp.worktree_path.clone();
-    let source_cwd = req.source_cwd.clone();
+    let created = wt_resp.status == "created";
     match restore_remote_session_into_worktree(
         req,
         ops,
@@ -248,7 +228,9 @@ pub(crate) async fn resume_session_in_worktree(
     {
         Ok(resp) => Ok(resp),
         Err(e) => {
-            cleanup_worktree_on_failure(&source_cwd, &dest).await;
+            if created {
+                cleanup_worktree_on_failure(&dest).await;
+            }
             Err(e)
         }
     }
@@ -439,7 +421,9 @@ async fn resume_local_session_in_worktree(
     let fork_resp = match fork_session(fork_req, agent_id, auth_manager).await {
         Ok(r) => r,
         Err(e) => {
-            cleanup_worktree_on_failure(resolved_source_cwd, &wt_resp.worktree_path).await;
+            if wt_resp.status == "created" {
+                cleanup_worktree_on_failure(&wt_resp.worktree_path).await;
+            }
             return Err(anyhow::anyhow!("Failed to fork session into worktree: {e}"));
         }
     };
@@ -1092,7 +1076,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn cleanup_worktree_on_failure_removes_created_worktree() {
+    async fn cleanup_worktree_on_failure_preserves_active_creator_and_source() {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo_path = tmp.path().join("repo");
         std::fs::create_dir(&repo_path).unwrap();
@@ -1111,12 +1095,28 @@ mod tests {
         .expect("worktree creation should succeed");
         let wt_path = std::path::Path::new(&wt_resp.worktree_path);
         assert!(wt_path.exists(), "worktree should exist before cleanup");
-        cleanup_worktree_on_failure(&source_cwd, &wt_resp.worktree_path).await;
+        cleanup_worktree_on_failure(&wt_resp.worktree_path).await;
         assert!(
-            !wt_path.exists(),
-            "worktree directory should be removed after cleanup",
+            wt_path.exists(),
+            "a live creator keeps the worktree protected during cleanup",
         );
         assert!(repo_path.join("file.txt").exists());
+        xai_fast_worktree::remove_worktree(wt_path).unwrap();
+    }
+    #[tokio::test]
+    async fn cleanup_worktree_on_failure_rejects_unmanaged_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        git_commit_all(&repo, "initial");
+        cleanup_worktree_on_failure(repo.to_str().unwrap()).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "original"
+        );
+        assert!(repo.join(".git").is_dir());
     }
     #[test]
     fn worktree_base_dir_extracts_repo_name() {

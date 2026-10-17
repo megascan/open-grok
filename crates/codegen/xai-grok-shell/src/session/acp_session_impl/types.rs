@@ -130,6 +130,60 @@ pub(crate) enum ToolLoop {
     HookDenied {
         hook_name: String,
     },
+    /// A hook requested that the entire current turn stop.
+    HookStop(xai_grok_hooks::dispatcher::StopBlock),
+}
+
+/// A stop is valid only for the exact turn which observed it.
+#[derive(Debug, Default)]
+pub(crate) struct HookStopLatch {
+    value: std::cell::RefCell<Option<(TurnEpoch, String, xai_grok_hooks::dispatcher::StopBlock)>>,
+    token: std::cell::RefCell<Option<(TurnEpoch, String, tokio_util::sync::CancellationToken)>>,
+}
+
+impl HookStopLatch {
+    pub(super) fn get(
+        &self,
+        epoch: TurnEpoch,
+        prompt_id: &str,
+    ) -> Option<xai_grok_hooks::dispatcher::StopBlock> {
+        self.value
+            .borrow()
+            .as_ref()
+            .and_then(|(stored_epoch, stored_prompt, stop)| {
+                (*stored_epoch == epoch && stored_prompt == prompt_id).then(|| stop.clone())
+            })
+    }
+
+    pub(super) fn set(
+        &self,
+        epoch: TurnEpoch,
+        prompt_id: String,
+        stop: xai_grok_hooks::dispatcher::StopBlock,
+    ) {
+        let mut value = self.value.borrow_mut();
+        if !matches!(value.as_ref(), Some((e, p, _)) if *e == epoch && *p == prompt_id) {
+            *value = Some((epoch, prompt_id.clone(), stop));
+        }
+        drop(value);
+        self.token(epoch, &prompt_id).cancel();
+    }
+
+    pub(super) fn token(
+        &self,
+        epoch: TurnEpoch,
+        prompt_id: &str,
+    ) -> tokio_util::sync::CancellationToken {
+        let mut token = self.token.borrow_mut();
+        if !matches!(token.as_ref(), Some((e, p, _)) if *e == epoch && p == prompt_id) {
+            *token = Some((
+                epoch,
+                prompt_id.to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+        }
+        token.as_ref().expect("installed token").2.clone()
+    }
 }
 
 /// Why the TodoGate fired. Single variant today; kept as an enum so

@@ -1,7 +1,7 @@
 use super::*;
 use xai_grok_hooks::dispatcher::{
     AdditionalContext, OutputReplacement, PostToolUseBlock, PostToolUseResult, ReplacementChoice,
-    ReplacementKind, SelectedReplacement,
+    ReplacementKind, SelectedReplacement, StopBlock,
 };
 use xai_grok_hooks::event::{MAX_HOOK_OUTPUT_REPLACEMENT_CHARS, clip_text};
 use xai_grok_hooks::result::HookRunResult;
@@ -11,6 +11,7 @@ pub(super) struct PostToolUseDelivery {
     pub model_output: Option<String>,
     pub additional_context: Vec<AdditionalContext>,
     pub blocks: Vec<PostToolUseBlock>,
+    pub force_stop: Option<StopBlock>,
 }
 
 struct Rejection {
@@ -41,6 +42,7 @@ pub(super) fn plan_post_tool_use_delivery(
         model_output,
         additional_context: result.additional_context,
         blocks: result.blocks,
+        force_stop: result.force_stop,
     }
 }
 

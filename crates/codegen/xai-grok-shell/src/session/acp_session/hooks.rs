@@ -154,6 +154,23 @@ fn gate_failure_reason(outcome: ClientHookGateOutcome) -> Option<&'static str> {
     }
 }
 
+pub(super) fn client_hook_force_stop(
+    callback_id: &str,
+    response: &ClientHookResponse,
+) -> Option<xai_grok_hooks::dispatcher::StopBlock> {
+    if response.continue_ != Some(false) {
+        return None;
+    }
+    let hook_name = format!("client:{callback_id}");
+    let reason = response
+        .stop_reason
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| clip_text(s, MAX_HOOK_FEEDBACK_CHARS))
+        .unwrap_or_else(|| format!("Stopped by hook '{hook_name}'"));
+    Some(xai_grok_hooks::dispatcher::StopBlock { hook_name, reason })
+}
+
 struct OrderedGateResponse<'a> {
     callback_id: &'a str,
     response: ClientHookResponse,
@@ -162,6 +179,56 @@ struct OrderedGateResponse<'a> {
 }
 
 impl SessionActor {
+    pub(super) fn hook_stop_identity(&self) -> Option<(super::TurnEpoch, String)> {
+        let prompt = self.current_prompt_id.lock().ok()?.clone()?;
+        Some((self.turn_report.epoch(), prompt))
+    }
+
+    /// Return a stop only for the currently active prompt and epoch.
+    pub(super) fn current_hook_stop(&self) -> Option<xai_grok_hooks::dispatcher::StopBlock> {
+        let (epoch, prompt) = self.hook_stop_identity()?;
+        self.hook_stop_latch.get(epoch, &prompt)
+    }
+
+    pub(super) fn current_hook_stop_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        let (epoch, prompt) = self.hook_stop_identity()?;
+        Some(self.hook_stop_latch.token(epoch, &prompt))
+    }
+
+    pub(super) fn record_hook_stop_for(
+        &self,
+        identity: &(super::TurnEpoch, String),
+        stop: xai_grok_hooks::dispatcher::StopBlock,
+    ) -> bool {
+        if self.hook_stop_identity().as_ref() != Some(identity) {
+            return false;
+        }
+        self.hook_stop_latch
+            .set(identity.0, identity.1.clone(), stop);
+        true
+    }
+
+    pub(super) async fn stop_tool_by_hook(
+        &self,
+        model_call_id: &str,
+        tool_call_id: &acp::ToolCallId,
+        tool_name: &str,
+        stop: xai_grok_hooks::dispatcher::StopBlock,
+    ) -> Result<ToolLoop, acp::Error> {
+        self.handle_tool_not_executed(
+            model_call_id,
+            tool_call_id,
+            format!("Stopped by hook: {}", stop.reason),
+        )
+        .await?;
+        self.send_hook_annotation(&format!(
+            "`{tool_name}` stopped by hook `{}`: {}",
+            stop.hook_name, stop.reason
+        ))
+        .await;
+        Ok(ToolLoop::HookStop(stop))
+    }
+
     /// Build a [`HookEventEnvelope`] with this session's common fields filled (session id,
     /// cwd, workspace root, timestamp). Single source of truth for envelope shape; every
     /// fire site goes through here. The event name is canonicalized so alias
@@ -352,10 +419,20 @@ impl SessionActor {
         envelope: &'a HookEventEnvelope,
     ) -> Vec<OrderedGateResponse<'a>> {
         let match_value = envelope.payload.match_value();
+        let stop_identity = self.hook_stop_identity();
         let mut pending = self.client_gate_responses(groups, match_value, envelope);
         let mut responses = std::collections::HashMap::new();
         while let Some((callback_id, response, elapsed, gate_outcome)) = pending.next().await {
+            let force_stop = (envelope.hook_event_name == HookEventName::PostToolUse)
+                .then(|| client_hook_force_stop(callback_id, &response))
+                .flatten();
+            if let (Some(identity), Some(stop)) = (stop_identity.as_ref(), force_stop.as_ref()) {
+                self.record_hook_stop_for(identity, stop.clone());
+            }
             responses.insert(callback_id, (response, elapsed, gate_outcome));
+            if force_stop.is_some() {
+                break;
+            }
         }
         groups
             .iter()
@@ -397,8 +474,18 @@ impl SessionActor {
             .match_value()
             .unwrap_or(call.function.name.as_str());
 
+        let stop_identity = self.hook_stop_identity();
         let mut pending = self.client_gate_responses(&groups, Some(tool_name), envelope);
         while let Some((callback_id, response, _elapsed, _outcome)) = pending.next().await {
+            if let Some(stop) = client_hook_force_stop(callback_id, &response) {
+                if let Some(identity) = stop_identity.as_ref() {
+                    self.record_hook_stop_for(identity, stop.clone());
+                }
+                return Ok(Some(
+                    self.stop_tool_by_hook(&call.id, tool_call_id, tool_name, stop)
+                        .await?,
+                ));
+            }
             if response.decision == ClientHookDecision::Deny {
                 let reason = response
                     .system_message
@@ -548,6 +635,9 @@ impl SessionActor {
                 http_info: None,
                 system_message: None,
             });
+            if out.force_stop.is_none() {
+                out.force_stop = client_hook_force_stop(callback_id, &response);
+            }
             if response.decision == ClientHookDecision::Deny {
                 let reason = response
                     .system_message
@@ -618,6 +708,18 @@ mod tests {
 
     fn raw(value: serde_json::Value) -> Arc<RawValue> {
         serde_json::value::to_raw_value(&value).unwrap().into()
+    }
+
+    #[test]
+    fn client_continue_false_retains_bounded_reason() {
+        let response: ClientHookResponse = serde_json::from_value(serde_json::json!({
+            "continue": false, "stopReason": "done"
+        }))
+        .unwrap();
+        let stop = client_hook_force_stop("cb", &response).unwrap();
+        assert_eq!(stop.hook_name, "client:cb");
+        assert_eq!(stop.reason, "done");
+        assert!(client_hook_force_stop("cb", &ClientHookResponse::default()).is_none());
     }
 
     /// Only an explicit `deny` blocks; malformed/transport/timeout all proceed. The second

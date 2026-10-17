@@ -957,6 +957,7 @@ pub(crate) struct SessionActor {
     pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
     pub(crate) pending_native_agent_messages: Mutex<Vec<ConversationItem>>,
     pub(crate) code_mode_hook_followups: std::cell::RefCell<Vec<ConversationItem>>,
+    pub(crate) hook_stop_latch: HookStopLatch,
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered

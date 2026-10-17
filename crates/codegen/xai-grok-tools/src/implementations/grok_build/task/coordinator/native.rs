@@ -434,6 +434,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 self.handle_spawn(SubagentSpawnRequest {
                     request: Box::new(resumed),
                     result_tx,
+                    admission_reservation: None,
                 });
                 if !self.pending.contains_key(&new_target)
                     && !self.active.contains_key(&new_target)
