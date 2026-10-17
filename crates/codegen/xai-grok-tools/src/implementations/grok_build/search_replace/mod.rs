@@ -30,7 +30,7 @@ use crate::util::truncate_str_with_marker;
 use crate::{notification::types::ToolNotificationHandle, register_resource};
 use helpers::{
     NormalizedMatchResult, build_edit_details, find_normalized_match_positions,
-    replace_normalized_matches, replace_using_positions,
+    overlapping_match_positions, replace_normalized_matches, replace_using_positions,
 };
 pub(crate) const CONTEXT_LINES: usize = 3;
 /// Internal version discriminant for search_replace.
@@ -595,10 +595,17 @@ async fn handle_replacement(
     } else {
         std::borrow::Cow::Borrowed(&old_text)
     };
-    let mut positions: Vec<usize> = match_text
-        .match_indices(&input.old_string)
-        .map(|(index, _)| index)
-        .collect();
+    let mut positions: Vec<usize> =
+        overlapping_match_positions(&match_text, &input.old_string).collect();
+    if positions
+        .windows(2)
+        .any(|pair| pair[1] - pair[0] < input.old_string.len())
+    {
+        let name = TemplateRenderer::resolve(&resources, "${{ params.edit.old_string }}").await?;
+        return Ok(SearchReplaceOutput::MultipleMatchesFound(format!(
+            "The string to replace has overlapping matches. Provide a more specific {name}; overlapping matches cannot be replaced safely."
+        )));
+    }
     let mut used_normalized_fallback = false;
     if positions.is_empty() {
         let fallback_enabled = {
@@ -959,6 +966,64 @@ mod tests {
             new_string: new_string.to_string(),
             replace_all: false,
         }
+    }
+    #[tokio::test]
+    async fn overlapping_matches_refused_even_with_replace_all() {
+        for (text, pattern) in [("aaa", "aa"), ("ééé", "éé"), ("🙂🙂🙂", "🙂🙂")] {
+            for replace_all in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("test.txt");
+                std::fs::write(&path, text).unwrap();
+                let mut resources = test_resources(tmp.path());
+                resources.insert(Params(SearchReplaceParams {
+                    skip_read_before_edit: true,
+                    ..Default::default()
+                }));
+                let mut input = make_input("test.txt", pattern, "replacement");
+                input.replace_all = replace_all;
+                let result = xai_tool_runtime::Tool::run(
+                    &SearchReplaceTool,
+                    test_ctx(resources.into_shared()),
+                    input,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(result, SearchReplaceOutput::MultipleMatchesFound(_)),
+                    "{result:?}"
+                );
+                assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_normalized_matches_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "“a”a”").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(Params(SearchReplaceParams {
+            skip_read_before_edit: true,
+            unicode_normalized_fallback: true,
+            ..Default::default()
+        }));
+        let mut input = make_input("test.txt", "\"a\"a\"", "replacement");
+        // "“a”a”" normalizes to '"a"a"'; look for '"a"' twice.
+        input.old_string = "\"a\"".to_string();
+        input.replace_all = true;
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            test_ctx(resources.into_shared()),
+            input,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, SearchReplaceOutput::MultipleMatchesFound(_)),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "“a”a”");
     }
     fn description_renderer() -> TemplateRenderer {
         let edit_params = std::collections::HashMap::from([

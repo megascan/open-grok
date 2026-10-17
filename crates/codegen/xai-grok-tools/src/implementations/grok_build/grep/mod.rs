@@ -385,26 +385,30 @@ impl xai_tool_runtime::Tool for GrepTool {
         let mut output = CappedOutput::new(&config);
         let io_result = tokio::time::timeout_at(deadline, async {
             let stdout_truncated = loop {
-                let Some(chunk) = rg.read_stdout().await else {
+                let Some(chunk) = rg.read_stdout().await? else {
                     break false;
                 };
                 match output.accept(chunk).fill {
                     Fill::Open => {}
                     Fill::Overflowed => break true,
-                    Fill::FullAtChunkEnd => break rg.has_more_stdout().await,
+                    Fill::FullAtChunkEnd => break rg.has_more_stdout().await?,
                 }
             };
             if stdout_truncated {
                 rg.stop();
             }
             let mut stderr_buf = Vec::new();
-            rg.drain_stderr(&mut stderr_buf).await;
-            (stdout_truncated, stderr_buf)
+            rg.drain_stderr(&mut stderr_buf).await?;
+            Ok::<_, std::io::Error>((stdout_truncated, stderr_buf))
         })
         .await;
 
         let (stdout_truncated, stderr_buf) = match io_result {
-            Ok(result) => result,
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                rg.kill_and_reap().await;
+                return Ok(spawn_failure_output(&error));
+            }
             Err(_elapsed) => {
                 tracing::Span::current().record("timed_out", true);
                 tracing::Span::current().record("early_kill", true);
@@ -416,7 +420,14 @@ impl xai_tool_runtime::Tool for GrepTool {
             }
         };
 
-        let exit_code = rg.exit_code(stdout_truncated).await;
+        let exit_code =
+            match tokio::time::timeout_at(deadline, rg.exit_code(stdout_truncated)).await {
+                Ok(code) => code,
+                Err(_) => {
+                    rg.kill_and_reap().await;
+                    return Ok(grep_timeout_output(timeout.as_secs()));
+                }
+            };
 
         tracing::Span::current().record("early_kill", stdout_truncated);
         if stdout_truncated {
@@ -522,8 +533,14 @@ fn grep_progress_stream(
                 }
                 chunk = rg.read_stdout() => chunk,
             };
-            let Some(chunk) = chunk else {
-                break false;
+            let chunk = match chunk {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break false,
+                Err(error) => {
+                    rg.kill_and_reap().await;
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(spawn_failure_output(&error)));
+                    return;
+                }
             };
             let accepted = output.accept(chunk);
             for p in accepted.deltas {
@@ -534,7 +551,14 @@ fn grep_progress_stream(
                 Fill::Overflowed => break true,
                 // Probe budget only, never the shared `deadline_at`: expiring the tool deadline here would force the
                 // timeout terminal branch (banner, exit -1) for a normal head-limit fill near the wall-clock edge.
-                Fill::FullAtChunkEnd => break rg.has_more_stdout().await,
+                Fill::FullAtChunkEnd => match rg.has_more_stdout().await {
+                    Ok(more) => break more,
+                    Err(error) => {
+                        rg.kill_and_reap().await;
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(spawn_failure_output(&error)));
+                        return;
+                    }
+                },
             }
         };
 
@@ -568,14 +592,36 @@ fn grep_progress_stream(
             rg.stop();
         }
         let mut stderr_buf = Vec::new();
-        if tokio::time::timeout_at(deadline_at, rg.drain_stderr(&mut stderr_buf))
-        .await
-        .is_err()
-        {
-            span.in_scope(|| tracing::debug!("rg stderr drain hit the grep deadline"));
+        match tokio::time::timeout_at(deadline_at, rg.drain_stderr(&mut stderr_buf)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                rg.kill_and_reap().await;
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(spawn_failure_output(&error)));
+                return;
+            }
+            Err(_) => {
+                span.record("timed_out", true);
+                span.record("grep_reason", "timeout");
+                rg.kill_and_reap().await;
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(
+                    grep_partial_timeout_output(output.into_bytes(), timeout.as_secs(), &config)
+                ));
+                return;
+            }
         }
 
-        let exit_code = rg.exit_code(stdout_truncated).await;
+        let exit_code = match tokio::time::timeout_at(deadline_at, rg.exit_code(stdout_truncated)).await {
+            Ok(code) => code,
+            Err(_) => {
+                span.record("timed_out", true);
+                span.record("grep_reason", "timeout");
+                rg.kill_and_reap().await;
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(
+                    grep_partial_timeout_output(output.into_bytes(), timeout.as_secs(), &config)
+                ));
+                return;
+            }
+        };
 
         let wall_ms = stream_started.elapsed().as_millis() as u64;
         span.record("early_kill", stdout_truncated);
@@ -935,6 +981,97 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("No matches found"));
         assert_eq!(output.match_count, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_regex_is_reported_in_blocking_and_streaming_paths() {
+        use futures::StreamExt;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.txt"), "hello\n").unwrap();
+        let resources = || {
+            let mut resources = Resources::new();
+            resources.insert(Cwd(tmp.path().to_path_buf()));
+            resources.into_shared()
+        };
+        let blocking =
+            xai_tool_runtime::Tool::run(&GrepTool, test_ctx(resources()), make_grep_input("["))
+                .await
+                .unwrap();
+        let mut stream =
+            xai_tool_runtime::Tool::execute(&GrepTool, test_ctx(resources()), make_grep_input("["))
+                .await;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if let xai_tool_runtime::ToolStreamItem::Terminal(result) = item {
+                terminal = Some(result.unwrap());
+            }
+        }
+        for result in [blocking, terminal.expect("terminal result")] {
+            let output = crate::types::output::ToolOutput::GrepSearch(result);
+            assert!(output.is_error());
+            let prompt = output.to_prompt_format();
+            assert!(prompt.contains("Error calling tool"), "{prompt}");
+            assert!(!prompt.contains("No matches found"), "{prompt}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_subdirectory_reports_failure_after_partial_match() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let unreadable = tmp.path().join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        fs::write(tmp.path().join("readable.txt"), "needle\n").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&unreadable).is_err() {
+            let resources = || {
+                let mut resources = Resources::new();
+                resources.insert(Cwd(tmp.path().to_path_buf()));
+                resources.into_shared()
+            };
+            let blocking = xai_tool_runtime::Tool::run(
+                &GrepTool,
+                test_ctx(resources()),
+                make_grep_input("needle"),
+            )
+            .await
+            .unwrap();
+            let mut stream = xai_tool_runtime::Tool::execute(
+                &GrepTool,
+                test_ctx(resources()),
+                make_grep_input("needle"),
+            )
+            .await;
+            let mut terminal = None;
+            let mut streamed = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    xai_tool_runtime::ToolStreamItem::Progress(progress) => {
+                        streamed.push_str(&read_grep_delta(&progress));
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(result) => {
+                        terminal = Some(result.unwrap());
+                    }
+                }
+            }
+            assert!(streamed.contains("needle"), "{streamed}");
+            for result in [blocking, terminal.expect("terminal result")] {
+                let output = crate::types::output::ToolOutput::GrepSearch(result);
+                assert!(output.is_error());
+                let prompt = output.to_prompt_format();
+                assert!(
+                    prompt.to_lowercase().contains("permission denied"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains("needle") && prompt.contains("partial"),
+                    "{prompt}"
+                );
+            }
+        }
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test]

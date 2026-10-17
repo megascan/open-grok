@@ -152,26 +152,30 @@ impl RgRunner {
         })
     }
 
-    /// The next chunk of stdout; `None` at EOF or on a read error. Cancel-safe.
-    pub(crate) async fn read_stdout(&mut self) -> Option<&[u8]> {
-        let stdout = self.stdout.as_mut()?;
+    /// The next chunk of stdout; `None` at EOF. Cancel-safe.
+    pub(crate) async fn read_stdout(&mut self) -> io::Result<Option<&[u8]>> {
+        let Some(stdout) = self.stdout.as_mut() else {
+            return Ok(None);
+        };
         match stdout.read(&mut self.chunk).await {
-            Ok(0) | Err(_) => None,
-            Ok(n) => self.chunk.get(..n),
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(self.chunk.get(..n)),
+            Err(error) => Err(error),
         }
     }
 
     /// Exact-fit probe once a budget filled on a chunk boundary: `false` only when
     /// stdout reaches EOF within [`EXACT_FIT_PROBE_TIMEOUT`].
-    pub(crate) async fn has_more_stdout(&mut self) -> bool {
+    pub(crate) async fn has_more_stdout(&mut self) -> io::Result<bool> {
         let Some(stdout) = self.stdout.as_mut() else {
-            return false;
+            return Ok(false);
         };
         match tokio::time::timeout(EXACT_FIT_PROBE_TIMEOUT, stdout.read(&mut self.chunk)).await {
-            Ok(Ok(0)) => false,
+            Ok(Ok(0)) => Ok(false),
             // Silence counts as overflow too: the caller kills `rg` and keeps the
             // buffer instead of escalating to the timeout path that drops matches.
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => true,
+            Ok(Ok(_)) | Err(_) => Ok(true),
+            Ok(Err(error)) => Err(error),
         }
     }
 
@@ -186,12 +190,11 @@ impl RgRunner {
     }
 
     /// Drain stderr until EOF. After an early stop, call [`RgRunner::stop`] first.
-    pub(crate) async fn drain_stderr(&mut self, stderr: &mut Vec<u8>) {
-        if let Some(pipe) = self.stderr.take()
-            && let Err(error) = pipe.take(MAX_STDERR_BYTES).read_to_end(stderr).await
-        {
-            tracing::debug!(%error, "reading rg stderr failed");
+    pub(crate) async fn drain_stderr(&mut self, stderr: &mut Vec<u8>) -> io::Result<()> {
+        if let Some(pipe) = self.stderr.take() {
+            pipe.take(MAX_STDERR_BYTES).read_to_end(stderr).await?;
         }
+        Ok(())
     }
 
     /// `rg`'s exit code. Truncated output means `rg` was already killed: bounded

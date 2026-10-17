@@ -221,13 +221,8 @@ fn apply_byte_budget(
     bounded.content_concise.push_str(&marker);
     bounded
 }
-/// Harness-compatible negative offset resolution (1-indexed start line).
-///
-/// Negatives use the reference `split('\n')` field count plus a phantom field when
-/// the file is non-empty and has no trailing `\n`. Extraction still uses
-/// `split_inclusive`, so a start that lands on the phantom-only field yields
-/// an empty window (harness-aligned; not a Grok-line clamp).
-fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
+/// Resolve negative offsets from the actual final line (1-indexed).
+pub(crate) fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
     let offset_raw = offset.unwrap_or(1);
     if offset_raw == 0 {
         return 1;
@@ -235,11 +230,8 @@ fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
     if offset_raw > 0 {
         return offset_raw as usize;
     }
-    let mut total_fields = file_content.split('\n').count();
-    if !file_content.is_empty() && !file_content.ends_with('\n') {
-        total_fields += 1;
-    }
-    let computed = (total_fields as i64) + offset_raw + 1;
+    let total_lines = file_content.split_inclusive('\n').count();
+    let computed = (total_lines as i64) + offset_raw + 1;
     computed.max(1) as usize
 }
 /// Only non-negative raw offsets are stored on `FileContent`. Negatives become
@@ -322,8 +314,6 @@ pub fn extract_file_content_lines(
     let (mut start, mut end) = (0, 0);
     let mut first_line: Option<usize> = None;
     let mut extracted_images: Vec<crate::util::base64_images::ExtractedImage> = Vec::new();
-    let split_count = file_content.split_inclusive('\n').count();
-    let has_trailing_empty = !file_content.is_empty() && file_content.ends_with('\n');
     let skip = resolve_read_start_line(file_content, offset).saturating_sub(1);
     let take = limit.unwrap_or(usize::MAX);
     if file_content.is_empty() && total_lines > 0 && skip == 0 && take > 0 {
@@ -366,23 +356,6 @@ pub fn extract_file_content_lines(
         } else {
             output.push_str(&line);
             output_concise.push_str(&line);
-        }
-    }
-    if has_trailing_empty {
-        let trailing_line_idx = split_count;
-        if trailing_line_idx >= skip && trailing_line_idx < skip.saturating_add(take) {
-            let line_num = trailing_line_idx + 1;
-            let is_first_visible = first_line.is_none();
-            if is_first_visible {
-                first_line = Some(line_num);
-            } else {
-                output.push('\n');
-                output_concise.push('\n');
-            }
-            if is_first_visible || line_num.is_multiple_of(10) {
-                _ = write!(&mut output, "{line_num}→").ok();
-                _ = write!(&mut output_concise, "{line_num}→").ok();
-            }
         }
     }
     let mut raw_output = if first_line.is_none() || file_content.is_empty() {
@@ -602,7 +575,7 @@ pub(crate) async fn run_read_file(
             extracted_images: Vec::new(),
         }));
     }
-    let total_lines = file_content.matches('\n').count() + 1;
+    let total_lines = file_content.split_inclusive('\n').count();
     let whole_candidate =
         is_whole_read.then(|| extract_file_content_lines(&file_content, None, None, total_lines));
     let whole_read = match whole_candidate {
@@ -1012,7 +985,7 @@ mod tests {
         let ReadFileOutput::FileContent(fc) = out else {
             panic!("expected FileContent, got {out:?}");
         };
-        assert_eq!(fc.content, "1→a\nb\nc\n");
+        assert_eq!(fc.content, "1→a\nb\nc");
         assert!(!fc.content.contains("truncated"));
     }
     #[tokio::test]
@@ -1068,7 +1041,7 @@ mod tests {
                 assert!(content.content.contains("line2"));
                 assert!(content.content.contains("line3"));
                 assert!(content.raw_output.contains("line1"));
-                assert_eq!(content.total_lines, 4);
+                assert_eq!(content.total_lines, 3);
             }
             other => panic!("Expected FileContent, got {:?}", other),
         }
@@ -1403,10 +1376,47 @@ mod tests {
             .unwrap();
         match result {
             ReadFileOutput::FileContent(content) => {
-                assert_eq!(content.content, "1→hello\n");
-                assert_eq!(content.total_lines, 2);
+                assert_eq!(content.content, "1→hello");
+                assert_eq!(content.total_lines, 1);
             }
             other => panic!("Expected FileContent, got {:?}", other),
+        }
+    }
+    #[tokio::test]
+    async fn read_file_counts_real_lines_and_stops_at_eof() {
+        let tmp = TempDir::new().unwrap();
+        for (text, count, last) in [
+            ("hello", 1, "1→hello"),
+            ("hello\n", 1, "1→hello"),
+            ("hello\n\n", 2, "2→"),
+            ("α\r\nβ\r\n", 2, "2→β"),
+        ] {
+            std::fs::write(tmp.path().join("lines.txt"), text).unwrap();
+            for (offset, expected) in [
+                (Some(count as i64), last),
+                (Some(count as i64 + 1), ""),
+                (Some(-1), last),
+            ] {
+                let input = ReadFileInput {
+                    path: "lines.txt".into(),
+                    offset,
+                    limit: Some(1),
+                    pages: None,
+                    format: None,
+                };
+                let result = xai_tool_runtime::Tool::run(
+                    &ReadFileTool,
+                    test_ctx(test_resources(tmp.path()).into_shared()),
+                    input,
+                )
+                .await
+                .unwrap();
+                let ReadFileOutput::FileContent(content) = result else {
+                    panic!("{result:?}");
+                };
+                assert_eq!(content.total_lines, count, "{text:?}");
+                assert_eq!(content.content, expected, "{text:?}, offset {offset:?}");
+            }
         }
     }
     #[tokio::test]
@@ -1428,7 +1438,7 @@ mod tests {
         match result {
             ReadFileOutput::FileContent(content) => {
                 let concise = content.content_concise.unwrap();
-                assert_eq!(concise, "1→hello\nworld\n");
+                assert_eq!(concise, "1→hello\nworld");
             }
             other => panic!("Expected FileContent, got {:?}", other),
         }
@@ -1569,8 +1579,8 @@ mod tests {
     #[test]
     fn test_extract_file_content_lines_basic() {
         let extracted = extract_file_content_lines("1\n2\r\n3\n", None, None, 4);
-        assert_eq!(extracted.content, "1→1\n2\n3\n");
-        assert_eq!(extracted.content_concise, "1→1\n2\n3\n");
+        assert_eq!(extracted.content, "1→1\n2\n3");
+        assert_eq!(extracted.content_concise, "1→1\n2\n3");
         assert_eq!(extracted.raw_output, "1\n2\r\n3\n");
     }
     /// Regression: a long single-line base64 URI used to be cut
@@ -1581,7 +1591,7 @@ mod tests {
     fn extract_captures_long_inline_base64_image_before_truncation() {
         let payload = "A".repeat(50_000);
         let file_content = format!("# README\n![logo](data:image/png;base64,{payload})\n");
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let extracted = extract_file_content_lines(&file_content, None, None, total_lines);
         assert_eq!(extracted.extracted_images.len(), 1);
         assert_eq!(extracted.extracted_images[0].mime_type, "image/png");
@@ -1611,7 +1621,7 @@ mod tests {
     fn extract_captures_short_inline_base64_image_without_truncation_pressure() {
         let payload = "A".repeat(1500);
         let file_content = format!("inline data:image/png;base64,{payload} done\n");
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let extracted = extract_file_content_lines(&file_content, None, None, total_lines);
         assert_eq!(extracted.extracted_images.len(), 1);
         assert_eq!(extracted.extracted_images[0].data, payload);
@@ -1626,11 +1636,11 @@ mod tests {
     #[test]
     fn extract_leaves_non_data_uri_lines_untouched() {
         let file_content = "fn main() {\n    println!(\"hello\");\n}\n";
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let extracted = extract_file_content_lines(file_content, None, None, total_lines);
         assert_eq!(
             extracted.content,
-            "1→fn main() {\n    println!(\"hello\");\n}\n"
+            "1→fn main() {\n    println!(\"hello\");\n}"
         );
         assert!(extracted.extracted_images.is_empty());
     }
@@ -1916,11 +1926,11 @@ mod tests {
     #[test]
     fn extract_file_content_lines_full_file() {
         let file_content = "use std::io;\n\nfn main() {\n    println!(\"Hello, world!\");\n}\n";
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let extracted = extract_file_content_lines(file_content, None, None, total_lines);
         assert_eq!(
             extracted.content,
-            "1→use std::io;\n\nfn main() {\n    println!(\"Hello, world!\");\n}\n"
+            "1→use std::io;\n\nfn main() {\n    println!(\"Hello, world!\");\n}"
         );
     }
     #[test]
@@ -1950,7 +1960,7 @@ impl Config {
     }
 }
 ";
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let max_reread_lines = 2_000;
         let effective_limit = Some(max_reread_lines);
         let extracted =
@@ -1973,7 +1983,7 @@ impl Config {
     }
 }
 ";
-        assert_eq!(extracted.content, expected);
+        assert_eq!(extracted.content, expected.trim_end_matches('\n'));
         let truncated = effective_limit.map(|l| l < total_lines).unwrap_or(false);
         assert!(
             !truncated,
@@ -2009,11 +2019,8 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
             "test file should be under the byte threshold"
         );
         let file_content = String::from_utf8_lossy(&file_bytes).into_owned();
-        let total_lines = file_content.matches('\n').count() + 1;
-        assert_eq!(
-            total_lines, 12,
-            "source_code should have 12 lines (11 content + trailing empty)"
-        );
+        let total_lines = file_content.split_inclusive('\n').count();
+        assert_eq!(total_lines, 11, "source_code should have 11 lines");
         let max_reread_lines: usize = 2_000;
         let effective_limit = Some(max_reread_lines);
         let extracted =
@@ -2031,11 +2038,11 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
 10\u{2192}    jwt::decode(token)
 }
 ";
-        assert_eq!(extracted.content, expected);
+        assert_eq!(extracted.content, expected.trim_end_matches('\n'));
         let truncated = effective_limit.map(|l| l < total_lines).unwrap_or(false);
         assert!(
             !truncated,
-            "12-line file should not be truncated at 2000-line limit"
+            "11-line file should not be truncated at 2000-line limit"
         );
         assert_eq!(extracted.raw_output, source_code);
     }
@@ -2050,8 +2057,8 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         std::fs::write(&file_path, source).unwrap();
         let file_bytes = tokio::fs::read(&file_path).await.unwrap();
         let file_content = String::from_utf8_lossy(&file_bytes).into_owned();
-        let total_lines = file_content.matches('\n').count() + 1;
-        assert_eq!(total_lines, 11);
+        let total_lines = file_content.split_inclusive('\n').count();
+        assert_eq!(total_lines, 10);
         let offset = Some(4);
         let limit = 3_usize;
         let max_reread_lines = 2_000_usize;
@@ -2062,7 +2069,7 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         let truncated = effective_limit.map(|l| l < total_lines).unwrap_or(false);
         assert!(
             truncated,
-            "3-line window on 11-line file should be truncated"
+            "3-line window on 10-line file should be truncated"
         );
     }
     use crate::implementations::read_file::image::{
@@ -2984,11 +2991,11 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
     }
     #[test]
     fn resolve_read_start_line_negative_trailing_newline() {
-        assert_eq!(resolve_read_start_line("a\nb\nc\n", Some(-3)), 2);
+        assert_eq!(resolve_read_start_line("a\nb\nc\n", Some(-3)), 1);
     }
     #[test]
     fn resolve_read_start_line_negative_no_trailing_newline() {
-        assert_eq!(resolve_read_start_line("a\nb\nc", Some(-3)), 2);
+        assert_eq!(resolve_read_start_line("a\nb\nc", Some(-3)), 1);
     }
     #[test]
     fn resolve_read_start_line_very_negative_clamps_to_one() {
@@ -3001,21 +3008,21 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
     #[test]
     fn extract_file_content_lines_negative_offset() {
         let file_content = "line1\nline2\nline3\nline4\nline5\n";
-        let total_lines = file_content.matches('\n').count() + 1;
+        let total_lines = file_content.split_inclusive('\n').count();
         let extracted = extract_file_content_lines(file_content, Some(-2), Some(2), total_lines);
-        assert_eq!(extracted.content, "5→line5\n");
+        assert_eq!(extracted.content, "4→line4\nline5");
     }
     #[test]
     fn extract_first_line_always_numbered_small_read() {
         let extracted = extract_file_content_lines("a\nb\nc\n", None, None, 4);
-        assert_eq!(extracted.content, "1→a\nb\nc\n");
-        assert_eq!(extracted.content_concise, "1→a\nb\nc\n");
+        assert_eq!(extracted.content, "1→a\nb\nc");
+        assert_eq!(extracted.content_concise, "1→a\nb\nc");
     }
     #[test]
     fn extract_first_visible_line_numbered_with_offset() {
         let file_content = "a\nb\nc\nd\ne\n";
         let extracted = extract_file_content_lines(file_content, Some(3), None, 6);
-        assert_eq!(extracted.content, "3→c\nd\ne\n");
+        assert_eq!(extracted.content, "3→c\nd\ne");
     }
     #[test]
     fn extract_decade_line_numbered_in_addition_to_first() {
@@ -3023,33 +3030,22 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         let extracted = extract_file_content_lines(&file_content, None, None, 13);
         assert_eq!(
             extracted.content,
-            "1→L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\n10→L10\nL11\nL12\n"
+            "1→L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\n10→L10\nL11\nL12"
         );
     }
-    /// Reviewer case: a window that resolves to only an empty line (here the
-    /// phantom trailing empty of "hello\n" via offset=2) must still emit a
-    /// line-number anchor rather than an empty body.
     #[test]
-    fn extract_empty_only_window_still_anchored() {
-        let extracted = extract_file_content_lines("hello\n", Some(2), None, 2);
-        assert_eq!(extracted.content, "2→");
-        assert_eq!(extracted.content_concise, "2→");
-    }
-    /// Harness parity: offset=-1 on a file with no trailing `\n` resolves to the
-    /// phantom field only (start past any `split_inclusive` line), so Grok
-    /// returns empty content/raw — same as the reference phantom-only window.
-    #[test]
-    fn extract_file_content_lines_negative_one_no_trailing_newline_stable() {
-        let file_content = "a\nb\nc";
-        let total_lines = file_content.matches('\n').count() + 1;
-        assert_eq!(resolve_read_start_line(file_content, Some(-1)), 4);
-        let extracted = extract_file_content_lines(file_content, Some(-1), Some(1), total_lines);
-        assert!(
-            extracted.content.is_empty(),
-            "phantom-only start must not emit split_inclusive lines"
-        );
-        assert!(extracted.raw_output.is_empty());
+    fn extract_past_eof_returns_no_phantom_line() {
+        let extracted = extract_file_content_lines("hello\n", Some(2), None, 1);
+        assert!(extracted.content.is_empty());
         assert!(extracted.content_concise.is_empty());
+        assert!(extracted.raw_output.is_empty());
+    }
+    #[test]
+    fn extract_negative_one_returns_last_line_with_or_without_newline() {
+        for file_content in ["a\nb\nc", "a\nb\nc\n"] {
+            let extracted = extract_file_content_lines(file_content, Some(-1), Some(1), 3);
+            assert_eq!(extracted.content, "3→c");
+        }
     }
     #[test]
     fn read_file_input_accepts_negative_offset_json() {

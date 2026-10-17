@@ -754,7 +754,7 @@ impl ToolOutput {
             ToolOutput::Todo(
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
-            ToolOutput::GrepSearch(g) => g.exit_code > 1,
+            ToolOutput::GrepSearch(g) => g.exit_code != 0 && g.exit_code != 1,
             _ => false,
         }
     }
@@ -827,7 +827,21 @@ impl ToolOutput {
             },
             ToolOutput::Bash(bash_output) => bash_output.output_for_prompt.clone(),
             ToolOutput::GrepSearch(grep_search_output) => {
-                String::from_utf8_lossy(&grep_search_output.stdout).into_owned()
+                let stdout = String::from_utf8_lossy(&grep_search_output.stdout);
+                let stderr = String::from_utf8_lossy(&grep_search_output.stderr);
+                if grep_search_output.exit_code != 0
+                    && grep_search_output.exit_code != 1
+                    && !stderr.is_empty()
+                    && !stdout.contains(stderr.as_ref())
+                {
+                    if stdout.is_empty() {
+                        stderr.into_owned()
+                    } else {
+                        format!("{stdout}\n{stderr}")
+                    }
+                } else {
+                    stdout.into_owned()
+                }
             }
             ToolOutput::Todo(todo_output) => match todo_output {
                 TodoWriteOutput::TodosUpdated(success) => success.summary_for_prompt.to_owned(),

@@ -72,13 +72,48 @@ pub(crate) fn grep_partial_timeout_output(
 
 /// Terminal card when `rg` could not be spawned.
 pub(crate) fn spawn_failure_output(error: &io::Error) -> GrepSearchOutput {
+    let message = format!("Error calling tool: {}", error).into_bytes();
     GrepSearchOutput {
-        stdout: Vec::new(),
-        stderr: format!("Error calling tool: {}", error).into_bytes(),
+        stdout: message.clone(),
+        stderr: message,
         exit_code: -1,
         match_count: 0,
         file_matches: Vec::new(),
     }
+}
+
+fn grep_failure_output(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+    config: &GrepFormatConfig,
+) -> GrepSearchOutput {
+    let detail = String::from_utf8_lossy(&stderr);
+    let detail = if detail.is_empty() {
+        "unknown error"
+    } else {
+        &detail
+    };
+    let message = format!(
+        "Error calling tool: {detail} (exit {exit_code}, root: {})",
+        config.cwd_display
+    );
+    if stdout.is_empty() {
+        return GrepSearchOutput {
+            stdout: message.into_bytes(),
+            stderr,
+            exit_code,
+            match_count: 0,
+            file_matches: Vec::new(),
+        };
+    }
+    let mut partial = finalize_grep(stdout, true, Vec::new(), 0, config);
+    partial.stdout.extend_from_slice(
+        format!("\nSearch failed; matches above are partial. {message}").as_bytes(),
+    );
+    partial.stderr = stderr;
+    partial.exit_code = exit_code;
+    partial
 }
 
 /// Build the authoritative terminal card from the fully-read rg output.
@@ -90,13 +125,12 @@ pub(crate) fn finalize_grep(
     exit_code: i32,
     config: &GrepFormatConfig,
 ) -> GrepSearchOutput {
-    let stdout = String::from_utf8_lossy(&stdout_buf);
-    let stderr = String::from_utf8_lossy(&stderr_buf);
-
     // Handle exit codes.
-    if (exit_code == 1 && stdout.is_empty())
-        || (exit_code == 2 && stderr.contains("No files were searched"))
-    {
+    // Even after a head-limit stop the child may already have reported a walk error.
+    if exit_code == 0 && !stderr_buf.is_empty() {
+        return grep_failure_output(stdout_buf, stderr_buf, 2, config);
+    }
+    if exit_code == 1 && stdout_buf.is_empty() && stderr_buf.is_empty() {
         let result = format!(
             "<workspace_result workspace_path=\"{}\">\nNo matches found\n</workspace_result>",
             config.cwd_display
@@ -110,34 +144,16 @@ pub(crate) fn finalize_grep(
         };
     }
 
-    if exit_code == 2 {
-        let error_msg = format!(
-            "Error calling tool: {} (exit 2, root: {})",
-            stderr, config.cwd_display
-        );
-        return GrepSearchOutput {
-            stdout: error_msg.into_bytes(),
-            stderr: stderr_buf,
-            exit_code,
-            match_count: 0,
-            file_matches: Vec::new(),
-        };
-    }
-
     if exit_code != 0 {
-        let error_msg = format!(
-            "Error calling tool: unknown error (exit {}, root: {})",
-            exit_code, config.cwd_display
+        return grep_failure_output(
+            stdout_buf,
+            stderr_buf,
+            if exit_code == 1 { 2 } else { exit_code },
+            config,
         );
-        return GrepSearchOutput {
-            stdout: error_msg.into_bytes(),
-            stderr: stderr_buf,
-            exit_code,
-            match_count: 0,
-            file_matches: Vec::new(),
-        };
     }
 
+    let stdout = String::from_utf8_lossy(&stdout_buf);
     let (formatted_output, match_count, file_matches) = {
         let mut output_lines: Vec<String> = stdout.lines().map(|s| s.to_string()).collect();
         let mut is_truncated = stdout_truncated;

@@ -168,10 +168,14 @@ fn get_or_init_dir<'a>(
 // Collection + rendering
 // ───────────────────────────────────────────────────────────────────────────
 
-fn collect(root_path: &Path, walker: ignore::Walk, cfg: &RenderConfig) -> Collected {
+fn collect(
+    root_path: &Path,
+    walker: ignore::Walk,
+    cfg: &RenderConfig,
+) -> Result<Collected, ignore::Error> {
     let mut dirs: HashMap<PathBuf, DirectoryView> = HashMap::new();
     for directory_entry in walker {
-        let Ok(entry) = directory_entry else { continue };
+        let entry = directory_entry?;
         let Some(file_type) = entry.file_type() else {
             continue;
         };
@@ -230,7 +234,7 @@ fn collect(root_path: &Path, walker: ignore::Walk, cfg: &RenderConfig) -> Collec
             });
         }
     }
-    Collected { dirs }
+    Ok(Collected { dirs })
 }
 
 fn render(root: &Path, collected: &Collected, cfg: &RenderConfig) -> Vec<String> {
@@ -309,7 +313,7 @@ fn render_with_fallback(root: &Path, collected: &Collected, cfg: &RenderConfig) 
 /// Render a directory listing using the legacy (0.4.10) depth-threshold algorithm.
 ///
 /// Returns the body text (without the root path header line).
-pub(crate) fn render_legacy(root: &Path, max_output_bytes: usize) -> String {
+pub(crate) fn render_legacy(root: &Path, max_output_bytes: usize) -> Result<String, ignore::Error> {
     let cfg = RenderConfig {
         max_output_bytes,
         ..Default::default()
@@ -317,14 +321,14 @@ pub(crate) fn render_legacy(root: &Path, max_output_bytes: usize) -> String {
     let walker = ignore::WalkBuilder::new(root)
         .standard_filters(true)
         .build();
-    let collected = collect(root, walker, &cfg);
+    let collected = collect(root, walker, &cfg)?;
     let output_lines = render_with_fallback(root, &collected, &cfg);
     // Skip the first line (root dir name) — the caller prepends its own.
-    if output_lines.len() > 1 {
+    Ok(if output_lines.len() > 1 {
         output_lines[1..].join("\n")
     } else {
         String::new()
-    }
+    })
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -373,7 +377,7 @@ mod tests {
     fn legacy_renders_small_tree_exact_fixture() {
         let tmp = TempDir::new().unwrap();
         create_fixture_tree(tmp.path());
-        let body = render_legacy(tmp.path(), 40_000);
+        let body = render_legacy(tmp.path(), 40_000).unwrap();
 
         // Exact archived output from the depth-threshold algorithm.
         // Root files listed alphabetically, src/ expanded (< 15 children),
@@ -392,7 +396,7 @@ mod tests {
     #[test]
     fn legacy_empty_directory_returns_empty_string() {
         let tmp = TempDir::new().unwrap();
-        let body = render_legacy(tmp.path(), 40_000);
+        let body = render_legacy(tmp.path(), 40_000).unwrap();
         assert!(
             body.is_empty(),
             "empty dir should produce empty body, got: {body}"
@@ -411,7 +415,7 @@ mod tests {
         for i in 0..20 {
             std::fs::write(large_dir.join(format!("file_{i}.rs")), "").unwrap();
         }
-        let body = render_legacy(tmp.path(), 40_000);
+        let body = render_legacy(tmp.path(), 40_000).unwrap();
 
         // Should show a summary line with file count and extension breakdown.
         assert!(
@@ -431,7 +435,7 @@ mod tests {
     fn legacy_indentation_matches_historical_pattern() {
         let tmp = TempDir::new().unwrap();
         create_fixture_tree(tmp.path());
-        let body = render_legacy(tmp.path(), 40_000);
+        let body = render_legacy(tmp.path(), 40_000).unwrap();
 
         // Every line should start with some number of "  " pairs followed by "- "
         // or be a summary line (starts with spaces + "[").

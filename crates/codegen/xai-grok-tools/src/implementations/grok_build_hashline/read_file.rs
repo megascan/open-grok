@@ -6,7 +6,9 @@
 //!
 //! Output format: `ANCHOR→CONTENT` (e.g. `22:abc:rst→  let x = 1;`).
 
-use crate::implementations::grok_build::read_file::{ReadFileInput, run_read_file};
+use crate::implementations::grok_build::read_file::{
+    ReadFileInput, resolve_read_start_line, run_read_file,
+};
 use crate::types::context::TruncationConfig;
 
 use crate::types::output::ReadFileOutput;
@@ -42,7 +44,14 @@ pub(crate) fn format_hashline_content(
     let mut raw_output = String::new();
     let mut first_line: Option<usize> = None;
 
-    for (i, line) in all_lines.iter().enumerate().skip(skip).take(take) {
+    let real_lines = file_content.split_inclusive('\n').count().max(1);
+    for (i, line) in all_lines
+        .iter()
+        .take(real_lines)
+        .enumerate()
+        .skip(skip)
+        .take(take)
+    {
         let line_num = i + 1; // 1-based
 
         if first_line.is_none() {
@@ -193,6 +202,7 @@ impl xai_tool_runtime::Tool for HashlineReadTool {
         // `None`: the hashline tool does not stream, so it needs no
         // text-path streamability signal (see `run_read_file`).
         let invoking = crate::types::tool_metadata::invoking_param_names(&ctx);
+        let requested_offset = input.offset;
         let result = run_read_file(
             input,
             cwd_override,
@@ -238,8 +248,14 @@ impl xai_tool_runtime::Tool for HashlineReadTool {
                 };
 
                 let effective_limit = Some(fc.limit.unwrap_or(usize::MAX).min(max_lines));
-                let (hashline_content, _raw) =
-                    format_hashline_content(&full_content, fc.offset, effective_limit, &*scheme);
+                let effective_offset = requested_offset
+                    .map(|offset| resolve_read_start_line(&full_content, Some(offset)));
+                let (hashline_content, _raw) = format_hashline_content(
+                    &full_content,
+                    effective_offset,
+                    effective_limit,
+                    &*scheme,
+                );
 
                 fc.content = hashline_content;
                 fc.content_concise = None; // hashline has only one format
@@ -322,6 +338,15 @@ mod tests {
         assert_eq!(content_lines.len(), 2);
         assert!(content_lines[0].starts_with("2:"));
         assert!(content_lines[1].starts_with("3:"));
+    }
+
+    #[test]
+    fn hashline_formatter_does_not_expose_a_phantom_line() {
+        let scheme = HashlineSchemeParams::default().build_scheme().unwrap();
+        let (full, _) = format_hashline_content("one\ntwo\n", None, None, &*scheme);
+        assert_eq!(full.lines().count(), 2);
+        let (past, _) = format_hashline_content("one\ntwo\n", Some(3), None, &*scheme);
+        assert!(past.is_empty());
     }
 
     #[test]
@@ -579,6 +604,41 @@ mod tests {
                 // no longer emits "... lines not shown ..."
             }
             other => panic!("Expected FileContent, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_and_past_eof_offsets_match_core_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\n").unwrap();
+        for offset in [-1, 3] {
+            let input = ReadFileInput {
+                path: "lines.txt".into(),
+                offset: Some(offset),
+                limit: Some(1),
+                pages: None,
+                format: None,
+            };
+            let result = xai_tool_runtime::Tool::run(
+                &HashlineReadTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                input,
+            )
+            .await
+            .unwrap();
+            let ReadFileOutput::FileContent(fc) = result else {
+                panic!("{result:?}");
+            };
+            assert_eq!(fc.total_lines, 2);
+            if offset == -1 {
+                assert!(
+                    fc.content.starts_with("2:") && fc.content.ends_with("→two"),
+                    "{}",
+                    fc.content
+                );
+            } else {
+                assert!(fc.content.is_empty(), "{}", fc.content);
+            }
         }
     }
 
