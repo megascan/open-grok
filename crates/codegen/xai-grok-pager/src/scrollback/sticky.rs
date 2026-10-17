@@ -47,6 +47,36 @@ pub struct PromptDescriptor {
     pub sticky: bool,
 }
 
+/// Select the only descriptors that can affect a sticky layout.
+///
+/// Descriptors are sorted by entry index and virtual position. Positions are
+/// rebased only after locating the last sticky prompt before the viewport;
+/// its immediate successor participates in the push even when non-sticky.
+/// The backward walk is bounded by the run of preceding non-sticky prompts.
+pub(super) fn sticky_prompt_pair(
+    prompts: &[PromptDescriptor],
+    entry_range: std::ops::Range<usize>,
+    base_y: usize,
+    scroll_offset: usize,
+) -> Option<(PromptDescriptor, Option<PromptDescriptor>)> {
+    if entry_range.is_empty() || scroll_offset == 0 {
+        return None;
+    }
+    let start = prompts.partition_point(|p| p.entry_idx < entry_range.start);
+    let end = prompts.partition_point(|p| p.entry_idx < entry_range.end);
+    let prompts = &prompts[start..end];
+    let passed = prompts.partition_point(|p| p.y_virtual.saturating_sub(base_y) < scroll_offset);
+    let pinned = prompts[..passed].iter().rposition(|p| p.sticky)?;
+    let rebase = |mut prompt: PromptDescriptor| {
+        prompt.y_virtual = prompt.y_virtual.saturating_sub(base_y);
+        prompt
+    };
+    Some((
+        rebase(prompts[pinned]),
+        prompts.get(pinned + 1).copied().map(rebase),
+    ))
+}
+
 /// Minimum height for pinned headers.
 /// This is a reasonable default - blocks should be at least this tall.
 pub const MIN_PINNED_HEIGHT: u16 = 4;
@@ -460,6 +490,142 @@ fn calculate_render_height(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    // Reference for the former pane/navigation path: rebuild a relative
+    // descriptor vector, then run the existing geometry over the whole slice.
+    fn reference_range_layout(
+        prompts: &[PromptDescriptor],
+        range: std::ops::Range<usize>,
+        base_y: usize,
+        scroll: usize,
+        viewport: u16,
+    ) -> StickyHeaderLayout {
+        let relative: Vec<_> = prompts
+            .iter()
+            .filter(|p| range.contains(&p.entry_idx))
+            .map(|p| PromptDescriptor {
+                y_virtual: p.y_virtual.saturating_sub(base_y),
+                ..*p
+            })
+            .collect();
+        compute_sticky_layout(scroll, viewport, &relative)
+    }
+
+    fn optimized_range_layout(
+        prompts: &[PromptDescriptor],
+        range: std::ops::Range<usize>,
+        base_y: usize,
+        scroll: usize,
+        viewport: u16,
+    ) -> StickyHeaderLayout {
+        match sticky_prompt_pair(prompts, range, base_y, scroll) {
+            Some((pinned, Some(next))) => compute_sticky_layout(scroll, viewport, &[pinned, next]),
+            Some((pinned, None)) => compute_sticky_layout(scroll, viewport, &[pinned]),
+            None => StickyHeaderLayout::default(),
+        }
+    }
+
+    #[test]
+    fn range_lookup_matches_full_descriptor_reference() {
+        // Includes equal y values (hidden/zero-height entries), sparse entry
+        // indices, non-sticky runs, large offsets and a nonzero range origin.
+        let indices = [0, 2, 3, 5, 7, 8];
+        let ys = [70_000, 70_000, 70_003, 70_006, 70_006, 70_014];
+        for mask in 0..(1usize << indices.len()) {
+            let prompts: Vec<_> = indices
+                .iter()
+                .zip(ys)
+                .enumerate()
+                .map(|(i, (&entry_idx, y_virtual))| PromptDescriptor {
+                    entry_idx,
+                    y_virtual,
+                    full_height: 3 + i as u16,
+                    min_height: 2,
+                    sticky: mask & (1 << i) != 0,
+                })
+                .collect();
+            for start in 0..=10 {
+                for end in start..=10 {
+                    for base_y in [70_000, 70_003, 70_006] {
+                        for scroll in 0..=22 {
+                            for viewport in [0, 1, 8, 24] {
+                                let range = start..end;
+                                assert_eq!(
+                                    optimized_range_layout(
+                                        &prompts,
+                                        range.clone(),
+                                        base_y,
+                                        scroll,
+                                        viewport
+                                    ),
+                                    reference_range_layout(
+                                        &prompts,
+                                        range.clone(),
+                                        base_y,
+                                        scroll,
+                                        viewport
+                                    ),
+                                    "mask={mask} range={range:?} base={base_y} scroll={scroll} viewport={viewport}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run explicitly with `cargo test ... scrollback_perf_benchmark -- --ignored --nocapture`.
+    /// Timing is reported for inspection only; parity is the only assertion.
+    #[test]
+    #[ignore = "opt-in synthetic performance measurement"]
+    fn scrollback_perf_benchmark_sticky() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for count in [10_000usize, 100_000] {
+            let prompts: Vec<_> = (0..count)
+                .map(|i| PromptDescriptor {
+                    entry_idx: i,
+                    y_virtual: i * 4,
+                    full_height: 3,
+                    min_height: 2,
+                    sticky: true,
+                })
+                .collect();
+            let iterations = 100;
+            for scroll in [1, count * 2, count * 4 - 1] {
+                let reference = reference_range_layout(&prompts, 0..count, 0, scroll, 24);
+                let optimized = optimized_range_layout(&prompts, 0..count, 0, scroll, 24);
+                assert_eq!(reference, optimized);
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(reference_range_layout(
+                        black_box(&prompts),
+                        0..count,
+                        0,
+                        black_box(scroll),
+                        24,
+                    ));
+                }
+                let baseline = start.elapsed();
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(optimized_range_layout(
+                        black_box(&prompts),
+                        0..count,
+                        0,
+                        black_box(scroll),
+                        24,
+                    ));
+                }
+                eprintln!(
+                    "sticky prompts={count} scroll={scroll} iterations={iterations} reference={baseline:?} optimized={:?}; reference visits/copies {} descriptors, optimized copies <= 2 per iteration",
+                    start.elapsed(),
+                    count * iterations
+                );
+            }
+        }
+    }
 
     /// Helper to create prompt descriptors from (y_virtual, full_height) tuples.
     /// Uses a default min_height of 4 (2 content + 2 vpad) for all prompts.

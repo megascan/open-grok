@@ -736,12 +736,8 @@ impl ScrollbackState {
         let entry_height = cache.entries[selected_idx].height;
         let entry_bottom = entry_y + entry_height as usize;
 
-        // Build prompt descriptors relative to visible range (for sticky layout)
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, &visible_range);
-
-        // Compute sticky header at current scroll position
-        let sticky =
-            compute_sticky_layout(self.scroll_offset, self.viewport_height, &relative_prompts);
+        // Compute sticky header at current scroll position.
+        let sticky = self.current_sticky_layout(cache, &visible_range);
         let header_height = sticky.header_screen_rows();
 
         // Content area bounds
@@ -769,7 +765,8 @@ impl ScrollbackState {
             // Entry top is clipped (or within margin) - scroll up to show top with margin
             let target_scroll = self.find_scroll_for_entry_at_content_top(
                 entry_y.saturating_sub(top_margin),
-                &relative_prompts,
+                cache,
+                &visible_range,
             );
             self.scroll_offset = target_scroll;
             self.follow_mode = false;
@@ -782,8 +779,12 @@ impl ScrollbackState {
 
                 // But check: at the new scroll position, will a sticky header appear
                 // that clips the entry's top?
-                let sticky_at_target =
-                    compute_sticky_layout(target_scroll, self.viewport_height, &relative_prompts);
+                let sticky_at_target = self.sticky_layout_for_cache(
+                    cache,
+                    &visible_range,
+                    target_scroll,
+                    self.viewport_height,
+                );
                 let header_at_target = sticky_at_target.header_screen_rows();
                 let content_top_at_target = target_scroll + header_at_target as usize;
 
@@ -793,13 +794,13 @@ impl ScrollbackState {
                 } else {
                     // Sticky header would clip the top - show top instead
                     let target_scroll =
-                        self.find_scroll_for_entry_at_content_top(entry_y, &relative_prompts);
+                        self.find_scroll_for_entry_at_content_top(entry_y, cache, &visible_range);
                     self.scroll_offset = target_scroll;
                 }
             } else {
                 // Entry doesn't fit - show top at content area top
                 let target_scroll =
-                    self.find_scroll_for_entry_at_content_top(entry_y, &relative_prompts);
+                    self.find_scroll_for_entry_at_content_top(entry_y, cache, &visible_range);
                 self.scroll_offset = target_scroll;
             }
             self.follow_mode = false;
@@ -838,47 +839,58 @@ impl ScrollbackState {
         }
     }
 
-    /// Build prompt descriptors relative to a visible range.
-    ///
-    /// Filters to only prompts in the range, adjusts y_virtual to be relative
-    /// to the range start. This is needed because scroll_offset is relative to
-    /// the visible range, not the full entry list.
-    pub(super) fn build_relative_prompt_descriptors(
+    /// Compute sticky geometry from the cached descriptors without copying the
+    /// entire history. The selected prompt and its successor suffice for the
+    /// same layout calculation used by the full descriptor list.
+    fn sticky_layout_for_cache(
         &self,
         cache: &LayoutCache,
         visible_range: &Range<usize>,
-    ) -> Vec<PromptDescriptor> {
-        if visible_range.is_empty() {
-            return Vec::new();
+        scroll: usize,
+        viewport_height: u16,
+    ) -> StickyHeaderLayout {
+        let Some(base_y) = cache.virtual_y.get(visible_range.start).copied() else {
+            return StickyHeaderLayout::default();
+        };
+        let Some((pinned, next)) = super::super::sticky::sticky_prompt_pair(
+            &cache.prompt_descriptors,
+            visible_range.clone(),
+            base_y,
+            scroll,
+        ) else {
+            return StickyHeaderLayout::default();
+        };
+        match next {
+            Some(next) => compute_sticky_layout(scroll, viewport_height, &[pinned, next]),
+            None => compute_sticky_layout(scroll, viewport_height, &[pinned]),
         }
-
-        let base_y = cache.virtual_y[visible_range.start];
-
-        cache
-            .prompt_descriptors
-            .iter()
-            .filter(|p| visible_range.contains(&p.entry_idx))
-            .map(|p| PromptDescriptor {
-                entry_idx: p.entry_idx, // Keep absolute index for lookup
-                y_virtual: p.y_virtual.saturating_sub(base_y), // Relative Y
-                full_height: p.full_height,
-                min_height: p.min_height,
-                sticky: p.sticky,
-            })
-            .collect()
     }
 
-    /// Compute the current sticky header layout.
-    ///
-    /// Uses the current scroll_offset and viewport_height. Requires a valid
-    /// layout cache (caller must pass it in — avoids &mut self).
+    /// Render-time entry point, using the same geometry as navigation.
+    pub(crate) fn sticky_layout_for_range(
+        &self,
+        visible_range: Range<usize>,
+        scroll: usize,
+        viewport_height: u16,
+    ) -> StickyHeaderLayout {
+        let cache = self
+            .layout_cache
+            .as_ref()
+            .expect("layout cache must be valid - was prepare_layout() called?");
+        self.sticky_layout_for_cache(cache, &visible_range, scroll, viewport_height)
+    }
+
     pub(super) fn current_sticky_layout(
         &self,
         cache: &LayoutCache,
         visible_range: &Range<usize>,
     ) -> StickyHeaderLayout {
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, visible_range);
-        compute_sticky_layout(self.scroll_offset, self.viewport_height, &relative_prompts)
+        self.sticky_layout_for_cache(
+            cache,
+            visible_range,
+            self.scroll_offset,
+            self.viewport_height,
+        )
     }
 
     pub(super) fn sticky_adjusted_entry_top(
@@ -887,10 +899,10 @@ impl ScrollbackState {
         visible_range: &Range<usize>,
         entry_y: usize,
     ) -> usize {
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, visible_range);
         let mut scroll = entry_y;
         for _ in 0..3 {
-            let sticky = compute_sticky_layout(scroll, self.viewport_height, &relative_prompts);
+            let sticky =
+                self.sticky_layout_for_cache(cache, visible_range, scroll, self.viewport_height);
             scroll = entry_y.saturating_sub(sticky.header_screen_rows() as usize);
         }
         scroll
@@ -903,15 +915,20 @@ impl ScrollbackState {
     fn find_scroll_for_entry_at_content_top(
         &self,
         entry_y: usize,
-        relative_prompts: &[PromptDescriptor],
+        cache: &LayoutCache,
+        visible_range: &Range<usize>,
     ) -> usize {
         let mut target_scroll = entry_y;
 
         // Iterate to find fixed point (max 3 iterations as safety bound).
         // Converges quickly because header shrinks monotonically as we scroll up.
         for _ in 0..3 {
-            let sticky =
-                compute_sticky_layout(target_scroll, self.viewport_height, relative_prompts);
+            let sticky = self.sticky_layout_for_cache(
+                cache,
+                visible_range,
+                target_scroll,
+                self.viewport_height,
+            );
             let header_at_target = sticky.header_screen_rows();
             let content_top_at_target = target_scroll + header_at_target as usize;
 
@@ -994,10 +1011,10 @@ impl ScrollbackState {
         let entry_y = cache.virtual_y[entry_idx] - base_y;
         let half_vp = self.viewport_height as usize / 2;
         let target = entry_y.saturating_sub(half_vp);
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, &visible_range);
         let mut scroll = target;
         for _ in 0..3 {
-            let sticky = compute_sticky_layout(scroll, self.viewport_height, &relative_prompts);
+            let sticky =
+                self.sticky_layout_for_cache(cache, &visible_range, scroll, self.viewport_height);
             let header = sticky.header_screen_rows();
             scroll = entry_y.saturating_sub(half_vp + header as usize);
         }

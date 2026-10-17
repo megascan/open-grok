@@ -15,7 +15,7 @@ use crate::scrollback::layout::HorizontalLayout;
 use crate::scrollback::render::{ScratchBuffer, render_scrolled_entries_with_selection_boundaries};
 use crate::scrollback::selection::{RenderOutput, ScrollInfo, SelectionBox};
 use crate::scrollback::state::{ScrollbackState, ViewMode};
-use crate::scrollback::sticky::{PromptDescriptor, StickyHeaderLayout, compute_sticky_layout};
+use crate::scrollback::sticky::StickyHeaderLayout;
 use crate::scrollback::text_selection::{
     ResolvedSelectableLine, ResolvedSelectionBoundaries, ResolvedSelectionModel,
     VisibleBlockGeometry,
@@ -379,24 +379,11 @@ impl ScrollbackPane {
         scratch: &mut ScratchBuffer,
     ) -> RenderOutputWithSelectionBoundaries {
         let layout_cfg = &state.appearance().scrollback.layout;
-        let layout = HorizontalLayout::new(area, layout_cfg);
-        let entry_content_width = layout.entry_content_area().width;
-
-        // Build prompt descriptors for the given entry range.
-        // For SingleTurn, this gives us relative y_virtual coordinates.
-        // For AllTurns, this is equivalent to the full range.
-        let prompts = self.build_prompt_descriptors_for_range(
-            state,
-            entry_content_width,
-            theme,
-            entry_range.clone(),
-        );
-
         // Compute sticky header layout (disabled in compact mode).
         let use_sticky = state.appearance().scrollback.display.sticky_headers
             && !state.appearance().prompt.compact;
         let sticky = if use_sticky {
-            compute_sticky_layout(state.scroll_offset(), area.height, &prompts)
+            state.sticky_layout_for_range(entry_range.clone(), state.scroll_offset(), area.height)
         } else {
             StickyHeaderLayout::default()
         };
@@ -603,53 +590,6 @@ impl ScrollbackPane {
         // (None during push transitions and degenerate tiny viewports).
         output.output.sticky_gap_row = sticky.gap_row().filter(|row| *row < area.height);
         output
-    }
-
-    /// Build prompt descriptors for a range of entries.
-    ///
-    /// The y_virtual coordinates are relative to the range start, not absolute.
-    /// This allows the same sticky layout logic to work for both:
-    /// - SingleTurn: range = visible_entry_range() (one turn's entries)
-    /// - AllTurns: range = 0..len() (all entries)
-    ///
-    /// NOTE: This method now uses cached data from prepare_layout().
-    /// Heights are NOT recomputed - they come from the LayoutCache.
-    fn build_prompt_descriptors_for_range(
-        &self,
-        state: &ScrollbackState,
-        _entry_content_width: u16, // Kept for API compat, but not used (heights from cache)
-        _theme: &Theme,            // Kept for API compat, but not used
-        entry_range: Range<usize>,
-    ) -> Vec<PromptDescriptor> {
-        // Get cached data - must be valid after prepare_layout()
-        let cached_descriptors = state
-            .get_cached_prompt_descriptors()
-            .expect("layout cache must be valid - was prepare_layout() called?");
-
-        let cached_virtual_y = state
-            .get_cached_virtual_y()
-            .expect("layout cache must be valid - was prepare_layout() called?");
-
-        // Get the y_offset of the first entry in the range
-        // All y_virtual values will be adjusted relative to this
-        let y_offset = cached_virtual_y
-            .get(entry_range.start)
-            .copied()
-            .unwrap_or(0);
-
-        // Filter descriptors to only those in the entry range,
-        // and adjust y_virtual to be relative to range start
-        cached_descriptors
-            .iter()
-            .filter(|p| entry_range.contains(&p.entry_idx))
-            .map(|p| PromptDescriptor {
-                entry_idx: p.entry_idx,
-                y_virtual: p.y_virtual.saturating_sub(y_offset),
-                full_height: p.full_height,
-                min_height: p.min_height,
-                sticky: p.sticky,
-            })
-            .collect()
     }
 
     /// Render a sticky header (pushed or pinned).

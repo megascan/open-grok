@@ -90,6 +90,18 @@ impl LayoutCache {
         self
     }
 
+    /// Height of a contiguous range, including the last entry's gap.
+    /// `virtual_y` is the prefix sum of cached heights and gaps.
+    fn height_of_range(&self, range: Range<usize>) -> usize {
+        if range.is_empty() {
+            return 0;
+        }
+        let last = range.end - 1;
+        self.virtual_y[last] - self.virtual_y[range.start]
+            + self.entries[last].height as usize
+            + self.entries[last].gap_after as usize
+    }
+
     /// Binary-search `virtual_y` to find the entry that contains `content_y`.
     ///
     /// `content_y` is an absolute position in the virtual content space.
@@ -1097,16 +1109,10 @@ impl ScrollbackState {
     pub(super) fn compute_total_height_from_cache(&mut self) {
         if let Some(ref cache) = self.layout_cache {
             let range = self.visible_entry_range();
-            let layouts = &cache.entries[range.clone()];
-            // Sum entry heights + gap_after values in the visible range.
-            // Per-entry heights are u16; accumulate into usize so a long
-            // session (many entries / tall content) is not truncated.
-            let total: usize = layouts
-                .iter()
-                .map(|e| e.height as usize + e.gap_after as usize)
-                .sum();
-            // gap_after of the last entry acts as the trailing gap (always 1)
-            // for selection box bottom corner space, so total is correct as-is.
+            // The last entry's end includes its gap even when the range is
+            // an interior SingleTurn, without reading an entry after it.
+            let total = cache.height_of_range(range);
+            // Include the range's final gap exactly as the full sum did.
             self.release_pin_reserve_if_below_fold();
             self.pin_reserve_pad = self.pin_reserve_pad_rows(total);
             self.total_height = total.saturating_add(self.pin_reserve_pad);
@@ -1236,15 +1242,14 @@ impl ScrollbackState {
     /// entirely and just shift the virtual_y entries after the earliest change.
     ///
     /// `changes` is a list of `(entry_index, height_delta)` from
-    /// `update_dirty_entry_heights`. Returns the total height delta (sum of all
-    /// individual deltas), useful for O(1) total_height update.
-    pub(super) fn patch_virtual_y_for_dirty(&mut self, changes: &[(usize, i32)]) -> i32 {
+    /// `update_dirty_entry_heights`.
+    pub(super) fn patch_virtual_y_for_dirty(&mut self, changes: &[(usize, i32)]) {
         if changes.is_empty() {
-            return 0;
+            return;
         }
 
         let Some(cache) = self.layout_cache.as_mut() else {
-            return 0;
+            return;
         };
 
         // Find the earliest changed index. All virtual_y entries after it
@@ -1259,8 +1264,6 @@ impl ScrollbackState {
         // Sort changes by index to apply them in order.
         let mut sorted_changes = changes.to_vec();
         sorted_changes.sort_unstable_by_key(|&(idx, _)| idx);
-
-        let total_delta: i32 = sorted_changes.iter().map(|&(_, d)| d).sum();
 
         // Apply deltas to virtual_y. Walk from earliest_idx+1 to the end,
         // accumulating the delta as we pass each change point.
@@ -1298,27 +1301,17 @@ impl ScrollbackState {
             }
         }
 
-        // Update prompt_descriptors y_virtual values for affected prompts
-        for pd in cache.prompt_descriptors.iter_mut() {
-            if pd.entry_idx > earliest_idx {
-                pd.y_virtual = (pd.y_virtual as i64 + total_delta as i64) as usize;
-            } else if pd.entry_idx == earliest_idx {
-                // The prompt itself didn't move, but its full_height may have changed
-                // (update from the cache which was already patched by update_dirty_entry_heights)
-                pd.full_height = cache.entries[pd.entry_idx].height;
-            }
+        // A prompt between multiple dirty entries moves only by the deltas
+        // before it, not by their total. Read authoritative positions and
+        // heights after patching, starting at the first affected prompt. A
+        // streaming entry at the end therefore skips the earlier prompts.
+        let first_prompt = cache
+            .prompt_descriptors
+            .partition_point(|pd| pd.entry_idx < earliest_idx);
+        for pd in &mut cache.prompt_descriptors[first_prompt..] {
+            pd.y_virtual = cache.virtual_y[pd.entry_idx];
+            pd.full_height = cache.entries[pd.entry_idx].height;
         }
-
-        // Also update full_height for any prompts at dirty indices
-        for &(idx, _) in changes {
-            for pd in cache.prompt_descriptors.iter_mut() {
-                if pd.entry_idx == idx {
-                    pd.full_height = cache.entries[idx].height;
-                }
-            }
-        }
-
-        total_delta
     }
 
     /// Try to extend an existing layout cache for a single newly appended entry.
@@ -1766,10 +1759,7 @@ impl ScrollbackState {
 
         let cache = self.layout_cache.as_ref()?;
         let visible_range = self.visible_entry_range();
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, &visible_range);
-
-        let sticky =
-            compute_sticky_layout(self.scroll_offset, self.viewport_height, &relative_prompts);
+        let sticky = self.current_sticky_layout(cache, &visible_range);
 
         if sticky.has_header() {
             Some(sticky)

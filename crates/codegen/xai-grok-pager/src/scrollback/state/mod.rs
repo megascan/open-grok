@@ -1739,15 +1739,10 @@ impl ScrollbackState {
                     // Fast path (streaming): only heights changed, gaps are stable.
                     // Patch virtual_y in O(n-k) where k is the earliest dirty index.
                     // For streaming (dirty entry at end), this is O(1).
-                    let total_delta = self.patch_virtual_y_for_dirty(&changes);
-                    // Apply delta directly instead of re-summing entire visible range.
-                    // Clamp at 0 to avoid underflow; no upper cap (total_height is
-                    // usize, so tall sessions are not truncated).
-                    let content = self.total_height.saturating_sub(self.pin_reserve_pad);
-                    let new_content = (content as i64 + total_delta as i64).max(0) as usize;
-                    self.release_pin_reserve_if_below_fold();
-                    self.pin_reserve_pad = self.pin_reserve_pad_rows(new_content);
-                    self.total_height = new_content.saturating_add(self.pin_reserve_pad);
+                    self.patch_virtual_y_for_dirty(&changes);
+                    // The visible turn may also have changed since the previous
+                    // frame. Recompute its total from prefix positions in O(1).
+                    self.compute_total_height_from_cache();
                 }
             } else if self.gaps_may_be_dirty {
                 // Heights didn't change, but structural state is dirty (e.g.,
