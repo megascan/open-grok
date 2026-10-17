@@ -13498,6 +13498,7 @@ dependencies = [
  "dirs 5.0.1",
  "dunce",
  "filetime",
+ "flate2",
  "futures",
  "gcloud-storage",
  "indexmap",
