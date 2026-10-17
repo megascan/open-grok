@@ -63,6 +63,35 @@ impl GatePreflight {
         }
     }
 
+    /// A patch is one transaction: a deny or ask on any target applies to
+    /// the entire call, while a path allow covers it only if every target is
+    /// allowed. Do not use the synthetic `Edit("apply_patch")` as a filename.
+    pub(crate) fn evaluate_edit_targets(
+        &mut self,
+        policy: Option<&CompiledPolicy>,
+        targets: &[String],
+        cwd: &Path,
+    ) {
+        let Some(policy) = policy else {
+            self.direct = None;
+            self.native_symlink_fail_closed = false;
+            return;
+        };
+        let mut escalation = None;
+        let mut all_allowed = !targets.is_empty();
+        self.native_symlink_fail_closed = false;
+        for path in targets {
+            let (decision, fail_closed) =
+                policy.evaluate_with_cwd_details(&AccessKind::Edit(path.clone()), Some(cwd));
+            self.native_symlink_fail_closed |= fail_closed;
+            all_allowed &= matches!(decision, Some(Decision::Allow));
+            if matches!(decision, Some(Decision::Ask | Decision::Reject(_))) {
+                escalation = combine_decisions(escalation, decision);
+            }
+        }
+        self.direct = escalation.or_else(|| all_allowed.then_some(Decision::Allow));
+    }
+
     /// Combined managed decision (deny > ask > allow), as the manager applied
     /// it before provenance existed.
     pub(crate) fn policy_decision(&self) -> Option<Decision> {
@@ -250,5 +279,47 @@ mod tests {
         let open_preflight = GatePreflight::evaluate(Some(&open), &access, ws.path(), false);
         assert!(open_preflight.policy_decision().is_none());
         assert!(!open_preflight.shell_forced_prompt());
+    }
+
+    #[test]
+    fn patch_targets_require_allows_for_every_path_and_deny_or_ask_wins() {
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![
+            PermissionRule {
+                action: RuleAction::Allow,
+                tool: ToolFilter::Edit,
+                pattern: Some("src/**".into()),
+                pattern_mode: PatternMode::Glob,
+            },
+            PermissionRule {
+                action: RuleAction::Deny,
+                tool: ToolFilter::Edit,
+                pattern: Some("secrets/**".into()),
+                pattern_mode: PatternMode::Glob,
+            },
+            PermissionRule {
+                action: RuleAction::Ask,
+                tool: ToolFilter::Edit,
+                pattern: Some("review/**".into()),
+                pattern_mode: PatternMode::Glob,
+            },
+        ]));
+        let cwd = Path::new("/work");
+        let access = AccessKind::Edit("apply_patch".into());
+        let decision = |paths: &[&str]| {
+            let mut preflight = GatePreflight::evaluate(Some(&policy), &access, cwd, false);
+            preflight.evaluate_edit_targets(
+                Some(&policy),
+                &paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                cwd,
+            );
+            preflight.policy_decision()
+        };
+        assert_eq!(decision(&["src/a.rs", "src/b.rs"]), Some(Decision::Allow));
+        assert_eq!(decision(&["src/a.rs", "other/b.rs"]), None);
+        assert_eq!(decision(&["src/a.rs", "review/a.rs"]), Some(Decision::Ask));
+        assert!(matches!(
+            decision(&["review/a.rs", "secrets/token"]),
+            Some(Decision::Reject(_))
+        ));
     }
 }

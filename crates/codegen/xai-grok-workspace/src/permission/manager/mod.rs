@@ -1283,6 +1283,7 @@ impl PermissionHandle {
     ) -> PermissionResolution {
         self.request_with_context(PermissionRequest {
             access,
+            edit_targets: None,
             tool_call_update,
             path_context,
             session_id,
@@ -1881,6 +1882,7 @@ fn spawn_permission_manager_with_pin(
                     request:
                         PermissionRequest {
                             access,
+                            edit_targets,
                             tool_call_update,
                             path_context,
                             session_id: request_session_id,
@@ -2028,6 +2030,21 @@ fn spawn_permission_manager_with_pin(
                         continue;
                     }
 
+                    if edit_targets.as_ref().is_some_and(|targets| {
+                        targets.is_empty() || !matches!(&access, AccessKind::Edit(_))
+                    }) {
+                        let decision = Decision::PolicyDeny(
+                            "invalid multi-file edit permission request".to_owned(),
+                        );
+                        let event =
+                            emit_event(&decision, false, false, None, Some(reasons::POLICY_DENY));
+                        let _ = respond_to.send(PermissionResolution {
+                            decision,
+                            event: Some(event),
+                        });
+                        continue;
+                    }
+
                     if matches!(
                         &access,
                         AccessKind::Bash(_) | AccessKind::MCPTool { .. } | AccessKind::WebFetch(_)
@@ -2082,44 +2099,54 @@ fn spawn_permission_manager_with_pin(
                     };
                     let recovered_classification =
                         auto_mode && requires_recovered_classification(bash_evaluation.as_ref());
-                    let protected_edit = match (&access, path_context.as_ref()) {
-                        (AccessKind::Edit(path), Some(context)) => {
-                            let resolved = resolve_model_path(
-                                &context.real_cwd,
-                                context.display_cwd.as_deref(),
-                                path,
-                            );
-                            edit_target_protection(&resolved)
-                        }
-                        // Direct workspace callers predate per-request context and execute
-                        // against the manager cwd; the shell always supplies context.
-                        (AccessKind::Edit(path), None) => {
-                            let resolved = resolve_model_path(cwd.as_path(), None, path);
-                            edit_target_protection(&resolved)
-                        }
-                        (AccessKind::Bash(_), context) => bash_evaluation.as_ref().and_then(|e| {
-                            if e.has_cwd_change
-                                && e.creation_paths
-                                    .iter()
-                                    .any(|p| !std::path::Path::new(p).is_absolute())
-                            {
-                                return Some(
-                                    crate::permission::shell_access::ProtectedEditReason::Sensitive,
+                    let protected_edit = if let Some(targets) = &edit_targets {
+                        targets.iter().find_map(|path| {
+                            // Patch targets are already resolved by the caller in the
+                            // same cwd used by the patch implementation.
+                            edit_target_protection(std::path::Path::new(path))
+                        })
+                    } else {
+                        match (&access, path_context.as_ref()) {
+                            (AccessKind::Edit(path), Some(context)) => {
+                                let resolved = resolve_model_path(
+                                    &context.real_cwd,
+                                    context.display_cwd.as_deref(),
+                                    path,
                                 );
-                            }
-                            e.creation_paths.iter().find_map(|path| {
-                                let resolved = match context {
-                                    Some(ctx) => resolve_model_path(
-                                        &ctx.real_cwd,
-                                        ctx.display_cwd.as_deref(),
-                                        path,
-                                    ),
-                                    None => resolve_model_path(cwd.as_path(), None, path),
-                                };
                                 edit_target_protection(&resolved)
-                            })
-                        }),
-                        _ => None,
+                            }
+                            // Direct workspace callers predate per-request context and execute
+                            // against the manager cwd; the shell always supplies context.
+                            (AccessKind::Edit(path), None) => {
+                                let resolved = resolve_model_path(cwd.as_path(), None, path);
+                                edit_target_protection(&resolved)
+                            }
+                            (AccessKind::Bash(_), context) => {
+                                bash_evaluation.as_ref().and_then(|e| {
+                                    if e.has_cwd_change
+                                        && e.creation_paths
+                                            .iter()
+                                            .any(|p| !std::path::Path::new(p).is_absolute())
+                                    {
+                                        return Some(
+                                            crate::permission::shell_access::ProtectedEditReason::Sensitive,
+                                        );
+                                    }
+                                    e.creation_paths.iter().find_map(|path| {
+                                        let resolved = match context {
+                                            Some(ctx) => resolve_model_path(
+                                                &ctx.real_cwd,
+                                                ctx.display_cwd.as_deref(),
+                                                path,
+                                            ),
+                                            None => resolve_model_path(cwd.as_path(), None, path),
+                                        };
+                                        edit_target_protection(&resolved)
+                                    })
+                                })
+                            }
+                            _ => None,
+                        }
                     };
 
                     // Evaluate managed policy (direct access + per-segment Bash command
@@ -2127,12 +2154,19 @@ fn spawn_permission_manager_with_pin(
                     // paths below honor a deny or forced prompt. The preflight also
                     // resolves the auto-mode disposition of a fail-closed gate Ask:
                     // defer to the classifier or stay prompt-binding on a rule match.
-                    let preflight = GatePreflight::evaluate(
+                    let mut preflight = GatePreflight::evaluate(
                         compiled_policy.as_ref(),
                         &access,
                         request_cwd,
                         auto_mode,
                     );
+                    if let Some(targets) = edit_targets.as_deref() {
+                        preflight.evaluate_edit_targets(
+                            compiled_policy.as_ref(),
+                            targets,
+                            request_cwd,
+                        );
+                    }
                     let policy_decision = preflight.policy_decision();
                     let policy_forced_prompt = preflight.policy_forced_prompt();
                     // An `Ask` from either bash gate must block the YOLO/auto fast paths.
@@ -2630,6 +2664,7 @@ fn spawn_permission_manager_with_pin(
                             };
                             (d, reason)
                         }),
+                        AccessKind::Edit(_) if policy_forced_prompt => None,
                         AccessKind::Edit(_) => {
                             if allow_edits_for_session && protected_edit.is_none() {
                                 Some((Decision::Allow, reasons::PERSISTED_GRANT))
@@ -3330,6 +3365,77 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn patch_targets_enforce_deny_before_yolo_and_ask_before_grants() {
+        use crate::permission::types::{
+            PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let config = PermissionConfig::new(vec![
+                    PermissionRule {
+                        action: RuleAction::Deny,
+                        tool: ToolFilter::Edit,
+                        pattern: Some("**/secrets/**".into()),
+                        pattern_mode: PatternMode::Glob,
+                    },
+                    PermissionRule {
+                        action: RuleAction::Ask,
+                        tool: ToolFilter::Edit,
+                        pattern: Some("**/review/**".into()),
+                        pattern_mode: PatternMode::Glob,
+                    },
+                ]);
+                let (yolo, _) = test_manager_with_config(&cwd, config.clone(), true);
+                let client = IdSelectingClient::new("allow-edits-session");
+                let prompts = client.prompts.clone();
+                let (ask, _) = manager_with_recording_client_remember(
+                    &cwd,
+                    Some(config),
+                    client,
+                    ClientType::GrokPager,
+                    true,
+                );
+                let request = |paths: &[&str]| PermissionRequest {
+                    edit_targets: Some(
+                        paths
+                            .iter()
+                            .map(|p| cwd.as_path().join(p).to_string_lossy().into_owned())
+                            .collect(),
+                    ),
+                    ..PermissionRequest::new(AccessKind::Edit("apply_patch".into()), tool_call())
+                };
+                let denied = yolo
+                    .request_with_context(request(&["src/a.rs", "secrets/token"]))
+                    .await;
+                assert!(
+                    matches!(denied.decision, Decision::PolicyDeny(_)),
+                    "{:?}",
+                    denied.decision
+                );
+                let allowed = yolo
+                    .request_with_context(request(&["src/a.rs", "src/b.rs"]))
+                    .await;
+                assert_eq!(allowed.decision, Decision::Allow);
+                let first = ask.request_with_context(request(&["src/a.rs"])).await;
+                assert_eq!(first.decision, Decision::Allow);
+                assert_eq!(prompts.borrow().len(), 1);
+                let prompted = ask
+                    .request_with_context(request(&["src/a.rs", "review/a.rs"]))
+                    .await;
+                assert_eq!(prompted.decision, Decision::Allow);
+                assert_eq!(
+                    prompts.borrow().len(),
+                    2,
+                    "the ask rule must override the remembered edit grant"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

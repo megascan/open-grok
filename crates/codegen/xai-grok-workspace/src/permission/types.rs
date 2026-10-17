@@ -313,6 +313,10 @@ impl HookAsk {
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
     pub access: AccessKind,
+    /// All paths changed by a multi-file edit, resolved as the tool resolves
+    /// them. The actor evaluates these together before any fast path; `access`
+    /// remains the operation identity used for the approval card.
+    pub edit_targets: Option<Vec<String>>,
     pub tool_call_update: acp::ToolCallUpdate,
     pub path_context: Option<RequestPathContext>,
     pub session_id: Option<String>,
@@ -324,6 +328,7 @@ impl PermissionRequest {
     pub fn new(access: AccessKind, tool_call_update: acp::ToolCallUpdate) -> Self {
         Self {
             access,
+            edit_targets: None,
             tool_call_update,
             path_context: None,
             session_id: None,
