@@ -40,7 +40,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum time to wait for the dump reader task after the child process exits.
 /// Uses a 5s close timeout. If a background process inherits fd 4,
 /// the reader would hang forever without this.
-const DUMP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const DUMP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound memory even if a command writes arbitrary data to its inherited fd 4.
+const MAX_DUMP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Environment overrides applied to every agent terminal / persistent shell spawn.
 /// Prevents color/pager noise in captured output and marks the process as agent-driven.
@@ -883,66 +885,80 @@ pub async fn write_snapshot_to_pipe(snapshot: &str, fd: OwnedFd) -> std::io::Res
     .map_err(std::io::Error::other)?
 }
 
-/// Read the full dump output from the state-out pipe with a timeout.
+/// Read the dump while the command runs, stopping at the end marker or EOF.
 ///
-/// If a background process inherits fd 4, the pipe never closes and the reader
-/// hangs. The timeout (5s close timeout) prevents this from
-/// blocking the actor loop forever. On timeout, returns whatever was read so far
-/// (which is typically empty, so marker validation will fail and prior state is kept).
+/// The caller bounds the wait *after* the shell exits. The descriptor is
+/// nonblocking so aborting this future closes it even if another process has
+/// inherited the write end; no blocking worker is left behind.
 pub async fn read_dump_from_pipe(fd: OwnedFd) -> std::io::Result<String> {
-    // Read until either of the END markers appears, *not* until EOF.
-    //
-    // When the user's command backgrounds a subprocess (`cmd &`), the bg
-    // shell inherits fd 4 (the dump pipe's write-end) and keeps it open
-    // until *it* exits. The parent shell finishes its dump and exits, but
-    // the kernel doesn't close the read-end's EOF until every write-end
-    // holder closes theirs. Without marker-driven termination we'd block
-    // on `read_to_string` for the entire bg lifetime, hit the 5s safety
-    // timeout, and discard the (perfectly complete) dump — which manifests
-    // as `cd` / function / alias state silently failing to persist after
-    // any command that backgrounds something. (See harness scenarios
-    // "State persistence after backgrounded command" and the cd-roundtrip
-    // tests for shell state persistence parity.)
-    //
-    // We additionally cap on `DUMP_READ_TIMEOUT` so a shell that crashed
-    // before emitting the END marker doesn't wedge the actor.
-    match tokio::time::timeout(
-        DUMP_READ_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
-            std::mem::forget(fd);
-            let mut buf = String::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let n = file.read(&mut chunk)?;
-                if n == 0 {
-                    // EOF: every write-end holder closed fd 4 (the
-                    // expected path when no bg subprocess was spawned).
-                    break;
-                }
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                // Either marker suffices; we accept whichever shell the
-                // child happens to be (bash vs zsh).
-                if buf.contains(BASH_STATE_END_MARKER) || buf.contains(ZSH_STATE_END_MARKER) {
-                    break;
-                }
-            }
-            drop(file);
-            Ok(buf)
-        }),
+    read_dump_with_limit(fd, MAX_DUMP_BYTES).await
+}
+
+async fn read_dump_with_limit(fd: OwnedFd, limit: usize) -> std::io::Result<String> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use tokio::io::unix::AsyncFd;
+
+    let flags = fcntl(&fd, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    fcntl(
+        &fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
     )
-    .await
-    {
-        Ok(join_result) => join_result.map_err(std::io::Error::other)?,
-        Err(_timeout) => {
-            tracing::warn!(
-                "shell state dump read timed out after {}s (END marker never arrived)",
-                DUMP_READ_TIMEOUT.as_secs()
-            );
-            Ok(String::new())
+    .map_err(std::io::Error::from)?;
+    let fd = AsyncFd::new(fd)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut trailing = Vec::new();
+    let mut exceeded = false;
+    let mut since_yield = 0;
+    loop {
+        let mut ready = fd.readable().await?;
+        let n = match ready.try_io(|inner| {
+            nix::unistd::read(inner.get_ref(), &mut chunk).map_err(std::io::Error::from)
+        }) {
+            Ok(result) => result?,
+            Err(_) => continue,
+        };
+        if n == 0 {
+            break;
+        }
+        if !exceeded {
+            if n > limit.saturating_sub(bytes.len()) {
+                exceeded = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+        }
+        // Keep only a marker-sized overlap after an oversized dump. We keep
+        // draining without storing it so the shell can finish and retain its
+        // command exit status instead of receiving SIGPIPE while dumping.
+        trailing.extend_from_slice(&chunk[..n]);
+        let found = trailing
+            .windows(BASH_STATE_END_MARKER.len())
+            .any(|w| w == BASH_STATE_END_MARKER.as_bytes())
+            || trailing
+                .windows(ZSH_STATE_END_MARKER.len())
+                .any(|w| w == ZSH_STATE_END_MARKER.as_bytes());
+        if found {
+            break;
+        }
+        let overlap = BASH_STATE_END_MARKER.len().max(ZSH_STATE_END_MARKER.len()) - 1;
+        if trailing.len() > overlap {
+            trailing.drain(..trailing.len() - overlap);
+        }
+        since_yield += n;
+        if since_yield >= 64 * 1024 {
+            since_yield = 0;
+            tokio::task::yield_now().await;
         }
     }
+    if exceeded {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("shell state dump exceeded {limit} bytes"),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ============================================================================
@@ -957,6 +973,38 @@ mod cli_facing_unchanged_tests;
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[tokio::test]
+    async fn oversized_dump_is_discarded_without_closing_live_writer() {
+        let (read, write) = os_pipe().unwrap();
+        let reader = tokio::spawn(read_dump_with_limit(read, 64));
+        nix::unistd::write(&write, &[b'x'; 80]).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reader.is_finished(),
+            "reader must keep draining while shell runs"
+        );
+        nix::unistd::write(&write, BASH_STATE_END_MARKER.as_bytes()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn cancelling_dump_reader_closes_open_pipe() {
+        let (read, write) = os_pipe().unwrap();
+        let reader = tokio::spawn(read_dump_from_pipe(read));
+        tokio::task::yield_now().await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            nix::unistd::write(&write, b"x"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
 
     #[test]
     fn shell_env_overrides_marks_agent_terminal() {

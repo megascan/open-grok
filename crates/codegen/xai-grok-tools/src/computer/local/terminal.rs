@@ -5,7 +5,7 @@
 //! - `LocalTerminalActor` runs in a spawned task and owns all mutable state
 //! - No mutex locks are needed - all state access is through message passing
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -40,6 +40,9 @@ struct SpawnResult {
 }
 
 const READ_BUFFER_SIZE: usize = 8192;
+/// Bound per-process actor work and allocation on each poll, even when a
+/// writer keeps its pipe continuously readable.
+const MAX_POLL_OUTPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_NOTIFICATION_INTERVAL_MS: u64 = 100;
 const COMMAND_CHANNEL_SIZE: usize = 32;
 /// How long to keep completed background tasks in memory before eviction.
@@ -207,6 +210,12 @@ enum TerminalCommand {
         task_id: String,
         output: Vec<u8>,
         status: ExitStatus,
+    },
+
+    /// Result of the bounded, asynchronous persistent-shell dump collection.
+    ShellDumpReady {
+        task_id: String,
+        result: std::io::Result<String>,
     },
 
     Run {
@@ -399,6 +408,7 @@ struct ProcessState {
     /// is a truncated tail that *shrinks* once `maybe_truncate` fires; a
     /// length-based gate would go (and stay) false after truncation.
     last_notified_total: usize,
+    last_notified_at: Instant,
     /// Set when a `block=true` waiter consumed this task's result.
     block_waited: bool,
     /// Display/tombstone: kill tool, UI, or teardown — not a natural exit.
@@ -409,11 +419,26 @@ struct ProcessState {
     /// When present, the actor collects the dump on process exit and updates
     /// the canonical `ShellState`.
     state_dump_handle: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+    /// Abort handle retained while the post-exit collector owns the reader.
+    pending_dump: Option<tokio::task::AbortHandle>,
 
     /// Session that owns this process. Used to scope kill operations so
     /// subagent teardown only kills the subagent's own tasks.
     owner_session_id: Option<String>,
     description: Option<String>,
+}
+
+impl Drop for ProcessState {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches its task. Close the dump pipe even
+        // on an abandoned or evicted process rather than leaving a reader.
+        if let Some(handle) = self.state_dump_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.pending_dump.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl ProcessState {
@@ -438,9 +463,32 @@ impl ProcessState {
     }
 
     fn notify_waiters(&mut self, result: Result<TerminalRunResult, ComputerError>) {
+        self.notify_pending_output(true);
         for waiter in self.completion_waiters.drain(..) {
             let _ = waiter.send(result.clone());
         }
+    }
+
+    /// Pipe draining can run much faster than the UI can consume full output
+    /// snapshots. Coalesce streaming updates and always flush the final one.
+    fn notify_pending_output(&mut self, force: bool) {
+        if self.total_bytes == self.last_notified_total
+            || (!force && self.last_notified_at.elapsed() < notification_interval())
+        {
+            return;
+        }
+        self.notification_handle.send_output_chunk(BashOutputChunk {
+            base: BashNotificationBase {
+                tool_call_id: self.tool_call_id.clone(),
+                command: self.command.clone(),
+                output: self.output_buffer.clone(),
+                total_bytes: self.total_bytes,
+                truncated: self.truncated,
+                cwd: self.cwd.clone().into(),
+            },
+        });
+        self.last_notified_total = self.total_bytes;
+        self.last_notified_at = Instant::now();
     }
 
     /// Front-and-back truncation using character counts.
@@ -497,6 +545,8 @@ impl ProcessState {
 
     fn is_complete(&self) -> bool {
         self.lifecycle.is_complete()
+            && self.pending_dump.is_none()
+            && self.state_dump_handle.is_none()
     }
 
     /// The output is not final until `finish_output`.
@@ -606,6 +656,13 @@ struct LocalTerminalActor {
     /// Active processes: task_id -> ProcessState
     processes: HashMap<String, ProcessState>,
 
+    /// Keep polling briefly after output, allowing writers to refill their pipes.
+    fast_poll_until: Option<Instant>,
+    just_read_output: bool,
+
+    /// Preserve command order while a prior persistent-shell dump is collected.
+    deferred_runs: VecDeque<TerminalCommand>,
+
     /// task_id -> list of waiters registered by WaitForCompletion commands
     child_exit: ChildExitWake,
 
@@ -704,6 +761,9 @@ impl LocalTerminalActor {
             shell_env_policy,
             sandbox_launch,
             processes: HashMap::new(),
+            fast_poll_until: None,
+            just_read_output: false,
+            deferred_runs: VecDeque::new(),
             child_exit: ChildExitWake::new(),
             completion_waiters: HashMap::new(),
             completed_task_snapshots: HashMap::new(),
@@ -1024,6 +1084,11 @@ impl LocalTerminalActor {
 
         loop {
             let waiter_deadline = self.next_waiter_deadline();
+            let can_run_deferred = !self.deferred_runs.is_empty()
+                && !self.processes.values().any(|p| p.pending_dump.is_some());
+            let fast_poll = self
+                .fast_poll_until
+                .is_some_and(|until| Instant::now() < until);
             tokio::select! {
                 // Bias towards commands (cancel, kill) over periodic ticking
                 // so that kill_foreground_commands is handled promptly even
@@ -1034,6 +1099,11 @@ impl LocalTerminalActor {
                 _ = self.cancel_token.cancelled() => {
                     self.shutdown_all().await;
                     break;
+                }
+
+                _ = std::future::ready(()), if can_run_deferred => {
+                    let cmd = self.deferred_runs.pop_front().unwrap();
+                    self.handle_command(cmd).await;
                 }
 
                 // Handle incoming commands
@@ -1060,6 +1130,17 @@ impl LocalTerminalActor {
                 }
 
                 _ = self.child_exit.recv(), if !self.processes.is_empty() => {
+                    self.poll_all_processes().await;
+                }
+
+                // Yield between productive bounded batches. After an empty
+                // read, briefly retry to allow small pipes to refill without
+                // spinning or waiting for the 100ms maintenance tick.
+                _ = tokio::task::yield_now(), if fast_poll && self.just_read_output => {
+                    self.poll_all_processes().await;
+                }
+
+                _ = tokio::time::sleep(Duration::from_millis(1)), if fast_poll && !self.just_read_output => {
                     self.poll_all_processes().await;
                 }
 
@@ -1096,13 +1177,41 @@ impl LocalTerminalActor {
                 }
                 process.flush_and_truncate_output_file().await;
                 process.finish_output(Collection::of(&process.child));
-                self.collect_shell_state_dumps(std::slice::from_ref(&task_id))
-                    .await;
-                if !already_exited && let Some(process) = self.processes.get_mut(&task_id) {
+                self.collect_shell_state_dumps(std::slice::from_ref(&task_id));
+                if let Some(process) = self.processes.get_mut(&task_id)
+                    && process.is_complete()
+                {
                     let result = Ok(process.to_result());
                     process.notify_waiters(result);
                 }
                 self.notify_completion_waiters().await;
+            }
+            TerminalCommand::ShellDumpReady { task_id, result } => {
+                if let Some(process) = self.processes.get_mut(&task_id)
+                    && process.pending_dump.take().is_some()
+                {
+                    #[cfg(unix)]
+                    match result {
+                        Ok(dump) => {
+                            if let Some(state) = self.shell_state.as_mut() {
+                                state.update_from_dump(&dump);
+                            }
+                        }
+                        Err(e) => tracing::debug!("failed to read shell state dump: {e}"),
+                    }
+                    #[cfg(not(unix))]
+                    let _ = result;
+                    if process.is_complete() {
+                        let result = Ok(process.to_result());
+                        process.notify_waiters(result);
+                    }
+                }
+                self.notify_completion_waiters().await;
+            }
+            cmd @ (TerminalCommand::Run { .. } | TerminalCommand::RunBackground { .. })
+                if self.processes.values().any(|p| p.pending_dump.is_some()) =>
+            {
+                self.deferred_runs.push_back(cmd);
             }
             TerminalCommand::Run { request, reply } => {
                 if request.notification_handle.is_delivery_revoked() {
@@ -1324,10 +1433,12 @@ impl LocalTerminalActor {
             tool_call_id: request.tool_call_id.clone(),
             kind: request.kind,
             last_notified_total: 0,
+            last_notified_at: Instant::now(),
             block_waited: false,
             explicitly_killed: false,
             kill_result_delivered: false,
             state_dump_handle,
+            pending_dump: None,
             owner_session_id: request.owner_session_id.clone(),
             description: request.description.filter(|d| !d.trim().is_empty()),
         };
@@ -1505,21 +1616,14 @@ impl LocalTerminalActor {
             tool_call_id: request.tool_call_id.clone(),
             kind: request.kind,
             last_notified_total: 0,
+            last_notified_at: Instant::now(),
             block_waited: false,
             explicitly_killed: false,
             kill_result_delivered: false,
-            // Background commands don't update the canonical shell state —
-            // they may run for hours and their env mutations shouldn't leak.
-            // Detach the dump reader so its result is discarded (the task
-            // continues independently until EOF or DUMP_READ_TIMEOUT).
-            state_dump_handle: if self.persistent_shell {
-                // Still spawn with the state wrapping (so bg commands inherit
-                // the session env), but discard the dump reader.
-                drop(state_dump_handle);
-                None
-            } else {
-                None
-            },
+            // Keep draining the dump while the shell runs so its writer cannot
+            // block. Background dumps are discarded after the shell exits.
+            state_dump_handle,
+            pending_dump: None,
             owner_session_id: request.owner_session_id.clone(),
             description: request.description.filter(|d| !d.trim().is_empty()),
         };
@@ -1608,6 +1712,7 @@ impl LocalTerminalActor {
 
     /// Poll all processes for output and completion
     async fn poll_all_processes(&mut self) {
+        self.just_read_output = false;
         // 0a. Check if the memory monitor detected a memory.high breach.
         //     If so, kill the *newest* running foreground process (kill the
         //     most recent command first).
@@ -1627,7 +1732,7 @@ impl LocalTerminalActor {
             }
         }
 
-        self.collect_shell_state_dumps(&task_ids).await;
+        self.collect_shell_state_dumps(&task_ids);
         self.notify_completion_waiters().await;
         self.sweep_finished_background_tasks().await;
         self.evict_exited_processes().await;
@@ -1661,6 +1766,9 @@ impl LocalTerminalActor {
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
                 process.finish_output(Collection::of(&process.child));
+                if let Some(handle) = process.state_dump_handle.take() {
+                    handle.abort();
+                }
                 let result = Ok(process.to_result());
                 process.notify_waiters(result);
             }
@@ -1722,60 +1830,64 @@ impl LocalTerminalActor {
                 });
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
-                // Notify any waiter immediately (may be a still-foreground
-                // command, unlike the bg-only max-runtime sweep; mirrors OOM).
-                let result = Ok(process.to_result());
-                process.notify_waiters(result);
+                // Completion is reported after escalation and output drain.
             }
         }
     }
 
-    // Once a child is reaped (`child.id()` is `None`), drop the actor's
-    // strong `Arc<ProcessGroup>` so the `ProcessScope`'s `Weak` dies at reap.
-    // A completed task lingers in `self.processes` for the TTL; keeping the
-    // Arc that long would let `kill_all` upgrade the `Weak` and `killpg` a
-    // pid the OS may have recycled. Runs after the poll loop so it catches a
-    // reap from any path (normal/kill/oom/timeout) within one tick.
-    //
-    // Unix-only: only `killpg` can hit a recycled pid. On Windows the group
-    // is a JobObject HANDLE (no recyclable pid), so an early drop buys
-    // nothing — the Arc is released when the `ProcessState` is removed.
-    async fn collect_shell_state_dumps(&mut self, task_ids: &[String]) {
+    /// Collect a foreground dump without blocking the actor. New commands wait
+    /// until its result is applied, while cancellation and queries remain live.
+    fn collect_shell_state_dumps(&mut self, task_ids: &[String]) {
         #[cfg(unix)]
-        // 0c. Collect state dumps from completed foreground processes and update
-        //     the canonical shell state (persistent shell only).
-        //     Uses a scoped borrow on self.processes so self.shell_state can be
-        //     updated afterwards.
         if self.persistent_shell {
             for task_id in task_ids {
-                let handle = {
-                    let Some(process) = self.processes.get_mut(task_id) else {
-                        continue;
-                    };
-                    // Only foreground processes update the canonical state.
-                    if !process.lifecycle.has_exited() || process.bg_status.is_backgrounded() {
-                        continue;
-                    }
-                    process.state_dump_handle.take()
+                let Some(process) = self.processes.get_mut(task_id) else {
+                    continue;
                 };
-                // Borrow on self.processes is released — safe to access self.shell_state.
-                if let Some(handle) = handle {
-                    match handle.await {
-                        Ok(Ok(dump)) => {
-                            if let Some(ref mut state) = self.shell_state {
-                                state.update_from_dump(&dump);
+                if !process.lifecycle.has_exited() || process.child.id().is_some() {
+                    continue;
+                }
+                let Some(mut handle) = process.state_dump_handle.take() else {
+                    continue;
+                };
+                if process.bg_status.is_backgrounded() {
+                    handle.abort();
+                    continue;
+                }
+                process.pending_dump = Some(handle.abort_handle());
+                let task_id = task_id.clone();
+                let sender = self.self_tx.clone();
+                let cancel = self.cancel_token.clone();
+                tokio::spawn(async move {
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            handle.abort();
+                            let _ = handle.await;
+                            return;
+                        }
+                        result = tokio::time::timeout(shell_state::DUMP_READ_TIMEOUT, &mut handle) => {
+                            match result {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(error)) => Err(std::io::Error::other(error)),
+                                Err(_) => {
+                                    handle.abort();
+                                    let _ = handle.await;
+                                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "shell state dump timed out"))
+                                }
                             }
                         }
-                        Ok(Err(e)) => {
-                            tracing::debug!("failed to read shell state dump: {e}");
-                        }
-                        Err(e) => {
-                            tracing::debug!("shell state dump task panicked: {e}");
+                    };
+                    if let Some(sender) = sender.upgrade() {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {},
+                            _ = sender.send(TerminalCommand::ShellDumpReady { task_id, result }) => {},
                         }
                     }
-                }
+                });
             }
         }
+        #[cfg(not(unix))]
+        let _ = task_ids;
     }
 
     // 1. Notify completion waiters for processes that have exited
@@ -1911,7 +2023,8 @@ impl LocalTerminalActor {
                     return false;
                 }
                 if !p.bg_status.is_backgrounded() {
-                    return true; // foreground already replied
+                    // Forced exits still need escalation and output collection.
+                    return p.is_complete();
                 }
                 // Backgrounded + completed: evict after TTL
                 matches!(p.lifecycle.swept_at(), Some(t) if t.elapsed() >= self.completed_task_ttl)
@@ -1976,8 +2089,9 @@ impl LocalTerminalActor {
             return;
         }
 
-        // An exited task may still hold a live child. Escalate to SIGKILL if
-        // needed, drain the pipes once it dies, and keep trying to collect it.
+        // Forced exits hold the unreaped leader through the grace period.
+        // A zombie leader pins its PID, making the eventual group SIGKILL safe
+        // even if that leader exited promptly and descendants ignored SIGTERM.
         if let Some(recorded_status) = process.lifecycle.exit_status().cloned() {
             if process.lifecycle.is_settled() {
                 return;
@@ -1986,26 +2100,25 @@ impl LocalTerminalActor {
                 Lifecycle::Exiting { since, .. } => Some(*since),
                 Lifecycle::Running | Lifecycle::Finished { .. } | Lifecycle::Swept { .. } => None,
             };
+            if waiting_since.is_some_and(|since| since.elapsed() < SIGTERM_GRACE) {
+                return;
+            }
+            send_sigkill_to_group(process);
             match process.child.try_wait() {
-                Ok(None) if process.is_complete() => {
-                    // Already given up on this one; keep the kill signal fresh
-                    // and keep trying to collect it.
-                    send_sigkill_to_group(process);
-                }
                 Ok(None) => {
-                    // Process was told to die but is still running — escalate to SIGKILL
-                    send_sigkill_to_group(process);
                     let gave_up = waiting_since.is_some_and(|since| since.elapsed() >= REAP_GRACE);
-                    if gave_up {
-                        // It is not dying. Take the output there is so the task
-                        // can report completion instead of waiting forever.
+                    if gave_up && !process.is_complete() {
                         take_available_output(process).await;
                         process.flush_and_truncate_output_file().await;
                         process.finish_output(Collection::ABANDONED);
+                        if let Some(handle) = process.state_dump_handle.take() {
+                            handle.abort();
+                        }
+                        let result = Ok(process.to_result());
+                        process.notify_waiters(result);
                     }
                 }
                 Ok(Some(_)) | Err(_) => {
-                    // A second drain is harmless: the first one closes the pipes.
                     process.draining = true;
                     spawn_detached_drain(
                         self.self_tx.clone(),
@@ -2019,60 +2132,17 @@ impl LocalTerminalActor {
             return;
         }
 
-        // ── Non-blocking reads ──────────────────────────────────────────
-        //
-        // Read all *currently available* bytes from stdout and stderr using
-        // non-blocking `poll_read`.  This avoids the old 10 ms timeout-per-
-        // stream approach which cost 20 ms per process even when idle —
-        // with N processes that compounded to N×20 ms per tick, easily
-        // exceeding the 100 ms tick interval and delaying file writes.
-        //
-        // Data from both streams is collected into `new_bytes`, then written
-        // to the output file in a single batch + flush at the end.
-        let mut new_bytes: Vec<u8> = Vec::new();
-
-        // Read all available stdout (non-blocking)
-        let mut stdout_eof = false;
-        if let Some(stdout) = process.child.stdout.as_mut() {
-            loop {
-                let mut buf = [0u8; READ_BUFFER_SIZE];
-                match try_read_nonblocking(stdout, &mut buf) {
-                    Some(Ok(0)) => {
-                        stdout_eof = true;
-                        break;
-                    }
-                    Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
-                    }
-                    Some(Err(_)) => {
-                        stdout_eof = true;
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        }
-
-        // Read all available stderr (non-blocking)
-        let mut stderr_eof = false;
-        if let Some(stderr) = process.child.stderr.as_mut() {
-            loop {
-                let mut buf = [0u8; READ_BUFFER_SIZE];
-                match try_read_nonblocking(stderr, &mut buf) {
-                    Some(Ok(0)) => {
-                        stderr_eof = true;
-                        break;
-                    }
-                    Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
-                    }
-                    Some(Err(_)) => {
-                        stderr_eof = true;
-                        break;
-                    }
-                    None => break,
-                }
-            }
+        // Alternate the two pipes under a fixed per-process budget. A writer
+        // can keep stdout continuously ready, so draining it to Pending before
+        // checking stderr or timers can otherwise monopolize the actor.
+        let (new_bytes, stdout_eof, stderr_eof) = collect_available_output(
+            process.child.stdout.as_mut(),
+            process.child.stderr.as_mut(),
+            MAX_POLL_OUTPUT_BYTES,
+        );
+        if !new_bytes.is_empty() {
+            self.just_read_output = true;
+            self.fast_poll_until = Some(Instant::now() + Duration::from_millis(5));
         }
 
         // Batch write to file + flush so the output is visible to readers
@@ -2089,29 +2159,9 @@ impl LocalTerminalActor {
         // Truncate in-memory buffer if needed (file has full output)
         process.maybe_truncate();
 
-        // Send output chunk notification if there's new output since last tick.
-        // This happens every ~100ms (the actor's tick interval).
-        // If the handle is noop(), send() silently drops — no performance cost.
-        //
-        // Keyed off the monotonic `total_bytes` (not `output_buffer.len()`):
-        // after `maybe_truncate` freezes the front half and keeps only the
-        // shrinking tail, a length-based gate would go false and stay false,
-        // starving the stream of chunks for the rest of a long-output command.
-        if process.total_bytes > process.last_notified_total {
-            process
-                .notification_handle
-                .send_output_chunk(BashOutputChunk {
-                    base: BashNotificationBase {
-                        tool_call_id: process.tool_call_id.clone(),
-                        command: process.command.clone(),
-                        output: process.output_buffer.clone(),
-                        total_bytes: process.total_bytes,
-                        truncated: process.truncated,
-                        cwd: process.cwd.clone().into(),
-                    },
-                });
-            process.last_notified_total = process.total_bytes;
-        }
+        // Drain promptly, but coalesce full snapshots for the notification
+        // bridge; it consumes these over an unbounded channel.
+        process.notify_pending_output(false);
 
         // Foreground budget: auto-backgroundable commands stop blocking the
         // turn after the per-process budget (independent of `timeout`) — this
@@ -2152,8 +2202,7 @@ impl LocalTerminalActor {
             });
             process.end_wall_time = Some(std::time::SystemTime::now());
             process.flush_and_truncate_output_file().await;
-            let result = Ok(process.to_result());
-            process.notify_waiters(result);
+            // Reply only after escalation and output collection.
             return;
         }
 
@@ -2161,6 +2210,9 @@ impl LocalTerminalActor {
         let process_done = stdout_eof && stderr_eof;
         match process.child.try_wait() {
             Ok(Some(status)) => {
+                let status = extract_exit_status(status);
+                process.mark_exited(status.clone());
+                process.end_wall_time = Some(std::time::SystemTime::now());
                 // Process exited — drain any remaining stdout/stderr that arrived
                 // after the timeout-based reads above. This fixes a race where fast
                 // commands (e.g. `python3 -c "print('x')"`) exit before their pipe
@@ -2171,7 +2223,7 @@ impl LocalTerminalActor {
                     terminal_id.to_owned(),
                     process.child.stdout.take(),
                     process.child.stderr.take(),
-                    extract_exit_status(status),
+                    status,
                 );
             }
             Ok(None) if process_done => {
@@ -2201,8 +2253,7 @@ impl LocalTerminalActor {
         let sandbox_hook = self.sandbox_launch.as_deref();
         for (_, process) in self.processes.iter_mut() {
             send_sigkill_to_group(process);
-            // Abort the state dump reader so its spawn_blocking thread
-            // doesn't outlive the actor.
+            // Cancel the asynchronous state dump reader and close its pipe.
             if let Some(handle) = process.state_dump_handle.take() {
                 handle.abort();
             }
@@ -2330,13 +2381,18 @@ impl LocalTerminalActor {
         let fg_ids: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.bg_status.is_backgrounded() && !p.lifecycle.has_exited())
+            .filter(|(_, p)| {
+                !p.bg_status.is_backgrounded()
+                    && (p.child.id().is_some() || p.pending_dump.is_some())
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
         for id in &fg_ids {
             if let Some(process) = self.processes.get_mut(id) {
-                send_sigkill_to_group(process);
+                if process.child.id().is_some() {
+                    send_sigkill_to_group(process);
+                }
 
                 // Wait for the child to actually exit so the kernel reclaims
                 // its memory.  Bounded to 5 s — SIGKILL is unconditional so
@@ -2345,12 +2401,7 @@ impl LocalTerminalActor {
                     tokio::time::timeout(std::time::Duration::from_secs(5), process.child.wait())
                         .await;
 
-                // Abort the state dump reader task so its `spawn_blocking`
-                // thread doesn't leak. Without this, a grandchild that
-                // inherited fd 4 and escaped the process group keeps the
-                // pipe's write end open, and the blocking `read_to_string`
-                // hangs indefinitely (the timeout future was abandoned when
-                // the JoinHandle was dropped).
+                // Cancel the state dump reader if a descendant inherited fd 4.
                 if let Some(handle) = process.state_dump_handle.take() {
                     handle.abort();
                 }
@@ -2362,8 +2413,10 @@ impl LocalTerminalActor {
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
 
-                let result = Ok(process.to_result());
-                process.notify_waiters(result);
+                let mut result = process.to_result();
+                result.exit_code = None;
+                result.signal = Some("cancelled".to_owned());
+                process.notify_waiters(Ok(result));
             }
         }
 
@@ -2382,14 +2435,16 @@ impl LocalTerminalActor {
             .filter(|(_, p)| {
                 p.owner_session_id.as_deref() == Some(owner_session_id)
                     && !p.bg_status.is_backgrounded()
-                    && !p.lifecycle.has_exited()
+                    && (p.child.id().is_some() || p.pending_dump.is_some())
             })
             .map(|(id, _)| id.clone())
             .collect();
 
         for id in &fg_ids {
             if let Some(process) = self.processes.get_mut(id) {
-                send_sigkill_to_group(process);
+                if process.child.id().is_some() {
+                    send_sigkill_to_group(process);
+                }
                 let _ =
                     tokio::time::timeout(std::time::Duration::from_secs(5), process.child.wait())
                         .await;
@@ -2402,8 +2457,10 @@ impl LocalTerminalActor {
                 });
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
-                let result = Ok(process.to_result());
-                process.notify_waiters(result);
+                let mut result = process.to_result();
+                result.exit_code = None;
+                result.signal = Some("cancelled".to_owned());
+                process.notify_waiters(Ok(result));
             }
         }
 
@@ -3113,9 +3170,48 @@ fn send_sigkill_to_group(process: &mut ProcessState) {
     let _ = process.child.start_kill();
 }
 
-/// Drain remaining stdout/stderr into the output buffer and file.
-/// Bounded by `DRAIN_TIMEOUT` so a backgrounded child holding the
-/// pipe open cannot block the actor loop indefinitely.
+/// Read both pipes fairly under one deadline and one shared byte budget.
+/// An inherited stdout writer must not prevent already-buffered stderr from
+/// being collected (or vice versa).
+async fn collect_drained_output<A, B>(mut stdout: Option<A>, mut stderr: Option<B>) -> Vec<u8>
+where
+    A: tokio::io::AsyncRead + Unpin,
+    B: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut stdout_buf = [0u8; READ_BUFFER_SIZE];
+        let mut stderr_buf = [0u8; READ_BUFFER_SIZE];
+        while (stdout.is_some() || stderr.is_some())
+            && output.len() < MAX_RETAINED_OUTPUT_FILE_BYTES as usize
+        {
+            let remaining = MAX_RETAINED_OUTPUT_FILE_BYTES as usize - output.len();
+            tokio::select! {
+                result = async {
+                    match stdout.as_mut() {
+                        Some(pipe) => pipe.read(&mut stdout_buf[..remaining.min(READ_BUFFER_SIZE)]).await,
+                        None => std::future::pending().await,
+                    }
+                } => match result {
+                    Ok(0) | Err(_) => stdout = None,
+                    Ok(n) => output.extend_from_slice(&stdout_buf[..n]),
+                },
+                result = async {
+                    match stderr.as_mut() {
+                        Some(pipe) => pipe.read(&mut stderr_buf[..remaining.min(READ_BUFFER_SIZE)]).await,
+                        None => std::future::pending().await,
+                    }
+                } => match result {
+                    Ok(0) | Err(_) => stderr = None,
+                    Ok(n) => output.extend_from_slice(&stderr_buf[..n]),
+                },
+            }
+        }
+    })
+    .await;
+    output
+}
+
 fn spawn_detached_drain(
     self_tx: mpsc::WeakSender<TerminalCommand>,
     task_id: String,
@@ -3124,20 +3220,7 @@ fn spawn_detached_drain(
     status: ExitStatus,
 ) {
     tokio::spawn(async move {
-        let mut output = Vec::new();
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            if let Some(stdout) = stdout {
-                let _ = stdout
-                    .take(MAX_RETAINED_OUTPUT_FILE_BYTES)
-                    .read_to_end(&mut output)
-                    .await;
-            }
-            if let Some(stderr) = stderr {
-                let remaining = MAX_RETAINED_OUTPUT_FILE_BYTES.saturating_sub(output.len() as u64);
-                let _ = stderr.take(remaining).read_to_end(&mut output).await;
-            }
-        })
-        .await;
+        let output = collect_drained_output(stdout, stderr).await;
         if let Some(tx) = self_tx.upgrade() {
             let _ = tx
                 .send(TerminalCommand::DrainedOutput {
@@ -3151,68 +3234,27 @@ fn spawn_detached_drain(
 }
 
 async fn drain_remaining_output(process: &mut ProcessState) {
-    let timed_out = tokio::time::timeout(DRAIN_TIMEOUT, async {
-        if let Some(stdout) = process.child.stdout.as_mut() {
-            let mut buf = [0u8; READ_BUFFER_SIZE];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
-                        process.total_bytes += n;
-                        if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
-                        }
-                    }
-                }
-            }
+    let output =
+        collect_drained_output(process.child.stdout.take(), process.child.stderr.take()).await;
+    if !output.is_empty() {
+        process.output_buffer.extend_from_slice(&output);
+        process.total_bytes += output.len();
+        if let Some(ref mut file) = process.file_handle {
+            let _ = file.write_all(&output).await;
         }
-
-        if let Some(stderr) = process.child.stderr.as_mut() {
-            let mut buf = [0u8; READ_BUFFER_SIZE];
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
-                        process.total_bytes += n;
-                        if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
-                        }
-                    }
-                }
-            }
-        }
-    })
-    .await;
-
-    if timed_out.is_err() {
-        tracing::debug!(
-            command = %process.command,
-            "drain timed out after {:?}, a backgrounded child may be holding the pipe open",
-            DRAIN_TIMEOUT,
-        );
+        process.maybe_truncate();
     }
-
-    // Drop the pipe handles so orphaned children holding them open cannot
-    // cause repeated drain timeouts on subsequent poll ticks.
-    process.child.stdout.take();
-    process.child.stderr.take();
-
-    process.maybe_truncate();
 }
 
 /// Take the output already sitting in the pipes, then drop the handles.
 /// Never waits: a live pipe would hold the single threaded actor for the
 /// full drain timeout, so this is safe on a process that is still running.
 async fn take_available_output(process: &mut ProcessState) {
-    let mut collected = Vec::new();
-    if let Some(stdout) = process.child.stdout.as_mut() {
-        read_available(stdout, &mut collected);
-    }
-    if let Some(stderr) = process.child.stderr.as_mut() {
-        read_available(stderr, &mut collected);
-    }
+    let (collected, _, _) = collect_available_output(
+        process.child.stdout.as_mut(),
+        process.child.stderr.as_mut(),
+        MAX_POLL_OUTPUT_BYTES,
+    );
     process.child.stdout.take();
     process.child.stderr.take();
 
@@ -3227,14 +3269,49 @@ async fn take_available_output(process: &mut ProcessState) {
     process.maybe_truncate();
 }
 
-fn read_available(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut Vec<u8>) {
+/// Nonblocking, bounded and fair collection for one actor turn. A pipe is
+/// revisited only while it remains ready; EOF flags describe this batch.
+fn collect_available_output<A, B>(
+    mut stdout: Option<&mut A>,
+    mut stderr: Option<&mut B>,
+    limit: usize,
+) -> (Vec<u8>, bool, bool)
+where
+    A: tokio::io::AsyncRead + Unpin,
+    B: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut stdout_eof = stdout.is_none();
+    let mut stderr_eof = stderr.is_none();
     let mut buf = [0u8; READ_BUFFER_SIZE];
-    loop {
-        match try_read_nonblocking(reader, &mut buf) {
-            Some(Ok(0)) | Some(Err(_)) | None => return,
-            Some(Ok(n)) => out.extend_from_slice(&buf[..n]),
+    while output.len() < limit && (stdout.is_some() || stderr.is_some()) {
+        if let Some(pipe) = stdout.as_mut() {
+            let remaining = (limit - output.len()).min(READ_BUFFER_SIZE);
+            match try_read_nonblocking(*pipe, &mut buf[..remaining]) {
+                Some(Ok(0)) | Some(Err(_)) => {
+                    stdout_eof = true;
+                    stdout = None;
+                }
+                Some(Ok(n)) => output.extend_from_slice(&buf[..n]),
+                None => stdout = None,
+            }
+        }
+        if output.len() == limit {
+            break;
+        }
+        if let Some(pipe) = stderr.as_mut() {
+            let remaining = (limit - output.len()).min(READ_BUFFER_SIZE);
+            match try_read_nonblocking(*pipe, &mut buf[..remaining]) {
+                Some(Ok(0)) | Some(Err(_)) => {
+                    stderr_eof = true;
+                    stderr = None;
+                }
+                Some(Ok(n)) => output.extend_from_slice(&buf[..n]),
+                None => stderr = None,
+            }
         }
     }
+    (output, stdout_eof, stderr_eof)
 }
 
 /// Two-phase kill that synchronously waits for the process to exit.
@@ -3246,35 +3323,18 @@ fn read_available(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut Ve
 async fn graceful_kill_and_wait(process: &mut ProcessState) {
     send_sigterm_to_group(process);
 
-    // Wait up to SIGTERM_GRACE (1s) for graceful exit
-    if tokio::time::timeout(SIGTERM_GRACE, process.child.wait())
-        .await
-        .is_ok()
-    {
-        drain_remaining_output(process).await;
-        return;
-    }
-
-    // Escalate to SIGKILL
+    // Do not wait/reap the leader during the grace period: its unreaped PID
+    // pins the process-group identity until the whole group is escalated.
+    tokio::time::sleep(SIGTERM_GRACE).await;
     send_sigkill_to_group(process);
 
-    // Wait for reap — bounded at 5s. SIGKILL is unconditional so this
-    // almost always returns instantly. The cap protects against D-state
-    // (uninterruptible kernel I/O, e.g. NFS hang). If it times out,
-    // abandon — poll_process will pick it up later.
     const SIGKILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
     if tokio::time::timeout(SIGKILL_REAP_TIMEOUT, process.child.wait())
         .await
         .is_err()
     {
-        tracing::warn!(
-            pid = ?process.child.id(),
-            "Process did not exit after SIGKILL within {:?}, \
-             abandoning reap — poll loop will pick it up",
-            SIGKILL_REAP_TIMEOUT
-        );
+        tracing::warn!(pid = ?process.child.id(), "process did not exit after SIGKILL");
     }
-
     drain_remaining_output(process).await;
 }
 
@@ -3317,8 +3377,7 @@ async fn kill_and_finalize(process: &mut ProcessState) -> KillOutcome {
         process.process_group = None;
     }
 
-    // Abort the state dump reader so its spawn_blocking thread doesn't
-    // leak (same rationale as kill_foreground_commands).
+    // Cancel the state dump reader if a descendant inherited fd 4.
     if let Some(handle) = process.state_dump_handle.take() {
         handle.abort();
     }
@@ -3348,6 +3407,9 @@ async fn finalize_process(process: &mut ProcessState, status: Option<std::proces
 
     process.flush_and_truncate_output_file().await;
     process.finish_output(Collection::of(&process.child));
+    if let Some(handle) = process.state_dump_handle.take() {
+        handle.abort();
+    }
 
     let result = Ok(process.to_result());
     process.notify_waiters(result);
@@ -5541,6 +5603,219 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    fn term_ignoring_descendant_request(tmp: &tempfile::TempDir) -> TerminalRunRequest {
+        let mut request = make_request(
+            r#"bash -c 'trap "" TERM; echo ready > "$READY_FILE"; sleep 3; echo survived > "$SURVIVED_FILE"' & wait"#,
+        );
+        request.working_directory = tmp.path().to_path_buf();
+        request.output_file = tmp.path().join("task.log");
+        request.env.insert(
+            "READY_FILE".into(),
+            tmp.path().join("ready").display().to_string(),
+        );
+        request.env.insert(
+            "SURVIVED_FILE".into(),
+            tmp.path().join("survived").display().to_string(),
+        );
+        request
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_ready(path: &std::path::Path) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_escalates_after_leader_exits() {
+        let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+            login_shell_capture: false,
+            ..Default::default()
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut request = term_ignoring_descendant_request(&tmp);
+        request.timeout = Duration::from_secs(1);
+        let run_backend = backend.clone();
+        let run = tokio::spawn(async move { run_backend.run(request).await });
+        let ready = wait_for_ready(&tmp.path().join("ready")).await;
+        let result = tokio::time::timeout(Duration::from_secs(8), run).await;
+        // Even on a failed assertion, wait for the bounded fixture to exit.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(ready, "descendant did not start");
+        assert!(result.unwrap().unwrap().unwrap().timed_out);
+        assert!(
+            !tmp.path().join("survived").exists(),
+            "TERM-ignoring descendant survived timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_task_escalates_after_leader_exits() {
+        let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+            login_shell_capture: false,
+            ..Default::default()
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut request = term_ignoring_descendant_request(&tmp);
+        request.command = r#"trap 'echo CLEANUP_DIAGNOSTIC >&2; exit' TERM; bash -c 'trap "" TERM; echo ready > "$READY_FILE"; sleep 3; echo survived > "$SURVIVED_FILE"' & wait"#.into();
+        let handle = backend.run_background(request).await.unwrap();
+        let ready = wait_for_ready(&tmp.path().join("ready")).await;
+        let outcome = backend.kill_task(&handle.task_id).await;
+        let snapshot = backend.get_task(&handle.task_id).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(ready, "descendant did not start");
+        assert_eq!(outcome, KillOutcome::Killed);
+        let snapshot = snapshot.unwrap();
+        assert!(
+            snapshot.output.contains("CLEANUP_DIAGNOSTIC"),
+            "missing stderr: {:?}",
+            snapshot.output
+        );
+        assert!(
+            !tmp.path().join("survived").exists(),
+            "TERM-ignoring descendant survived kill"
+        );
+    }
+
+    #[test]
+    fn live_poll_is_bounded_and_reads_stderr_with_infinite_stdout() {
+        struct InfiniteStdout;
+        impl tokio::io::AsyncRead for InfiniteStdout {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let data = [b'x'; READ_BUFFER_SIZE];
+                let n = buf.remaining().min(data.len());
+                buf.put_slice(&data[..n]);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut stdout = InfiniteStdout;
+        let mut stderr = std::io::Cursor::new(b"diagnostic".as_slice());
+        let (output, stdout_eof, stderr_eof) =
+            collect_available_output(Some(&mut stdout), Some(&mut stderr), MAX_POLL_OUTPUT_BYTES);
+        assert_eq!(output.len(), MAX_POLL_OUTPUT_BYTES);
+        assert!(
+            output
+                .windows(b"diagnostic".len())
+                .any(|w| w == b"diagnostic")
+        );
+        assert!(!stdout_eof);
+        assert!(stderr_eof);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_output_does_not_block_actor_or_timeout() {
+        let scope = crate::util::ProcessScope::new();
+        let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+            login_shell_capture: false,
+            scope: scope.clone(),
+            settings: ActorSettings {
+                output_file_cap: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut request = make_request(
+            "echo DIAGNOSTIC >&2; (yes | head -c 12000000) & (yes | head -c 12000000) & wait; sleep 30",
+        );
+        request.working_directory = tmp.path().to_path_buf();
+        request.output_file = tmp.path().join("task.log");
+        request.timeout = Duration::from_secs(1);
+        let run_backend = backend.clone();
+        let run = tokio::spawn(async move { run_backend.run(request).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let responsive = tokio::time::timeout(Duration::from_secs(2), backend.get_shell_cwd())
+            .await
+            .is_ok();
+        if !responsive {
+            scope.kill_all();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), run).await;
+        // A failed assertion must not leave a writer running.
+        scope.kill_all();
+        let log = tokio::fs::read(tmp.path().join("task.log"))
+            .await
+            .unwrap_or_default();
+        assert!(responsive, "continuous stdout blocked the actor");
+        assert!(result.unwrap().unwrap().unwrap().timed_out);
+        assert!(log.windows(b"DIAGNOSTIC".len()).any(|w| w == b"DIAGNOSTIC"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_output_burst_is_not_throttled_to_tick_rate() {
+        let scope = crate::util::ProcessScope::new();
+        let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+            login_shell_capture: false,
+            scope: scope.clone(),
+            settings: ActorSettings {
+                output_file_cap: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut request = make_request("head -c 8388608 /dev/zero");
+        request.working_directory = tmp.path().to_path_buf();
+        request.output_file = tmp.path().join("task.log");
+        request.timeout = Duration::from_secs(2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        request.notification_handle = ToolNotificationHandle::from_sender(tx);
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), backend.run(request)).await;
+        let elapsed = started.elapsed();
+        scope.kill_all();
+        let result = result.unwrap().unwrap();
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "finite burst timed out or failed"
+        );
+        assert_eq!(result.total_bytes, 8 * 1024 * 1024);
+        let mut chunks = Vec::new();
+        while let Ok(notification) = rx.try_recv() {
+            if let crate::notification::types::ToolNotification::BashOutputChunk(chunk) =
+                notification
+            {
+                chunks.push(chunk);
+            }
+        }
+        let max_chunks = (elapsed.as_millis() / 100) as usize + 3;
+        assert!(
+            chunks.len() <= max_chunks,
+            "too many output notifications: {} in {elapsed:?}",
+            chunks.len()
+        );
+        assert_eq!(chunks.last().unwrap().base.total_bytes, result.total_bytes);
+    }
+
+    #[tokio::test]
+    async fn drain_collects_stderr_while_stdout_remains_open() {
+        use tokio::io::AsyncWriteExt;
+        let (_stdout_writer, stdout_reader) = tokio::io::duplex(64);
+        let (mut stderr_writer, stderr_reader) = tokio::io::duplex(64);
+        stderr_writer
+            .write_all(b"cleanup diagnostic\n")
+            .await
+            .unwrap();
+        drop(stderr_writer);
+        let output = collect_drained_output(Some(stdout_reader), Some(stderr_reader)).await;
+        assert_eq!(output, b"cleanup diagnostic\n");
+    }
+
     // ================================================================
     // Persistent shell tests
     // ================================================================
@@ -5561,6 +5836,85 @@ mod tests {
             pwd == "/tmp" || pwd == "/private/tmp",
             "cwd should persist across commands, got: {pwd}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_long_command_preserves_state() {
+        let backend = LocalTerminalBackend::with_persistent_shell();
+        let result = backend
+            .run(make_request("sleep 6; export GROK_LONG_PERSIST=preserved"))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        let result = backend
+            .run(make_request("printf %s \"$GROK_LONG_PERSIST\""))
+            .await
+            .unwrap();
+        assert_eq!(result.combined_output, "preserved");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_shell_dump_keeps_actor_responsive_and_defers_commands() {
+        let scope = crate::util::ProcessScope::new();
+        let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+            persistent_shell: true,
+            login_shell_capture: false,
+            scope: scope.clone(),
+            ..Default::default()
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = make_request("sleep 3 >/dev/null 2>&1 & exit 0");
+        first.working_directory = tmp.path().to_path_buf();
+        first.output_file = tmp.path().join("first.log");
+        first.tool_call_id = "dump-owner".to_owned();
+        let run_backend = backend.clone();
+        let first_run = tokio::spawn(async move { run_backend.run(first).await });
+
+        // Wait until the leader has exited but the inherited dump descriptor is
+        // still open, rather than relying on a scheduling delay.
+        let mut observed = false;
+        for _ in 0..100 {
+            if backend
+                .get_task("dump-owner")
+                .await
+                .is_some_and(|s| s.exit_code == Some(0) && !s.completed)
+            {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut second = make_request("printf started > second-started");
+        second.working_directory = tmp.path().to_path_buf();
+        second.output_file = tmp.path().join("second.log");
+        second.tool_call_id = "second".to_owned();
+        let run_backend = backend.clone();
+        let second_run = tokio::spawn(async move { run_backend.run(second).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let deferred = !tmp.path().join("second-started").exists();
+        let responsive = tokio::time::timeout(Duration::from_millis(500), backend.get_shell_cwd())
+            .await
+            .is_ok();
+        backend.kill_foreground_commands().await;
+        let first_result = tokio::time::timeout(Duration::from_secs(1), first_run).await;
+        let second_result = tokio::time::timeout(Duration::from_secs(2), second_run).await;
+        scope.kill_all();
+        // The descriptor-holding descendant self-exits; give it time to finish
+        // even if an assertion fails so the test leaves no helper behind.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(observed, "did not observe a pending dump");
+        assert!(
+            deferred,
+            "a new command started before dump collection completed"
+        );
+        assert!(responsive, "dump collection blocked the actor");
+        assert_eq!(
+            first_result.unwrap().unwrap().unwrap().signal.as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(second_result.unwrap().unwrap().unwrap().exit_code, Some(0));
     }
 
     #[tokio::test]
