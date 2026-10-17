@@ -1,6 +1,13 @@
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::num::NonZeroU64;
+
+mod model_notice;
+
+pub use self::model_notice::{
+    MODEL_NOTICE_META_KEY, ModelNotice, ModelNoticeSeverity, parse_model_notice_meta,
+};
 
 // ============================================================================
 // TraceContext — cloneable, type-erased context for request tracing
@@ -1133,6 +1140,110 @@ pub fn parse_reasoning_efforts_meta(
 
 pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_json::Value {
     serde_json::to_value(opts).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+/// The `session/set_model` `_meta` key for the context window size, in tokens, that the client selected.
+pub const CONTEXT_WINDOW_META_KEY: &str = "contextWindow";
+/// The model `meta` key that lists the context window sizes a client can select.
+pub const CONTEXT_WINDOWS_META_KEY: &str = "contextWindows";
+
+/// Returns the selected context window, or `None` with a warning when the value is not a positive integer.
+pub fn parse_context_window_meta(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<NonZeroU64> {
+    let raw = meta?.get(CONTEXT_WINDOW_META_KEY)?;
+    match parse_context_window_value(raw) {
+        Some(window) => Some(window),
+        None => {
+            tracing::warn!(value = %raw, "meta.contextWindow: expected a positive integer, ignoring");
+            None
+        }
+    }
+}
+
+/// Returns the context windows a client can select from a model's ACP `meta`, or `None` when there are none.
+pub fn parse_context_windows_meta(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<Vec<NonZeroU64>> {
+    let raw = meta?.get(CONTEXT_WINDOWS_META_KEY)?;
+    let arr = match raw.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(value = %raw, "meta.contextWindows: expected array, ignoring");
+            return None;
+        }
+    };
+    let windows: Vec<NonZeroU64> = arr.iter().filter_map(parse_context_window_value).collect();
+    (!windows.is_empty()).then_some(windows)
+}
+
+fn parse_context_window_value(value: &Value) -> Option<NonZeroU64> {
+    value.as_u64().and_then(NonZeroU64::new)
+}
+
+pub fn context_windows_meta_value(windows: &[NonZeroU64]) -> Value {
+    Value::Array(
+        windows
+            .iter()
+            .map(|w| context_window_meta_value(*w))
+            .collect(),
+    )
+}
+
+pub fn context_window_meta_value(window: NonZeroU64) -> Value {
+    Value::Number(window.get().into())
+}
+
+#[cfg(test)]
+mod context_window_meta_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selected_window_requires_a_positive_integer() {
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1024"),
+            json!(null),
+            json!(true),
+        ] {
+            let meta = serde_json::Map::from_iter([(CONTEXT_WINDOW_META_KEY.into(), invalid)]);
+            assert_eq!(parse_context_window_meta(Some(&meta)), None);
+        }
+        let selected = NonZeroU64::new(128_000).unwrap();
+        let meta = serde_json::Map::from_iter([(
+            CONTEXT_WINDOW_META_KEY.into(),
+            context_window_meta_value(selected),
+        )]);
+        assert_eq!(parse_context_window_meta(Some(&meta)), Some(selected));
+        assert_eq!(parse_context_window_meta(None), None);
+    }
+
+    #[test]
+    fn available_windows_ignore_invalid_entries_and_empty_lists() {
+        let meta = serde_json::Map::from_iter([(
+            CONTEXT_WINDOWS_META_KEY.into(),
+            json!([0, 128000, null, -1, "256000", 256000]),
+        )]);
+        let windows = [
+            NonZeroU64::new(128_000).unwrap(),
+            NonZeroU64::new(256_000).unwrap(),
+        ];
+        assert_eq!(
+            parse_context_windows_meta(Some(&meta)),
+            Some(windows.to_vec())
+        );
+        assert_eq!(
+            context_windows_meta_value(&windows),
+            json!([128000, 256000])
+        );
+        for invalid in [json!([]), json!([0, null]), json!({}), json!(100)] {
+            let meta = serde_json::Map::from_iter([(CONTEXT_WINDOWS_META_KEY.into(), invalid)]);
+            assert_eq!(parse_context_windows_meta(Some(&meta)), None);
+        }
+    }
 }
 
 // ============================================================================
