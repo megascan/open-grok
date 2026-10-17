@@ -21,6 +21,94 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 use xai_grok_telemetry::events::{CancellationCompleted, CancellationScope};
 impl AgentView {
+    /// Queue the user's title intent before changing the optimistic UI. RPCs
+    /// are serialized, but their task results can be delivered out of order.
+    pub(crate) fn begin_title_mutation(&mut self, kind: super::TitleMutationKind) {
+        let confirmed_display_name = self.display_name.clone();
+        let confirmed_generated_title = self.generated_session_title.clone();
+        let ledger = self
+            .title_mutations
+            .get_or_insert_with(|| super::TitleMutationLedger {
+                confirmed_display_name,
+                confirmed_generated_title,
+                pending: VecDeque::new(),
+            });
+        ledger.pending.push_back(super::TitleMutation {
+            generation: self.title_mutation_generation,
+            kind,
+            result: None,
+        });
+    }
+
+    /// Fold only the completed prefix, so a later failure cannot roll back to
+    /// an optimistic rename whose own request failed. Reconcile a reset once
+    /// every preceding outcome is known.
+    pub(crate) fn finish_title_mutation(&mut self, generation: u64, success: bool) {
+        let Some(ledger) = self.title_mutations.as_mut() else {
+            return;
+        };
+        let Some(entry) = ledger
+            .pending
+            .iter_mut()
+            .find(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        if entry.result.is_some() {
+            return;
+        }
+        entry.result = Some(success);
+        let mut last = None;
+        while ledger
+            .pending
+            .front()
+            .is_some_and(|entry| entry.result.is_some())
+        {
+            let entry = ledger.pending.pop_front().expect("checked front");
+            let succeeded = entry.result.expect("checked result");
+            let is_reset = matches!(&entry.kind, super::TitleMutationKind::Reset);
+            if succeeded {
+                match entry.kind {
+                    super::TitleMutationKind::Rename(title) => {
+                        ledger.confirmed_display_name = Some(title.clone());
+                        ledger.confirmed_generated_title = Some(title);
+                    }
+                    super::TitleMutationKind::Reset => {
+                        let pin = ledger.confirmed_display_name.take();
+                        if pin.is_some() && ledger.confirmed_generated_title == pin {
+                            ledger.confirmed_generated_title = None;
+                        }
+                    }
+                }
+            }
+            last = Some((is_reset, succeeded));
+        }
+        if !ledger.pending.is_empty() {
+            return;
+        }
+        let Some((is_reset, succeeded)) = last else {
+            return;
+        };
+        let settlement = super::TitleMutationSettlement {
+            is_reset,
+            succeeded,
+            display_name: ledger.confirmed_display_name.clone(),
+            generated_title: ledger.confirmed_generated_title.clone(),
+        };
+        self.title_mutations = None;
+        if settlement.is_reset {
+            if settlement.succeeded {
+                let pin = self.display_name.take();
+                if pin.is_some() && self.generated_session_title == pin {
+                    self.generated_session_title = settlement.generated_title;
+                }
+            } else {
+                self.display_name = settlement.display_name;
+                self.generated_session_title = settlement.generated_title;
+            }
+        }
+    }
+
     /// Always bumps [`Self::last_turn_summary_gen`] so a concurrent disk hydrate that captured an older generation cannot overwrite this write.
     pub(crate) fn set_last_turn_summary(&mut self, summary: Option<String>) {
         self.last_turn_summary = summary;
@@ -32,6 +120,10 @@ impl AgentView {
     pub(crate) fn bind_session_id(&mut self, session_id: agent_client_protocol::SessionId) {
         if self.session.session_id.as_ref() != Some(&session_id) {
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
+            self.adopted_paste_binding_epoch = None;
+            self.title_mutations = None;
+            self.title_pending_rename = None;
+            self.title_unpin_committed = false;
             self.last_seen_event_id = None;
             self.last_seen_event_seq = None;
             self.last_applied_event_seq = None;
@@ -44,6 +136,22 @@ impl AgentView {
         self.session_new_phase = None;
         self.pending_session_id = None;
         self.load_failed = false;
+    }
+    /// Adopt a draft prepared while this new session was still being created.
+    pub(crate) fn bind_created_session_id(&mut self, session_id: agent_client_protocol::SessionId) {
+        let old_epoch = self.session_binding_epoch;
+        let adopt = self.session.session_id.is_none();
+        let deferred_matches = self.deferred_paste_matches();
+        self.bind_session_id(session_id);
+        if adopt {
+            self.adopted_paste_binding_epoch = Some(old_epoch);
+            if deferred_matches
+                && let Some(identity) = self.deferred_paste_identity.as_mut()
+                && identity.binding_epoch == old_epoch
+            {
+                identity.binding_epoch = self.session_binding_epoch;
+            }
+        }
     }
     /// Advance the reconnect cursor forward-only. Stores the raw id and its parsed sequence together so later compares need not re-parse the string.
     ///
@@ -70,6 +178,10 @@ impl AgentView {
     pub(crate) fn unbind_session_id(&mut self) {
         if self.session.session_id.take().is_some() {
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
+            self.adopted_paste_binding_epoch = None;
+            self.title_mutations = None;
+            self.title_pending_rename = None;
+            self.title_unpin_committed = false;
             self.deferred_subagent_finishes.clear();
             self.clear_minimal_btw_lifecycle();
         }
@@ -113,6 +225,10 @@ impl AgentView {
         let mut view = Self {
             session,
             session_binding_epoch: 0,
+            adopted_paste_binding_epoch: None,
+            title_mutation_generation: 0,
+            title_mutations: None,
+            title_pending_rename: None,
             scrollback,
             prompt,
             tip_typing_dismissed: false,
@@ -403,6 +519,8 @@ impl AgentView {
             pending_effects: Vec::new(),
             paste_probe_in_flight: 0,
             deferred_send: None,
+            deferred_paste_identity: None,
+            deferred_paste_hold_reported: false,
             pending_turn_end_reconcile: None,
             pending_cancel_resend: None,
             cancel_latency: None,

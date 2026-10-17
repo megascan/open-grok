@@ -187,12 +187,18 @@ fn apply_clipboard_paste_result(
     app: &mut AppView,
 ) -> ClipboardPasteCompletion {
     match ctx.target.clone() {
-        ClipboardPasteTarget::AgentPrompt { agent_id, .. } => app
-            .agents
-            .get_mut(&agent_id)
-            .map_or(ClipboardPasteCompletion::Dropped, |agent| {
-                agent.complete_clipboard_attachment_paste(ctx, image, file_urls)
-            }),
+        ClipboardPasteTarget::AgentPrompt { agent_id, .. } => {
+            app.agents
+                .get_mut(&agent_id)
+                .map_or(ClipboardPasteCompletion::Dropped, |agent| {
+                    let completion =
+                        agent.complete_clipboard_attachment_paste(ctx, image, file_urls);
+                    if !matches!(completion, ClipboardPasteCompletion::Dropped) {
+                        agent.refresh_deferred_paste_identity();
+                    }
+                    completion
+                })
+        }
         ClipboardPasteTarget::DashboardDispatch | ClipboardPasteTarget::DashboardPeek { .. } => app
             .dashboard
             .as_mut()
@@ -205,9 +211,46 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
     match target {
         ClipboardPasteTarget::AgentPrompt { agent_id, .. } => {
             let is_active = app.active_view == ActiveView::Agent(*agent_id);
+            let blocked_by_app = app.reconnect_pending || app.esc_owned_before_agent();
             let Some(agent) = app.agents.get_mut(agent_id) else {
                 return vec![];
             };
+            let prompt_send = matches!(
+                agent.deferred_send,
+                Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+            );
+            if prompt_send && agent.paste_probe_in_flight == 0 {
+                if !agent.deferred_paste_matches() {
+                    agent.cancel_stale_deferred_paste();
+                    return std::mem::take(&mut agent.pending_effects);
+                }
+                let blocked = !is_active
+                    || blocked_by_app
+                    || agent.load_failed
+                    || agent.active_subagent.is_some()
+                    || agent.active_modal.is_some()
+                    || agent.extensions_modal.is_some()
+                    || agent.agents_modal.is_some()
+                    || agent.question_view.is_some()
+                    || agent.feedback_modal.is_some()
+                    || agent.elicitation_view.is_some()
+                    || agent.plan_approval_view.is_some()
+                    || agent.cancel_turn_view.is_some()
+                    || agent.rewind_state.is_some()
+                    || !matches!(
+                        agent.prompt_mode,
+                        crate::app::agent_view::PromptMode::Normal
+                    );
+                if blocked {
+                    if !agent.deferred_paste_hold_reported {
+                        agent.scrollback.push_block(RenderBlock::system(
+                            "Submitted prompt is waiting for its original session to be available.",
+                        ));
+                        agent.deferred_paste_hold_reported = true;
+                    }
+                    return std::mem::take(&mut agent.pending_effects);
+                }
+            }
             let resend = agent.take_deferred_send_after_paste();
             let action = resend
                 .filter(|kind| is_active || matches!(kind, AgentDeferredSend::Stash))
@@ -219,12 +262,33 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
             effects
         }
         ClipboardPasteTarget::DashboardDispatch | ClipboardPasteTarget::DashboardPeek { .. } => {
+            let blocked_by_app = app.reconnect_pending || app.esc_owned_before_agent();
             let Some(dashboard) = app.dashboard.as_mut() else {
                 return vec![];
             };
-            let resends = dashboard.take_deferred_sends_after_paste();
             let mut effects = std::mem::take(&mut dashboard.pending_effects);
-            if matches!(app.active_view, ActiveView::AgentDashboard) {
+            let blocked = !matches!(app.active_view, ActiveView::AgentDashboard)
+                || blocked_by_app
+                || dashboard.settings_modal.is_some()
+                || dashboard.shortcuts_modal.is_some()
+                || dashboard.location_picker.is_some()
+                || dashboard.worktree_dialog.is_some()
+                || dashboard.usage_modal.is_some()
+                || dashboard.rename.is_some()
+                || dashboard.search_mode;
+            if blocked
+                && dashboard.paste_probe_in_flight == 0
+                && (dashboard.deferred_dispatch_send.is_some()
+                    || dashboard.deferred_peek_send.is_some())
+                && !dashboard.deferred_paste_hold_reported
+            {
+                dashboard.set_error_toast(
+                    "Submitted prompt is waiting for the dashboard to be available",
+                );
+                dashboard.deferred_paste_hold_reported = true;
+            }
+            if !blocked {
+                let resends = dashboard.take_deferred_sends_after_paste();
                 for action in resends {
                     effects.extend(dispatch(action, app));
                 }
@@ -232,6 +296,40 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
             effects
         }
     }
+}
+
+/// Retry a paste-dependent submission after its original surface becomes
+/// available again. The normal dispatcher retains all send gates.
+pub(in crate::app) fn resume_focused_deferred_paste(app: &mut AppView) -> Vec<Effect> {
+    let target = match app.active_view {
+        ActiveView::Agent(id)
+            if app.agents.get(&id).is_some_and(|agent| {
+                agent.paste_probe_in_flight == 0
+                    && matches!(
+                        agent.deferred_send,
+                        Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+                    )
+            }) =>
+        {
+            ClipboardPasteTarget::AgentPrompt {
+                agent_id: id,
+                binding_epoch: app.agents[&id].session_binding_epoch,
+                images_dir: None,
+                feedback_tool_call_id: None,
+            }
+        }
+        ActiveView::AgentDashboard
+            if app.dashboard.as_ref().is_some_and(|dashboard| {
+                dashboard.paste_probe_in_flight == 0
+                    && (dashboard.deferred_dispatch_send.is_some()
+                        || dashboard.deferred_peek_send.is_some())
+            }) =>
+        {
+            ClipboardPasteTarget::DashboardDispatch
+        }
+        _ => return vec![],
+    };
+    drain_clipboard_target(&target, app)
 }
 
 fn settings_modal_is_open(app: &AppView) -> bool {
@@ -5354,8 +5452,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             error,
             seq,
         } => handle_coding_data_sharing_failed(app, agent_id, error, seq),
-        TaskResult::RenameSessionComplete { agent_id, title } => {
+        TaskResult::RenameSessionComplete {
+            agent_id,
+            title,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, true);
+                if agent.title_mutation_generation != generation {
+                    return vec![];
+                }
                 let safe = crate::views::session_title::sanitize_display_text(&title);
                 agent
                     .scrollback
@@ -5365,8 +5475,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::RenameSessionFailed { agent_id, error } => {
+        TaskResult::RenameSessionFailed {
+            agent_id,
+            error,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, false);
+                if agent.title_mutation_generation == generation {
+                    agent.title_pending_rename = None;
+                }
                 agent
                     .scrollback
                     .push_block(crate::scrollback::block::RenderBlock::system(format!(
@@ -5375,8 +5497,19 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::ResetSessionTitleComplete { agent_id } => {
+        TaskResult::ResetSessionTitleComplete {
+            agent_id,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, true);
+                if agent.title_mutation_generation != generation {
+                    return vec![];
+                }
                 agent.title_unpin_committed = false;
                 agent
                     .scrollback
@@ -5389,11 +5522,19 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::ResetSessionTitleFailed {
             agent_id,
             error,
-            previous_display_name,
-            previous_generated_title,
+            previous_display_name: _,
+            previous_generated_title: _,
+            generation,
+            binding_epoch,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
-                if agent.title_unpin_committed {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                let committed =
+                    agent.title_mutation_generation == generation && agent.title_unpin_committed;
+                agent.finish_title_mutation(generation, committed);
+                if committed {
                     agent.title_unpin_committed = false;
                     agent
                         .scrollback
@@ -5401,8 +5542,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                             "Session title reset to auto",
                         ));
                 } else {
-                    agent.display_name = previous_display_name;
-                    agent.generated_session_title = previous_generated_title;
                     agent
                         .scrollback
                         .push_block(crate::scrollback::block::RenderBlock::system(format!(

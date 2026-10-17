@@ -1410,6 +1410,108 @@ fn dashboard_dispatch_send_before_paste_probe_keeps_image() {
         "the dispatched prompt carries the pasted image"
     );
 }
+
+#[test]
+fn dashboard_paste_send_waits_for_dashboard_and_reconnect() {
+    use crate::app::actions::{
+        ClipboardPasteContext, ClipboardPasteSource, ClipboardPasteTarget, ClipboardTextRead,
+        ProbedAttachment,
+    };
+    let mut app = test_app_with_agent();
+    open_dashboard(&mut app);
+    let dashboard = app.dashboard.as_mut().unwrap();
+    dashboard.dispatch.set_text("look at this");
+    dashboard.paste_probe_in_flight = 1;
+    dispatch(
+        Action::DashboardDispatch {
+            text: "look at this".into(),
+            attach: false,
+        },
+        &mut app,
+    );
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: vec![1, 2, 3],
+        mime_type: "image/png".into(),
+    });
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+            ctx: ClipboardPasteContext {
+                target: ClipboardPasteTarget::DashboardDispatch,
+                source: ClipboardPasteSource::ClipboardKey {
+                    text: ClipboardTextRead::Success(None),
+                    tip_showing: false,
+                },
+            },
+            image: ProbedAttachment::Image(pasted),
+            file_urls: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.agents.len(), 1);
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+    )));
+    assert!(
+        app.dashboard
+            .as_ref()
+            .unwrap()
+            .deferred_dispatch_send
+            .is_some()
+    );
+    app.active_view = ActiveView::AgentDashboard;
+    app.reconnect_pending = true;
+    super::super::task_result::resume_focused_deferred_paste(&mut app);
+    assert!(
+        app.dashboard
+            .as_ref()
+            .unwrap()
+            .deferred_dispatch_send
+            .is_some()
+    );
+    app.reconnect_pending = false;
+    super::super::task_result::resume_focused_deferred_paste(&mut app);
+    assert_eq!(app.agents.len(), 2);
+    assert_eq!(
+        app.agents[&AgentId(1)]
+            .session
+            .pending_prompts
+            .back()
+            .unwrap()
+            .images
+            .len(),
+        1
+    );
+    super::super::task_result::resume_focused_deferred_paste(&mut app);
+    assert_eq!(app.agents.len(), 2);
+}
+
+#[test]
+fn dashboard_deferred_paste_send_cancels_after_edit() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    open_dashboard(&mut app);
+    let d = app.dashboard.as_mut().unwrap();
+    d.dispatch.set_text("original");
+    d.list_focused = false;
+    d.paste_probe_in_flight = 1;
+    dispatch(
+        Action::DashboardDispatch {
+            text: "original".into(),
+            attach: false,
+        },
+        &mut app,
+    );
+    let d = app.dashboard.as_mut().unwrap();
+    d.handle_input(
+        &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        &crate::actions::ActionRegistry::defaults(),
+    );
+    assert!(d.deferred_dispatch_send.is_none());
+    d.dispatch.set_text("original");
+    assert!(d.deferred_dispatch_send.is_none());
+}
 /// Per-surface stashes: a dispatch send AND a peek reply stashed during the
 /// same probe window must both survive (the old single slot let the second
 /// stash silently overwrite the first) and both re-issue on completion:

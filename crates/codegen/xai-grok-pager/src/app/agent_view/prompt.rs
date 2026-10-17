@@ -125,6 +125,20 @@ impl AgentView {
         registry: &ActionRegistry,
         prompt_paging: bool,
     ) -> InputOutcome {
+        let had_deferred_submission = self.deferred_paste_identity.is_some();
+        let outcome = self.handle_prompt_key_inner(key, registry, prompt_paging);
+        if had_deferred_submission && !self.deferred_paste_matches() {
+            self.cancel_stale_deferred_paste();
+        }
+        outcome
+    }
+
+    fn handle_prompt_key_inner(
+        &mut self,
+        key: &KeyEvent,
+        registry: &ActionRegistry,
+        prompt_paging: bool,
+    ) -> InputOutcome {
         // Taken first so only a stash made after this key leaves the next Ctrl+Z armed
         let stash_undo_armed = self
             .prompt_stash
@@ -628,7 +642,7 @@ impl AgentView {
                             && enter_steers_enabled()
                         {
                             if self.paste_probe_in_flight > 0 {
-                                self.deferred_send = Some(AgentDeferredSend::Interject);
+                                self.defer_prompt_send(AgentDeferredSend::Interject);
                                 return InputOutcome::Changed;
                             }
                             let image_notice = self.unbound_image_placeholder_notice();
@@ -692,7 +706,7 @@ impl AgentView {
                                 // Queue (Enter's default role). Leave chips on the
                                 // prompt so `dispatch_send_prompt` can drain them.
                                 if self.paste_probe_in_flight > 0 {
-                                    self.deferred_send = Some(AgentDeferredSend::SendPrompt);
+                                    self.defer_prompt_send(AgentDeferredSend::SendPrompt);
                                     return InputOutcome::Changed;
                                 }
                                 return InputOutcome::Action(Action::SendPrompt(text));
@@ -701,7 +715,7 @@ impl AgentView {
                             // off-thread. Stash (draft untouched) and re-issue on
                             // completion so the not-yet-attached chip isn't dropped.
                             if self.paste_probe_in_flight > 0 {
-                                self.deferred_send = Some(AgentDeferredSend::Interject);
+                                self.defer_prompt_send(AgentDeferredSend::Interject);
                                 return InputOutcome::Changed;
                             }
                             // Drain images BEFORE set_text("") wipes the chip elements.

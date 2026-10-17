@@ -258,6 +258,7 @@ fn deferred_paste_completion_after_refused_editor_does_not_implicitly_send_witho
             ctx: crate::app::actions::ClipboardPasteContext {
                 target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                     agent_id: id,
+                    binding_epoch: app.agents[&id].session_binding_epoch,
                     images_dir: None,
                     feedback_tool_call_id: None,
                 },

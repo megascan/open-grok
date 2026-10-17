@@ -1326,6 +1326,7 @@ fn x11_primary_hint_requires_canonical_full_miss_outcome() {
     );
     let target = ClipboardPasteTarget::AgentPrompt {
         agent_id: AgentId(0),
+        binding_epoch: 0,
         images_dir: None,
         feedback_tool_call_id: None,
     };
@@ -1393,6 +1394,7 @@ fn x11_primary_hint_routes_to_originating_agent() {
     app.active_view = ActiveView::Agent(active);
     let target = crate::app::actions::ClipboardPasteTarget::AgentPrompt {
         agent_id: origin,
+        binding_epoch: app.agents[&origin].session_binding_epoch,
         images_dir: None,
         feedback_tool_call_id: None,
     };
@@ -1453,6 +1455,7 @@ fn clipboard_failure_routes_to_originating_agent_without_duplicate() {
     app.active_view = ActiveView::Agent(active);
     let target = crate::app::actions::ClipboardPasteTarget::AgentPrompt {
         agent_id: origin,
+        binding_epoch: app.agents[&origin].session_binding_epoch,
         images_dir: None,
         feedback_tool_call_id: None,
     };
@@ -3036,6 +3039,8 @@ fn rename_session_failed_keeps_local_display_name_and_pushes_system_block() {
         TaskResult::RenameSessionFailed {
             agent_id: AgentId(0),
             error: "boom".into(),
+            generation: 0,
+            binding_epoch: 0,
         },
         &mut app,
     );

@@ -563,7 +563,7 @@ pub(super) fn dispatch_send_prompt_inner(
     // not-yet-attached image — draft-preserving sends (follow-up chip,
     // slash-preserving) keep it in the draft for the next real send.
     if consume_input && agent.paste_probe_in_flight > 0 {
-        agent.deferred_send = Some(crate::app::agent_view::AgentDeferredSend::SendPrompt);
+        agent.defer_prompt_send(crate::app::agent_view::AgentDeferredSend::SendPrompt);
         return vec![];
     }
 

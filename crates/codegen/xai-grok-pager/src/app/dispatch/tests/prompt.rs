@@ -3329,9 +3329,7 @@ fn interject_before_paste_probe_keeps_image() {
     assert!(app.agents[&id].prompt.images.is_empty());
 }
 
-/// Guard: a stashed send must NOT be re-issued to the wrong session when the
-/// user switched agents during the probe window. The image still attaches to
-/// the original target; the stale send is dropped, not sent to the new agent.
+/// A paste-dependent send stays bound to the original session across a switch.
 #[test]
 fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3398,8 +3396,8 @@ fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     assert_eq!(app.agents[&a].prompt.images.len(), 1);
     assert!(app.agents[&a].prompt.text().contains("[Image #1]"));
     let preview_identity = app.agents[&a].prompt.images[0].preview.identity();
-    // (2) A's stash is cleared so it can't leak.
-    assert!(app.agents[&a].deferred_send.is_none());
+    // (2) A's submission stays pending, rather than being sent to B.
+    assert!(app.agents[&a].deferred_send.is_some());
     assert_eq!(app.agents[&a].paste_probe_in_flight, 0);
     // (3) No send is re-issued to the now-active B. The only returned effect
     // prepares the image that was attached to A.
@@ -3416,6 +3414,344 @@ fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
         b_queue_before,
         "agent B's queue must be untouched"
     );
+    app.active_view = ActiveView::Agent(a);
+    app.reconnect_pending = true;
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+    assert!(app.agents[&a].deferred_send.is_some());
+    app.reconnect_pending = false;
+    app.agents.get_mut(&a).unwrap().active_modal =
+        Some(crate::views::modal::ActiveModal::CommandPalette {
+            entries: vec![],
+            state: crate::views::picker::PickerState::input_active(),
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+    assert!(app.agents[&a].deferred_send.is_some());
+    app.agents.get_mut(&a).unwrap().active_modal = None;
+    let effects = super::super::task_result::resume_focused_deferred_paste(&mut app);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SendPromptBlocks { agent_id, blocks, .. }
+            if *agent_id == a && blocks.iter().any(|block| matches!(block, acp::ContentBlock::Image(_))))));
+    assert!(app.agents[&a].deferred_send.is_none());
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+}
+
+#[test]
+fn deferred_paste_send_cancels_when_draft_or_binding_changes() {
+    use crate::app::actions::{
+        ClipboardPasteContext, ClipboardPasteSource, ClipboardPasteTarget, ClipboardTextRead,
+        ProbedAttachment,
+    };
+    use crate::app::agent_view::AgentDeferredSend;
+    for rebind in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("original");
+        agent.paste_probe_in_flight = 1;
+        agent.defer_prompt_send(AgentDeferredSend::SendPrompt);
+        let binding_epoch = agent.session_binding_epoch;
+        if rebind {
+            agent.bind_session_id(acp::SessionId::new("new-session"));
+        } else {
+            agent.prompt.set_text("changed");
+        }
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx: ClipboardPasteContext {
+                    target: ClipboardPasteTarget::AgentPrompt {
+                        agent_id: id,
+                        binding_epoch,
+                        images_dir: None,
+                        feedback_tool_call_id: None,
+                    },
+                    source: ClipboardPasteSource::ClipboardKey {
+                        text: ClipboardTextRead::Success(None),
+                        tip_showing: false,
+                    },
+                },
+                image: ProbedAttachment::NoRaster,
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )));
+        assert!(app.agents[&id].deferred_send.is_none());
+        assert_eq!(
+            app.agents[&id].prompt.text(),
+            if rebind { "original" } else { "changed" }
+        );
+    }
+}
+
+#[test]
+fn editing_a_deferred_paste_send_cancels_it_even_if_text_is_restored() {
+    use crate::app::agent_view::AgentDeferredSend;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.prompt.set_text("original");
+    agent.paste_probe_in_flight = 1;
+    agent.defer_prompt_send(AgentDeferredSend::SendPrompt);
+    agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(agent.deferred_send.is_none());
+    agent.prompt.set_text("original");
+    assert!(agent.deferred_send.is_none());
+}
+
+#[test]
+fn second_image_paste_cancels_earlier_submission_in_either_completion_order() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for reverse in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("original");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .handle_prompt_key_for_test(&key);
+        let first_ctx = app.agents[&id]
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("first probe");
+        app.agents.get_mut(&id).unwrap().pending_effects.clear();
+        dispatch(Action::SendPrompt("original".into()), &mut app);
+        assert!(app.agents[&id].deferred_send.is_some());
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .handle_prompt_key_for_test(&key);
+        let second_ctx = app.agents[&id]
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("second probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        app.agents.get_mut(&id).unwrap().pending_effects.clear();
+        assert!(app.agents[&id].deferred_send.is_none());
+        let mut contexts = vec![first_ctx, second_ctx];
+        if reverse {
+            contexts.reverse();
+        }
+        for ctx in contexts {
+            let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+                data: vec![1, 2, 3],
+                mime_type: "image/png".into(),
+            });
+            let effects = dispatch(
+                Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                    ctx,
+                    image: crate::app::actions::ProbedAttachment::Image(pasted),
+                    file_urls: None,
+                }),
+                &mut app,
+            );
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+            )));
+        }
+        assert_eq!(app.agents[&id].prompt.images.len(), 2);
+        assert!(app.agents[&id].prompt.text().contains("original"));
+    }
+}
+
+#[test]
+fn bracketed_paste_cancels_submission_but_keeps_the_earlier_image() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.set_active_pane(ActivePane::Prompt, true);
+    agent.prompt.set_text("original");
+    crate::clipboard::set_clipboard_probe_hook(crate::clipboard::ClipboardProbeHook::with_raster(
+        None,
+    ));
+    agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    let ctx = agent
+        .pending_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+            _ => None,
+        })
+        .expect("probe");
+    crate::clipboard::clear_clipboard_probe_hook();
+    agent.pending_effects.clear();
+    dispatch(Action::SendPrompt("original".into()), &mut app);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.handle_input(
+        &Event::Paste("more\ntext".into()),
+        &crate::actions::ActionRegistry::defaults(),
+    );
+    assert!(agent.deferred_send.is_none());
+    let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: vec![1, 2, 3],
+        mime_type: "image/png".into(),
+    });
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+            ctx,
+            image: crate::app::actions::ProbedAttachment::Image(pasted),
+            file_urls: None,
+        }),
+        &mut app,
+    );
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+    )));
+    assert_eq!(app.agents[&id].prompt.images.len(), 1);
+    assert!(app.agents[&id].prompt.text().contains("more"));
+}
+
+#[test]
+fn canceled_paste_probe_cannot_attach_after_session_rebind() {
+    use crate::app::actions::{ClipboardPasteSource, ClipboardTextRead, ProbedAttachment};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for is_image in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("original");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let mut ctx = agent
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        agent.pending_effects.clear();
+        dispatch(Action::SendPrompt("original".into()), &mut app);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(agent.deferred_send.is_none());
+        agent.bind_session_id(acp::SessionId::new("new-session"));
+        let new_draft = agent.prompt.text().to_owned();
+        ctx.source = ClipboardPasteSource::ClipboardKey {
+            text: ClipboardTextRead::Success(Some("stale caption".into())),
+            tip_showing: false,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let staged_path = directory.path().join("stale.png");
+        let image = if is_image {
+            std::fs::write(&staged_path, [1, 2, 3]).unwrap();
+            let mut pasted =
+                crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+                    data: vec![1, 2, 3],
+                    mime_type: "image/png".into(),
+                });
+            pasted.staged_temp_path = Some(staged_path.clone());
+            ProbedAttachment::Image(pasted)
+        } else {
+            ProbedAttachment::NoRaster
+        };
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx,
+                image,
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )));
+        let agent = &app.agents[&id];
+        assert_eq!(agent.prompt.text(), new_draft);
+        assert!(agent.prompt.images.is_empty());
+        assert_eq!(agent.paste_probe_in_flight, 0);
+        assert!(!staged_path.exists());
+    }
+}
+
+#[test]
+fn new_session_adopts_paste_probe_started_before_creation() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for submit in [false, true] {
+        let mut app = test_app();
+        dispatch(Action::NewSession, &mut app);
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        assert!(agent.session.session_id.is_none());
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("new draft");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let ctx = agent
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        agent.pending_effects.clear();
+        if submit {
+            dispatch(Action::SendPrompt("new draft".into()), &mut app);
+            assert!(app.agents[&id].deferred_send.is_some());
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: id,
+                session_id: acp::SessionId::new("created-session"),
+                models: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: "image/png".into(),
+        });
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx,
+                image: crate::app::actions::ProbedAttachment::Image(pasted),
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        if submit {
+            assert!(effects.iter().any(|effect| matches!(effect,
+                Effect::SendPromptBlocks { agent_id, blocks, .. }
+                    if *agent_id == id && blocks.iter().any(|block| matches!(block, acp::ContentBlock::Image(_))))));
+            assert!(app.agents[&id].deferred_send.is_none());
+        } else {
+            assert_eq!(app.agents[&id].prompt.images.len(), 1);
+            assert!(app.agents[&id].prompt.text().contains("new draft"));
+        }
+    }
 }
 
 /// A prompt submitted before the session binds is held in the agent's queue rather than dropped.

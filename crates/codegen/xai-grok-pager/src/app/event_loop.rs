@@ -394,11 +394,9 @@ fn plan_reconnect_load(
 ///
 /// - `all_restored` (AND across every reloaded tab, plus `init_ok`) drives the
 ///   user-facing toast: it reports whether the WHOLE reconnect came back.
-/// - `active_restored` is per-agent: the ACTIVE tab's OWN reload succeeded. It
-///   gates that tab's post-reconnect queue drain. Gating the drain on
-///   `all_restored` would let one failed background tab strand prompts queued
-///   on a healthy active tab — the drain (`dispatch_drain_queue`) only ever
-///   touches the active agent, so a background failure has no bearing on it.
+/// - `active_restored` reports whether the ACTIVE tab's own reload succeeded.
+///   Queue drains are now driven by each successfully finalized reload, so a
+///   failed tab does not prevent another session from resuming.
 ///
 /// `loads` maps each reloaded agent to `(success, running_prompt_id)`; an agent
 /// in `pending_agent_ids` but absent from `loads` is treated as failed
@@ -415,6 +413,38 @@ fn reconnect_restore_outcome(
     let active_restored = init_ok
         && active_agent_id.is_some_and(|aid| pending_agent_ids.contains(&aid) && load_ok(&aid));
     (all_restored, active_restored)
+}
+
+/// Finalize each reload against its own result, then resume only successfully
+/// restored sessions. Local queues belong to sessions, not the focused tab.
+fn finalize_reconnect_loads(
+    app: &mut AppView,
+    generation: u64,
+    init_ok: bool,
+    agent_ids: &[super::agent::AgentId],
+    loads: &mut std::collections::HashMap<
+        super::agent::AgentId,
+        (bool, Option<String>, Option<bool>),
+    >,
+) -> Vec<Effect> {
+    let mut restored_ids = Vec::new();
+    for id in agent_ids {
+        let (ok, running_prompt_id, scheduler_background_loops) =
+            loads.remove(id).unwrap_or((false, None, None));
+        let ok = init_ok && ok;
+        if let Some(agent) = app.agents.get_mut(id) {
+            if ok && let Some(mode) = scheduler_background_loops {
+                agent.scheduler_background_loops = Some(mode);
+            }
+            if agent.finalize_reload_and_maybe_adopt(generation, ok, running_prompt_id) && ok {
+                restored_ids.push(*id);
+            }
+        }
+    }
+    restored_ids
+        .into_iter()
+        .flat_map(|id| dispatch::maybe_drain_queue_and_note_peek(app, id))
+        .collect()
 }
 
 /// Compute the folder-trust verdict for the session cwd and seed
@@ -2342,6 +2372,14 @@ pub(crate) async fn run(
             break;
         }
 
+        let deferred_paste_effects = dispatch::resume_focused_deferred_paste(&mut app);
+        if !deferred_paste_effects.is_empty() {
+            presenter.request(false);
+        }
+        if process_effects(deferred_paste_effects, &mut tasks, &mut app, &progress_tx) {
+            break;
+        }
+
         let workspace_effects = super::workspace_sync::drain(&mut app);
         if process_effects(workspace_effects, &mut tasks, &mut app, &progress_tx) {
             break;
@@ -3328,29 +3366,20 @@ pub(crate) async fn run(
                     ActiveView::Agent(id) => Some(id),
                     _ => None,
                 };
-                let (restored, active_restored) = reconnect_restore_outcome(
+                let (restored, _active_restored) = reconnect_restore_outcome(
                     outcome.init_ok,
                     &pending.agent_ids,
                     &loads,
                     active_agent_id,
                 );
                 restore_dashboard_peek_before_reload(&mut app.dashboard, &mut app.agents);
-                for id in &pending.agent_ids {
-                    let (ok, running_prompt_id, scheduler_background_loops) =
-                        loads.remove(id).unwrap_or((false, None, None));
-                    if let Some(agent) = app.agents.get_mut(id) {
-                        // The reloaded actor re-pinned the fire mode; a failed
-                        // load leaves the previous value rather than guessing.
-                        if let Some(mode) = scheduler_background_loops {
-                            agent.scheduler_background_loops = Some(mode);
-                        }
-                        agent.finalize_reload_and_maybe_adopt(
-                            pending.generation,
-                            ok,
-                            running_prompt_id,
-                        );
-                    }
-                }
+                let drain_effects = finalize_reconnect_loads(
+                    &mut app,
+                    pending.generation,
+                    outcome.init_ok,
+                    &pending.agent_ids,
+                    &mut loads,
+                );
 
                 if pending.agent_ids.is_empty() {
                     // Nothing was reloaded (no open sessions at reconnect).
@@ -3361,18 +3390,8 @@ pub(crate) async fn run(
                     app.show_toast("Session restore failed. Kept the existing transcript.");
                 }
 
-                // Re-trigger the queue drain suppressed during the outage: every
-                // normal trigger (PromptResponse, DrainQueue, send-prompt,
-                // session-created) early-returns while `reconnect_pending` is set
-                // and defers here, and the agent was just force-idled above. Gate
-                // on the active tab's own restore (see `reconnect_restore_outcome`):
-                // a failed active restore suppresses the drain, since sending into
-                // an unrestored session would be wrong.
-                if active_restored {
-                    let drain_effects = dispatch::dispatch(Action::DrainQueue, &mut app);
-                    if process_effects(drain_effects, &mut tasks, &mut app, &progress_tx) {
-                        return Ok(finish_run(&mut app));
-                    }
+                if process_effects(drain_effects, &mut tasks, &mut app, &progress_tx) {
+                    return Ok(finish_run(&mut app));
                 }
 
                 presenter.request(false);
@@ -5215,6 +5234,61 @@ mod tests {
     }
 
     // ── reconnect_restore_outcome ────────────────────────────────────────
+
+    #[test]
+    fn reconnect_drains_each_successful_session_independent_of_focus() {
+        use crate::app::agent::{AgentId, AgentState};
+        for dashboard in [false, true] {
+            let mut app = crate::app::app_view::tests::test_app_with_agent();
+            let a = AgentId(0);
+            let b = AgentId(1);
+            let mut other = crate::test_util::make_agent_view(Some("session-b"), "/tmp");
+            other.session.id = b;
+            app.agents.insert(b, other);
+            app.active_view = if dashboard {
+                ActiveView::AgentDashboard
+            } else {
+                ActiveView::Agent(b)
+            };
+            for id in [a, b] {
+                let agent = app.agents.get_mut(&id).unwrap();
+                agent.session.state = AgentState::TurnRunning;
+                agent.session.enqueue_prompt(format!("queued-{id:?}"));
+                agent.begin_session_reload(10);
+            }
+            let mut loads = std::collections::HashMap::from([
+                (a, (true, None, None)),
+                (b, (false, None, None)),
+            ]);
+            let effects = finalize_reconnect_loads(&mut app, 10, true, &[a, b], &mut loads);
+            assert!(effects.iter().any(
+                |effect| matches!(effect, Effect::SendPrompt { agent_id, .. } if *agent_id == a)
+            ));
+            assert!(!effects.iter().any(
+                |effect| matches!(effect, Effect::SendPrompt { agent_id, .. } if *agent_id == b)
+            ));
+            assert_eq!(app.agents[&b].session.pending_prompts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reconnect_does_not_drain_superseded_or_running_reload() {
+        use crate::app::agent::{AgentId, AgentState};
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        let a = AgentId(0);
+        let agent = app.agents.get_mut(&a).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.session.enqueue_prompt("queued".into());
+        agent.begin_session_reload(11);
+        let mut stale = std::collections::HashMap::from([(a, (true, None, None))]);
+        assert!(finalize_reconnect_loads(&mut app, 10, true, &[a], &mut stale).is_empty());
+        assert_eq!(app.agents[&a].session.pending_prompts.len(), 1);
+        let mut running =
+            std::collections::HashMap::from([(a, (true, Some("prompt-running".into()), None))]);
+        let effects = finalize_reconnect_loads(&mut app, 11, true, &[a], &mut running);
+        assert!(effects.is_empty());
+        assert_eq!(app.agents[&a].session.pending_prompts.len(), 1);
+    }
 
     /// The regression guard: one background tab fails, the active tab
     /// succeeds. The whole-reconnect flag goes false (toast says "failed"),

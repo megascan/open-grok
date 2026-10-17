@@ -114,6 +114,12 @@ pub(in crate::app::dispatch) fn dispatch_rename_session(
         ));
         return vec![];
     }
+    agent.title_mutation_generation = agent.title_mutation_generation.wrapping_add(1);
+    agent.begin_title_mutation(crate::app::agent_view::TitleMutationKind::Rename(
+        title.clone(),
+    ));
+    agent.title_pending_rename = Some(title.clone());
+    agent.title_unpin_committed = false;
     agent.display_name = Some(title.clone());
     vec![Effect::RenameSession {
         agent_id: id,
@@ -121,6 +127,8 @@ pub(in crate::app::dispatch) fn dispatch_rename_session(
         title,
         cwd: agent.session.cwd.clone(),
         kind: agent.rename_kind(),
+        generation: agent.title_mutation_generation,
+        binding_epoch: agent.session_binding_epoch,
     }]
 }
 /// Unpin the current session title via `x.ai/session/rename` with `resetToAuto`.
@@ -147,6 +155,11 @@ pub(in crate::app::dispatch) fn dispatch_reset_session_title(app: &mut AppView) 
     }
     let previous_display_name = agent.display_name.clone();
     let previous_generated_title = agent.generated_session_title.clone();
+    agent.title_pending_rename = None;
+    agent.title_mutation_generation = agent.title_mutation_generation.wrapping_add(1);
+    let generation = agent.title_mutation_generation;
+    let binding_epoch = agent.session_binding_epoch;
+    agent.begin_title_mutation(crate::app::agent_view::TitleMutationKind::Reset);
     agent.title_unpin_committed = false;
     let pin = agent.display_name.take();
     if agent.generated_session_title.as_deref() == pin.as_deref() {
@@ -159,5 +172,7 @@ pub(in crate::app::dispatch) fn dispatch_reset_session_title(app: &mut AppView) 
         kind,
         previous_display_name,
         previous_generated_title,
+        generation,
+        binding_epoch,
     }]
 }

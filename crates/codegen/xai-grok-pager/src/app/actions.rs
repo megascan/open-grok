@@ -1530,6 +1530,8 @@ pub enum ClipboardPasteTarget {
     /// off-thread persist (`None` when no session exists yet).
     AgentPrompt {
         agent_id: AgentId,
+        /// Session binding at probe creation, independent of any deferred send.
+        binding_epoch: u32,
         images_dir: Option<std::path::PathBuf>,
         feedback_tool_call_id: Option<String>,
     },
@@ -2786,6 +2788,8 @@ pub enum Effect {
         title: String,
         cwd: std::path::PathBuf,
         kind: SessionKind,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// Unpin the current session title (`/rename --auto`).
     ResetSessionTitle {
@@ -2796,6 +2800,8 @@ pub enum Effect {
         /// Pre-clear caches so `ResetSessionTitleFailed` can restore the pin.
         previous_display_name: Option<String>,
         previous_generated_title: Option<String>,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// Delete a session's stored data (local + remote) via
     /// `x.ai/session/delete`.
@@ -3839,15 +3845,21 @@ pub enum TaskResult {
     RenameSessionComplete {
         agent_id: AgentId,
         title: String,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// Session rename failed.
     RenameSessionFailed {
         agent_id: AgentId,
         error: String,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// `/rename --auto` completed successfully.
     ResetSessionTitleComplete {
         agent_id: AgentId,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// `/rename --auto` failed.
     ResetSessionTitleFailed {
@@ -3855,6 +3867,8 @@ pub enum TaskResult {
         error: String,
         previous_display_name: Option<String>,
         previous_generated_title: Option<String>,
+        generation: u64,
+        binding_epoch: u32,
     },
     /// Session delete completed successfully.
     DeleteSessionComplete {

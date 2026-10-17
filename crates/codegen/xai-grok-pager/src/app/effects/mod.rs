@@ -247,6 +247,22 @@ impl Drop for KimiMutationTicket {
     }
 }
 
+/// Admit title RPCs synchronously in dispatch order, independently per session.
+/// Weak entries prevent closed sessions from accumulating process-wide state.
+fn title_mutation_ticket(session_id: &acp::SessionId) -> KimiMutationTicket {
+    static QUEUES: LazyLock<Mutex<std::collections::HashMap<String, std::sync::Weak<KimiMutationQueueInner>>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut queues = QUEUES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    let key = session_id.0.to_string();
+    let inner = queues.get(&key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+        let queue = KimiMutationQueue::new();
+        queues.insert(key, Arc::downgrade(&queue.inner));
+        queue.inner
+    });
+    KimiMutationQueue { inner }.enqueue()
+}
+
 fn latest_kimi_key_transport_token(endpoint: KimiApiEndpoint) -> &'static AtomicU64 {
     match endpoint {
         KimiApiEndpoint::Platform => &LATEST_KIMI_PLATFORM_KEY,
@@ -6782,10 +6798,14 @@ pub(crate) fn execute(
             title,
             cwd,
             kind,
+            generation,
+            binding_epoch,
         } => {
             let tx = acp_tx.clone();
+            let mut ticket = title_mutation_ticket(&session_id);
             tasks
                 .spawn(async move {
+                    ticket.wait_turn().await;
                     match session_rename_rpc(
                             &tx,
                             actions::RenameSessionRequest::for_rename(
@@ -6801,12 +6821,16 @@ pub(crate) fn execute(
                             TaskResult::RenameSessionComplete {
                                 agent_id,
                                 title,
+                                generation,
+                                binding_epoch,
                             }
                         }
                         Err(error) => {
                             TaskResult::RenameSessionFailed {
                                 agent_id,
                                 error,
+                                generation,
+                                binding_epoch,
                             }
                         }
                     }
@@ -6819,10 +6843,14 @@ pub(crate) fn execute(
             kind,
             previous_display_name,
             previous_generated_title,
+            generation,
+            binding_epoch,
         } => {
             let tx = acp_tx.clone();
+            let mut ticket = title_mutation_ticket(&session_id);
             tasks
                 .spawn(async move {
+                    ticket.wait_turn().await;
                     match session_rename_rpc(
                             &tx,
                             actions::RenameSessionRequest::for_reset(
@@ -6836,6 +6864,8 @@ pub(crate) fn execute(
                         Ok(()) => {
                             TaskResult::ResetSessionTitleComplete {
                                 agent_id,
+                                generation,
+                                binding_epoch,
                             }
                         }
                         Err(error) => {
@@ -6844,6 +6874,8 @@ pub(crate) fn execute(
                                 error,
                                 previous_display_name,
                                 previous_generated_title,
+                                generation,
+                                binding_epoch,
                             }
                         }
                     }
@@ -8818,6 +8850,26 @@ fn build_interject_params(
 #[cfg(test)]
 mod kimi_serialization_invariant_tests {
     use super::{KimiMutationQueue, kimi_key_apply_owned_at_lock};
+
+    #[tokio::test]
+    async fn title_mutation_tickets_order_per_session_without_blocking_others() {
+        let sid = agent_client_protocol::SessionId::new("title-ordered-test");
+        let other = agent_client_protocol::SessionId::new("title-other-test");
+        let mut first = super::title_mutation_ticket(&sid);
+        let mut second = super::title_mutation_ticket(&sid);
+        let mut independent = super::title_mutation_ticket(&other);
+        first.wait_turn().await;
+        independent.wait_turn().await;
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            second.wait_turn().await;
+            let _ = started_tx.send(());
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut started_rx).await.is_err());
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx).await.unwrap().unwrap();
+        task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn fifo_ticket_preserves_enqueue_order_when_successor_runs_first() {

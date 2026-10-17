@@ -118,6 +118,47 @@ pub(crate) struct DeferredPeekSend {
     pub(crate) attach: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredDashboardDraft {
+    text: String,
+    elements: Vec<(
+        xai_ratatui_textarea::ElementId,
+        std::ops::Range<usize>,
+        xai_ratatui_textarea::ElementKind,
+    )>,
+    images: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredDashboardRoute {
+    cwd: PathBuf,
+    worktree: bool,
+    mode: DashboardDispatchMode,
+    model: Option<(
+        String,
+        Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    )>,
+}
+
+impl DeferredDashboardDraft {
+    fn capture(prompt: &PromptWidget) -> Self {
+        Self {
+            text: prompt.text().to_owned(),
+            elements: prompt
+                .textarea
+                .elements()
+                .iter()
+                .map(|element| (element.id, element.range.clone(), element.kind))
+                .collect(),
+            images: prompt
+                .images
+                .iter()
+                .map(|image| image.preview.identity())
+                .collect(),
+        }
+    }
+}
+
 /// Persistent identity for a pinned/reordered row.
 ///
 /// Not keyed by `AgentId(usize)`: that key is meaningless across restarts (and worse, could attach to the *wrong* agent if `next_agent_id` happened
@@ -431,6 +472,10 @@ pub struct DashboardState {
     pub(crate) deferred_dispatch_send: Option<DeferredDispatchSend>,
     /// A peek-reply send deferred the same way; per-surface slots so stashing one surface can never overwrite the other's pending send.
     pub(crate) deferred_peek_send: Option<DeferredPeekSend>,
+    deferred_dispatch_draft: Option<DeferredDashboardDraft>,
+    deferred_dispatch_route: Option<DeferredDashboardRoute>,
+    deferred_peek_draft: Option<DeferredDashboardDraft>,
+    pub(crate) deferred_paste_hold_reported: bool,
     /// When the dispatch input last sent its text.
     /// `AppView` clears it on any key other than Enter.
     pub(crate) last_send_at: Option<Instant>,
@@ -1220,6 +1265,10 @@ impl DashboardState {
             paste_probe_in_flight: 0,
             deferred_dispatch_send: None,
             deferred_peek_send: None,
+            deferred_dispatch_draft: None,
+            deferred_dispatch_route: None,
+            deferred_peek_draft: None,
+            deferred_paste_hold_reported: false,
             last_send_at: None,
             peek: None,
             peek_viewport: None,
@@ -1703,7 +1752,10 @@ impl DashboardState {
         let row_changed = peek.as_ref().map(|p| &p.row) != self.peek.as_ref().map(|p| &p.row);
         if row_changed {
             self.clear_peek_reply();
-            self.deferred_peek_send = None;
+            if self.deferred_peek_send.take().is_some() {
+                self.set_error_toast("Reply canceled: peek panel changed");
+            }
+            self.deferred_peek_draft = None;
         }
         self.peek = peek;
     }
@@ -1871,6 +1923,17 @@ impl DashboardState {
     }
 
     pub(crate) fn handle_input_with_paste_provenance(
+        &mut self,
+        ev: &Event,
+        registry: &ActionRegistry,
+        paste_provenance: crate::app::app_view::PasteProvenance,
+    ) -> InputOutcome {
+        let outcome = self.handle_input_with_paste_provenance_inner(ev, registry, paste_provenance);
+        self.cancel_changed_deferred_drafts();
+        outcome
+    }
+
+    fn handle_input_with_paste_provenance_inner(
         &mut self,
         ev: &Event,
         registry: &ActionRegistry,
@@ -2227,6 +2290,17 @@ impl DashboardState {
         } else {
             crate::app::actions::ClipboardPasteTarget::DashboardDispatch
         };
+        // The dashboard shares a probe counter across its two composers. A
+        // new probe must not silently join either already submitted draft.
+        let canceled_dispatch = self.deferred_dispatch_send.take().is_some();
+        let canceled_peek = self.deferred_peek_send.take().is_some();
+        if canceled_dispatch || canceled_peek {
+            self.deferred_dispatch_draft = None;
+            self.deferred_dispatch_route = None;
+            self.deferred_peek_draft = None;
+            self.deferred_paste_hold_reported = false;
+            self.set_error_toast("Paste submission canceled: a new paste started");
+        }
         self.paste_probe_in_flight += 1;
         self.pending_effects
             .push(crate::app::actions::Effect::ProbeClipboardAttachment {
@@ -2339,6 +2413,58 @@ impl DashboardState {
             .0
     }
 
+    pub(crate) fn defer_dispatch_send(&mut self, attach: bool) {
+        self.deferred_dispatch_send = Some(DeferredDispatchSend { attach });
+        self.deferred_dispatch_draft = Some(DeferredDashboardDraft::capture(&self.dispatch));
+        self.deferred_dispatch_route = Some(self.deferred_dashboard_route());
+        self.deferred_paste_hold_reported = false;
+    }
+
+    fn deferred_dashboard_route(&self) -> DeferredDashboardRoute {
+        DeferredDashboardRoute {
+            cwd: self.cwd.clone(),
+            worktree: self.dispatch_worktree,
+            mode: self.pending_mode,
+            model: self
+                .pending_model
+                .as_ref()
+                .map(|model| (model.id.0.to_string(), model.effort)),
+        }
+    }
+
+    pub(crate) fn defer_peek_send(&mut self, row: DashboardRowId, attach: bool) {
+        self.deferred_peek_send = Some(DeferredPeekSend { row, attach });
+        self.deferred_peek_draft = Some(DeferredDashboardDraft::capture(&self.peek_reply));
+        self.deferred_paste_hold_reported = false;
+    }
+
+    fn cancel_changed_deferred_drafts(&mut self) {
+        let dispatch_changed = self
+            .deferred_dispatch_draft
+            .as_ref()
+            .is_some_and(|draft| *draft != DeferredDashboardDraft::capture(&self.dispatch))
+            || self
+                .deferred_dispatch_route
+                .as_ref()
+                .is_some_and(|route| *route != self.deferred_dashboard_route());
+        let peek_changed = self
+            .deferred_peek_draft
+            .as_ref()
+            .is_some_and(|draft| *draft != DeferredDashboardDraft::capture(&self.peek_reply));
+        if dispatch_changed {
+            self.deferred_dispatch_send = None;
+            self.deferred_dispatch_draft = None;
+            self.deferred_dispatch_route = None;
+        }
+        if peek_changed {
+            self.deferred_peek_send = None;
+            self.deferred_peek_draft = None;
+        }
+        if dispatch_changed || peek_changed {
+            self.set_error_toast("Paste submission canceled: draft or settings changed");
+        }
+    }
+
     /// Attach the result of a deferred clipboard attachment probe ([`Effect::ProbeClipboardAttachment`]) to the surface named by `ctx.target`
     /// (dispatch input or peek reply).
     /// The heavy read/decode already ran off-thread; this only mutates input state on the event loop.
@@ -2358,9 +2484,29 @@ impl DashboardState {
         let peek = peek_row.is_some();
         self.paste_probe_in_flight = self.paste_probe_in_flight.saturating_sub(1);
 
+        let stale = if peek {
+            self.deferred_peek_draft
+                .as_ref()
+                .is_some_and(|draft| *draft != DeferredDashboardDraft::capture(&self.peek_reply))
+        } else {
+            self.deferred_dispatch_draft
+                .as_ref()
+                .is_some_and(|draft| *draft != DeferredDashboardDraft::capture(&self.dispatch))
+        };
+        self.cancel_changed_deferred_drafts();
+        if stale {
+            if let ProbedAttachment::Image(pasted) = &image {
+                crate::prompt_images::cleanup_temp_file(pasted);
+            }
+            return ClipboardPasteCompletion::Dropped;
+        }
+
         if let Some(row) = &peek_row
             && self.peek.as_ref().is_none_or(|p| p.row != *row)
         {
+            if let ProbedAttachment::Image(pasted) = &image {
+                crate::prompt_images::cleanup_temp_file(pasted);
+            }
             return ClipboardPasteCompletion::Dropped;
         }
 
@@ -2441,6 +2587,11 @@ impl DashboardState {
             file,
             text,
         );
+        if peek && self.deferred_peek_draft.is_some() {
+            self.deferred_peek_draft = Some(DeferredDashboardDraft::capture(&self.peek_reply));
+        } else if !peek && self.deferred_dispatch_draft.is_some() {
+            self.deferred_dispatch_draft = Some(DeferredDashboardDraft::capture(&self.dispatch));
+        }
         if completion == ClipboardPasteCompletion::FullMiss && ctx.source.is_clipboard_key() {
             crate::clipboard::log_paste_key_empty_host_clipboard(ctx.target.surface_str());
         }
@@ -2455,14 +2606,19 @@ impl DashboardState {
         if self.paste_probe_in_flight != 0 {
             return Vec::new();
         }
+        self.cancel_changed_deferred_drafts();
+        self.deferred_paste_hold_reported = false;
         let mut actions = Vec::new();
         if let Some(DeferredDispatchSend { attach }) = self.deferred_dispatch_send.take() {
+            self.deferred_dispatch_draft = None;
+            self.deferred_dispatch_route = None;
             actions.push(crate::app::actions::Action::DashboardDispatch {
                 text: self.dispatch.text().to_string(),
                 attach,
             });
         }
         if let Some(DeferredPeekSend { row, attach }) = self.deferred_peek_send.take() {
+            self.deferred_peek_draft = None;
             let same_row = self.peek.as_ref().is_some_and(|p| p.row == row);
             let in_question = self.peek.as_ref().is_some_and(|p| p.question.is_some());
             if same_row && !in_question {
@@ -8059,6 +8215,139 @@ mod tests {
             state.dispatch.images.is_empty(),
             "peek completion must not leak into dispatch"
         );
+    }
+
+    #[test]
+    fn changed_peek_draft_cancels_its_deferred_send_and_drops_the_probe() {
+        let mut state = state_with_open_peek();
+        let row = state.peek.as_ref().unwrap().row.clone();
+        state.peek_reply.set_text("original");
+        state.paste_probe_in_flight = 1;
+        state.defer_peek_send(row, false);
+        state.peek_reply.set_text("changed");
+        let completion = state.complete_clipboard_attachment_paste(
+            completion_ctx(None, true),
+            crate::app::actions::ProbedAttachment::Image(completion_pasted_image()),
+            None,
+        );
+        assert_eq!(
+            completion,
+            crate::app::actions::ClipboardPasteCompletion::Dropped
+        );
+        assert!(state.deferred_peek_send.is_none());
+        assert!(state.peek_reply.images.is_empty());
+        assert_eq!(state.peek_reply.text(), "changed");
+    }
+
+    #[test]
+    fn changed_dashboard_route_cancels_deferred_dispatch() {
+        let mut state = DashboardState::new();
+        state.dispatch.set_text("original");
+        state.defer_dispatch_send(false);
+        state.cwd = PathBuf::from("/different-project");
+        assert!(state.take_deferred_sends_after_paste().is_empty());
+        assert!(state.deferred_dispatch_send.is_none());
+        assert_eq!(state.dispatch.text(), "original");
+    }
+
+    #[test]
+    fn a_second_dashboard_probe_cancels_prior_submission_on_both_surfaces() {
+        use crate::app::actions::{
+            ClipboardPasteSource, ClipboardTextRead, Effect, ProbedAttachment,
+        };
+        for peek in [false, true] {
+            for reverse in [false, true] {
+                let mut state = if peek {
+                    state_with_open_peek()
+                } else {
+                    DashboardState::new()
+                };
+                let source = ClipboardPasteSource::ClipboardKey {
+                    text: ClipboardTextRead::Success(None),
+                    tip_showing: false,
+                };
+                state.enqueue_clipboard_attachment_probe(source.clone(), peek, None);
+                if peek {
+                    let row = state.peek.as_ref().unwrap().row.clone();
+                    state.peek_reply.set_text("original");
+                    state.defer_peek_send(row, false);
+                } else {
+                    state.dispatch.set_text("original");
+                    state.defer_dispatch_send(false);
+                }
+                state.enqueue_clipboard_attachment_probe(source, peek, None);
+                assert!(state.deferred_dispatch_send.is_none());
+                assert!(state.deferred_peek_send.is_none());
+                let mut contexts: Vec<_> = state
+                    .pending_effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(contexts.len(), 2);
+                if reverse {
+                    contexts.reverse();
+                }
+                for ctx in contexts {
+                    state.complete_clipboard_attachment_paste(
+                        ctx,
+                        ProbedAttachment::Image(completion_pasted_image()),
+                        None,
+                    );
+                }
+                let prompt = if peek {
+                    &state.peek_reply
+                } else {
+                    &state.dispatch
+                };
+                assert_eq!(prompt.images.len(), 2);
+                assert!(prompt.text().contains("original"));
+                assert!(state.take_deferred_sends_after_paste().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_bracketed_paste_preserves_the_pending_image_after_cancel() {
+        use crossterm::event::Event;
+        for peek in [false, true] {
+            let mut state = if peek {
+                state_with_open_peek()
+            } else {
+                DashboardState::new()
+            };
+            state.list_focused = false;
+            state.paste_probe_in_flight = 1;
+            if peek {
+                let row = state.peek.as_ref().unwrap().row.clone();
+                state.peek_reply.set_text("original");
+                state.defer_peek_send(row, false);
+            } else {
+                state.dispatch.set_text("original");
+                state.defer_dispatch_send(false);
+            }
+            state.handle_input(
+                &Event::Paste("more\ntext".into()),
+                &crate::actions::ActionRegistry::defaults(),
+            );
+            assert!(state.deferred_dispatch_send.is_none());
+            assert!(state.deferred_peek_send.is_none());
+            state.complete_clipboard_attachment_paste(
+                completion_ctx(None, peek),
+                crate::app::actions::ProbedAttachment::Image(completion_pasted_image()),
+                None,
+            );
+            let prompt = if peek {
+                &state.peek_reply
+            } else {
+                &state.dispatch
+            };
+            assert_eq!(prompt.images.len(), 1);
+            assert!(prompt.text().contains("more"));
+            assert!(state.take_deferred_sends_after_paste().is_empty());
+        }
     }
 
     /// A no-image miss on an image-wins dispatch Cmd+V inserts the carried

@@ -45,6 +45,7 @@ mod feedback_probe_owner_tests {
             ClipboardPasteContext {
                 target: ClipboardPasteTarget::AgentPrompt {
                     agent_id: agent.session.id,
+                    binding_epoch: agent.session_binding_epoch,
                     images_dir: None,
                     feedback_tool_call_id: Some("old-feedback-card".into()),
                 },
@@ -66,6 +67,64 @@ mod feedback_probe_owner_tests {
 }
 
 impl AgentView {
+    fn deferred_paste_identity(&self) -> super::DeferredPasteIdentity {
+        super::DeferredPasteIdentity {
+            binding_epoch: self.session_binding_epoch,
+            text: self.prompt.text().to_owned(),
+            elements: self
+                .prompt
+                .textarea
+                .elements()
+                .iter()
+                .map(|element| (element.id, element.range.clone(), element.kind))
+                .collect(),
+            images: self
+                .prompt
+                .images
+                .iter()
+                .map(|image| image.preview.identity())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn defer_prompt_send(&mut self, kind: AgentDeferredSend) {
+        debug_assert!(matches!(
+            kind,
+            AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject
+        ));
+        self.deferred_send = Some(kind);
+        self.deferred_paste_identity = Some(self.deferred_paste_identity());
+        self.deferred_paste_hold_reported = false;
+    }
+
+    pub(crate) fn deferred_paste_matches(&self) -> bool {
+        self.deferred_paste_identity
+            .as_ref()
+            .is_none_or(|identity| *identity == self.deferred_paste_identity())
+    }
+
+    pub(crate) fn refresh_deferred_paste_identity(&mut self) {
+        if self.deferred_paste_identity.is_some() {
+            self.deferred_paste_identity = Some(self.deferred_paste_identity());
+        }
+    }
+
+    pub(crate) fn cancel_stale_deferred_paste(&mut self) {
+        self.deferred_send = None;
+        self.deferred_paste_identity = None;
+        self.deferred_paste_hold_reported = false;
+        self.show_toast("Paste submission canceled: draft or session changed");
+    }
+
+    pub(crate) fn cancel_pending_paste_submission(&mut self) {
+        if matches!(
+            self.deferred_send,
+            Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+        ) {
+            self.cancel_stale_deferred_paste();
+        }
+    }
+
     /// Insert a plain-text (caption) clipboard paste into the prompt, matching
     /// the bracketed arm's whitespace policy + slash/suggestion refresh. The
     /// image/file-url portion of a paste is handled by the deferred probe.
@@ -143,6 +202,9 @@ impl AgentView {
         source: crate::app::actions::ClipboardPasteSource,
         change_count: Option<u64>,
     ) {
+        // A later paste is a new draft change, even when its image probe has
+        // not produced a chip yet. Do not add it to an accepted submission.
+        self.cancel_pending_paste_submission();
         let images_dir = crate::prompt_images::session_images_dir(
             self.session.session_id.as_ref(),
             &self.session.cwd,
@@ -153,6 +215,7 @@ impl AgentView {
                 ctx: crate::app::actions::ClipboardPasteContext {
                     target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                         agent_id: self.session.id,
+                        binding_epoch: self.session_binding_epoch,
                         images_dir,
                         feedback_tool_call_id: self
                             .question_view
@@ -209,6 +272,37 @@ impl AgentView {
             ClipboardPasteCompletion, ClipboardPasteFailure, ProbedAttachment,
         };
         self.paste_probe_in_flight = self.paste_probe_in_flight.saturating_sub(1);
+        if matches!(
+            &ctx.target,
+            crate::app::actions::ClipboardPasteTarget::AgentPrompt { binding_epoch, .. }
+                if *binding_epoch != self.session_binding_epoch
+                    && Some(*binding_epoch) != self.adopted_paste_binding_epoch
+        ) {
+            // The submission may already have been canceled by an edit, so
+            // its identity cannot establish ownership of this probe.
+            if matches!(
+                self.deferred_send,
+                Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+            ) && !self.deferred_paste_matches()
+            {
+                self.cancel_stale_deferred_paste();
+            }
+            if let ProbedAttachment::Image(pasted) = &image {
+                crate::prompt_images::cleanup_temp_file(pasted);
+            }
+            return ClipboardPasteCompletion::Dropped;
+        }
+        if matches!(
+            self.deferred_send,
+            Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+        ) && !self.deferred_paste_matches()
+        {
+            self.cancel_stale_deferred_paste();
+            if let ProbedAttachment::Image(pasted) = &image {
+                crate::prompt_images::cleanup_temp_file(pasted);
+            }
+            return ClipboardPasteCompletion::Dropped;
+        }
         if let crate::app::actions::ClipboardPasteTarget::AgentPrompt {
             feedback_tool_call_id: Some(origin),
             ..
@@ -309,6 +403,8 @@ impl AgentView {
         if self.paste_probe_in_flight != 0 {
             return None;
         }
+        self.deferred_paste_identity = None;
+        self.deferred_paste_hold_reported = false;
         self.deferred_send.take()
     }
     pub(crate) fn resume_deferred_send(&mut self, kind: AgentDeferredSend) -> Option<Action> {
@@ -323,7 +419,7 @@ impl AgentView {
                     self.session.state.is_turn_running(),
                     !text.is_empty(),
                 ) {
-                    return None;
+                    return (!text.is_empty()).then_some(Action::SendPrompt(text));
                 }
                 let image_notice = self.unbound_image_placeholder_notice();
                 let images = self.prompt.drain_images();
@@ -2303,6 +2399,7 @@ pub(super) mod paste_key_tests {
         crate::app::actions::ClipboardPasteContext {
             target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                 agent_id: agent.session.id,
+                binding_epoch: agent.session_binding_epoch,
                 images_dir: None,
                 feedback_tool_call_id: None,
             },

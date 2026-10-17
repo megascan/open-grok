@@ -1,5 +1,77 @@
 use super::*;
 use xai_grok_shell::sampling::error::format_rate_limited_user_message;
+
+/// A response to an earlier reset/rename must not undo a newer optimistic
+/// rename. The shell emits the matching manual notification after earlier
+/// title RPCs, so that notification releases the guard.
+fn accept_title_notification(agent: &mut AgentView, manual: Option<bool>, summary: &str) -> bool {
+    let Some(expected) = agent.title_pending_rename.as_ref() else {
+        return true;
+    };
+    match manual {
+        Some(true) => {
+            let clean = xai_grok_shell::session::persistence::sanitize_and_cap_title(summary);
+            if clean.as_deref() == Some(expected.as_str()) {
+                agent.title_pending_rename = None;
+                true
+            } else {
+                false
+            }
+        }
+        Some(false) => false,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod title_mutation_tests {
+    use super::{accept_title_notification, handle_session_notification};
+
+    #[test]
+    fn old_title_notifications_cannot_override_pending_rename() {
+        let mut agent = crate::test_util::make_agent_view(Some("session"), "/tmp");
+        agent.display_name = Some("new".into());
+        agent.title_pending_rename = Some("new".into());
+        assert!(!accept_title_notification(&mut agent, Some(false), ""));
+        assert!(!accept_title_notification(&mut agent, Some(true), "old"));
+        assert_eq!(agent.display_name.as_deref(), Some("new"));
+        assert!(accept_title_notification(&mut agent, Some(true), "new"));
+        assert!(agent.title_pending_rename.is_none());
+        assert!(accept_title_notification(&mut agent, Some(false), ""));
+    }
+
+    #[test]
+    fn stale_unpin_notification_does_not_clear_the_newer_title() {
+        use xai_grok_shell::extensions::notification::{
+            SessionNotification, SessionUpdate, title_is_manual_meta, title_is_unpinned_meta,
+        };
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        let id = crate::app::agent::AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.display_name = Some("new".into());
+        agent.title_pending_rename = Some("new".into());
+        for (title, meta) in [
+            ("", title_is_unpinned_meta()),
+            ("new", title_is_manual_meta()),
+        ] {
+            let notification = SessionNotification {
+                session_id: agent_client_protocol::SessionId::new("test-session"),
+                update: SessionUpdate::SessionSummaryGenerated {
+                    session_summary: title.into(),
+                },
+                meta: Some(meta),
+            };
+            let raw = serde_json::value::to_raw_value(&notification).unwrap();
+            let ext = agent_client_protocol::ExtNotification::new(
+                "x.ai/session_notification",
+                raw.into(),
+            );
+            handle_session_notification(&ext, &mut app);
+            assert_eq!(app.agents[&id].display_name.as_deref(), Some("new"));
+        }
+        assert!(app.agents[&id].title_pending_rename.is_none());
+    }
+}
 /// Stash a live stop-family batch under `stash_pid` for the turn marker
 /// to fold. `merge_same_name` merges a same-name repeat instead of standalone.
 /// Stash a live stop-family batch under `stash_pid` for the turn marker to fold.
@@ -1231,38 +1303,42 @@ pub(super) fn handle_session_notification_with_origin(
                 v.get(xai_grok_shell::extensions::notification::TITLE_IS_MANUAL_META_KEY)
                     .and_then(|v| v.as_bool())
             });
-            match title_is_manual {
-                Some(true) => {
-                    if let Some(clean) =
-                        xai_grok_shell::session::persistence::sanitize_and_cap_title(
-                            &session_summary,
-                        )
-                    {
-                        agent.display_name = Some(clean.clone());
-                        agent.generated_session_title = Some(clean);
-                        agent.title_unpin_committed = false;
+            if !accept_title_notification(agent, title_is_manual, &session_summary) {
+                false
+            } else {
+                match title_is_manual {
+                    Some(true) => {
+                        if let Some(clean) =
+                            xai_grok_shell::session::persistence::sanitize_and_cap_title(
+                                &session_summary,
+                            )
+                        {
+                            agent.display_name = Some(clean.clone());
+                            agent.generated_session_title = Some(clean);
+                            agent.title_unpin_committed = false;
+                        }
+                    }
+                    other => {
+                        let pin = if other == Some(false) {
+                            agent.title_unpin_committed = true;
+                            agent.display_name.take()
+                        } else {
+                            None
+                        };
+                        let decoded = decode_html_entities(&session_summary);
+                        if let Some(clean) =
+                            xai_grok_shell::session::persistence::sanitize_and_cap_title(&decoded)
+                        {
+                            agent.generated_session_title = Some(clean);
+                        } else if other == Some(false)
+                            && agent.generated_session_title.as_deref() == pin.as_deref()
+                        {
+                            agent.generated_session_title = None;
+                        }
                     }
                 }
-                other => {
-                    let pin = if other == Some(false) {
-                        agent.title_unpin_committed = true;
-                        agent.display_name.take()
-                    } else {
-                        None
-                    };
-                    let decoded = decode_html_entities(&session_summary);
-                    if let Some(clean) =
-                        xai_grok_shell::session::persistence::sanitize_and_cap_title(&decoded)
-                    {
-                        agent.generated_session_title = Some(clean);
-                    } else if other == Some(false)
-                        && agent.generated_session_title.as_deref() == pin.as_deref()
-                    {
-                        agent.generated_session_title = None;
-                    }
-                }
+                true
             }
-            true
         }
         XaiSessionUpdate::LastTurnSummary {
             summary,

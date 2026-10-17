@@ -61,6 +61,7 @@ pub(in crate::app) use rewind::find_user_prompt_entry_for_shell_index;
 pub(crate) use router::{dispatch, flush_image_notices};
 pub(crate) use settings::ui::refresh_open_settings_modals;
 pub(crate) use status::commit_minimal_update_notice;
+pub(super) use task_result::resume_focused_deferred_paste;
 pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};
 
 // Test-only consumers (cfg(test) mods elsewhere in the crate); a plain

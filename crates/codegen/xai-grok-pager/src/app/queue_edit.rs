@@ -888,6 +888,7 @@ mod tests {
         let ctx = crate::app::actions::ClipboardPasteContext {
             target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                 agent_id: agent.session.id,
+                binding_epoch: agent.session_binding_epoch,
                 images_dir: None,
                 feedback_tool_call_id: None,
             },

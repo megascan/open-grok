@@ -798,12 +798,61 @@ pub(crate) enum AgentDeferredSend {
     SubmitFeedback,
     Stash,
 }
+
+/// The composer and session that owned a paste-dependent submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredPasteIdentity {
+    pub(crate) binding_epoch: u32,
+    pub(crate) text: String,
+    pub(crate) elements: Vec<(
+        xai_ratatui_textarea::ElementId,
+        std::ops::Range<usize>,
+        xai_ratatui_textarea::ElementKind,
+    )>,
+    pub(crate) images: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TitleMutationKind {
+    Rename(String),
+    Reset,
+}
+
+#[derive(Debug)]
+pub(crate) struct TitleMutation {
+    generation: u64,
+    kind: TitleMutationKind,
+    result: Option<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TitleMutationLedger {
+    confirmed_display_name: Option<String>,
+    confirmed_generated_title: Option<String>,
+    pending: std::collections::VecDeque<TitleMutation>,
+}
+
+pub(crate) struct TitleMutationSettlement {
+    pub(crate) is_reset: bool,
+    pub(crate) succeeded: bool,
+    pub(crate) display_name: Option<String>,
+    pub(crate) generated_title: Option<String>,
+}
+
 pub struct AgentView {
     pub(crate) replayed_visible_prompts: HashSet<String>,
     pub(crate) replayed_bash_prompts: HashSet<String>,
     pub(crate) last_resize_at: Option<std::time::Instant>,
     pub session: AgentSession,
     pub(crate) session_binding_epoch: u32,
+    /// Pre-creation binding epoch adopted by the newly created session.
+    pub(crate) adopted_paste_binding_epoch: Option<u32>,
+    /// Monotonic identity for optimistic title mutations in this binding.
+    pub(crate) title_mutation_generation: u64,
+    /// Confirmed title and ordered in-flight mutations for this binding.
+    pub(crate) title_mutations: Option<TitleMutationLedger>,
+    /// Ignore notifications from older operations until this rename is observed.
+    pub(crate) title_pending_rename: Option<String>,
     pub scrollback: ScrollbackState,
     pub prompt: PromptWidget,
     /// Sticky: once the user types in the prompt, hide the tip for the session.
@@ -1684,6 +1733,8 @@ pub struct AgentView {
     /// complete. Kind-only: the payload is re-derived from the widget on
     /// reissue so the freshly attached image chip travels with it.
     pub(crate) deferred_send: Option<AgentDeferredSend>,
+    pub(crate) deferred_paste_identity: Option<DeferredPasteIdentity>,
+    pub(crate) deferred_paste_hold_reported: bool,
     /// Armed when an `x.ai/session/prompt_complete` broadcast arrives for the
     /// turn THIS client drives while it is still awaiting that turn's
     /// `session/prompt` RPC response. The RPC normally lands milliseconds

@@ -1120,7 +1120,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id_clone.0,
             )));
         }
-        agent.bind_session_id(session_id);
+        agent.bind_created_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
@@ -1231,7 +1231,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         agent.session.finish_command();
         agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         let session_id_clone = session_id.clone();
-        agent.bind_session_id(session_id);
+        agent.bind_created_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;

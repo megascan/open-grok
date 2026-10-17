@@ -1197,8 +1197,7 @@ pub(super) fn dispatch_dashboard_dispatch(
     if let Some(d) = app.dashboard.as_mut()
         && d.paste_probe_in_flight > 0
     {
-        d.deferred_dispatch_send =
-            Some(crate::views::dashboard::state::DeferredDispatchSend { attach });
+        d.defer_dispatch_send(attach);
         return vec![];
     }
     let trimmed = text.trim().to_string();
@@ -1727,8 +1726,7 @@ pub(super) fn dispatch_dashboard_peek_reply(
     if let Some(d) = app.dashboard.as_mut()
         && d.paste_probe_in_flight > 0
     {
-        d.deferred_peek_send =
-            Some(crate::views::dashboard::state::DeferredPeekSend { row, attach });
+        d.defer_peek_send(row, attach);
         return vec![];
     }
 
@@ -1881,6 +1879,12 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
         let kind = agent.rename_kind();
         if let Some(session_id) = agent.session.session_id.clone() {
             let cwd = agent.session.cwd.clone();
+            agent.title_mutation_generation = agent.title_mutation_generation.wrapping_add(1);
+            agent.begin_title_mutation(crate::app::agent_view::TitleMutationKind::Rename(
+                title.clone(),
+            ));
+            agent.title_pending_rename = Some(title.clone());
+            agent.title_unpin_committed = false;
             agent.display_name = Some(title.clone());
             effects.push(Effect::RenameSession {
                 agent_id,
@@ -1888,8 +1892,14 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
                 title,
                 cwd,
                 kind,
+                generation: agent.title_mutation_generation,
+                binding_epoch: agent.session_binding_epoch,
             });
         } else {
+            agent.title_mutation_generation = agent.title_mutation_generation.wrapping_add(1);
+            agent.title_mutations = None;
+            agent.title_pending_rename = None;
+            agent.title_unpin_committed = false;
             agent.display_name = Some(title);
         }
     }

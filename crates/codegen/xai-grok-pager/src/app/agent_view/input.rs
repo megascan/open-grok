@@ -1155,6 +1155,9 @@ impl AgentView {
                     return InputOutcome::ActionThenForward(Action::FocusPrompt);
                 }
                 if self.active_pane == AgentPane::Prompt {
+                    // Invalidate before applying the new paste, so the earlier
+                    // probe still attaches to this same session's edited draft.
+                    self.cancel_pending_paste_submission();
                     self.ephemeral_tip
                         .clear(crate::tips::clipboard_focus::CLIPBOARD_IMAGE_TIP_KEY);
                     self.btw_focused = false;
