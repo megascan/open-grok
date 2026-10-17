@@ -1255,7 +1255,6 @@ fn try_btrfs_remove_from_metadata_inner(
                 else {
                     continue;
                 };
-
                 if meta.mount_target != target {
                     continue;
                 }
@@ -1353,9 +1352,9 @@ fn try_btrfs_remove_from_metadata_inner(
 
 /// Scan btrfs mount points for orphaned direct btrfs snapshots.
 ///
-/// A btrfs snapshot is orphaned if its metadata file exists but the
-/// `mount_target` is not an active mount point. For each orphan: unmount
-/// stale target, delete the btrfs snapshot, and remove metadata.
+/// A missing mount or symlink is only an orphan candidate. Existing snapshots
+/// require matching registry/source identity and idle, clean checks; replaced
+/// targets and unverifiable snapshots are retained.
 ///
 /// This is the btrfs counterpart to `cleanup_orphaned_overlay_snapshots()`.
 #[cfg(target_os = "linux")]
@@ -1415,14 +1414,23 @@ fn cleanup_orphaned_btrfs_snapshots_inner(
 
                 let meta_path = dir_entry.path();
                 let Ok(content) = std::fs::read_to_string(&meta_path) else {
-                    let _ = std::fs::remove_file(&meta_path);
                     continue;
                 };
                 let Ok(meta) = serde_json::from_str::<btrfs::BtrfsSnapshotMetadata>(&content)
                 else {
-                    let _ = std::fs::remove_file(&meta_path);
                     continue;
                 };
+
+                if meta.kind != "btrfs"
+                    || !meta.mount_target.is_absolute()
+                    || meta.mount_target.components().any(|c| {
+                        c.as_os_str() == ".git" || matches!(c, std::path::Component::ParentDir)
+                    })
+                    || meta.snapshot_path.parent() != Some(dir.as_path())
+                    || btrfs::btrfs_meta_path(&meta.snapshot_path).as_ref() != Some(&meta_path)
+                {
+                    continue;
+                }
 
                 // A live worktree is active either as a bind mount (appears in
                 // mountinfo) or as a symlink resolving to its snapshot (the
@@ -1460,9 +1468,15 @@ fn cleanup_orphaned_btrfs_snapshots_inner(
                 // Untrusted metadata: only delete a snapshot contained directly
                 // in the directory we scanned. Leave anything else (and its
                 // metadata) untouched for inspection.
+                let snapshot_present = match std::fs::symlink_metadata(&meta.snapshot_path) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => continue,
+                };
                 let snapshot_contained = meta.snapshot_path.parent() == Some(dir.as_path())
                     && btrfs::is_safe_snapshot_delete_target(&meta.snapshot_path);
-                if meta.snapshot_path.exists() && !snapshot_contained {
+                if snapshot_present && !snapshot_contained {
                     tracing::warn!(
                         snapshot = %meta.snapshot_path.display(),
                         dir = %dir.display(),
@@ -1472,25 +1486,37 @@ fn cleanup_orphaned_btrfs_snapshots_inner(
                     continue;
                 }
 
+                // Losing an exposure symlink or mount does not prove that the
+                // snapshot is unused or clean. Keep registered live/dirty
+                // snapshots and any snapshot whose ownership cannot be proven.
+                if snapshot_present {
+                    #[cfg(feature = "metadata")]
+                    if let Err(error) = gc::validate_orphaned_btrfs_snapshot(
+                        &meta.snapshot_path,
+                        &meta.mount_target,
+                    ) {
+                        tracing::warn!(snapshot = %meta.snapshot_path.display(), %error, "retaining unverified btrfs snapshot");
+                        continue;
+                    }
+                    #[cfg(not(feature = "metadata"))]
+                    continue;
+                }
+
+                // An unrelated replacement at the old exposure path is not
+                // ours to unmount or remove, even if metadata names it.
+                if !matches!(std::fs::symlink_metadata(&meta.mount_target), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    tracing::warn!(target = %meta.mount_target.display(), "retaining replaced btrfs target");
+                    continue;
+                }
+
                 tracing::info!(
                     target = %meta.mount_target.display(),
                     snapshot = %meta.snapshot_path.display(),
                     "cleaning up orphaned btrfs snapshot"
                 );
 
-                // Remove the worktree reference: a symlink is unlinked; a legacy
-                // bind-mount dir is unmounted then removed.
-                if meta.mount_target.is_symlink() {
-                    let _ = std::fs::remove_file(&meta.mount_target);
-                } else {
-                    let mut umount_cmd = std::process::Command::new("umount");
-                    xai_tty_utils::detach_std_command(&mut umount_cmd);
-                    umount_cmd.stdin(std::process::Stdio::null());
-                    let _ = umount_cmd.arg(&meta.mount_target).output();
-                    let _ = std::fs::remove_dir(&meta.mount_target);
-                }
-
-                if meta.snapshot_path.exists() {
+                if snapshot_present {
                     if let Err(e) = btrfs::delete_snapshot(&meta.snapshot_path) {
                         tracing::warn!(
                             path = %meta.snapshot_path.display(),
@@ -1557,7 +1583,12 @@ pub(crate) fn register_worktree(
     } else {
         dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf())
     };
-    let source = dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let source = if crate::worktree::is_grove_strategy(creation_mode) {
+        source.to_path_buf()
+    } else {
+        crate::git::find_worktree_root(source).unwrap_or_else(|_| source.to_path_buf())
+    };
+    let source = dunce::canonicalize(&source).unwrap_or(source);
     let record = db::WorktreeRecord {
         id: worktree_id.unwrap_or_else(|| db::id_from_path(&path)),
         path,
@@ -1727,9 +1758,10 @@ pub mod gc {
         Failed,
     }
 
-    /// `force` bypasses CWD requirements; `Failed` blocks age deletes.
+    /// A failed or unavailable scan cannot establish that a worktree is idle.
     pub(crate) fn age_path_cwd_usable(scan: &LiveCwdScan, force: bool) -> bool {
-        force || matches!(scan, LiveCwdScan::Ok(_) | LiveCwdScan::Unsupported)
+        let _ = force;
+        matches!(scan, LiveCwdScan::Ok(_))
     }
 
     fn scan_contains_cwd(cwds: &[PathBuf], path: &Path) -> bool {
@@ -1832,33 +1864,30 @@ pub mod gc {
         validate_cwd_scan(out)
     }
 
-    /// `proc_listallpids` returns a **byte** count (probe and fill), not a PID count.
-    /// Convert via `size_of::<pid_t>()` / `i32` before allocating or truncating.
+    /// `proc_listallpids` returns a PID count, while its buffer-size argument
+    /// is measured in bytes. Confusing these units silently omits processes.
     #[cfg(target_os = "macos")]
     fn macos_list_all_pids() -> Option<Vec<i32>> {
         const PID_SIZE: usize = std::mem::size_of::<i32>();
-        // SAFETY: null + size 0 is the documented size probe (returns bytes needed).
-        let bytes_needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        if bytes_needed < 1 {
+        // SAFETY: null + size 0 probes the required number of PID slots.
+        let pids_needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if pids_needed < 1 {
             return None;
         }
-        let mut capacity_pids = (bytes_needed as usize) / PID_SIZE;
-        if capacity_pids < 1 {
-            return None;
-        }
+        let mut capacity_pids = pids_needed as usize;
         for _ in 0..4 {
             // Headroom for pids that appear between probe and fill.
             capacity_pids = capacity_pids
                 .saturating_add(capacity_pids / 4)
                 .max(capacity_pids + 32);
             let mut pids = vec![0i32; capacity_pids];
-            let buf_bytes = (pids.len() * PID_SIZE) as i32;
-            // SAFETY: kernel writes at most `buf_bytes` into `pids`; return is byte count.
-            let n_bytes = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), buf_bytes) };
-            if n_bytes < 1 {
+            let buf_bytes = i32::try_from(pids.len().checked_mul(PID_SIZE)?).ok()?;
+            // SAFETY: the buffer has `buf_bytes` writable bytes; return is a PID count.
+            let n_pids = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), buf_bytes) };
+            if n_pids < 1 {
                 return None;
             }
-            let n_pids = (n_bytes as usize) / PID_SIZE;
+            let n_pids = n_pids as usize;
             if n_pids < pids.len() {
                 pids.truncate(n_pids);
                 return Some(pids);
@@ -1904,6 +1933,543 @@ pub mod gc {
         !protect_paths.is_empty() && cwd_within(wt_path, protect_paths)
     }
 
+    /// Read the atomic TUI registry independently of process CWD: a session can
+    /// operate in a worktree while the host process remains in another folder.
+    fn active_session_cwds(home: &Path) -> Result<Vec<PathBuf>> {
+        use anyhow::{Context, bail};
+        #[derive(serde::Deserialize)]
+        struct ActiveSession {
+            pid: u32,
+            cwd: PathBuf,
+        }
+        let bytes = match std::fs::read(home.join("active_sessions.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("cannot read active session registry"),
+        };
+        let sessions: Vec<ActiveSession> =
+            serde_json::from_slice(&bytes).context("cannot parse active session registry")?;
+        let mut cwds = Vec::new();
+        for session in sessions {
+            if session.pid == 0 || session.pid > i32::MAX as u32 || !session.cwd.is_absolute() {
+                bail!("invalid active session registry entry");
+            }
+            if is_pid_alive(session.pid) {
+                // Do not stat session paths here: a session may be on a
+                // wedged Grove mount. `cwd_within` resolves aliases when safe.
+                cwds.push(session.cwd);
+            }
+        }
+        Ok(cwds)
+    }
+
+    /// Drain status output without retaining it and bound both the child and
+    /// the reader. A timeout or read error is never treated as a clean tree.
+    fn status_has_changes(
+        command: &mut std::process::Command,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        Ok(!bounded_command_output(command, timeout)?.is_empty())
+    }
+
+    fn bounded_command_output(
+        command: &mut std::process::Command,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        use anyhow::{Context, bail};
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("cannot start git status")?;
+        let mut output = child
+            .stdout
+            .take()
+            .context("cannot read git status output")?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            let mut result = Vec::new();
+            let mut overflow = false;
+            let result = loop {
+                match output.read(&mut buffer) {
+                    Ok(0) if overflow => {
+                        break Err(std::io::Error::other("command output exceeded 1 MiB"));
+                    }
+                    Ok(0) => break Ok(result),
+                    Ok(n) => {
+                        if result.len().saturating_add(n) > 1024 * 1024 {
+                            overflow = true;
+                        } else if !overflow {
+                            result.extend_from_slice(&buffer[..n]);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = sender.send(result);
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("git status timed out");
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("cannot wait for git status");
+                }
+            }
+        };
+        if !status.success() {
+            bail!("git status failed: {status}");
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("git status output timed out")?
+            .context("cannot read git status output")
+    }
+
+    /// Recover the identity of a jj workspace created under Open Grok's
+    /// managed directory, including workspaces created before DB registration.
+    /// The shared `.jj/repo` link and jj's recorded workspace root must agree.
+    pub fn jj_worktree_record(path: &Path, home: &Path) -> Result<crate::db::WorktreeRecord> {
+        use anyhow::{Context, bail};
+        let metadata = std::fs::symlink_metadata(path).context("cannot inspect jj workspace")?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("jj workspace is not a directory");
+        }
+        let path = dunce::canonicalize(path).context("cannot resolve jj workspace")?;
+        let roots = crate::discovery::managed_worktree_roots(home);
+        let managed = roots.iter().any(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .is_some_and(|suffix| suffix.components().count() == 2)
+        });
+        if !managed {
+            bail!("jj workspace is outside the managed worktree layout");
+        }
+        let repo_link = path.join(".jj/repo");
+        let link_meta =
+            std::fs::symlink_metadata(&repo_link).context("missing jj repository link")?;
+        if !link_meta.is_file() || link_meta.file_type().is_symlink() || link_meta.len() > 8192 {
+            bail!("jj workspace has no shared repository link");
+        }
+        let link = std::fs::read_to_string(&repo_link).context("cannot read jj repository link")?;
+        if link.len() > 8192 || link.trim().is_empty() {
+            bail!("invalid jj repository link");
+        }
+        let repo = dunce::canonicalize(path.join(".jj").join(link.trim()))
+            .context("cannot resolve jj shared repository")?;
+        if repo.file_name() != Some(std::ffi::OsStr::new("repo"))
+            || repo.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new(".jj"))
+            || !repo.is_dir()
+        {
+            bail!("invalid jj shared repository");
+        }
+        let source = repo
+            .parent()
+            .and_then(Path::parent)
+            .context("invalid jj source workspace")?
+            .to_path_buf();
+        if source.starts_with(&path) || path == source {
+            bail!("refusing to remove a jj source repository");
+        }
+        let mut list = std::process::Command::new("jj");
+        list.current_dir(&path).args([
+            "--no-pager",
+            "workspace",
+            "list",
+            "-T",
+            "name ++ \"\\t\" ++ root ++ \"\\n\"",
+        ]);
+        let output = bounded_command_output(&mut list, std::time::Duration::from_secs(15))
+            .context("cannot inspect jj workspace identity")?;
+        let output = std::str::from_utf8(&output).context("invalid jj workspace list")?;
+        let mut names = Vec::new();
+        for line in output.lines() {
+            let Some((name, root)) = line.split_once('\t') else {
+                bail!("invalid jj workspace list");
+            };
+            if root.is_empty() {
+                continue;
+            }
+            if Path::new(root) == path.as_path() {
+                if name.is_empty() || name == "default" || name.contains(['\n', '\r', '\t']) {
+                    bail!("invalid managed jj workspace name");
+                }
+                names.push(name.to_owned());
+            }
+        }
+        if names.len() != 1 {
+            bail!("jj workspace root is not uniquely recorded");
+        }
+        let name = names.pop().expect("one jj workspace name");
+        Ok(crate::db::WorktreeRecord {
+            id: crate::db::id_from_path(&path),
+            path,
+            source_repo: source.clone(),
+            repo_name: crate::db::repo_name_from_path(&source),
+            kind: WorktreeKind::Session,
+            creation_mode: "jj".to_owned(),
+            git_ref: None,
+            head_commit: None,
+            session_id: None,
+            creator_pid: None,
+            created_at: crate::db::now_epoch_secs(),
+            last_accessed_at: None,
+            status: WorktreeStatus::Alive,
+            metadata: Some(serde_json::json!({"jj_workspace_name": name})),
+        })
+    }
+
+    /// Validate a registered worktree before a user-requested or GC removal.
+    /// A registry row alone is insufficient: rebuild may discover ordinary
+    /// directories and a path may have been replaced since registration.
+    pub fn validate_managed_removal(rec: &crate::db::WorktreeRecord, force: bool) -> Result<()> {
+        validate_managed_removal_in(rec, force, &crate::db::resolve_grok_home()?)
+    }
+
+    /// Check a record's filesystem identity without requiring it to be idle or clean.
+    pub fn validate_managed_identity(rec: &crate::db::WorktreeRecord) -> Result<()> {
+        validate_managed_identity_in(rec, &crate::db::resolve_grok_home()?)
+    }
+
+    /// Resolve the exposed destination for a registered btrfs snapshot. Older
+    /// rows recorded the canonical snapshot path rather than its symlink.
+    pub fn managed_removal_path(rec: &crate::db::WorktreeRecord) -> Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        if rec.creation_mode == crate::worktree::STRATEGY_BTRFS {
+            use anyhow::{Context, bail};
+            let snapshot =
+                dunce::canonicalize(&rec.path).context("cannot resolve btrfs snapshot")?;
+            let meta_path = crate::btrfs::btrfs_meta_path(&snapshot)
+                .context("cannot resolve btrfs snapshot metadata")?;
+            let data = match std::fs::read(&meta_path) {
+                Ok(data) => data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !rec.path.is_symlink() => {
+                    return Ok(rec.path.clone());
+                }
+                Err(e) => return Err(e).context("cannot read btrfs snapshot metadata"),
+            };
+            let meta: crate::btrfs::BtrfsSnapshotMetadata =
+                serde_json::from_slice(&data).context("invalid btrfs snapshot metadata")?;
+            if meta.kind != "btrfs"
+                || dunce::canonicalize(&meta.snapshot_path).ok().as_ref() != Some(&snapshot)
+                || !crate::btrfs::is_safe_snapshot_delete_target(&snapshot)
+                || !meta.mount_target.is_symlink()
+                || dunce::canonicalize(&meta.mount_target).ok().as_ref() != Some(&snapshot)
+                || !crate::btrfs::snapshot_meta_targets(&snapshot, &meta.mount_target)
+                || crate::btrfs::is_btrfs_subvolume(&snapshot)?.is_none()
+            {
+                bail!("btrfs snapshot metadata does not prove its destination");
+            }
+            return Ok(meta.mount_target);
+        }
+        Ok(rec.path.clone())
+    }
+
+    /// Remove a checked record, preserving strategy-specific teardown.
+    pub fn remove_managed_worktree_with_delegate(
+        rec: &crate::db::WorktreeRecord,
+        force: bool,
+        delegate: Option<Arc<dyn BtrfsDelegate>>,
+    ) -> Result<crate::RemoveReport> {
+        remove_managed_worktree_in(rec, force, delegate, &crate::db::resolve_grok_home()?)
+    }
+
+    fn remove_managed_worktree_in(
+        rec: &crate::db::WorktreeRecord,
+        force: bool,
+        delegate: Option<Arc<dyn BtrfsDelegate>>,
+        home: &Path,
+    ) -> Result<crate::RemoveReport> {
+        use anyhow::Context;
+        validate_managed_removal_in(rec, force, home)?;
+        if rec.creation_mode == "jj" {
+            let name = rec
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("jj_workspace_name"))
+                .and_then(serde_json::Value::as_str)
+                .context("missing jj workspace name")?;
+            let mut command = std::process::Command::new("jj");
+            command.current_dir(&rec.path).args([
+                "--no-pager",
+                "--ignore-working-copy",
+                "workspace",
+                "forget",
+                name,
+            ]);
+            bounded_command_output(&mut command, std::time::Duration::from_secs(15))
+                .context("cannot forget jj workspace")?;
+        }
+        super::remove_worktree_inner(&managed_removal_path(rec)?, delegate.as_ref(), Some(home))
+    }
+
+    #[cfg(unix)]
+    fn grove_marker_matches_record(
+        marker: &crate::nfs::BackingMarker,
+        rec: &crate::db::WorktreeRecord,
+    ) -> bool {
+        marker.schema == 1
+            && crate::nfs::is_safe_worktree_id(&rec.id)
+            && marker.worktree_id == rec.id
+            && marker.pin_ref == format!("refs/grok/worktrees/{}", rec.id)
+            && crate::nfs::dest_paths_equivalent(&marker.dest, &rec.path)
+            && crate::nfs::dest_paths_equivalent(&marker.source_repo, &rec.source_repo)
+    }
+
+    #[cfg(unix)]
+    fn validate_grove_identity(rec: &crate::db::WorktreeRecord) -> Result<()> {
+        use anyhow::bail;
+        if !rec.path.is_absolute()
+            || !rec.source_repo.is_absolute()
+            || rec
+                .path
+                .components()
+                .any(|c| c.as_os_str() == ".git" || matches!(c, std::path::Component::ParentDir))
+        {
+            bail!("invalid Grove worktree path");
+        }
+        if !crate::nfs::dest_is_projected_mount(&rec.path) {
+            bail!("managed Grove worktree is not a verified projected mount");
+        }
+        if !crate::nfs::candidate_data_dirs().iter().any(|data| {
+            crate::nfs::load_backing_markers(data)
+                .iter()
+                .any(|marker| grove_marker_matches_record(marker, rec))
+        }) {
+            bail!("managed Grove worktree has no matching backing marker");
+        }
+        if crate::nfs::dest_path_contains(&rec.path, &rec.source_repo) {
+            bail!("refusing to remove source repository mount");
+        }
+        Ok(())
+    }
+
+    fn validate_managed_removal_in(
+        rec: &crate::db::WorktreeRecord,
+        force: bool,
+        home: &Path,
+    ) -> Result<()> {
+        validate_managed_identity_in(rec, home)?;
+        validate_idle_and_clean(rec, force, home)
+    }
+
+    fn validate_managed_identity_in(rec: &crate::db::WorktreeRecord, home: &Path) -> Result<()> {
+        use anyhow::{Context, bail};
+
+        let path = &rec.path;
+        if rec.creation_mode == "jj" {
+            let actual = jj_worktree_record(path, home)?;
+            if actual.source_repo != rec.source_repo
+                || actual
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("jj_workspace_name"))
+                    != rec
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("jj_workspace_name"))
+            {
+                bail!("jj workspace identity no longer matches its record");
+            }
+            return Ok(());
+        }
+        if crate::worktree::is_grove_strategy(&rec.creation_mode) {
+            #[cfg(unix)]
+            validate_grove_identity(rec)?;
+            #[cfg(not(unix))]
+            bail!("Grove worktree identity is unavailable on this platform");
+            return Ok(());
+        }
+        let visible_path = managed_removal_path(rec)?;
+        let path = visible_path.as_path();
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("cannot inspect worktree {}", path.display()))?;
+        let symlink = metadata.file_type().is_symlink();
+        if (!metadata.is_dir() && !symlink)
+            || (symlink
+                && !(cfg!(target_os = "linux")
+                    && rec.creation_mode == crate::worktree::STRATEGY_BTRFS))
+        {
+            bail!(
+                "refusing to remove a non-directory or symlink: {}",
+                path.display()
+            );
+        }
+        let canonical = dunce::canonicalize(path).context("cannot resolve worktree path")?;
+        let source = dunce::canonicalize(&rec.source_repo)
+            .context("cannot resolve worktree source repository")?;
+        if source.starts_with(&canonical) || canonical.components().any(|c| c.as_os_str() == ".git")
+        {
+            bail!("refusing to remove a repository or its containing directory");
+        }
+
+        let git = path.join(".git");
+        if git.is_file() {
+            // A DB rebuild also discovers arbitrary linked worktrees under the
+            // managed directory. A discovered row without a creator or session
+            // cannot prove that Open Grok created it.
+            if rec.creator_pid.is_none() && rec.session_id.is_none() {
+                bail!("linked worktree has no recorded Open Grok owner");
+            }
+            let registration = super::read_worktree_gitdir(path)
+                .context("invalid linked worktree registration")?;
+            if registration.parent().and_then(|p| p.file_name())
+                != Some(std::ffi::OsStr::new("worktrees"))
+                || crate::git::registration_worktree_path(&registration)
+                    != Some(crate::git::normalized_for_match(path))
+            {
+                bail!("linked worktree registration does not point back to this directory");
+            }
+            let source_repo = gix::discover(&source).context("cannot inspect source repository")?;
+            let source_common = dunce::canonicalize(source_repo.common_dir())
+                .context("cannot resolve source git directory")?;
+            let registration_common = registration
+                .parent()
+                .and_then(|p| p.parent())
+                .context("invalid linked worktree registration")?;
+            if dunce::canonicalize(registration_common)? != source_common {
+                bail!("linked worktree belongs to a different source repository");
+            }
+        } else if git.is_dir() {
+            let marker = std::fs::read_to_string(git.join("grok-worktree-source"))
+                .context("standalone worktree has no source marker")?;
+            let marker_source = dunce::canonicalize(marker.trim())
+                .context("cannot resolve standalone worktree source")?;
+            let expected_source =
+                match std::fs::read_to_string(source.join(".git/grok-worktree-source")) {
+                    Ok(inherited) => dunce::canonicalize(inherited.trim())
+                        .context("cannot resolve source worktree marker")?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => source.clone(),
+                    Err(error) => return Err(error).context("cannot read source worktree marker"),
+                };
+            if marker_source == canonical || marker_source != expected_source {
+                bail!("standalone worktree belongs to a different source repository");
+            }
+        } else {
+            bail!("directory is not an identifiable managed worktree");
+        }
+
+        Ok(())
+    }
+
+    fn validate_idle_and_clean(
+        rec: &crate::db::WorktreeRecord,
+        force: bool,
+        home: &Path,
+    ) -> Result<()> {
+        use anyhow::{Context, bail};
+        let path = &rec.path;
+        let cwds = match live_process_cwds() {
+            LiveCwdScan::Ok(cwds) => cwds,
+            LiveCwdScan::Failed | LiveCwdScan::Unsupported => {
+                bail!("cannot verify whether the worktree is active")
+            }
+        };
+        if is_guarded(rec, &cwds) {
+            bail!("worktree is in use by a running process");
+        }
+        let active = active_session_cwds(home)?;
+        if cwd_within(path, &active) {
+            bail!("worktree is in use by an active session");
+        }
+
+        // Always perform this check, even with --force. An error is not proof
+        // that the worktree is clean and must never authorize deletion.
+        let mut command = if rec.creation_mode == "jj" {
+            let mut command = std::process::Command::new("jj");
+            command.args(["--no-pager", "diff", "--summary", "-r", "@"]);
+            command
+        } else {
+            let mut command = std::process::Command::new("git");
+            command.arg("--no-optional-locks").args([
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ]);
+            command
+        };
+        command.current_dir(path);
+        let dirty = status_has_changes(&mut command, std::time::Duration::from_secs(15))
+            .context("cannot check worktree for uncommitted changes")?;
+        if !force && dirty {
+            bail!("worktree has uncommitted changes; use -f to remove it");
+        }
+        Ok(())
+    }
+
+    /// A disappeared btrfs exposure is not proof that the backing tree is
+    /// orphaned. Reclaim data only while the registry still proves its origin,
+    /// the source marker agrees and the normal liveness/status checks pass.
+    #[cfg(target_os = "linux")]
+    pub(super) fn validate_orphaned_btrfs_snapshot(snapshot: &Path, target: &Path) -> Result<()> {
+        use anyhow::bail;
+        let home = crate::db::resolve_grok_home()?;
+        let db = WorktreeDb::open(&home)?;
+        let Some(rec) = db
+            .get(&snapshot.to_string_lossy())?
+            .or(db.get(&target.to_string_lossy())?)
+        else {
+            bail!("snapshot has no managed worktree record");
+        };
+        validate_orphaned_btrfs_record(&rec, snapshot, target, &home)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_orphaned_btrfs_record(
+        rec: &crate::db::WorktreeRecord,
+        snapshot: &Path,
+        target: &Path,
+        home: &Path,
+    ) -> Result<()> {
+        use anyhow::{Context, bail};
+        let canonical = dunce::canonicalize(snapshot).context("cannot resolve snapshot")?;
+        if rec.creation_mode != crate::worktree::STRATEGY_BTRFS
+            || (rec.creator_pid.is_none() && rec.session_id.is_none())
+            || dunce::canonicalize(&rec.path).ok().as_ref() != Some(&canonical)
+            || canonical.components().any(|c| c.as_os_str() == ".git")
+        {
+            bail!("snapshot does not match its worktree record");
+        }
+        let source = dunce::canonicalize(&rec.source_repo).context("cannot resolve source")?;
+        if source.starts_with(&canonical) {
+            bail!("snapshot contains the source repository");
+        }
+        let marker = std::fs::read_to_string(canonical.join(".git/grok-worktree-source"))
+            .context("snapshot has no standalone source marker")?;
+        let marker_source = dunce::canonicalize(marker.trim()).context("invalid source marker")?;
+        let expected_source =
+            match std::fs::read_to_string(source.join(".git/grok-worktree-source")) {
+                Ok(inherited) => dunce::canonicalize(inherited.trim())?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => source,
+                Err(error) => return Err(error).context("cannot read source marker"),
+            };
+        if marker_source != expected_source {
+            bail!("snapshot source marker does not match its record");
+        }
+        if cwd_within(target, &active_session_cwds(home)?) {
+            bail!("snapshot exposure is in use by an active session");
+        }
+        validate_idle_and_clean(rec, false, home)
+    }
+
     /// Expired + unguarded + not path-protected + not never-expire (pre-remove re-check).
     fn is_reclaimable(
         rec: &crate::db::WorktreeRecord,
@@ -1932,6 +2498,15 @@ pub mod gc {
         db: &WorktreeDb,
         opts: &GcOptions,
         delegate: Option<Arc<dyn BtrfsDelegate>>,
+    ) -> Result<GcReport> {
+        gc_worktrees_inner(db, opts, delegate, validate_managed_removal)
+    }
+
+    fn gc_worktrees_inner(
+        db: &WorktreeDb,
+        opts: &GcOptions,
+        delegate: Option<Arc<dyn BtrfsDelegate>>,
+        validate: fn(&crate::db::WorktreeRecord, bool) -> Result<()>,
     ) -> Result<GcReport> {
         let mut report = GcReport::default();
         let now = crate::db::now_epoch_secs();
@@ -1981,11 +2556,7 @@ pub mod gc {
         // process that chdir'd into the tree after this snapshot is still guarded.
         // Failed scan → fail closed.
         if age_path_enabled(opts) {
-            let cwd_scan = if opts.force {
-                LiveCwdScan::Ok(Vec::new())
-            } else {
-                live_process_cwds()
-            };
+            let cwd_scan = live_process_cwds();
             if !age_path_cwd_usable(&cwd_scan, opts.force) {
                 tracing::warn!(
                     "process CWD scan failed or unusable; skipping age-expiry (fail closed)"
@@ -2020,14 +2591,20 @@ pub mod gc {
                     continue;
                 }
                 let path = Path::new(&rec.path);
-                if !crate::nfs::dest_is_known_unmounted(path) {
+                if !crate::nfs::dest_is_known_unmounted(path)
+                    && !(crate::worktree::is_grove_strategy(&rec.creation_mode)
+                        && crate::nfs::dest_is_projected_mount(path))
+                {
                     report.skipped_alive += 1;
                     continue;
                 }
-                if !opts.force
-                    && (is_guarded(&rec, live_cwds) || is_path_protected(path, &opts.protect_paths))
-                {
+                if is_guarded(&rec, live_cwds) || is_path_protected(path, &opts.protect_paths) {
                     report.skipped_alive += 1;
+                    continue;
+                }
+                if let Err(error) = validate(&rec, opts.force) {
+                    tracing::warn!(path = %path.display(), %error, "retaining unsafe or dirty worktree");
+                    report.remove_failed += 1;
                     continue;
                 }
                 if opts.dry_run {
@@ -2037,7 +2614,7 @@ pub mod gc {
                     continue;
                 }
                 // Fresh DB row + fresh CWD scan immediately before remove.
-                if !opts.force {
+                {
                     match db.get_by_id(&rec.id) {
                         Ok(Some(fresh)) => {
                             let recheck_scan = live_process_cwds();
@@ -2054,7 +2631,15 @@ pub mod gc {
                                     unreachable!("gated by age_path_cwd_usable")
                                 }
                             };
-                            if !is_reclaimable(&fresh, now, recheck_cwds, opts) {
+                            if fresh.path != rec.path
+                                || fresh.source_repo != rec.source_repo
+                                || fresh.creation_mode != rec.creation_mode
+                                || fresh.session_id != rec.session_id
+                                || fresh.creator_pid != rec.creator_pid
+                                || fresh.metadata != rec.metadata
+                                || !is_reclaimable(&fresh, now, recheck_cwds, opts)
+                                || validate(&fresh, opts.force).is_err()
+                            {
                                 report.skipped_alive += 1;
                                 continue;
                             }
@@ -2063,8 +2648,28 @@ pub mod gc {
                     }
                 }
                 if std::fs::symlink_metadata(path).is_ok() {
-                    match super::remove_worktree_with_delegate(path, delegate.clone()) {
-                        Ok(_) => report.expired_removed += 1,
+                    let removal_path = match managed_removal_path(&rec) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            tracing::warn!(path = %path.display(), %error, "cannot resolve managed removal path");
+                            report.remove_failed += 1;
+                            continue;
+                        }
+                    };
+                    let result = if rec.creation_mode == "jj" {
+                        remove_managed_worktree_with_delegate(&rec, opts.force, delegate.clone())
+                    } else {
+                        super::remove_worktree_with_delegate(&removal_path, delegate.clone())
+                    };
+                    match result {
+                        Ok(_) => {
+                            // The caller may have opened a non-default registry.
+                            // Unregister the row in the same DB used for this GC.
+                            if let Err(error) = db.unregister(&rec.id) {
+                                tracing::warn!(%error, id = %rec.id, "removed worktree but could not unregister it");
+                            }
+                            report.expired_removed += 1;
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 path = %path.display(),
@@ -2081,6 +2686,17 @@ pub mod gc {
         }
 
         Ok(report)
+    }
+
+    // The GC policy unit tests use synthetic directory records to isolate age
+    // and liveness decisions. Deletion identity is covered by real Git fixtures.
+    #[cfg(test)]
+    pub(super) fn gc_with_synthetic_records(
+        db: &WorktreeDb,
+        opts: &GcOptions,
+        delegate: Option<Arc<dyn BtrfsDelegate>>,
+    ) -> Result<GcReport> {
+        gc_worktrees_inner(db, opts, delegate, |_, _| Ok(()))
     }
 
     #[cfg(unix)]
@@ -2128,6 +2744,456 @@ pub mod gc {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        fn managed_fixture(temp: &tempfile::TempDir) -> crate::db::WorktreeRecord {
+            use xai_test_utils::git::{git_commit_all, init_git_repo};
+            let source = temp.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            init_git_repo(&source);
+            std::fs::write(source.join("tracked"), "original").unwrap();
+            git_commit_all(&source, "initial");
+            let path = temp.path().join("worktree");
+            let out = std::process::Command::new("git")
+                .current_dir(&source)
+                .args(["worktree", "add", "--detach"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            crate::db::WorktreeRecord {
+                id: "fixture".into(),
+                path,
+                source_repo: source,
+                repo_name: "source".into(),
+                kind: WorktreeKind::Session,
+                creation_mode: "linked".into(),
+                git_ref: None,
+                head_commit: None,
+                session_id: Some("fixture".into()),
+                creator_pid: None,
+                created_at: 1,
+                last_accessed_at: None,
+                status: WorktreeStatus::Alive,
+                metadata: None,
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn managed_removal_status_is_bounded_and_fails_closed() {
+            use std::time::{Duration, Instant};
+            let mut stalled = std::process::Command::new("sh");
+            stalled.args(["-c", "exec sleep 5"]);
+            let start = Instant::now();
+            let err = status_has_changes(&mut stalled, Duration::from_millis(200)).unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(start.elapsed() < Duration::from_secs(3));
+
+            let mut output = std::process::Command::new("sh");
+            output.args([
+                "-c",
+                "i=0; while [ $i -lt 30000 ]; do printf 'changed\\n'; i=$((i + 1)); done",
+            ]);
+            assert!(status_has_changes(&mut output, Duration::from_secs(5)).unwrap());
+            let mut failure = std::process::Command::new("sh");
+            failure.args(["-c", "exit 1"]);
+            assert!(status_has_changes(&mut failure, Duration::from_secs(5)).is_err());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn managed_grove_marker_requires_matching_source_destination_and_pin() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut rec = crate::db::WorktreeRecord {
+                id: "wt-example".into(),
+                path: temp.path().join("managed"),
+                source_repo: temp.path().join("source"),
+                repo_name: "source".into(),
+                kind: WorktreeKind::Session,
+                creation_mode: crate::worktree::STRATEGY_GROVE_NFS.into(),
+                git_ref: None,
+                head_commit: None,
+                session_id: None,
+                creator_pid: None,
+                created_at: 1,
+                last_accessed_at: None,
+                status: WorktreeStatus::Alive,
+                metadata: None,
+            };
+            let marker = crate::nfs::BackingMarker {
+                schema: 1,
+                worktree_id: rec.id.clone(),
+                dest: rec.path.clone(),
+                source_repo: rec.source_repo.clone(),
+                pin_ref: format!("refs/grok/worktrees/{}", rec.id),
+                mount_id: 1,
+                created_at: 1,
+            };
+            assert!(grove_marker_matches_record(&marker, &rec));
+            rec.path = temp.path().join("other");
+            assert!(!grove_marker_matches_record(&marker, &rec));
+            rec.path = marker.dest.clone();
+            rec.source_repo = temp.path().join("different-source");
+            assert!(!grove_marker_matches_record(&marker, &rec));
+            rec.source_repo = marker.source_repo.clone();
+            rec.id = "another-id".into();
+            assert!(!grove_marker_matches_record(&marker, &rec));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn managed_btrfs_rejects_forged_snapshot_symlink() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let snapshot = temp.path().join("snapshot");
+            let dest = temp.path().join("dest");
+            std::fs::create_dir(&snapshot).unwrap();
+            std::os::unix::fs::symlink(&snapshot, &dest).unwrap();
+            crate::btrfs::write_btrfs_metadata(&snapshot, &dest).unwrap();
+            let rec = crate::db::WorktreeRecord {
+                id: "fake".into(),
+                path: snapshot.clone(),
+                source_repo: temp.path().join("source"),
+                repo_name: "source".into(),
+                kind: WorktreeKind::Session,
+                creation_mode: crate::worktree::STRATEGY_BTRFS.into(),
+                git_ref: None,
+                head_commit: None,
+                session_id: Some("fixture".into()),
+                creator_pid: None,
+                created_at: 0,
+                last_accessed_at: None,
+                status: WorktreeStatus::Alive,
+                metadata: None,
+            };
+            assert!(managed_removal_path(&rec).is_err());
+            assert!(snapshot.exists() && dest.is_symlink());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn orphaned_btrfs_record_rejects_live_and_dirty_snapshots() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let source = temp.path().join("source");
+            let snapshot = temp.path().join("snapshot");
+            let target = temp.path().join("missing-target");
+            std::fs::create_dir(&source).unwrap();
+            xai_test_utils::git::init_git_repo(&source);
+            std::fs::write(source.join("tracked"), "original").unwrap();
+            xai_test_utils::git::git_commit_all(&source, "initial");
+            let clone = std::process::Command::new("git")
+                .arg("clone")
+                .arg(&source)
+                .arg(&snapshot)
+                .output()
+                .unwrap();
+            assert!(
+                clone.status.success(),
+                "{}",
+                String::from_utf8_lossy(&clone.stderr)
+            );
+            std::fs::write(
+                snapshot.join(".git/grok-worktree-source"),
+                source.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            let mut rec = crate::db::WorktreeRecord {
+                id: "snapshot".into(),
+                path: snapshot.clone(),
+                source_repo: source,
+                repo_name: "repo".into(),
+                kind: WorktreeKind::Session,
+                creation_mode: crate::worktree::STRATEGY_BTRFS.into(),
+                git_ref: None,
+                head_commit: None,
+                session_id: Some("managed-session".into()),
+                creator_pid: Some(std::process::id()),
+                created_at: 1,
+                last_accessed_at: None,
+                status: WorktreeStatus::Alive,
+                metadata: None,
+            };
+            assert!(
+                validate_orphaned_btrfs_record(&rec, &snapshot, &target, temp.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("in use")
+            );
+            rec.creator_pid = None;
+            std::fs::write(snapshot.join("tracked"), "changed").unwrap();
+            assert!(
+                validate_orphaned_btrfs_record(&rec, &snapshot, &target, temp.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("uncommitted")
+            );
+            std::fs::write(snapshot.join("tracked"), "original").unwrap();
+            validate_orphaned_btrfs_record(&rec, &snapshot, &target, temp.path()).unwrap();
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_jj_workspace_identity_dirty_check_and_forget() {
+            use std::process::Command;
+            if Command::new("jj").arg("--version").output().is_err() {
+                eprintln!("skipping: jj executable unavailable");
+                return;
+            }
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let source = temp.path().join("source");
+            let dest = home.join("worktrees/repo/workspace");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            let run = |cwd: &Path, args: &[&str]| {
+                let out = Command::new("jj")
+                    .current_dir(cwd)
+                    .args([
+                        "--no-pager",
+                        "--config",
+                        "user.name=Test",
+                        "--config",
+                        "user.email=test@example.invalid",
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run(
+                temp.path(),
+                &["git", "init", "--no-colocate", source.to_str().unwrap()],
+            );
+            std::fs::write(source.join("tracked"), "original").unwrap();
+            run(
+                &source,
+                &[
+                    "workspace",
+                    "add",
+                    dest.to_str().unwrap(),
+                    "--name",
+                    "child",
+                    "-r",
+                    "@",
+                ],
+            );
+            let rec = jj_worktree_record(&dest, &home).unwrap();
+            assert_eq!(rec.source_repo, dunce::canonicalize(&source).unwrap());
+            assert_eq!(rec.metadata.as_ref().unwrap()["jj_workspace_name"], "child");
+            validate_managed_removal_in(&rec, false, &home).unwrap();
+            std::fs::write(dest.join("tracked"), "changed").unwrap();
+            assert!(
+                validate_managed_removal_in(&rec, false, &home)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("uncommitted")
+            );
+            validate_managed_removal_in(&rec, true, &home).unwrap();
+            let mut forged = rec.clone();
+            forged.source_repo = dest.clone();
+            assert!(validate_managed_removal_in(&forged, true, &home).is_err());
+            assert!(jj_worktree_record(&source, &home).is_err());
+            remove_managed_worktree_in(&rec, true, None, &home).unwrap();
+            assert!(!dest.exists());
+            assert_eq!(
+                std::fs::read_to_string(source.join("tracked")).unwrap(),
+                "original"
+            );
+            let listed = Command::new("jj")
+                .current_dir(&source)
+                .args(["--no-pager", "workspace", "list", "-T", "name ++ \"\\n\""])
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            assert!(
+                !String::from_utf8_lossy(&listed.stdout)
+                    .lines()
+                    .any(|name| name == "child")
+            );
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_removal_protects_registered_active_session_cwd() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let rec = managed_fixture(&temp);
+            let nested = rec.path.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(
+                temp.path().join("active_sessions.json"),
+                serde_json::json!([
+                    {"pid": std::process::id(), "cwd": nested}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            for force in [false, true] {
+                let error = validate_managed_removal_in(&rec, force, temp.path()).unwrap_err();
+                assert!(error.to_string().contains("active session"), "{error}");
+            }
+            std::fs::write(temp.path().join("active_sessions.json"), b"[").unwrap();
+            assert!(validate_managed_removal_in(&rec, true, temp.path()).is_err());
+            assert!(rec.path.exists());
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_removal_allows_identified_worktree_nested_in_source() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut rec = managed_fixture(&temp);
+            rec.path = rec.source_repo.join("managed-nested");
+            let result = std::process::Command::new("git")
+                .current_dir(&rec.source_repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&rec.path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            validate_managed_removal(&rec, false).unwrap();
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_removal_checks_identity_dirty_status_and_active_process() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut rec = managed_fixture(&temp);
+            validate_managed_removal(&rec, false).unwrap();
+
+            std::fs::write(rec.path.join("tracked"), "dirty").unwrap();
+            let error = validate_managed_removal(&rec, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("uncommitted") && error.contains("-f"),
+                "{error}"
+            );
+            validate_managed_removal(&rec, true).unwrap();
+
+            rec.creator_pid = Some(std::process::id());
+            let error = validate_managed_removal(&rec, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("in use") && !error.contains("-f"), "{error}");
+            rec.creator_pid = None;
+            let registration = super::super::read_worktree_gitdir(&rec.path).unwrap();
+            std::fs::write(registration.join("index"), b"invalid index").unwrap();
+            for force in [false, true] {
+                let error = validate_managed_removal(&rec, force)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("cannot check") && !error.contains("-f"),
+                    "{error}"
+                );
+            }
+            assert!(rec.path.exists() && rec.source_repo.join("tracked").exists());
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_removal_rejects_replaced_worktrees_and_repository_paths() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let rec = managed_fixture(&temp);
+            let mut discovered = rec.clone();
+            discovered.session_id = None;
+            assert!(validate_managed_removal(&discovered, true).is_err());
+            assert!(discovered.path.exists());
+            let mut candidate = rec.clone();
+            candidate.path = rec.source_repo.clone();
+            assert!(validate_managed_removal(&candidate, true).is_err());
+            candidate.path = rec.source_repo.join(".git");
+            assert!(validate_managed_removal(&candidate, true).is_err());
+            candidate.path = temp.path().join("plain");
+            std::fs::create_dir(&candidate.path).unwrap();
+            assert!(validate_managed_removal(&candidate, true).is_err());
+
+            let other_temp = tempfile::TempDir::new().unwrap();
+            let other = managed_fixture(&other_temp);
+            candidate.path = other.path.clone();
+            assert!(validate_managed_removal(&candidate, true).is_err());
+            // A standalone replacement with a valid marker for another source is also rejected.
+            let standalone = temp.path().join("replacement");
+            std::fs::create_dir(&standalone).unwrap();
+            xai_test_utils::git::init_git_repo(&standalone);
+            std::fs::write(
+                standalone.join(".git/grok-worktree-source"),
+                other.source_repo.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            candidate.path = standalone;
+            assert!(validate_managed_removal(&candidate, true).is_err());
+            assert!(rec.path.exists() && other.path.exists());
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn managed_gc_retains_dirty_and_active_worktrees_even_with_force() {
+            xai_test_utils::require_git!();
+            let _cwd_lock = crate::api::cwd_test_guard();
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut rec = managed_fixture(&temp);
+            let db = WorktreeDb::open(temp.path()).unwrap();
+            std::fs::write(rec.path.join("tracked"), "dirty").unwrap();
+            db.register(&rec).unwrap();
+            let opts = GcOptions {
+                max_age_secs: Some(0),
+                ..Default::default()
+            };
+            let report = gc_worktrees(&db, &opts).unwrap();
+            assert_eq!(report.expired_removed, 0);
+            assert_eq!(report.remove_failed, 1);
+            assert!(rec.path.exists());
+            rec.creator_pid = Some(std::process::id());
+            db.register(&rec).unwrap();
+            let forced = gc_worktrees(
+                &db,
+                &GcOptions {
+                    force: true,
+                    ..opts
+                },
+            )
+            .unwrap();
+            assert_eq!(forced.expired_removed, 0);
+            assert_eq!(forced.skipped_alive, 1);
+            assert!(rec.path.exists());
+            rec.creator_pid = None;
+            db.register(&rec).unwrap();
+            let removed = gc_worktrees(
+                &db,
+                &GcOptions {
+                    max_age_secs: Some(0),
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(removed.expired_removed, 1);
+            assert!(!rec.path.exists());
+            assert!(db.get_by_id(&rec.id).unwrap().is_none());
+            assert!(rec.source_repo.join("tracked").exists());
+        }
 
         #[cfg(unix)]
         #[test]
@@ -2198,6 +3264,20 @@ pub mod gc {
             );
         }
 
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_pid_scan_uses_pid_count_not_byte_count() {
+            let expected = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+            assert!(expected > 0);
+            let pids = macos_list_all_pids().expect("PID enumeration must succeed");
+            assert!(pids.contains(&(std::process::id() as i32)));
+            assert!(
+                pids.len().saturating_mul(2) >= expected as usize,
+                "enumeration omitted too many PIDs: got {}, probe reported {expected}",
+                pids.len()
+            );
+        }
+
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[test]
         fn live_process_cwds_ok_and_nonempty_on_supported_os() {
@@ -2241,15 +3321,12 @@ pub mod gc {
                 !age_path_cwd_usable(&LiveCwdScan::Failed, false),
                 "Failed scan must block age path"
             );
-            assert!(
-                age_path_cwd_usable(&LiveCwdScan::Failed, true),
-                "force bypasses CWD scan requirement"
-            );
+            assert!(!age_path_cwd_usable(&LiveCwdScan::Failed, true));
             assert!(age_path_cwd_usable(
                 &LiveCwdScan::Ok(vec![PathBuf::from("/")]),
                 false
             ));
-            assert!(age_path_cwd_usable(&LiveCwdScan::Unsupported, false));
+            assert!(!age_path_cwd_usable(&LiveCwdScan::Unsupported, false));
         }
 
         #[cfg(target_os = "macos")]
@@ -3045,6 +4122,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn orphaned_btrfs_metadata_cannot_remove_a_replacement_target() {
+        use crate::btrfs;
+        use crate::mount_info::MountEntry;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("worktrees");
+        std::fs::create_dir(&dir).unwrap();
+        let snapshot = dir.join("gone-snapshot");
+        let target = temp.path().join("replacement");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), "precious").unwrap();
+        btrfs::write_btrfs_metadata(&snapshot, &target).unwrap();
+        let metadata = btrfs::btrfs_meta_path(&snapshot).unwrap();
+        let entries = [MountEntry {
+            mount_id: 1,
+            parent_id: 0,
+            root: "/".into(),
+            mount_point: temp.path().to_path_buf(),
+            fs_type: "btrfs".into(),
+            source: "/dev/loop0".into(),
+            super_options: String::new(),
+        }];
+        let report = cleanup_orphaned_btrfs_snapshots_inner(&entries);
+        assert_eq!(report.removed, 0);
+        assert!(metadata.exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep")).unwrap(),
+            "precious"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_cleanup_orphaned_btrfs_snapshots_with_metadata() {
         use crate::btrfs;
         use crate::mount_info::MountEntry;
@@ -3478,6 +4587,18 @@ mod tests {
     #[cfg(feature = "metadata")]
     mod metadata_integration {
         use super::*;
+
+        fn policy_gc(db: &WorktreeDb, opts: &gc::GcOptions) -> anyhow::Result<gc::GcReport> {
+            gc::gc_with_synthetic_records(db, opts, None)
+        }
+
+        fn policy_gc_with_delegate(
+            db: &WorktreeDb,
+            opts: &gc::GcOptions,
+            delegate: Option<Arc<dyn BtrfsDelegate>>,
+        ) -> anyhow::Result<gc::GcReport> {
+            gc::gc_with_synthetic_records(db, opts, delegate)
+        }
         use crate::db::{ListFilter, WorktreeDb, WorktreeKind};
 
         fn db_at(tmp: &tempfile::TempDir) -> WorktreeDb {
@@ -3525,6 +4646,32 @@ mod tests {
             assert_eq!(mine[0].creation_mode, "linked");
             assert_eq!(mine[0].head_commit.as_deref(), Some("abc123"));
             assert!(mine[0].creator_pid.is_some());
+        }
+
+        #[test]
+        fn registration_records_repository_root_from_subdirectory() {
+            xai_test_utils::require_git!();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            let nested = repo.join("nested");
+            let worktree = tmp.path().join("worktree");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            xai_test_utils::git::init_git_repo(&repo);
+            super::super::register_worktree(
+                Some(tmp.path()),
+                &worktree,
+                &nested,
+                WorktreeKind::Session,
+                "linked",
+                "HEAD",
+                "fixture",
+                None,
+                Some("nested-source".into()),
+                None,
+            );
+            let rec = db_at(&tmp).get_by_id("nested-source").unwrap().unwrap();
+            assert_eq!(rec.source_repo, dunce::canonicalize(repo).unwrap());
         }
 
         #[test]
@@ -3615,7 +4762,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(&db, &gc::GcOptions::default()).unwrap();
+            let report = policy_gc(&db, &gc::GcOptions::default()).unwrap();
             assert_eq!(report.dead_removed, 1);
 
             let all = db
@@ -3662,7 +4809,7 @@ mod tests {
             record2.path = dir.clone();
             db.register(&record2).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -3702,7 +4849,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     dry_run: true,
@@ -3725,7 +4872,7 @@ mod tests {
         }
 
         #[test]
-        fn gc_force_overrides_liveness() {
+        fn gc_force_preserves_liveness() {
             let tmp = tempfile::TempDir::new().unwrap();
             let db = db_at(&tmp);
 
@@ -3750,7 +4897,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -3761,8 +4908,9 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(report.expired_removed, 1);
-            assert_eq!(report.skipped_alive, 0);
+            assert_eq!(report.expired_removed, 0);
+            assert_eq!(report.skipped_alive, 1);
+            assert!(dir.exists());
         }
 
         #[test]
@@ -3791,7 +4939,7 @@ mod tests {
             // `now - i64::MIN` would overflow/wrap the cutoff into the future and
             // reclaim everything; the clamp treats any negative age as 0 so the
             // cutoff is `now` and nothing fresh is reclaimed (and no panic).
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(i64::MIN),
@@ -3844,7 +4992,7 @@ mod tests {
             })
             .unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -3933,7 +5081,7 @@ mod tests {
                 dry_run: false,
                 ..Default::default()
             };
-            let guarded = gc::gc_worktrees(&db, &opts).unwrap();
+            let guarded = policy_gc(&db, &opts).unwrap();
             assert_eq!(
                 guarded.skipped_alive, 1,
                 "a live in-tree CWD must protect the expired worktree"
@@ -3948,7 +5096,7 @@ mod tests {
                 wait_until(|| !scan_has_cwd_under(&want)),
                 "child CWD must leave the scan after exit before reclaim"
             );
-            let reclaimed = gc::gc_worktrees(&db, &opts).unwrap();
+            let reclaimed = policy_gc(&db, &opts).unwrap();
             assert_eq!(
                 reclaimed.expired_removed, 1,
                 "no live process inside ⇒ the expired worktree is reclaimed"
@@ -3959,9 +5107,9 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[test]
         fn gc_age_path_fail_closed_when_scan_unusable() {
-            // Pure gate: Failed scan blocks age; force still allows.
+            // A failed scan blocks age reclamation even with force.
             assert!(!gc::age_path_cwd_usable(&gc::LiveCwdScan::Failed, false));
-            assert!(gc::age_path_cwd_usable(&gc::LiveCwdScan::Failed, true));
+            assert!(!gc::age_path_cwd_usable(&gc::LiveCwdScan::Failed, true));
         }
 
         #[test]
@@ -3992,7 +5140,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4040,7 +5188,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4092,7 +5240,7 @@ mod tests {
             };
             db.register(&record).unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4258,7 +5406,7 @@ mod tests {
                 deletes: Arc::clone(&deletes),
             });
 
-            let report = gc::gc_worktrees_with_delegate(
+            let report = policy_gc_with_delegate(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4375,7 +5523,7 @@ mod tests {
             db.register(&record).unwrap();
 
             // Protect via a nested path (same canonicalize rules as cwd_within).
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4395,7 +5543,7 @@ mod tests {
             assert!(dir.exists());
 
             // Without protect, dry_run would-count it.
-            let unguarded = gc::gc_worktrees(
+            let unguarded = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4431,7 +5579,7 @@ mod tests {
                 metadata: None,
             })
             .unwrap();
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4471,7 +5619,7 @@ mod tests {
                 metadata: None,
             })
             .unwrap();
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4537,7 +5685,7 @@ mod tests {
             })
             .unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4584,7 +5732,7 @@ mod tests {
                 metadata: None,
             })
             .unwrap();
-            let dry = gc::gc_worktrees(
+            let dry = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4646,7 +5794,7 @@ mod tests {
             })
             .unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4712,7 +5860,7 @@ mod tests {
             })
             .unwrap();
 
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(7 * 86400),
@@ -4751,7 +5899,7 @@ mod tests {
                 metadata: None,
             })
             .unwrap();
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4819,7 +5967,7 @@ mod tests {
             })
             .unwrap();
 
-            let dry = gc::gc_worktrees(
+            let dry = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(7 * 86400),
@@ -4842,7 +5990,7 @@ mod tests {
             assert!(sub_dir.exists() && sess_dir.exists() && man_dir.exists());
 
             // max_age_secs=0: session+subagent would-expire; manual never → skipped.
-            let dry0 = gc::gc_worktrees(
+            let dry0 = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(0),
@@ -4901,7 +6049,7 @@ mod tests {
                 ..base
             })
             .unwrap();
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: None,
@@ -4951,14 +6099,14 @@ mod tests {
                 max_age_by_kind: [(WorktreeKind::Manual, Some(0))].into_iter().collect(),
                 ..Default::default()
             };
-            let report = gc::gc_worktrees(&db, &opts).unwrap();
+            let report = policy_gc(&db, &opts).unwrap();
             assert!(
                 dir.exists(),
                 "skip_kinds must win over max_age_by_kind Some(secs)"
             );
             assert_eq!(report.expired_removed, 0);
 
-            let dry = gc::gc_worktrees(
+            let dry = policy_gc(
                 &db,
                 &gc::GcOptions {
                     dry_run: true,
@@ -4997,7 +6145,7 @@ mod tests {
                 metadata: None,
             })
             .unwrap();
-            let report = gc::gc_worktrees(
+            let report = policy_gc(
                 &db,
                 &gc::GcOptions {
                     max_age_secs: Some(7 * 86400),

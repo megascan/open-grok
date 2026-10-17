@@ -11,7 +11,7 @@
 //! the worktree/git parts.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -1470,22 +1470,123 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
 // Remove Worktree
 // ============================================================================
 
+/// Legacy jj workspaces were not registered. Require a persisted fork session
+/// tying this destination to its source in addition to jj's own identity.
+fn legacy_jj_session_proves_ownership(
+    home: &Path,
+    record: &xai_fast_worktree::WorktreeRecord,
+) -> Result<bool> {
+    use std::io::Read;
+
+    let sessions = home.join("sessions");
+    let groups = match std::fs::read_dir(&sessions) {
+        Ok(groups) => groups,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("cannot inspect legacy jj session records"),
+    };
+    let mut examined = 0usize;
+    for group in groups {
+        let group = group.context("cannot inspect legacy jj session directory")?;
+        if !group.file_type()?.is_dir() {
+            continue;
+        }
+        for session in std::fs::read_dir(group.path())? {
+            let session = session.context("cannot inspect legacy jj session")?;
+            if !session.file_type()?.is_dir() {
+                continue;
+            }
+            examined += 1;
+            if examined > 100_000 {
+                anyhow::bail!("too many session records to verify legacy jj workspace");
+            }
+            let path = session.path().join("summary.json");
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > 2_097_152
+            {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            let Ok(mut file) = std::fs::File::open(path) else {
+                continue;
+            };
+            if file
+                .by_ref()
+                .take(2_097_153)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() > 2_097_152
+            {
+                continue;
+            }
+            let Ok(summary) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if summary.get("session_kind").and_then(|v| v.as_str()) != Some("worktree")
+                || summary
+                    .get("parent_session_id")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty)
+            {
+                continue;
+            }
+            let cwd = summary.pointer("/info/cwd").and_then(|v| v.as_str());
+            let source = summary.get("source_workspace_dir").and_then(|v| v.as_str());
+            let (Some(cwd), Some(source)) = (cwd, source) else {
+                continue;
+            };
+            let (Ok(cwd), Ok(source)) = (dunce::canonicalize(cwd), dunce::canonicalize(source))
+            else {
+                continue;
+            };
+            if cwd.starts_with(&record.path)
+                && source.starts_with(&record.source_repo)
+                && !source.starts_with(&record.path)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub async fn remove_worktree(
     req: &RemoveWorktreeRequest,
     copy_context: &BackgroundCopyContext,
 ) -> Result<RemoveWorktreeResponse> {
-    let resolved = match (&req.worktree_path, &req.id_or_path) {
+    let id_or_path = match (&req.worktree_path, &req.id_or_path) {
         (Some(_), Some(_)) => {
             anyhow::bail!("exactly one of worktreePath or idOrPath must be set, not both")
         }
-        (Some(path), None) => path.clone(),
-        (None, Some(id)) => match resolve_worktree_by_id_or_path(id)? {
-            Some(p) => p.display().to_string(),
-            None => anyhow::bail!("worktree not found: {id}"),
-        },
+        (Some(path), None) | (None, Some(path)) => path,
         (None, None) => anyhow::bail!("either worktreePath or idOrPath must be set"),
     };
-    let worktree_path = Path::new(&resolved);
+    let record = match open_db()?.get(id_or_path)? {
+        Some(record) => record,
+        None if Path::new(id_or_path).is_absolute() => {
+            let path = PathBuf::from(id_or_path);
+            let home = grok_home();
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let record = xai_fast_worktree::jj_worktree_record(&path, &home)?;
+                if !legacy_jj_session_proves_ownership(&home, &record)? {
+                    anyhow::bail!("no persisted worktree fork establishes jj ownership");
+                }
+                Ok(record)
+            })
+            .await?
+            .map_err(|error| {
+                anyhow::anyhow!("managed worktree not found or unsafe: {id_or_path}: {error:#}")
+            })?
+        }
+        None => anyhow::bail!("managed worktree not found: {id_or_path}"),
+    };
+    let resolved = xai_fast_worktree::managed_removal_path(&record)?
+        .to_string_lossy()
+        .into_owned();
+    let record_id = record.id.clone();
 
     tracing::info!(
         target: WORKTREE_LOG,
@@ -1495,52 +1596,35 @@ pub async fn remove_worktree(
         "REMOVE_START: removing worktree"
     );
 
-    // jj workspace: detect by .jj/repo and route to jj-specific cleanup.
-    if worktree_path.join(".jj").join("repo").exists() {
-        if req.dry_run {
-            return Ok(RemoveWorktreeResponse {
-                removed: false,
-                resolved_path: Some(resolved),
-            });
-        }
-        tracing::info!(target: WORKTREE_LOG, path = %resolved, "REMOVE_JJ: using jj workspace forget + rm");
-        remove_jj_workspace(&resolved).await?;
-        return Ok(RemoveWorktreeResponse {
-            removed: true,
-            resolved_path: Some(resolved),
-        });
-    }
+    let remove_start = std::time::Instant::now();
+    let force = req.force;
+    let dry_run = req.dry_run;
 
-    if req.dry_run {
+    // Validate before cancelling any copy or reporting a successful dry run.
+    let validation_record = record.clone();
+    tokio::task::spawn_blocking(move || {
+        xai_fast_worktree::validate_managed_removal(&validation_record, force)
+    })
+    .await??;
+    if dry_run {
         return Ok(RemoveWorktreeResponse {
             removed: false,
             resolved_path: Some(resolved),
         });
     }
-
-    let remove_start = std::time::Instant::now();
-
-    let was_copying = copy_context.cancel(&resolved);
-    if was_copying {
-        tracing::info!(
-            target: WORKTREE_LOG,
-            path = %resolved,
-            "REMOVE_CANCEL_BG_COPY: cancelled background ignored file copy"
-        );
-    }
-
-    let wt_path = worktree_path.to_path_buf();
-    let force = req.force;
-
+    copy_context.cancel(&resolved);
     // The btrfs delegate is used only as a fallback when a direct btrfs op fails
     // (rootless hosts lack CAP_SYS_ADMIN for direct subvolume ops).
     let delegate = btrfs_delegate_from_env();
     match tokio::task::spawn_blocking(move || {
-        xai_fast_worktree::remove_worktree_with_delegate(&wt_path, delegate)
+        xai_fast_worktree::remove_managed_worktree_with_delegate(&record, force, delegate)
     })
     .await
     {
         Ok(Ok(report)) => {
+            if let Err(error) = open_db().and_then(|db| db.unregister(&record_id)) {
+                tracing::warn!(%error, id = %record_id, "removed worktree but could not unregister it");
+            }
             let elapsed_ms = remove_start.elapsed().as_millis() as u64;
             if report.used_btrfs_delete {
                 tracing::info!(
@@ -1562,37 +1646,9 @@ pub async fn remove_worktree(
             })
         }
         Ok(Err(e)) => {
-            if force {
-                tracing::info!(
-                    target: WORKTREE_LOG,
-                    path = %resolved,
-                    error = %e,
-                    "REMOVE_FAST_FAILED: trying git worktree remove --force"
-                );
-                let git_root = find_main_repo_root_from_path(worktree_path)?;
-                git_cli(&git_root, &["worktree", "remove", "--force", &resolved]).await?;
-                let elapsed_ms = remove_start.elapsed().as_millis() as u64;
-                tracing::info!(
-                    target: WORKTREE_LOG,
-                    path = %resolved,
-                    elapsed_ms,
-                    "REMOVE_OK_FORCE: worktree removed via git CLI --force"
-                );
-                Ok(RemoveWorktreeResponse {
-                    removed: true,
-                    resolved_path: Some(resolved),
-                })
-            } else {
-                let elapsed_ms = remove_start.elapsed().as_millis() as u64;
-                tracing::warn!(
-                    target: WORKTREE_LOG,
-                    path = %resolved,
-                    elapsed_ms,
-                    error = %e,
-                    "REMOVE_ERROR: fast remove failed (force=false)"
-                );
-                Err(e)
-            }
+            let elapsed_ms = remove_start.elapsed().as_millis() as u64;
+            tracing::warn!(target: WORKTREE_LOG, path = %resolved, elapsed_ms, error = %e, "REMOVE_ERROR: removal refused or failed");
+            Err(e)
         }
         Err(e) => {
             let elapsed_ms = remove_start.elapsed().as_millis() as u64;
@@ -1606,6 +1662,61 @@ pub async fn remove_worktree(
             Err(anyhow::anyhow!("remove_worktree task failed: {}", e))
         }
     }
+}
+
+/// Verify an existing subagent worktree before resuming into it. Dirty and live
+/// trees are allowed, but an incomplete restore or mismatched owner is not.
+pub async fn validate_subagent_worktree_for_resume(
+    dest: &Path,
+    source_repo: &Path,
+    original_subagent_id: &str,
+) -> Result<()> {
+    let dest = dest.to_path_buf();
+    let source_repo = source_repo.to_path_buf();
+    let original_subagent_id = original_subagent_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        validate_subagent_worktree_for_resume_sync(&dest, &source_repo, &original_subagent_id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("subagent worktree validation task failed: {e}"))?
+}
+
+fn validate_subagent_worktree_for_resume_sync(
+    dest: &Path,
+    source_repo: &Path,
+    original_subagent_id: &str,
+) -> Result<()> {
+    use anyhow::{Context, bail};
+
+    if !dest.is_absolute() || original_subagent_id.is_empty() {
+        bail!("invalid subagent worktree destination or owner");
+    }
+    xai_fast_worktree::ensure_rehydrate_complete(dest)?;
+    let canonical_dest = dunce::canonicalize(dest).context("cannot resolve subagent worktree")?;
+    // Match canonical paths rather than passing a Windows path to the DB's
+    // id-or-path lookup, which treats strings without '/' as IDs.
+    let mut matches = open_db()?
+        .list(&xai_fast_worktree::ListFilter::default())?
+        .into_iter()
+        .filter(|record| dunce::canonicalize(&record.path).ok().as_ref() == Some(&canonical_dest));
+    let record = matches
+        .next()
+        .context("subagent worktree has no managed record")?;
+    if matches.next().is_some() {
+        bail!("subagent worktree has multiple managed records");
+    }
+    if record.kind != xai_fast_worktree::WorktreeKind::Subagent
+        || record.session_id.as_deref() != Some(original_subagent_id)
+        || record.status != xai_fast_worktree::WorktreeStatus::Alive
+        || dunce::canonicalize(crate::session::git::find_main_repo_root_from_path(
+            &record.source_repo,
+        )?)? != dunce::canonicalize(source_repo)?
+    {
+        bail!("subagent worktree owner or source does not match");
+    }
+    xai_fast_worktree::validate_managed_identity(&record)?;
+    // Check again after the identity lookup in case a restore began meanwhile.
+    xai_fast_worktree::ensure_rehydrate_complete(dest)
 }
 
 /// Recreate a disposed subagent worktree at `dest` from `snapshot_ref`, using
@@ -1672,15 +1783,13 @@ pub async fn snapshot_subagent_worktree(
 /// removal failure is safe to treat as best-effort (the durable ref already
 /// backs resume). The blocking fast-worktree work runs on a blocking thread.
 pub async fn remove_subagent_worktree(worktree_path: &Path) -> Result<()> {
-    let worktree_path = worktree_path.to_path_buf();
-    // On rootless hosts the snapshot delete needs the privileged helper; without
-    // the delegate the btrfs delete hits EPERM and the snapshot leaks.
-    let delegate = btrfs_delegate_from_env();
-    tokio::task::spawn_blocking(move || {
-        xai_fast_worktree::remove_worktree_with_delegate(&worktree_path, delegate)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("remove_subagent_worktree task failed: {e}"))??;
+    let request = RemoveWorktreeRequest {
+        worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
+        id_or_path: None,
+        force: false,
+        dry_run: false,
+    };
+    remove_worktree(&request, &BackgroundCopyContext::new()).await?;
     Ok(())
 }
 
@@ -1695,7 +1804,10 @@ async fn snapshot_and_remove_subagent_worktree(
     ref_name: &str,
 ) -> Result<String> {
     let snapshot_ref = snapshot_subagent_worktree(worktree_path, source_repo, ref_name).await?;
-    remove_subagent_worktree(worktree_path).await?;
+    // This test-only helper owns its temporary fixture; production removal
+    // requires registry identity and a liveness check.
+    let path = worktree_path.to_path_buf();
+    tokio::task::spawn_blocking(move || xai_fast_worktree::remove_worktree(&path)).await??;
     Ok(snapshot_ref)
 }
 
@@ -2647,6 +2759,23 @@ pub async fn create_jj_workspace(
     .await
     .map_err(|e| anyhow::anyhow!("jj workspace add failed: {e}"))?;
 
+    // Record new jj workspaces for listing, GC, and later ownership checks.
+    let registry_dest = PathBuf::from(&dest);
+    let registry_home = grok_home();
+    let registry_session_id = req.new_session_id.clone();
+    let registration = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut record = xai_fast_worktree::jj_worktree_record(&registry_dest, &registry_home)?;
+        record.creator_pid = Some(std::process::id());
+        record.session_id = Some(registry_session_id);
+        open_db()?.register(&record)
+    })
+    .await;
+    match registration {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, path = %dest, "could not register jj workspace"),
+        Err(error) => tracing::warn!(%error, path = %dest, "jj workspace registration task failed"),
+    }
+
     let commit = jj_commit_id(Path::new(&dest)).await;
     tracing::info!(dest = %dest, commit = ?commit, "jj workspace created");
 
@@ -2660,23 +2789,16 @@ pub async fn create_jj_workspace(
     })
 }
 
-/// Remove a jj workspace: forget + delete directory.
+/// Remove a jj workspace through the same identity and liveness checks used by
+/// the worktree removal command.
 pub async fn remove_jj_workspace(workspace_path: &str) -> Result<()> {
-    let path = Path::new(workspace_path);
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .replace(['/', '\\', '.'], "-");
-
-    if let Ok(root) = find_git_root_from_path(path) {
-        let _ = jj_cli_mut(&root, &["workspace", "forget", &name]).await;
-    }
-
-    if path.exists() {
-        tracing::info!(path = %workspace_path, "removing jj workspace directory");
-        tokio::fs::remove_dir_all(path).await?;
-    }
+    let request = RemoveWorktreeRequest {
+        worktree_path: Some(workspace_path.to_owned()),
+        id_or_path: None,
+        force: false,
+        dry_run: false,
+    };
+    remove_worktree(&request, &BackgroundCopyContext::new()).await?;
     Ok(())
 }
 
@@ -3080,6 +3202,53 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn legacy_jj_ownership_requires_matching_persisted_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source = temp.path().join("source");
+        let dest = home.join("worktrees/repo/dest");
+        let nested = dest.join("nested");
+        let session = home.join("sessions/group/session");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&session).unwrap();
+        let record = xai_fast_worktree::WorktreeRecord {
+            id: "test".into(),
+            path: dunce::canonicalize(&dest).unwrap(),
+            source_repo: dunce::canonicalize(&source).unwrap(),
+            repo_name: "repo".into(),
+            kind: xai_fast_worktree::WorktreeKind::Session,
+            creation_mode: "jj".into(),
+            git_ref: None,
+            head_commit: None,
+            session_id: None,
+            creator_pid: None,
+            created_at: 0,
+            last_accessed_at: None,
+            status: xai_fast_worktree::WorktreeStatus::Alive,
+            metadata: None,
+        };
+        let summary = session.join("summary.json");
+        let mut json = serde_json::json!({
+            "info": {"cwd": nested},
+            "session_kind": "worktree",
+            "source_workspace_dir": source,
+        });
+        std::fs::write(&summary, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(!legacy_jj_session_proves_ownership(&home, &record).unwrap());
+        json["parent_session_id"] = "parent".into();
+        std::fs::write(&summary, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(legacy_jj_session_proves_ownership(&home, &record).unwrap());
+        json["source_workspace_dir"] = dest.to_string_lossy().to_string().into();
+        std::fs::write(&summary, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(!legacy_jj_session_proves_ownership(&home, &record).unwrap());
+        json["source_workspace_dir"] = record.source_repo.to_string_lossy().to_string().into();
+        json["info"]["cwd"] = record.source_repo.to_string_lossy().to_string().into();
+        std::fs::write(&summary, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(!legacy_jj_session_proves_ownership(&home, &record).unwrap());
+    }
+
+    #[test]
     fn worktree_home_fallback_uses_open_grok_namespace() {
         let home = worktree_home_or_fallback(Err(anyhow::anyhow!("home unavailable")));
         assert_eq!(home, std::env::temp_dir().join(".opengrok"));
@@ -3230,7 +3399,7 @@ mod tests {
             "snapshot ref must resolve in the source repo after transfer"
         );
 
-        remove_subagent_worktree(&wt).await.unwrap();
+        xai_fast_worktree::remove_worktree(&wt).unwrap();
         assert!(!wt.exists());
         // Ref still resolves after the standalone `.git` is gone (the bug).
         assert!(!git_out(&repo, &["rev-parse", ref_name]).is_empty());
@@ -3276,6 +3445,19 @@ mod tests {
             not_a_worktree.join("keep.txt").exists(),
             "directory must be preserved when the snapshot fails"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_cleanup_rejects_unmanaged_repository() {
+        xai_test_utils::require_git!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let (repo, _) = repo_with_worktree(&temp);
+        assert!(remove_subagent_worktree(&repo).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "original"
+        );
+        assert!(repo.join(".git").is_dir());
     }
 
     // ── worktree_record_for_cwd / touch_worktree_for_cwd ─────────────────

@@ -58,7 +58,11 @@ fn detect_source_repo(worktree_path: &Path) -> Option<PathBuf> {
             .parent()
             .map(|p| p.to_path_buf())
     } else if git_entry.is_dir() {
-        Some(worktree_path.to_path_buf())
+        std::fs::read_to_string(git_entry.join("grok-worktree-source"))
+            .ok()
+            .map(|source| source.trim().to_owned())
+            .filter(|source| !source.is_empty())
+            .map(PathBuf::from)
     } else {
         None
     }
@@ -619,6 +623,16 @@ mod tests {
 
         let source = detect_source_repo(&wt);
         assert_eq!(source, Some(PathBuf::from("/home/user/myrepo")));
+    }
+
+    #[test]
+    fn detect_standalone_source_from_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        make_fake_standalone_worktree(&wt);
+        assert!(detect_source_repo(&wt).is_none());
+        std::fs::write(wt.join(".git/grok-worktree-source"), "/source/repo").unwrap();
+        assert_eq!(detect_source_repo(&wt), Some(PathBuf::from("/source/repo")));
     }
 
     #[test]

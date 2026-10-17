@@ -42,7 +42,11 @@ pub use api::cleanup_orphaned_overlay_snapshots;
 #[cfg(feature = "metadata")]
 pub use api::gc::effective_max_age;
 #[cfg(feature = "metadata")]
-pub use api::gc::{GcOptions, GcReport, gc_worktrees, gc_worktrees_with_delegate};
+pub use api::gc::{
+    GcOptions, GcReport, gc_worktrees, gc_worktrees_with_delegate, jj_worktree_record,
+    managed_removal_path, remove_managed_worktree_with_delegate, validate_managed_identity,
+    validate_managed_removal,
+};
 #[cfg(feature = "metadata")]
 pub use api::remove_worktree_in;
 pub use api::{
@@ -75,7 +79,8 @@ pub use discovery::{
     rebuild_worktree_db, rebuild_worktree_db_with_grove_data,
 };
 pub use git::checkout::{
-    rehydrate_worktree_from_ref, snapshot_worktree_to_ref, transfer_snapshot_to_repo,
+    ensure_rehydrate_complete, rehydrate_worktree_from_ref, snapshot_worktree_to_ref,
+    transfer_snapshot_to_repo,
 };
 pub use git::{
     StaleWorktreeMatch, remove_stale_worktree_registration, remove_stale_worktree_registrations,

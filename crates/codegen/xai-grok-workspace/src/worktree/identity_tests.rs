@@ -50,6 +50,52 @@ fn git_worktree_add_detached(repo: &Path, worktree: &Path) {
 }
 
 #[test]
+fn subagent_resume_requires_matching_owner_and_completed_restore() {
+    xai_test_utils::require_git!();
+    let temp = tempfile::TempDir::new().unwrap();
+    let fixture = locked_worktrees_fixture(&temp);
+    let repo = committed_repo(&fixture.root);
+    // The parent session can itself be a linked worktree. Its durable snapshot
+    // source is the main repository even though the DB records the parent cwd.
+    let parent = fixture.worktrees.join("repo").join("parent");
+    git_worktree_add_detached(&repo, &parent);
+    let wt = fixture.worktrees.join("repo").join("subagent-child");
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    xai_fast_worktree::WorktreeBuilder::new(&parent, &wt)
+        .creation_mode(xai_fast_worktree::CreationMode::Linked)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id("child")
+        .create()
+        .unwrap();
+    std::fs::write(wt.join("tracked.txt"), "dirty retained edit").unwrap();
+
+    let validate = |source: &Path, id: &str| {
+        crate::worktree::validate_subagent_worktree_for_resume_sync(&wt, source, id)
+    };
+    validate(&repo, "child").unwrap();
+    assert!(validate(&repo, "other").is_err());
+    let other_repo = fixture.root.join("other-repo");
+    std::fs::create_dir(&other_repo).unwrap();
+    assert!(validate(&other_repo, "child").is_err());
+
+    // Even a matching registered .git directory can be a partial restore.
+    let marker = wt.with_file_name("subagent-child.opengrok-rehydrating");
+    std::fs::create_dir(&marker).unwrap();
+    assert!(validate(&repo, "child").is_err());
+    std::fs::remove_dir(&marker).unwrap();
+    validate(&repo, "child").unwrap();
+
+    let moved = wt.with_file_name("original-worktree");
+    std::fs::rename(&wt, &moved).unwrap();
+    std::fs::create_dir(&wt).unwrap();
+    assert!(validate(&repo, "child").is_err());
+    assert_eq!(
+        std::fs::read_to_string(moved.join("tracked.txt")).unwrap(),
+        "dirty retained edit"
+    );
+}
+
+#[test]
 fn nested_subdir_cwd_derives_label_from_second_component_after_prefix() {
     let temp = tempfile::TempDir::new().unwrap();
     let fixture = locked_worktrees_fixture(&temp);
@@ -247,6 +293,85 @@ fn standalone_clone_with_source_marker_and_no_db_derives_marker_source() {
             label: "standalone".to_owned(),
             source_workspace_dir: Some("/marker-source".to_owned()),
         })
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn managed_removal_requires_registry_identity_and_clean_state() {
+    xai_test_utils::require_git!();
+    let temp = tempfile::TempDir::new().unwrap();
+    let fixture = locked_worktrees_fixture(&temp);
+    let repo = committed_repo(&fixture.root);
+    let wt = fixture.worktrees.join("repo").join("remove-me");
+    git_worktree_add_detached(&repo, &wt);
+    let db = xai_fast_worktree::WorktreeDb::open(&fixture.home).unwrap();
+    let mut rec = xai_fast_worktree::WorktreeRecord {
+        id: "remove-me".into(),
+        path: wt.clone(),
+        source_repo: repo.clone(),
+        repo_name: "repo".into(),
+        kind: xai_fast_worktree::WorktreeKind::Session,
+        creation_mode: "linked".into(),
+        git_ref: None,
+        head_commit: None,
+        session_id: None,
+        creator_pid: None,
+        created_at: 1,
+        last_accessed_at: None,
+        status: xai_fast_worktree::WorktreeStatus::Alive,
+        metadata: None,
+    };
+    let ctx = super::super::BackgroundCopyContext::new();
+    let request = |value: String, force, dry_run| super::super::RemoveWorktreeRequest {
+        worktree_path: Some(value),
+        id_or_path: None,
+        force,
+        dry_run,
+    };
+    // An existing checkout, its Git directory and an unregistered worktree
+    // must be refused even for force and dry-run requests.
+    for path in [&repo, &repo.join(".git"), &wt] {
+        for dry_run in [false, true] {
+            let result = super::super::remove_worktree(
+                &request(path.to_string_lossy().into_owned(), true, dry_run),
+                &ctx,
+            )
+            .await;
+            assert!(result.is_err());
+        }
+    }
+    db.register(&rec).unwrap();
+    assert!(
+        super::super::remove_worktree(&request("remove-me".into(), true, false), &ctx)
+            .await
+            .is_err()
+    );
+    assert!(wt.exists(), "a rebuilt row alone does not prove ownership");
+    rec.session_id = Some("managed-session".into());
+    db.register(&rec).unwrap();
+    std::fs::write(wt.join("tracked.txt"), "changed").unwrap();
+    let error = super::super::remove_worktree(&request("remove-me".into(), false, true), &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("-f"), "{error}");
+    rec.creator_pid = Some(std::process::id());
+    db.register(&rec).unwrap();
+    let error = super::super::remove_worktree(&request("remove-me".into(), true, false), &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("in use") && !error.contains("-f"), "{error}");
+    rec.creator_pid = None;
+    db.register(&rec).unwrap();
+    let result = super::super::remove_worktree(&request("remove-me".into(), true, false), &ctx)
+        .await
+        .unwrap();
+    assert!(result.removed && !wt.exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+        "original"
     );
 }
 

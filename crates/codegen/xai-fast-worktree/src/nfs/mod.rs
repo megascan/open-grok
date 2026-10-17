@@ -22,6 +22,8 @@ pub use liveness::WORKTREE_BACKING_DIR;
 #[cfg(feature = "metadata")]
 pub(crate) use liveness::candidate_data_dirs;
 #[cfg(feature = "metadata")]
+pub(crate) use liveness::{BackingMarker, load_backing_markers};
+#[cfg(feature = "metadata")]
 #[allow(unused_imports)]
 pub use liveness::{
     NfsIdentity, PIN_GC_GRACE_SECS, RANK_DB, collect_identities, gc_orphan_pins,
