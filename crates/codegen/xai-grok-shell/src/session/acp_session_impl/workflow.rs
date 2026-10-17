@@ -151,10 +151,10 @@ impl SessionActor {
             many => {
                 let rows: Vec<String> = many
                     .iter()
-                    .map(|(_, status, name)| format!("  {name} ({})", status.as_str()))
+                    .map(|(id, status, name)| format!("  {name} [{id}] ({})", status.as_str()))
                     .collect();
                 return format!(
-                    "Several runs could be '{}' — pick one by name:\n{}\n(/workflow {} <name>)",
+                    "Several runs could be '{}' — pick one by full run ID:\n{}\n(/workflow {} <id>)",
                     op.as_str(),
                     rows.join("\n"),
                     op.as_str(),
@@ -937,6 +937,12 @@ fn narrow_run_matches(mut all: Vec<RunMatch>, selector: &str, op: ManageOp) -> V
     if selector.is_empty() {
         return all;
     }
+    // Pausing or stopping a run must require an exact display name or full ID.
+    // Keep collisions ambiguous even when only one run is currently applicable.
+    if matches!(op, ManageOp::Pause | ManageOp::Stop) {
+        all.retain(|(id, _, name)| id == selector || name == selector);
+        return all;
+    }
     let exact: Vec<_> = all
         .iter()
         .filter(|(id, _, name)| id.as_str() == selector || name.as_str() == selector)
@@ -1166,14 +1172,48 @@ mod run_match_tests {
     }
 
     #[test]
-    fn prefix_still_narrows_by_op_applicability() {
+    fn destructive_ops_reject_prefixes_even_if_only_one_run_is_applicable() {
         let all = vec![
-            run("wf_1", "deep-research", WorkflowRunStatus::Complete),
+            run("wf_1", "deep-research", WorkflowRunStatus::Failed),
             run("wf_2", "deep-research-2", WorkflowRunStatus::Active),
         ];
-        let picked = narrow_run_matches(all, "deep", ManageOp::Stop);
+        for op in [ManageOp::Stop, ManageOp::Pause] {
+            assert!(narrow_run_matches(all.clone(), "deep", op).is_empty());
+            assert!(narrow_run_matches(all.clone(), "wf_", op).is_empty());
+        }
+        let picked = narrow_run_matches(all, "deep", ManageOp::Resume);
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].2, "deep-research-2");
+        assert_eq!(picked[0].2, "deep-research");
+    }
+
+    #[test]
+    fn destructive_ops_match_exact_full_id_or_name() {
+        let all = vec![
+            run("wf_123", "research", WorkflowRunStatus::Active),
+            run("wf_1234", "research-2", WorkflowRunStatus::Active),
+        ];
+        for op in [ManageOp::Stop, ManageOp::Pause] {
+            assert_eq!(
+                narrow_run_matches(all.clone(), "wf_123", op)[0].2,
+                "research"
+            );
+            assert_eq!(
+                narrow_run_matches(all.clone(), "research-2", op)[0].0,
+                "wf_1234"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_ops_keep_exact_id_and_name_collisions_ambiguous() {
+        let all = vec![
+            run("same", "first", WorkflowRunStatus::Complete),
+            run("wf_2", "same", WorkflowRunStatus::Active),
+            run("wf_3", "same", WorkflowRunStatus::Active),
+        ];
+        for op in [ManageOp::Stop, ManageOp::Pause] {
+            assert_eq!(narrow_run_matches(all.clone(), "same", op).len(), 3);
+        }
     }
 
     #[test]
