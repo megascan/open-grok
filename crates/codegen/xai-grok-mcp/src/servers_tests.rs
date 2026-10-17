@@ -56,50 +56,171 @@ fn make_http_server(name: &str, url: &str) -> acp::McpServer {
 #[test]
 fn plan_stdio_spawn_windows_resolves_bare_launcher_to_cmd_shim() {
     let args = vec!["-y".to_string(), "@scope/pkg".to_string()];
-    let (program, spawn_args) = plan_stdio_spawn("npx", &args, true, |c| {
+    let (program, spawn_args) = plan_stdio_spawn(OsStr::new("npx"), &args, None, true, |c| {
         assert_eq!(c, "npx");
         Some(PathBuf::from(r"C:\path\npx.cmd"))
     });
     assert_eq!(program, OsString::from(r"C:\path\npx.cmd"));
-    assert_eq!(spawn_args, args);
+    assert_eq!(
+        spawn_args,
+        args.iter()
+            .map(|arg| OsString::from(arg.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn plan_stdio_spawn_windows_unresolved_falls_back_to_raw_command() {
     let args = vec!["-y".to_string(), "@scope/pkg".to_string()];
-    let (program, spawn_args) = plan_stdio_spawn("npx", &args, true, |_| None);
+    let (program, spawn_args) = plan_stdio_spawn(OsStr::new("npx"), &args, None, true, |_| None);
     assert_eq!(program, OsString::from("npx"));
-    assert_eq!(spawn_args, args);
+    assert_eq!(
+        spawn_args,
+        args.iter()
+            .map(|arg| OsString::from(arg.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn plan_stdio_spawn_windows_backslash_path_command_used_as_is_without_resolving() {
     let args = vec!["--config".to_string(), "x.json".to_string()];
-    let (program, spawn_args) = plan_stdio_spawn(r"C:\tools\server.exe", &args, true, |_| {
-        panic!("resolver must not be consulted for a command with a backslash separator")
-    });
+    let (program, spawn_args) = plan_stdio_spawn(
+        OsStr::new(r"C:\tools\server.exe"),
+        &args,
+        None,
+        true,
+        |_| panic!("resolver must not be consulted for a command with a backslash separator"),
+    );
     assert_eq!(program, OsString::from(r"C:\tools\server.exe"));
-    assert_eq!(spawn_args, args);
+    assert_eq!(
+        spawn_args,
+        args.iter()
+            .map(|arg| OsString::from(arg.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn plan_stdio_spawn_windows_forward_slash_path_command_used_as_is_without_resolving() {
     let args = vec!["--port".to_string(), "8080".to_string()];
-    let (program, spawn_args) = plan_stdio_spawn("C:/tools/server.exe", &args, true, |_| {
-        panic!("resolver must not be consulted for a command with a forward-slash separator")
-    });
+    let (program, spawn_args) =
+        plan_stdio_spawn(OsStr::new("C:/tools/server.exe"), &args, None, true, |_| {
+            panic!("resolver must not be consulted for a command with a forward-slash separator")
+        });
     assert_eq!(program, OsString::from("C:/tools/server.exe"));
-    assert_eq!(spawn_args, args);
+    assert_eq!(
+        spawn_args,
+        args.iter()
+            .map(|arg| OsString::from(arg.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn plan_stdio_spawn_non_windows_never_resolves() {
     let args = vec!["-y".to_string(), "pkg".to_string()];
-    let (program, spawn_args) = plan_stdio_spawn("npx", &args, false, |_| {
+    let (program, spawn_args) = plan_stdio_spawn(OsStr::new("npx"), &args, None, false, |_| {
         panic!("resolver must not be consulted on non-Windows")
     });
     assert_eq!(program, OsString::from("npx"));
-    assert_eq!(spawn_args, args);
+    assert_eq!(
+        spawn_args,
+        args.iter()
+            .map(|arg| OsString::from(arg.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn plan_stdio_spawn_expands_home_without_interpreting_arguments() {
+    let args = [
+        "~",
+        "~/project $(touch file)",
+        "~other/x",
+        "x/~/y",
+        "$HOME/x",
+        "*",
+        "~/a b",
+    ]
+    .map(String::from);
+    let (program, spawn_args) = plan_stdio_spawn(
+        OsStr::new("~/bin/mcp server"),
+        &args,
+        Some(Path::new("/home/test user")),
+        true,
+        |_| panic!("expanded path must not be searched on PATH"),
+    );
+    assert_eq!(program, OsStr::new("/home/test user/bin/mcp server"));
+    assert_eq!(
+        spawn_args,
+        [
+            "/home/test user",
+            "/home/test user/project $(touch file)",
+            "~other/x",
+            "x/~/y",
+            "$HOME/x",
+            "*",
+            "/home/test user/a b",
+        ]
+        .map(OsString::from)
+    );
+}
+
+#[test]
+fn plan_stdio_spawn_preserves_tilde_when_home_is_unknown() {
+    let args = [String::from("~/data"), String::from("~")];
+    let (program, spawn_args) = plan_stdio_spawn(OsStr::new("~/mcp"), &args, None, true, |_| {
+        panic!("a path must not be searched on PATH")
+    });
+    assert_eq!(program, OsStr::new("~/mcp"));
+    assert_eq!(spawn_args, [OsString::from("~/data"), OsString::from("~")]);
+
+    let (program, _) = plan_stdio_spawn(
+        OsStr::new("~other"),
+        &[],
+        Some(Path::new("/home/test")),
+        true,
+        |_| panic!("~user must not be interpreted or resolved"),
+    );
+    assert_eq!(program, OsStr::new("~other"));
+}
+
+#[test]
+fn plan_stdio_spawn_supports_windows_home_separator() {
+    let (program, args) = plan_stdio_spawn(
+        OsStr::new(r"~\bin\mcp.exe"),
+        &[String::from(r"~\data")],
+        Some(Path::new(r"C:\Users\test")),
+        true,
+        |_| panic!("expanded path must not be searched on PATH"),
+    );
+    assert_eq!(program, OsStr::new(r"C:\Users\test\bin\mcp.exe"));
+    assert_eq!(args, [OsString::from(r"C:\Users\test\data")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_stdio_spawn_preserves_non_utf8_home_and_command() {
+    use std::os::unix::ffi::OsStringExt;
+    let home = PathBuf::from(OsString::from_vec(b"/home/\xff".to_vec()));
+    let (program, args) = plan_stdio_spawn(
+        OsStr::new("~/mcp"),
+        &[String::from("~/data")],
+        Some(&home),
+        false,
+        |_| panic!("non-Windows commands must not be searched"),
+    );
+    assert_eq!(program.into_vec(), b"/home/\xff/mcp");
+    assert_eq!(args[0].clone().into_vec(), b"/home/\xff/data");
+
+    let original = OsString::from_vec(b"/bin/mcp-\xff".to_vec());
+    let (program, _) = plan_stdio_spawn(&original, &[], Some(&home), false, |_| None);
+    assert_eq!(program, original);
+
+    let command = OsString::from_vec(b"~/bin/mcp-\xff".to_vec());
+    let (program, _) = plan_stdio_spawn(&command, &[], Some(&home), false, |_| None);
+    assert_eq!(program.into_vec(), b"/home/\xff/bin/mcp-\xff");
 }
 
 #[test]

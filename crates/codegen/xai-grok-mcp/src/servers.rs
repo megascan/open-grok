@@ -4,8 +4,9 @@ use crate::bearer_token_file::BearerTokenFile;
 use xai_grok_config::BearerTokenPath;
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
@@ -5256,23 +5257,54 @@ fn expand_session_id_headers(
 /// found". We resolve the bare name on `PATH` (honoring `PATHEXT`, via the
 /// `resolve` closure) so std spawns the real launcher path (e.g. `npx.cmd`) —
 /// std then runs `.cmd`/`.bat` through `cmd.exe` with hardened arg escaping. On
-/// non-Windows we never touch the command (verified working). A command
-/// containing a path separator is used as-is. The resolved path is returned as
-/// an `OsString` so it reaches `Command::new` without a lossy UTF-8 round-trip.
+/// non-Windows we do not resolve bare commands. Tilde expansion happens before
+/// this planning and never invokes a shell. Native OS strings preserve a home
+/// directory that is not UTF-8.
 fn plan_stdio_spawn(
-    command: &str,
+    command: &OsStr,
     args: &[String],
+    home: Option<&Path>,
     is_windows: bool,
     resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
-) -> (OsString, Vec<String>) {
+) -> (OsString, Vec<OsString>) {
+    let command = expand_stdio_tilde(command, home, is_windows);
+    let args = args
+        .iter()
+        .map(|arg| expand_stdio_tilde(OsStr::new(arg), home, is_windows))
+        .collect();
     if is_windows
+        && let Some(command) = command.to_str()
+        && !command.starts_with('~')
         && !command.contains('/')
         && !command.contains('\\')
         && let Some(resolved) = resolve(command)
     {
-        return (resolved.into_os_string(), args.to_vec());
+        return (resolved.into_os_string(), args);
     }
-    (OsString::from(command), args.to_vec())
+    (command, args)
+}
+
+fn expand_stdio_tilde(value: &OsStr, home: Option<&Path>, is_windows: bool) -> OsString {
+    let Some(home) = home else {
+        return value.to_os_string();
+    };
+    if value == OsStr::new("~") {
+        return home.as_os_str().to_owned();
+    }
+    if let Ok(rest) = Path::new(value).strip_prefix("~") {
+        return home.join(rest).into_os_string();
+    }
+    // Handle Windows-style separators when testing the Windows spawn plan on
+    // another platform; on Windows the path-component branch handles them.
+    if let Some(text) = value.to_str()
+        && is_windows
+        && text.starts_with("~\\")
+    {
+        let mut expanded = home.as_os_str().to_owned();
+        expanded.push(&text[1..]);
+        return expanded;
+    }
+    value.to_os_string()
 }
 
 fn is_figma_mcp(server_name: &str, url: &str) -> bool {
@@ -5440,19 +5472,25 @@ pub async fn start_mcp_server(
             }
 
             let (startup_timeout, _, _) = McpClient::load_timeouts(overrides, meta_config);
-            let command_str = command.to_string_lossy().into_owned();
             let spawn_start = std::time::Instant::now();
             let _stdio_spawn_timer = xai_grok_telemetry::instrumentation::timer("mcp_stdio_spawn");
             let path_override = stdio_path_override(&env);
-            let (program, spawn_args) = plan_stdio_spawn(&command_str, &args, cfg!(windows), |c| {
-                if let Some(path) = path_override
-                    && let Ok(cwd) = std::env::current_dir()
-                {
-                    which::which_in(c, Some(path), cwd).ok()
-                } else {
-                    which::which(c).ok()
-                }
-            });
+            let home = xai_dirs::home_dir();
+            let (program, spawn_args) = plan_stdio_spawn(
+                command.as_os_str(),
+                &args,
+                home.as_deref(),
+                cfg!(windows),
+                |c| {
+                    if let Some(path) = path_override
+                        && let Ok(cwd) = std::env::current_dir()
+                    {
+                        which::which_in(c, Some(path), cwd).ok()
+                    } else {
+                        which::which(c).ok()
+                    }
+                },
+            );
             let mut cmd = Command::new(&program);
             cmd.kill_on_drop(true).args(&spawn_args);
             apply_stdio_env(&mut cmd, &env, ctx.session_id);

@@ -13981,6 +13981,7 @@ dependencies = [
  "webbrowser",
  "which 8.0.0",
  "xai-computer-hub-sdk",
+ "xai-dirs",
  "xai-grok-config",
  "xai-grok-extra-ca",
  "xai-grok-sandbox",
