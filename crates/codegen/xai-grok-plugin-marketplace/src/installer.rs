@@ -61,39 +61,12 @@ pub fn install_from_marketplace(
         subdir: None,
     };
 
-    // Local copy from the synced source checkout: the pin gate governs remote
-    // fetches only (see install_from_remote_url's security doc).
-    match git_install::install_from_source(&source, registry, false) {
-        Ok(result) => {
-            let repo_key = result.repo_key.clone();
-            let mut repo = git_install::build_installed_repo(&result, &source);
-            repo.marketplace = Some(provenance);
-            registry.insert(repo_key.clone(), repo);
-            registry.save()?;
-            Ok(MarketplaceInstallResult::Installed { repo_key })
-        }
+    match git_install::install_and_register(&source, registry, false, None, Some(provenance)) {
+        Ok(result) => Ok(MarketplaceInstallResult::Installed {
+            repo_key: result.repo_key,
+        }),
         Err(InstallError::AlreadyInstalled { key }) => {
-            // Remove old installation and retry so re-install works after uninstall.
-            let old_path = registry.install_dir().join(&key);
-            if old_path.exists() {
-                let _ = std::fs::remove_dir_all(&old_path);
-            }
-            // Also remove the symlink if it's one.
-            let _ = std::fs::remove_file(&old_path);
-            registry.remove(&key);
-            registry.save()?;
-            // Retry — registry no longer has the key.
-            match git_install::install_from_source(&source, registry, false) {
-                Ok(result) => {
-                    let repo_key = result.repo_key.clone();
-                    let mut repo = git_install::build_installed_repo(&result, &source);
-                    repo.marketplace = Some(provenance);
-                    registry.insert(repo_key.clone(), repo);
-                    registry.save()?;
-                    Ok(MarketplaceInstallResult::Installed { repo_key })
-                }
-                Err(e) => Err(e),
-            }
+            Ok(MarketplaceInstallResult::AlreadyInstalled { repo_key: key })
         }
         Err(e) => Err(e),
     }
@@ -154,46 +127,18 @@ pub fn install_from_remote_url(
         subdir,
     };
 
-    // Single pin gate lives in install_from_source; pass plugin_name so refusals
-    // name the catalog entry rather than the bare URL.
-    match git_install::install_from_source_with_label(
+    match git_install::install_and_register(
         &source,
         registry,
         require_sha,
         Some(plugin_name),
+        Some(provenance),
     ) {
-        Ok(result) => {
-            let repo_key = result.repo_key.clone();
-            let mut repo = git_install::build_installed_repo(&result, &source);
-            repo.marketplace = Some(provenance);
-            registry.insert(repo_key.clone(), repo);
-            registry.save()?;
-            Ok(MarketplaceInstallResult::Installed { repo_key })
-        }
+        Ok(result) => Ok(MarketplaceInstallResult::Installed {
+            repo_key: result.repo_key,
+        }),
         Err(InstallError::AlreadyInstalled { key }) => {
-            let old_path = registry.install_dir().join(&key);
-            if old_path.exists() {
-                let _ = std::fs::remove_dir_all(&old_path);
-            }
-            let _ = std::fs::remove_file(&old_path);
-            registry.remove(&key);
-            registry.save()?;
-            match git_install::install_from_source_with_label(
-                &source,
-                registry,
-                require_sha,
-                Some(plugin_name),
-            ) {
-                Ok(result) => {
-                    let repo_key = result.repo_key.clone();
-                    let mut repo = git_install::build_installed_repo(&result, &source);
-                    repo.marketplace = Some(provenance);
-                    registry.insert(repo_key.clone(), repo);
-                    registry.save()?;
-                    Ok(MarketplaceInstallResult::Installed { repo_key })
-                }
-                Err(e) => Err(e),
-            }
+            Ok(MarketplaceInstallResult::AlreadyInstalled { repo_key: key })
         }
         Err(e) => Err(e),
     }
@@ -272,13 +217,8 @@ pub fn update_from_marketplace_entry_transactional(
         source: e,
     })?;
 
-    let nonce = staging_nonce();
-    let staging_path = install_dir.join(format!(".staging-{repo_key}-{nonce}"));
-    let backup_path = install_dir.join(format!(".backup-{repo_key}-{nonce}"));
+    let staging_path = git_install::create_staging_dir(registry)?;
     let final_path = old_repo.path.clone();
-
-    remove_path_if_exists(&staging_path)?;
-    remove_path_if_exists(&backup_path)?;
 
     let stage_result = if let Some((url, git_ref, git_sha)) = remote_source {
         clone_repo_to_path(url, git_ref, git_sha, &staging_path)
@@ -304,7 +244,11 @@ pub fn update_from_marketplace_entry_transactional(
         return Err(e);
     }
 
-    let plugins = match discover_plugins_in_dir(&staging_path, remote_subdir.as_deref()) {
+    let plugins = match discover_plugins_in_dir(
+        &staging_path,
+        remote_subdir.as_deref(),
+        &final_path,
+    ) {
         Ok(plugins) if !plugins.is_empty() => plugins,
         Ok(_) => {
             let _ = remove_path_if_exists(&staging_path);
@@ -352,75 +296,15 @@ pub fn update_from_marketplace_entry_transactional(
         marketplace: Some(provenance),
     };
 
-    let original_registry = registry.clone();
-    if !final_path.exists() {
+    let result = registry.publish_staged(&repo_key, new_repo, &staging_path);
+    // A journalled transaction retains its stage for recovery if recovery itself
+    // failed. Otherwise this is the unique directory created by this attempt.
+    if !(staging_path.join(".open-grok-transaction").exists()
+        && install_dir.join(".plugin-transaction.json").exists())
+    {
         let _ = remove_path_if_exists(&staging_path);
-        return Err(InstallError::InstallFailed {
-            detail: format!(
-                "installed plugin directory not found: {}",
-                final_path.display()
-            ),
-        });
     }
-    if let Err(e) = std::fs::rename(&final_path, &backup_path) {
-        let _ = remove_path_if_exists(&staging_path);
-        return Err(InstallError::Io {
-            path: final_path,
-            source: e,
-        });
-    }
-    if let Err(e) = std::fs::rename(&staging_path, &final_path) {
-        let restore_result = std::fs::rename(&backup_path, &final_path);
-        let _ = remove_path_if_exists(&staging_path);
-        *registry = original_registry;
-        if let Err(restore_error) = restore_result {
-            return Err(InstallError::InstallFailed {
-                detail: format!(
-                    "failed to install staged marketplace update: {e}; restore also failed: {restore_error}"
-                ),
-            });
-        }
-        return Err(InstallError::Io {
-            path: staging_path,
-            source: e,
-        });
-    }
-
-    registry.insert(repo_key.clone(), new_repo);
-    if let Err(save_error) = registry.save() {
-        // The directory swap already succeeded (final_path holds the new plugin).
-        // Roll the filesystem back to the previous install so it stays consistent
-        // with the on-disk registry, which still holds the old record. Only revert
-        // the registry record once the files are actually restored — otherwise we
-        // would leave the new files on disk while the registry claims the old
-        // version, which is the exact inconsistency we are guarding against.
-        let fs_rolled_back = remove_path_if_exists(&final_path).is_ok()
-            && std::fs::rename(&backup_path, &final_path).is_ok();
-        if !fs_rolled_back {
-            return Err(InstallError::InstallFailed {
-                detail: format!(
-                    "registry save failed after installing the update ({save_error}); \
-                     the installed plugin at {} could not be rolled back and no longer \
-                     matches the registry — rerun the update or reinstall (backup at {})",
-                    final_path.display(),
-                    backup_path.display()
-                ),
-            });
-        }
-        *registry = original_registry;
-        if let Err(rollback_error) = registry.save() {
-            return Err(InstallError::InstallFailed {
-                detail: format!(
-                    "registry save failed ({save_error}); filesystem rolled back but \
-                     registry rollback failed ({rollback_error}) — rerun the update or reinstall"
-                ),
-            });
-        }
-        let _ = remove_path_if_exists(&backup_path);
-        return Err(save_error);
-    }
-
-    let _ = remove_path_if_exists(&backup_path);
+    result?;
     Ok(MarketplaceUpdateResult {
         repo_key,
         old_version,
@@ -457,14 +341,6 @@ fn find_marketplace_repo<'r>(
                 && is_same_source_identity(&mp.source_url_or_path, source_url_or_path)
         })
     })
-}
-
-fn staging_nonce() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{}-{nanos}", std::process::id())
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), InstallError> {
@@ -601,6 +477,7 @@ struct StagedPlugin {
 fn discover_plugins_in_dir(
     root: &Path,
     subdir: Option<&str>,
+    logical_root: &Path,
 ) -> Result<Vec<StagedPlugin>, InstallError> {
     let scan_root = match subdir {
         Some(s) => {
@@ -630,7 +507,12 @@ fn discover_plugins_in_dir(
         None => root.to_path_buf(),
     };
 
-    if let Some(plugin) = try_load_plugin(&scan_root, subdir) {
+    let name_path = if subdir.is_none() {
+        logical_root
+    } else {
+        &scan_root
+    };
+    if let Some(plugin) = try_load_plugin(&scan_root, subdir, name_path) {
         return Ok(vec![plugin]);
     }
 
@@ -644,7 +526,7 @@ fn discover_plugins_in_dir(
                     Some(s) => Some(format!("{s}/{entry_name}")),
                     None => Some(entry_name),
                 };
-                if let Some(plugin) = try_load_plugin(&entry_path, sub.as_deref()) {
+                if let Some(plugin) = try_load_plugin(&entry_path, sub.as_deref(), &entry_path) {
                     plugins.push(plugin);
                 }
             }
@@ -654,7 +536,7 @@ fn discover_plugins_in_dir(
     Ok(plugins)
 }
 
-fn try_load_plugin(dir: &Path, subdir: Option<&str>) -> Option<StagedPlugin> {
+fn try_load_plugin(dir: &Path, subdir: Option<&str>, name_path: &Path) -> Option<StagedPlugin> {
     match load_manifest(dir) {
         Ok(ManifestLoadResult::Found(manifest)) => {
             return Some(StagedPlugin {
@@ -673,7 +555,7 @@ fn try_load_plugin(dir: &Path, subdir: Option<&str>) -> Option<StagedPlugin> {
     let has_hooks = dir.join("hooks").join("hooks.json").is_file();
 
     if has_skills || has_agents || has_mcp || has_hooks {
-        let name = name_from_dirname(dir)?;
+        let name = name_from_dirname(name_path)?;
         Some(StagedPlugin {
             name,
             subdir: subdir.map(|s| s.to_string()),
@@ -1571,7 +1453,7 @@ mod tests {
     fn discover_plugins_in_dir_rejects_escaping_subdir() {
         let dir = tempfile::tempdir().unwrap();
         for bad in ["../escape", "/etc"] {
-            match discover_plugins_in_dir(dir.path(), Some(bad)) {
+            match discover_plugins_in_dir(dir.path(), Some(bad), dir.path()) {
                 Err(InstallError::InstallFailed { detail }) => {
                     assert!(detail.contains("escapes"), "got detail: {detail}");
                 }

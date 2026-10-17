@@ -19,14 +19,6 @@ use xai_grok_plugin_marketplace::{
     scan_marketplace,
 };
 
-// ── Helpers (internal) ──────────────────────────────────────────────
-
-fn save_registry_or_warn(registry: &InstallRegistry) {
-    if let Err(e) = registry.save() {
-        tracing::warn!("failed to save install registry: {e}");
-    }
-}
-
 // ── Install ─────────────────────────────────────────────────────────
 
 pub struct InstallOutcome {
@@ -53,12 +45,13 @@ pub fn install_plugin(source: &str, cwd: &Path) -> Result<InstallOutcome, Instal
     let is_local = matches!(install_source, git_install::InstallSource::Local { .. });
     let mut registry = InstallRegistry::load();
 
-    let result =
-        git_install::install_from_source(&install_source, &registry, marketplace_require_sha())?;
-
-    let repo = git_install::build_installed_repo(&result, &install_source);
-    registry.insert(result.repo_key.clone(), repo);
-    save_registry_or_warn(&registry);
+    let result = git_install::install_and_register(
+        &install_source,
+        &mut registry,
+        marketplace_require_sha(),
+        None,
+        None,
+    )?;
 
     let (plugin_names, post_warnings) = crate::config::post_install_plugin(&result.repo_key);
 
@@ -78,6 +71,7 @@ pub struct UninstallOutcome {
 }
 
 pub enum UninstallError {
+    Failed(InstallError),
     NotFound {
         name: String,
     },
@@ -92,6 +86,7 @@ pub enum UninstallError {
 impl std::fmt::Display for UninstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Failed(error) => write!(f, "Failed to uninstall plugin: {error}"),
             Self::NotFound { name } => {
                 write!(
                     f,
@@ -152,21 +147,17 @@ pub fn uninstall_plugin(
         });
     }
 
-    if let Err(e) = git_install::remove_repo_path(&repo.path) {
-        tracing::warn!("failed to remove repo path: {e}");
-    }
-
-    if !keep_data {
-        // Plugins under $HOME are user-scope; everything else is config-path scope.
-        let scope = match dirs::home_dir() {
-            Some(home) if repo.path.starts_with(&home) => PluginScope::User,
-            _ => PluginScope::ConfigPath,
-        };
-        git_install::cleanup_plugin_data(&repo, scope);
-    }
-
-    registry.remove(&repo_key);
-    save_registry_or_warn(&registry);
+    registry
+        .uninstall_registered_with(&repo_key, || {
+            if !keep_data {
+                let scope = match dirs::home_dir() {
+                    Some(home) if repo.path.starts_with(&home) => PluginScope::User,
+                    _ => PluginScope::ConfigPath,
+                };
+                git_install::cleanup_plugin_data(&repo, scope);
+            }
+        })
+        .map_err(UninstallError::Failed)?;
 
     Ok(UninstallOutcome {
         repo_key,
@@ -341,7 +332,7 @@ fn configured_marketplace_git_source(source_url_or_path: &str) -> Option<(String
         })
 }
 
-/// Update one or all installed plugins. Saves the registry once at the end.
+/// Update one or all installed plugins.
 pub fn update_plugins(name: Option<&str>) -> Result<Vec<RepoUpdateOutcome>, UpdateError> {
     update_plugins_by_selector(name.map(|name| PluginUpdateSelector::PluginName(name.to_string())))
 }
@@ -401,13 +392,26 @@ pub(crate) fn update_plugins_by_selector(
                 },
             }
         } else {
+            // Ordinary git updates retain their existing in-place behavior;
+            // they are not serialized with staged install/uninstall swaps.
             match git_install::update_repo(repo_key, repo, marketplace_require_sha()) {
                 Ok(UpdateStatus::Updated(result)) if result.changed => {
                     apply_update_to_registry(&mut registry, repo_key, &result);
-                    RepoUpdateOutcome::Updated {
-                        repo_key: repo_key.clone(),
-                        old_commit: result.old_commit,
-                        new_commit: result.new_commit,
+                    match registry.save() {
+                        Ok(()) => RepoUpdateOutcome::Updated {
+                            repo_key: repo_key.clone(),
+                            old_commit: result.old_commit,
+                            new_commit: result.new_commit,
+                        },
+                        Err(e) => {
+                            registry = InstallRegistry::load();
+                            RepoUpdateOutcome::Failed {
+                                repo_key: repo_key.clone(),
+                                error: format!(
+                                    "updated plugin but failed to save its registry record: {e}"
+                                ),
+                            }
+                        }
                     }
                 }
                 Ok(UpdateStatus::Updated(_)) => RepoUpdateOutcome::AlreadyUpToDate {
@@ -428,8 +432,6 @@ pub(crate) fn update_plugins_by_selector(
         };
         outcomes.push(outcome);
     }
-
-    save_registry_or_warn(&registry);
 
     Ok(outcomes)
 }
@@ -1108,7 +1110,9 @@ fn install_marketplace_entry(
 }
 
 /// Remove all plugins installed from a marketplace source. Returns removed repo keys.
-pub fn uninstall_marketplace_source_plugins(source_identity: &str) -> Vec<String> {
+pub fn uninstall_marketplace_source_plugins(
+    source_identity: &str,
+) -> Result<Vec<String>, InstallError> {
     let mut registry = InstallRegistry::load();
     let to_remove: Vec<(String, std::path::PathBuf, InstalledRepo)> = registry
         .list()
@@ -1125,22 +1129,16 @@ pub fn uninstall_marketplace_source_plugins(source_identity: &str) -> Vec<String
         .collect();
 
     for (key, path, repo) in &to_remove {
-        if let Err(e) = git_install::remove_repo_path(path) {
-            tracing::warn!("failed to remove plugin dir for {key}: {e}");
-        }
-        let scope = match dirs::home_dir() {
-            Some(home) if path.starts_with(&home) => PluginScope::User,
-            _ => PluginScope::ConfigPath,
-        };
-        git_install::cleanup_plugin_data(repo, scope);
-        registry.remove(key);
+        registry.uninstall_registered_if_matches(key, repo, || {
+            let scope = match dirs::home_dir() {
+                Some(home) if path.starts_with(&home) => PluginScope::User,
+                _ => PluginScope::ConfigPath,
+            };
+            git_install::cleanup_plugin_data(repo, scope);
+        })?;
     }
 
-    if !to_remove.is_empty() {
-        save_registry_or_warn(&registry);
-    }
-
-    to_remove.into_iter().map(|(key, _, _)| key).collect()
+    Ok(to_remove.into_iter().map(|(key, _, _)| key).collect())
 }
 
 /// Remove a `[[marketplace.sources]]` entry matching `git` or `path`.

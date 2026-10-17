@@ -561,7 +561,7 @@ fn cmd_uninstall(name: &str, confirm: bool, keep_data: bool) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        Err(e @ UninstallError::NotFound { .. }) => bail!("{e}"),
+        Err(e @ (UninstallError::NotFound { .. } | UninstallError::Failed(_))) => bail!("{e}"),
     }
 }
 
@@ -1022,7 +1022,7 @@ fn marketplace_remove(
 
     let identity = source_identity(source);
 
-    let uninstalled = plugin::uninstall_marketplace_source_plugins(&identity);
+    let uninstalled = plugin::uninstall_marketplace_source_plugins(&identity)?;
 
     let config_path = xai_grok_config::grok_home().join("config.toml");
     let mut removed_from_config = false;

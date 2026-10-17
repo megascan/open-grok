@@ -247,7 +247,47 @@ fn repo_source_id(source: &InstallSource) -> String {
     }
 }
 
-/// Install a plugin source (clone or symlink) and discover plugins.
+/// Create a uniquely owned staging directory in managed storage.
+pub fn create_staging_dir(registry: &InstallRegistry) -> Result<PathBuf, InstallError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = registry.install_dir();
+    std::fs::create_dir_all(dir).map_err(|source| InstallError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    loop {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = dir.join(format!(".staging-{}-{nanos}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(InstallError::Io { path, source }),
+        }
+    }
+}
+
+pub(super) struct StagingDir(pub(super) PathBuf);
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if self.0.join(".open-grok-transaction").exists()
+            && self
+                .0
+                .parent()
+                .is_some_and(|parent| parent.join(".plugin-transaction.json").exists())
+        {
+            return;
+        }
+        let _ = remove_repo_path(&self.0);
+    }
+}
+
+/// Install a source without registering it. Callers that persist installs should
+/// use `install_and_register`, which also rolls back a failed registry save.
 pub fn install_from_source(
     source: &InstallSource,
     registry: &InstallRegistry,
@@ -256,35 +296,82 @@ pub fn install_from_source(
     install_from_source_with_label(source, registry, require_sha, None)
 }
 
-/// Like [`install_from_source`]; when `plugin_label` is set it appears in
-/// pin-refusal errors instead of the git URL (marketplace catalog names).
 pub fn install_from_source_with_label(
     source: &InstallSource,
     registry: &InstallRegistry,
     require_sha: bool,
     plugin_label: Option<&str>,
 ) -> Result<InstallResult, InstallError> {
+    let (result, stage) = stage_from_source(source, registry, require_sha, plugin_label)?;
+    if std::fs::symlink_metadata(&result.repo_path).is_ok() {
+        return Err(InstallError::InstallFailed {
+            detail: format!(
+                "unregistered plugin path already exists: {}",
+                result.repo_path.display()
+            ),
+        });
+    }
+    std::fs::rename(&stage.0, &result.repo_path).map_err(|source| InstallError::Io {
+        path: result.repo_path.clone(),
+        source,
+    })?;
+    Ok(result)
+}
+
+/// Stage, validate, and persist an install as one recoverable transaction.
+pub fn install_and_register(
+    source: &InstallSource,
+    registry: &mut InstallRegistry,
+    require_sha: bool,
+    plugin_label: Option<&str>,
+    marketplace: Option<super::install_registry::MarketplaceProvenance>,
+) -> Result<InstallResult, InstallError> {
+    install_and_register_with(
+        source,
+        registry,
+        require_sha,
+        plugin_label,
+        marketplace,
+        |registry, key, repo, stage| registry.publish_staged(key, repo, stage),
+    )
+}
+
+fn install_and_register_with(
+    source: &InstallSource,
+    registry: &mut InstallRegistry,
+    require_sha: bool,
+    plugin_label: Option<&str>,
+    marketplace: Option<super::install_registry::MarketplaceProvenance>,
+    publish: impl FnOnce(&mut InstallRegistry, &str, InstalledRepo, &Path) -> Result<(), InstallError>,
+) -> Result<InstallResult, InstallError> {
+    let (result, stage) = stage_from_source(source, registry, require_sha, plugin_label)?;
+    let mut repo = build_installed_repo(&result, source);
+    repo.marketplace = marketplace;
+    publish(registry, &result.repo_key, repo, &stage.0)?;
+    Ok(result)
+}
+
+fn stage_from_source(
+    source: &InstallSource,
+    registry: &InstallRegistry,
+    require_sha: bool,
+    plugin_label: Option<&str>,
+) -> Result<(InstallResult, StagingDir), InstallError> {
     let source = &normalize_install_source(source)?;
     if let InstallSource::Git { url, git_sha, .. } = source {
-        let label = plugin_label.unwrap_or(url.as_str());
-        ensure_pinned(require_sha, git_sha.as_deref(), label, url)?;
+        ensure_pinned(
+            require_sha,
+            git_sha.as_deref(),
+            plugin_label.unwrap_or(url),
+            url,
+        )?;
     }
-    let source_id = repo_source_id(source);
-    let repo_key = InstallRegistry::repo_key(&source_id);
-
-    // Check if already installed
+    let repo_key = InstallRegistry::repo_key(&repo_source_id(source));
     if registry.get_repo(&repo_key).is_some() {
         return Err(InstallError::AlreadyInstalled { key: repo_key });
     }
-
-    let install_dir = registry.install_dir().to_path_buf();
-    std::fs::create_dir_all(&install_dir).map_err(|e| InstallError::Io {
-        path: install_dir.clone(),
-        source: e,
-    })?;
-
-    let repo_path = install_dir.join(&repo_key);
-
+    let repo_path = registry.install_dir().join(&repo_key);
+    let stage = StagingDir(create_staging_dir(registry)?);
     let (kind, commit) = match source {
         InstallSource::Git {
             url,
@@ -292,15 +379,17 @@ pub fn install_from_source_with_label(
             git_sha,
             subdir,
         } => {
-            clone_repo(url, git_ref.as_deref(), git_sha.as_deref(), &repo_path)?;
-            let commit = read_head_commit(&repo_path);
-            let kind = InstallKind::Git {
-                url: url.clone(),
-                git_ref: git_sha.clone().or_else(|| git_ref.clone()),
-                commit: commit.clone().unwrap_or_default(),
-                subdir: subdir.clone(),
-            };
-            (kind, commit)
+            clone_repo(url, git_ref.as_deref(), git_sha.as_deref(), &stage.0)?;
+            let commit = read_head_commit(&stage.0);
+            (
+                InstallKind::Git {
+                    url: url.clone(),
+                    git_ref: git_sha.clone().or_else(|| git_ref.clone()),
+                    commit: commit.clone().unwrap_or_default(),
+                    subdir: subdir.clone(),
+                },
+                commit,
+            )
         }
         InstallSource::Local { path, subdir } => {
             if !path.is_dir() {
@@ -308,43 +397,41 @@ pub fn install_from_source_with_label(
                     detail: format!("local path is not a directory: {}", path.display()),
                 });
             }
-            // Deliberate full copy (not a symlink): isolates the install from
-            // later source edits/deletion and keeps uninstall a simple dir remove;
-            // local_refresh re-copies trusted sources to pick up new components.
-            copy_dir_recursive(path, &repo_path).map_err(|e| InstallError::Io {
-                path: repo_path.clone(),
-                source: e,
+            copy_dir_recursive(path, &stage.0).map_err(|source| InstallError::Io {
+                path: stage.0.clone(),
+                source,
             })?;
-            let kind = InstallKind::Local {
-                source_path: path.clone(),
-                subdir: subdir.clone(),
-            };
-            (kind, None)
+            (
+                InstallKind::Local {
+                    source_path: path.clone(),
+                    subdir: subdir.clone(),
+                },
+                None,
+            )
         }
     };
-
-    // Discover plugins
     let subdir = match source {
-        InstallSource::Git { subdir, .. } | InstallSource::Local { subdir, .. } => subdir.clone(),
+        InstallSource::Git { subdir, .. } | InstallSource::Local { subdir, .. } => {
+            subdir.as_deref()
+        }
     };
-    let plugins = discover_plugins_in_dir(&repo_path, subdir.as_deref())?;
-
+    let plugins = discover_plugins_in_dir_as(&stage.0, subdir, &repo_path)?;
     if plugins.is_empty() {
-        // Clean up — no valid plugins found
-        let _ = remove_repo_path(&repo_path);
         return Err(InstallError::InstallFailed {
             detail: "no plugins found in the source (no plugin.json or convention components)"
                 .to_string(),
         });
     }
-
-    Ok(InstallResult {
-        repo_key,
-        repo_path,
-        plugins,
-        commit,
-        kind,
-    })
+    Ok((
+        InstallResult {
+            repo_key,
+            repo_path,
+            plugins,
+            commit,
+            kind,
+        },
+        stage,
+    ))
 }
 
 fn normalize_install_source(source: &InstallSource) -> Result<InstallSource, InstallError> {
@@ -562,6 +649,14 @@ pub(super) fn discover_plugins_in_dir(
     root: &Path,
     subdir: Option<&str>,
 ) -> Result<Vec<DiscoveredPlugin>, InstallError> {
+    discover_plugins_in_dir_as(root, subdir, root)
+}
+
+pub(super) fn discover_plugins_in_dir_as(
+    root: &Path,
+    subdir: Option<&str>,
+    logical_root: &Path,
+) -> Result<Vec<DiscoveredPlugin>, InstallError> {
     let scan_root = match subdir {
         Some(s) => {
             let candidate = Path::new(s);
@@ -591,7 +686,12 @@ pub(super) fn discover_plugins_in_dir(
     };
 
     // Check if scan_root itself is a plugin
-    if let Some(plugin) = try_load_plugin(&scan_root, subdir) {
+    let name_path = if subdir.is_none() {
+        logical_root
+    } else {
+        &scan_root
+    };
+    if let Some(plugin) = try_load_plugin(&scan_root, subdir, name_path) {
         return Ok(vec![plugin]);
     }
 
@@ -606,7 +706,7 @@ pub(super) fn discover_plugins_in_dir(
                     Some(s) => Some(format!("{s}/{entry_name}")),
                     None => Some(entry_name),
                 };
-                if let Some(plugin) = try_load_plugin(&entry_path, sub.as_deref()) {
+                if let Some(plugin) = try_load_plugin(&entry_path, sub.as_deref(), &entry_path) {
                     plugins.push(plugin);
                 }
             }
@@ -619,7 +719,7 @@ pub(super) fn discover_plugins_in_dir(
 /// Try to load a plugin from a directory.
 ///
 /// Returns `Some` if the directory contains a plugin.json or convention components.
-fn try_load_plugin(dir: &Path, subdir: Option<&str>) -> Option<DiscoveredPlugin> {
+fn try_load_plugin(dir: &Path, subdir: Option<&str>, name_path: &Path) -> Option<DiscoveredPlugin> {
     // Try loading manifest
     match load_manifest(dir) {
         Ok(ManifestLoadResult::Found(manifest)) => {
@@ -640,7 +740,7 @@ fn try_load_plugin(dir: &Path, subdir: Option<&str>) -> Option<DiscoveredPlugin>
     let has_hooks = dir.join("hooks").join("hooks.json").is_file();
 
     if has_skills || has_agents || has_mcp || has_hooks {
-        let name = name_from_dirname(dir)?;
+        let name = name_from_dirname(name_path)?;
         Some(DiscoveredPlugin {
             name,
             subdir: subdir.map(|s| s.to_string()),
@@ -812,6 +912,104 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn registered_local_install_save_failure_cleans_stage_and_allows_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("skills/demo")).unwrap();
+        std::fs::write(source_dir.join("plugin.json"), r#"{"name":"demo"}"#).unwrap();
+        std::fs::write(source_dir.join("skills/demo/SKILL.md"), "first").unwrap();
+        let source = InstallSource::Local {
+            path: source_dir.clone(),
+            subdir: None,
+        };
+        let mut registry = InstallRegistry::empty(tmp.path().join("installed"));
+        let result = install_and_register_with(
+            &source,
+            &mut registry,
+            false,
+            None,
+            None,
+            |registry, key, repo, stage| {
+                registry.publish_staged_with(key, repo, stage, |_| {
+                    Err(InstallError::InstallFailed {
+                        detail: "injected save failure".into(),
+                    })
+                })
+            },
+        );
+        assert!(result.is_err());
+        let key = InstallRegistry::repo_key(&repo_source_id(&source));
+        assert!(!registry.install_dir().join(&key).exists());
+        assert!(registry.list().is_empty());
+        assert!(std::fs::read_dir(registry.install_dir()).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-")
+        }));
+
+        std::fs::write(source_dir.join("skills/demo/SKILL.md"), "retry").unwrap();
+        let installed = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(installed.repo_path.join("skills/demo/SKILL.md")).unwrap(),
+            "retry"
+        );
+        assert!(
+            InstallRegistry::try_load_from(registry.install_dir().to_path_buf())
+                .unwrap()
+                .get_repo(&key)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn registered_install_preserves_unregistered_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("skills/demo")).unwrap();
+        std::fs::write(source_dir.join("plugin.json"), r#"{"name":"demo"}"#).unwrap();
+        let source = InstallSource::Local {
+            path: source_dir,
+            subdir: None,
+        };
+        let mut registry = InstallRegistry::empty(tmp.path().join("installed"));
+        let final_path = registry
+            .install_dir()
+            .join(InstallRegistry::repo_key(&repo_source_id(&source)));
+        std::fs::create_dir_all(&final_path).unwrap();
+        std::fs::write(final_path.join("unrelated"), "safe").unwrap();
+        assert!(install_and_register(&source, &mut registry, false, None, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(final_path.join("unrelated")).unwrap(),
+            "safe"
+        );
+    }
+
+    #[test]
+    fn registered_convention_plugin_uses_final_directory_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("skills/demo")).unwrap();
+        let source = InstallSource::Local {
+            path: source_dir,
+            subdir: None,
+        };
+        let mut registry = InstallRegistry::empty(tmp.path().join("installed"));
+        let installed = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        assert_eq!(
+            installed.plugins[0].name,
+            name_from_dirname(&installed.repo_path).unwrap()
+        );
+        assert!(
+            registry
+                .get_repo(&installed.repo_key)
+                .unwrap()
+                .plugins
+                .contains_key(&installed.plugins[0].name)
+        );
+    }
 
     #[test]
     fn repo_key_distinct_per_git_subdir_and_bare_unchanged() {

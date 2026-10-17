@@ -374,26 +374,10 @@ impl SessionActor {
                     };
                 }
                 let cwd = std::path::Path::new(&self.session_info.cwd);
-                let install_source =
-                    xai_grok_agent::plugins::git_install::parse_install_source(&source, cwd);
-                let registry = xai_grok_agent::plugins::InstallRegistry::load();
-                match xai_grok_agent::plugins::git_install::install_from_source(
-                    &install_source,
-                    &registry,
-                    crate::plugin::marketplace_require_sha(),
-                ) {
+                match crate::plugin::install_plugin(&source, cwd) {
                     Ok(result) => {
-                        let repo = xai_grok_agent::plugins::git_install::build_installed_repo(
-                            &result,
-                            &install_source,
-                        );
-                        let mut registry = registry;
-                        registry.insert(result.repo_key.clone(), repo);
-                        if let Err(e) = registry.save() {
-                            tracing::warn!("Failed to save install registry: {e}");
-                        }
-                        let (names, post_warnings) =
-                            crate::config::post_install_plugin(&result.repo_key);
+                        let names = result.plugin_names;
+                        let post_warnings = result.warnings;
                         let count = names.len();
                         let mut msg = format!(
                             "Installed {count} plugin(s) from {source}: {}",
@@ -441,7 +425,6 @@ impl SessionActor {
                     },
                     Some((repo_key, repo, _plugin)) => {
                         let repo_key = repo_key.to_string();
-                        let repo_path = repo.path.clone();
                         let plugin_names: Vec<String> = repo.plugins.keys().cloned().collect();
                         let count = plugin_names.len();
 
@@ -459,14 +442,13 @@ impl SessionActor {
                         }
 
                         // Proceed with removal.
-                        if let Err(e) =
-                            xai_grok_agent::plugins::git_install::remove_repo_path(&repo_path)
-                        {
-                            tracing::warn!("Failed to remove repo path: {e}");
-                        }
-                        registry.remove(&repo_key);
-                        if let Err(e) = registry.save() {
-                            tracing::warn!("Failed to save install registry: {e}");
+                        if let Err(e) = registry.uninstall_registered(&repo_key) {
+                            return ActionOutcome {
+                                status: OutcomeStatus::InternalError,
+                                message: format!("Failed to uninstall plugin: {e}"),
+                                requires_reload: false,
+                                requires_restart: false,
+                            };
                         }
                         ActionOutcome {
                             status: OutcomeStatus::Success,

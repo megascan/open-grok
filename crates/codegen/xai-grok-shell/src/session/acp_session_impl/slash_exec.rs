@@ -661,6 +661,12 @@ impl SessionActor {
                             ))
                             .await;
                         }
+                        Err(UninstallError::Failed(error)) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Failed to uninstall plugin: {error}"
+                            ))
+                            .await;
+                        }
                     }
                 }
                 ok_end_turn(0, None)
