@@ -4,6 +4,15 @@ use tokio::{fs, time::sleep};
 
 use crate::computer::types::{AsyncFileSystem, ComputerError};
 
+#[cfg(unix)]
+#[path = "plan_file.rs"]
+mod plan_file;
+
+#[cfg(unix)]
+pub(crate) fn capture_plan_root(path: &Path) -> io::Result<crate::types::resources::PlanFileRoot> {
+    plan_file::capture_root(path)
+}
+
 /// Creates a local FS access which allows writing and reading from the local files
 pub struct LocalFs;
 
@@ -131,6 +140,20 @@ where
 
 #[async_trait::async_trait]
 impl AsyncFileSystem for LocalFs {
+    #[cfg(unix)]
+    async fn open_plan_file_at(
+        &self,
+        path: &Path,
+        trusted_root: &crate::types::resources::PlanFileRoot,
+    ) -> Result<crate::types::resources::PlanFile, ComputerError> {
+        let path = path.to_path_buf();
+        let trusted_root = trusted_root.clone();
+        tokio::task::spawn_blocking(move || plan_file::open(path, trusted_root))
+            .await
+            .map_err(|error| ComputerError::io(error.to_string()))?
+            .map_err(ComputerError::from)
+    }
+
     #[tracing::instrument(name = "fs.read_file", skip_all)]
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, ComputerError> {
         match crate::util::file_reader::read_file(

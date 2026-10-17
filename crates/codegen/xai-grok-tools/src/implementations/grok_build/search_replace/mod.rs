@@ -161,7 +161,8 @@ pub(crate) async fn run_search_replace(
         .get::<xai_tool_runtime::BehaviorVersion>()
         .map(|v| v.0.clone());
     let tool_call_id = ctx.call_id.as_str().to_owned();
-    let (cwd, display_cwd, fs, notification_handle, hints_enabled);
+    let plan_file = ctx.extensions.get::<crate::types::resources::PlanFile>();
+    let (cwd, display_cwd, mut fs, notification_handle, hints_enabled);
     {
         let res = resources.lock().await;
         cwd = match cwd_override {
@@ -175,20 +176,30 @@ pub(crate) async fn run_search_replace(
     }
     let resolved = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
     let policy_path = resolved.clone();
-    let path = match crate::util::fs::try_canonicalize(&resolved).await {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match crate::util::try_resolve_unicode_filename(&resolved).await {
-                Some(m) => m.resolved_path,
-                None => resolved,
-            }
+    let path = if let Some(plan) = &plan_file {
+        if let Err(error) = plan.check_path(&resolved) {
+            return Ok(SearchReplaceOutput::InvalidInput(format!(
+                "Invalid plan file target: {error}"
+            )));
         }
-        Err(_) => resolved,
+        fs = plan.filesystem();
+        plan.path().to_path_buf()
+    } else {
+        match crate::util::fs::try_canonicalize(&resolved).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match crate::util::try_resolve_unicode_filename(&resolved).await {
+                    Some(m) => m.resolved_path,
+                    None => resolved,
+                }
+            }
+            Err(_) => resolved,
+        }
     };
     if let Some(err) = validate_path_length(&input.file_path) {
         return Ok(err);
     }
-    if path.is_dir() {
+    if plan_file.is_none() && path.is_dir() {
         return Ok(SearchReplaceOutput::InvalidInput(
             "File path is a directory".to_owned(),
         ));
@@ -236,6 +247,7 @@ pub(crate) async fn run_search_replace(
             display_cwd.as_deref(),
             hints_enabled,
             empty_old_string_does_not_override,
+            plan_file.is_some(),
         )
         .await?
     } else {
@@ -252,6 +264,7 @@ pub(crate) async fn run_search_replace(
             hints_enabled,
             is_legacy,
             include_user_edit_hint,
+            plan_file.is_some(),
         )
         .await?
     };
@@ -307,6 +320,7 @@ async fn handle_new_file_creation(
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
     empty_old_string_does_not_override: bool,
+    constrained_plan: bool,
 ) -> Result<SearchReplaceOutput, xai_tool_runtime::ToolError> {
     let file_exists = match fs.read_file(path).await {
         Ok(bytes) => !bytes.is_empty(),
@@ -330,16 +344,20 @@ async fn handle_new_file_creation(
             old_string_name
         )));
     }
-    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
-        &resources,
-        policy_path,
-        input.new_string.as_bytes(),
-    )
-    .await
-    {
-        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
-        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
-        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    let is_memory_write = if constrained_plan {
+        false
+    } else {
+        match crate::types::memory_v2::write_memory_v2_file(
+            &resources,
+            policy_path,
+            input.new_string.as_bytes(),
+        )
+        .await
+        {
+            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+            Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+        }
     };
     if !is_memory_write && let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
         return Ok(match e.io_error_kind() {
@@ -548,6 +566,7 @@ async fn handle_replacement(
     hints_enabled: bool,
     is_legacy: bool,
     include_user_edit_hint: bool,
+    constrained_plan: bool,
 ) -> Result<SearchReplaceOutput, xai_tool_runtime::ToolError> {
     let bytes = match fs.read_file(path).await {
         Ok(bytes) => bytes,
@@ -588,7 +607,15 @@ async fn handle_replacement(
             return Ok(output);
         }
     };
-    let old_text = String::from_utf8_lossy(&bytes).into_owned();
+    let old_text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(SearchReplaceOutput::InvalidInput(format!(
+                "Error: {} is not valid UTF-8; no changes were made.",
+                input.file_path
+            )));
+        }
+    };
     let has_crlf = old_text.contains("\r\n");
     let match_text: std::borrow::Cow<'_, str> = if has_crlf {
         std::borrow::Cow::Owned(old_text.replace("\r\n", "\n"))
@@ -735,16 +762,20 @@ async fn handle_replacement(
     } else {
         new_text.clone()
     };
-    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
-        &resources,
-        policy_path,
-        write_text.as_bytes(),
-    )
-    .await
-    {
-        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
-        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
-        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    let is_memory_write = if constrained_plan {
+        false
+    } else {
+        match crate::types::memory_v2::write_memory_v2_file(
+            &resources,
+            policy_path,
+            write_text.as_bytes(),
+        )
+        .await
+        {
+            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+            Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+        }
     };
     if !is_memory_write && let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
         return Ok(match e.io_error_kind() {
@@ -1133,6 +1164,88 @@ mod tests {
             }
             other => panic!("Expected EditsApplied, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_non_utf8_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let invalid = b"\xff hello\n";
+        std::fs::write(tmp.path().join("test.txt"), invalid).unwrap();
+        let (handle, mut rx) = ToolNotificationHandle::channel();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(NotificationHandle(handle));
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            test_ctx(resources.into_shared()),
+            make_input("test.txt", "hello", "HELLO"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, SearchReplaceOutput::InvalidInput(ref msg) if msg.contains("UTF-8")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(tmp.path().join("test.txt")).unwrap(), invalid);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_restricts_search_replace_and_rejects_symlink_swap() {
+        use crate::computer::types::AsyncFileSystem;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = cwd.join("plan.md");
+        let outside = cwd.join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let shared = test_resources(&cwd).into_shared();
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "", "one\n"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "one", "two"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        assert_eq!(std::fs::read(&plan_path).unwrap(), b"two\n");
+
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("outside.txt", "outside", "changed"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        std::fs::remove_file(&plan_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &plan_path).unwrap();
+        let mut ctx = test_ctx(shared);
+        ctx.extensions.insert(plan);
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "", "changed"),
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
     }
     #[tokio::test]
     async fn new_file_creation() {

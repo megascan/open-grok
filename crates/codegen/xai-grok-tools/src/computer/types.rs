@@ -73,6 +73,29 @@ pub trait AsyncFileSystem: Send + Sync {
 
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), ComputerError>;
 
+    /// Pin a plan-file-only capability for one tool invocation. Backends must
+    /// opt in only when they can enforce the boundary at the actual write.
+    async fn open_plan_file(
+        &self,
+        path: &Path,
+    ) -> Result<crate::types::resources::PlanFile, ComputerError> {
+        let root = crate::types::resources::PlanFileRoot::capture(Path::new("/"))?;
+        self.open_plan_file_at(path, &root).await
+    }
+
+    /// As above, using a root pinned before the tool call. Every descendant
+    /// of that root remains no-follow.
+    async fn open_plan_file_at(
+        &self,
+        _path: &Path,
+        _trusted_root: &crate::types::resources::PlanFileRoot,
+    ) -> Result<crate::types::resources::PlanFile, ComputerError> {
+        Err(ComputerError::io_with_kind(
+            "safe plan-file writes are not supported by this backend",
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
+
     async fn delete_file(&self, path: &Path) -> Result<(), ComputerError>;
 
     /// Whether `path` exists as a readable regular file, without reading

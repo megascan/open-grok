@@ -13,9 +13,10 @@ pub use types::{HashlineEditInput, HashlineEditOutput, HashlineOp};
 
 use super::config::HashlineSchemeParams;
 
+use crate::notification::types::FileWritten;
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{
-    Cwd, DisplayCwd, FileSystem, Params, PathNotFoundHints, display_cwd_or_cwd,
+    Cwd, DisplayCwd, FileSystem, NotificationHandle, Params, PathNotFoundHints, display_cwd_or_cwd,
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 
@@ -227,6 +228,10 @@ impl crate::types::tool_metadata::ToolMetadata for HashlineEditTool {
         DESCRIPTION
     }
 
+    fn emitted_notifications(&self) -> &'static [&'static str] {
+        &["FileWritten"]
+    }
+
     fn versioned_definition(
         &self,
         _contract_version: Option<&str>,
@@ -299,7 +304,8 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
             ));
         }
 
-        let (cwd, display_cwd, fs, scheme, hints_enabled) = {
+        let plan_file = ctx.extensions.get::<crate::types::resources::PlanFile>();
+        let (cwd, display_cwd, mut fs, notification_handle, scheme, hints_enabled) = {
             let res = resources.lock().await;
             let cwd = match ctx.extensions.get::<xai_tool_runtime::Cwd>() {
                 Some(dir) => dir.0.clone(),
@@ -311,23 +317,59 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
                 .cloned()
                 .unwrap_or_default();
             let fs = res.require::<FileSystem>()?.0.clone();
+            let notification_handle = res.require::<NotificationHandle>()?.0.clone();
             let scheme = params
                 .0
                 .build_scheme()
                 .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
             let hints_enabled = res.get::<PathNotFoundHints>().is_some_and(|h| h.0);
-            (cwd, display_cwd, fs, scheme, hints_enabled)
+            (
+                cwd,
+                display_cwd,
+                fs,
+                notification_handle,
+                scheme,
+                hints_enabled,
+            )
         };
 
         let display_dcwd = display_cwd_or_cwd(&cwd, display_cwd.as_deref());
-        let joined_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+        let requested_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+        let joined_path = if let Some(plan) = &plan_file {
+            if let Err(error) = plan.check_path(&requested_path) {
+                return Ok(crate::types::output::SearchReplaceOutput::InvalidInput(
+                    format!("Invalid plan file target: {error}"),
+                ));
+            }
+            fs = plan.filesystem();
+            plan.path().to_path_buf()
+        } else {
+            requested_path
+        };
         // Error-preserving variant: the Err arm drives new-file creation.
-        let path = match crate::util::fs::try_canonicalize(&joined_path).await {
+        let path_result = if plan_file.is_some() {
+            match fs.file_exists(&joined_path).await {
+                Ok(true) => Ok(joined_path.clone()),
+                Ok(false) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                Err(error) => {
+                    return Ok(crate::types::output::SearchReplaceOutput::InvalidInput(
+                        format!("Failed to inspect plan file: {error}"),
+                    ));
+                }
+            }
+        } else {
+            crate::util::fs::try_canonicalize(&joined_path).await
+        };
+        let path = match path_result {
             Ok(p) => p,
             Err(_) => {
                 // Try unicode-confusable resolution before giving up.
                 // Used in search_replace.
-                let resolved = crate::util::try_resolve_unicode_filename(&joined_path).await;
+                let resolved = if plan_file.is_some() {
+                    None
+                } else {
+                    crate::util::try_resolve_unicode_filename(&joined_path).await
+                };
                 if let Some(m) = resolved {
                     m.resolved_path
                 } else {
@@ -335,6 +377,12 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
                     if input.edits.len() == 1
                         && let HashlineOp::Write { ref content } = input.edits[0]
                     {
+                        // Validate before creating the file, including the check for
+                        // accidentally copied hashline prefixes in the new content.
+                        let mut r = apply::apply_edits("", &input.edits, &joined_path, &*scheme);
+                        if r.new_content.is_none() {
+                            return Ok(to_search_replace(r.output, &joined_path, "", None, vec![]));
+                        }
                         if let Err(e) = fs.write_file(&joined_path, content.as_bytes()).await {
                             let display_path = display_dcwd.join(&input.file_path);
                             return Ok(match e.io_error_kind() {
@@ -353,8 +401,21 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
                                 ),
                             });
                         }
-                        let abs = crate::util::fs::canonicalize_with_timeout(joined_path).await;
-                        let r = apply::apply_edits(content, &input.edits, &abs, &*scheme);
+                        let abs = if plan_file.is_some() {
+                            joined_path
+                        } else {
+                            crate::util::fs::canonicalize_with_timeout(joined_path).await
+                        };
+                        if let HashlineEditOutput::EditsApplied(ref mut applied) = r.output {
+                            applied.absolute_path = abs.clone();
+                        }
+                        notification_handle.send_file_written(FileWritten {
+                            tool_call_id: ctx.call_id.as_str().to_owned(),
+                            absolute_path: abs.clone(),
+                            content: content.clone(),
+                            previous_content: None,
+                            is_new_file: true,
+                        });
                         let edit_details = r.edit_details;
                         return Ok(to_search_replace(
                             r.output,
@@ -400,7 +461,14 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
                 });
             }
         };
-        let old_content = String::from_utf8_lossy(&file_bytes).into_owned();
+        let old_content = match String::from_utf8(file_bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                return Ok(crate::types::output::SearchReplaceOutput::InvalidInput(
+                    "File is not valid UTF-8; no changes were made.".to_owned(),
+                ));
+            }
+        };
 
         let apply_result = apply::apply_edits(&old_content, &input.edits, &path, &*scheme);
 
@@ -427,6 +495,16 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
             ));
         }
 
+        if let Some(ref new_content) = apply_result.new_content {
+            notification_handle.send_file_written(FileWritten {
+                tool_call_id: ctx.call_id.as_str().to_owned(),
+                absolute_path: path.clone(),
+                content: new_content.clone(),
+                previous_content: Some(old_content.clone()),
+                is_new_file: false,
+            });
+        }
+
         let edit_details = apply_result.edit_details;
         Ok(to_search_replace(
             apply_result.output,
@@ -441,7 +519,7 @@ impl xai_tool_runtime::Tool for HashlineEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::tool_metadata::test_ctx;
+    use crate::types::tool_metadata::{test_ctx, test_ctx_with_call_id};
 
     use crate::computer::local::LocalFs;
     use crate::notification::types::ToolNotificationHandle;
@@ -505,6 +583,222 @@ mod tests {
             .iter()
             .map(|a| format!("{}:{}", a.line, anchor_suffix(a)))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn existing_edit_emits_file_written_with_before_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "old\n").unwrap();
+        let (handle, mut rx) = ToolNotificationHandle::channel();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(NotificationHandle(handle));
+        let input = HashlineEditInput {
+            file_path: "test.txt".to_owned(),
+            edits: vec![HashlineOp::Replace {
+                anchor: anchors_for("old\n")[0].clone(),
+                end_anchor: None,
+                content: "new".to_owned(),
+            }],
+        };
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            test_ctx_with_call_id(resources.into_shared(), "edit-call"),
+            input,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        let crate::notification::types::ToolNotification::FileWritten(written) =
+            rx.try_recv().unwrap()
+        else {
+            panic!("expected FileWritten");
+        };
+        assert_eq!(written.tool_call_id, "edit-call");
+        assert_eq!(
+            written.absolute_path,
+            dunce::canonicalize(tmp.path().join("test.txt")).unwrap()
+        );
+        assert_eq!(written.previous_content.as_deref(), Some("old\n"));
+        assert_eq!(written.content, "new\n");
+        assert!(!written.is_new_file);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn new_file_write_emits_file_written() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut rx) = ToolNotificationHandle::channel();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(NotificationHandle(handle));
+        let input = HashlineEditInput {
+            file_path: "new.txt".to_owned(),
+            edits: vec![HashlineOp::Write {
+                content: "new\n".to_owned(),
+            }],
+        };
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            test_ctx_with_call_id(resources.into_shared(), "create-call"),
+            input,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        let crate::notification::types::ToolNotification::FileWritten(written) =
+            rx.try_recv().unwrap()
+        else {
+            panic!("expected FileWritten");
+        };
+        assert_eq!(written.tool_call_id, "create-call");
+        assert_eq!(
+            written.absolute_path,
+            dunce::canonicalize(tmp.path().join("new.txt")).unwrap()
+        );
+        assert_eq!(written.previous_content, None);
+        assert_eq!(written.content, "new\n");
+        assert!(written.is_new_file);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_edits_neither_write_nor_emit_notification() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut rx) = ToolNotificationHandle::channel();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(NotificationHandle(handle));
+        let shared = resources.into_shared();
+        let input = HashlineEditInput {
+            file_path: "new.txt".to_owned(),
+            edits: vec![HashlineOp::Write {
+                content: "22:abc:rst→copied".to_owned(),
+            }],
+        };
+        let result =
+            xai_tool_runtime::Tool::run(&HashlineEditTool, test_ctx(shared.clone()), input)
+                .await
+                .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        assert!(!tmp.path().join("new.txt").exists());
+        assert!(rx.try_recv().is_err());
+
+        let invalid = b"\xff\nhello\n";
+        std::fs::write(tmp.path().join("invalid.txt"), invalid).unwrap();
+        let input = HashlineEditInput {
+            file_path: "invalid.txt".to_owned(),
+            edits: vec![HashlineOp::InsertAfter {
+                anchor: "EOF".to_owned(),
+                content: "new".to_owned(),
+            }],
+        };
+        let result =
+            xai_tool_runtime::Tool::run(&HashlineEditTool, test_ctx(shared.clone()), input)
+                .await
+                .unwrap();
+        assert!(
+            matches!(result, SearchReplaceOutput::InvalidInput(ref msg) if msg.contains("UTF-8"))
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("invalid.txt")).unwrap(),
+            invalid
+        );
+        assert!(rx.try_recv().is_err());
+
+        std::fs::write(tmp.path().join("block"), "unchanged").unwrap();
+        let input = HashlineEditInput {
+            file_path: "block/new.txt".to_owned(),
+            edits: vec![HashlineOp::Write {
+                content: "new".to_owned(),
+            }],
+        };
+        let result = xai_tool_runtime::Tool::run(&HashlineEditTool, test_ctx(shared), input)
+            .await
+            .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        assert_eq!(
+            std::fs::read(tmp.path().join("block")).unwrap(),
+            b"unchanged"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_restricts_hashline_edits_and_symlink_swaps() {
+        use crate::computer::types::AsyncFileSystem;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = cwd.join("plan.md");
+        let outside = cwd.join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let shared = test_resources(&cwd).into_shared();
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            ctx,
+            HashlineEditInput {
+                file_path: "plan.md".to_owned(),
+                edits: vec![HashlineOp::Write {
+                    content: "one\n".to_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            ctx,
+            HashlineEditInput {
+                file_path: "plan.md".to_owned(),
+                edits: vec![HashlineOp::InsertAfter {
+                    anchor: "EOF".to_owned(),
+                    content: "two".to_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        assert_eq!(std::fs::read(&plan_path).unwrap(), b"one\ntwo\n");
+
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            ctx,
+            HashlineEditInput {
+                file_path: "outside.txt".to_owned(),
+                edits: vec![HashlineOp::Write {
+                    content: "changed".to_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        std::fs::remove_file(&plan_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &plan_path).unwrap();
+        let mut ctx = test_ctx(shared);
+        ctx.extensions.insert(plan);
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineEditTool,
+            ctx,
+            HashlineEditInput {
+                file_path: "plan.md".to_owned(),
+                edits: vec![HashlineOp::Write {
+                    content: "changed".to_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
     }
 
     #[tokio::test]
