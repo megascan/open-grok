@@ -63,8 +63,18 @@ except BlockingIOError:
 
 def sample():
     # du reports allocated filesystem blocks, rather than sparse-file lengths.
-    result = subprocess.run(['du', '-sk', target], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
+    du_env = os.environ.copy()
+    du_env['LC_ALL'] = 'C'
+    result = subprocess.run(['du', '-sk', target], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=du_env)
+    # Cargo frequently removes temporary files while du is walking the tree.
+    # Accept only the specific ENOENT diagnostic, with a usable subtotal; all
+    # other failures remain fail-closed. The target itself must still exist.
+    diagnostics = result.stderr.splitlines()
+    vanished_only = bool(diagnostics) and all(
+        line.startswith('du: ') and line.endswith(': No such file or directory')
+        for line in diagnostics
+    ) and os.path.isdir(target)
+    if (result.returncode != 0 or diagnostics) and not vanished_only:
         raise RuntimeError(f"cannot measure target: {result.stderr.strip()}")
     try:
         used = int(result.stdout.split()[0]) * 1024
@@ -117,21 +127,68 @@ except OSError as exc:
     sys.exit(f'cargo-bounded: cannot start cargo: {exc}')
 
 
-def stop_group():
+def group_members():
+    # macOS can return EPERM from killpg after the leader is reaped. In that
+    # case inspect the group and signal only members belonging to this uid.
+    result = subprocess.run(['ps', '-axo', 'pid=,pgid=,uid='],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        raise RuntimeError(f'cannot inspect Cargo process group: {result.stderr.strip()}')
+    members = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            raise RuntimeError('cannot parse Cargo process group listing')
+        try:
+            pid, group, uid = map(int, fields)
+        except ValueError as exc:
+            raise RuntimeError('cannot parse Cargo process group listing') from exc
+        if group == process.pid:
+            if uid != os.geteuid():
+                raise RuntimeError(f'Cargo process group contains inaccessible process {pid}')
+            members.append(pid)
+    return members
+
+
+def signal_group(signum):
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signum)
     except ProcessLookupError:
-        pass
+        return
+    except PermissionError:
+        for pid in group_members():
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise RuntimeError(f'cannot signal Cargo process {pid}: {exc}') from exc
+
+
+def stop_group():
+    # Do not recursively interrupt cleanup. Its waits are deliberately bounded.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    errors = []
+    try:
+        signal_group(signal.SIGTERM)
+    except (OSError, RuntimeError) as exc:
+        errors.append(str(exc))
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         pass
     # Also stop surviving descendants if Cargo exited before them.
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+        signal_group(signal.SIGKILL)
+    except (OSError, RuntimeError) as exc:
+        errors.append(str(exc))
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        errors.append(f'Cargo process {process.pid} did not exit')
+    if errors:
+        print('cargo-bounded: cleanup incomplete: ' + '; '.join(errors), file=sys.stderr, flush=True)
 
 
 def interrupted(signum, _frame):

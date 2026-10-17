@@ -57,6 +57,9 @@ elif mode == "free":
 elif mode == "du-failure":
     pathlib.Path(os.environ["DU_MARKER"]).touch()
     time.sleep(30)
+elif mode == "du-vanished":
+    pathlib.Path(os.environ["DU_MARKER"]).touch()
+    time.sleep(1.5)
 else:
     raise SystemExit("unexpected fake Cargo invocation")
 '''
@@ -209,6 +212,59 @@ class CargoBoundedTest(unittest.TestCase):
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn("cannot measure target", result.stderr)
         self.assertIn("fake du failure", result.stderr)
+
+    @unittest.skipUnless(REAL_DU, "du is unavailable")
+    def test_du_accepts_only_disappearing_entries_with_a_subtotal(self) -> None:
+        du = self.bindir / "du"
+        du.write_text(
+            "#!/usr/bin/env python3\nimport os, subprocess, sys\n"
+            f"result = subprocess.run([{REAL_DU!r}, *sys.argv[1:]], capture_output=True, text=True)\n"
+            "if not (os.path.exists(os.environ['DU_MARKER']) and os.environ.get('DU_NO_OUTPUT') == '1'):\n"
+            "    sys.stdout.write(result.stdout)\n"
+            "sys.stderr.write(result.stderr)\n"
+            "if os.path.exists(os.environ['DU_MARKER']):\n"
+            "    sys.stderr.write('du: /tmp/vanished: No such file or directory\\n')\n"
+            "    if os.environ.get('DU_MIXED') == '1':\n"
+            "        sys.stderr.write('du: /tmp/blocked: Permission denied\\n')\n"
+            "    sys.exit(1)\n"
+            "sys.exit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        du.chmod(0o755)
+        result = self.invoke("du-vanished")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / "du-failure").unlink()
+        result = self.invoke("du-failure", DU_MIXED="1")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("Permission denied", result.stderr)
+        (self.root / "du-failure").unlink()
+        result = self.invoke("du-failure", DU_NO_OUTPUT="1")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("cannot measure disk usage", result.stderr)
+
+    def test_denied_group_signal_falls_back_to_owned_group_members(self) -> None:
+        site = self.root / "site"
+        site.mkdir()
+        (site / "sitecustomize.py").write_text(
+            "import os\n"
+            "def denied(*args):\n"
+            "    raise PermissionError(1, 'simulated killpg failure')\n"
+            "os.killpg = denied\n",
+            encoding="utf-8",
+        )
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            result = self.invoke("grow", PYTHONPATH=str(site), CARGO_BOUNDED_MAX_BYTES="65536")
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertNotIn("cleanup incomplete", result.stderr)
+            self.assertIsNone(unrelated.poll())
+            self.assertTrue((self.root / "descendant-started").exists())
+            time.sleep(3.2)
+            self.assertFalse((self.root / "descendant-survived").exists())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=10)
 
 
 if __name__ == "__main__":
