@@ -1326,7 +1326,9 @@ fn x11_primary_hint_requires_canonical_full_miss_outcome() {
     );
     let target = ClipboardPasteTarget::AgentPrompt {
         agent_id: AgentId(0),
+        binding_epoch: 0,
         images_dir: None,
+        feedback_tool_call_id: None,
     };
 
     for completion in [
@@ -1392,7 +1394,9 @@ fn x11_primary_hint_routes_to_originating_agent() {
     app.active_view = ActiveView::Agent(active);
     let target = crate::app::actions::ClipboardPasteTarget::AgentPrompt {
         agent_id: origin,
+        binding_epoch: app.agents[&origin].session_binding_epoch,
         images_dir: None,
+        feedback_tool_call_id: None,
     };
 
     maybe_show_x11_primary_paste_hint(
@@ -1451,7 +1455,9 @@ fn clipboard_failure_routes_to_originating_agent_without_duplicate() {
     app.active_view = ActiveView::Agent(active);
     let target = crate::app::actions::ClipboardPasteTarget::AgentPrompt {
         agent_id: origin,
+        binding_epoch: app.agents[&origin].session_binding_epoch,
         images_dir: None,
+        feedback_tool_call_id: None,
     };
 
     show_clipboard_failure(
@@ -2740,8 +2746,6 @@ fn available_commands_refreshed_empty_is_noop() {
     );
 }
 
-// -- Session deletion from the /resume picker -----------------------
-
 #[test]
 fn delete_session_complete_removes_only_matching_source_and_id() {
     use crate::views::modal::ActiveModal;
@@ -3035,6 +3039,8 @@ fn rename_session_failed_keeps_local_display_name_and_pushes_system_block() {
         TaskResult::RenameSessionFailed {
             agent_id: AgentId(0),
             error: "boom".into(),
+            generation: 0,
+            binding_epoch: 0,
         },
         &mut app,
     );
@@ -3062,8 +3068,6 @@ fn rename_session_failed_keeps_local_display_name_and_pushes_system_block() {
         "system block must surface the error; got: {text:?}"
     );
 }
-
-// ── GateRefreshed subscription flow ─────────────────────────────
 
 /// Regression: when the 30s gate poll detects the subscription gate has
 /// been lifted, it must emit `CheckSubscription` so the shell refreshes
@@ -3183,8 +3187,6 @@ fn gate_refreshed_newly_blocked_defers_gate_for_verification() {
         "must arm the verification timeout; got: {effects:?}"
     );
 }
-
-// ── Stale-gate verification resolution ──────────────────────────
 
 fn test_gate() -> xai_grok_shell::auth::GateInfo {
     xai_grok_shell::auth::GateInfo {
@@ -3655,8 +3657,6 @@ fn rollback_to_always_approve_blocked_by_policy_pin() {
     assert!(!app.default_yolo);
 }
 
-// -- Degraded conversations lane (SessionListLoaded.partial) ----------
-
 /// A degraded conversations lane surfaces an actionable notice instead of
 /// the misleading "No sessions found" toast.
 #[test]
@@ -3665,6 +3665,8 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
             sessions: vec![],
             partial: Some(crate::app::effects::ConversationsPartial::NoOauth),
@@ -3682,8 +3684,10 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
 /// Notice fires once per relaxed run; survives search, re-arms on a cwd-scoped browse.
 #[test]
 fn session_list_relax_surfaces_notice_once() {
-    let relax_response = || {
+    let relax_response = |generation| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation,
             scope: ListScope::Repo,
             sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
             partial: None,
@@ -3694,14 +3698,15 @@ fn session_list_relax_surfaces_notice_once() {
 
     let mut app = test_app_with_agent();
     open_session_picker_with(&mut app, vec![]);
-    let _ = dispatch(relax_response(), &mut app);
+    let generation = modal_picker_generation(&app);
+    let _ = dispatch(relax_response(generation), &mut app);
     assert!(
         read_toast(&app).contains("this repo"),
         "the relaxed scope must be explained"
     );
 
     app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
-    let _ = dispatch(relax_response(), &mut app);
+    let _ = dispatch(relax_response(generation), &mut app);
     assert!(
         app.agents[&AgentId(0)].toast.is_none(),
         "the relax notice must not repeat while the scope is unchanged"
@@ -3709,6 +3714,8 @@ fn session_list_relax_surfaces_notice_once() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation,
             scope: ListScope::Cwd,
             sessions: vec![],
             partial: None,
@@ -3717,7 +3724,7 @@ fn session_list_relax_surfaces_notice_once() {
         }),
         &mut app,
     );
-    let _ = dispatch(relax_response(), &mut app);
+    let _ = dispatch(relax_response(generation), &mut app);
     assert!(
         app.agents[&AgentId(0)].toast.is_none(),
         "a search response must not re-arm the relax notice"
@@ -3725,6 +3732,8 @@ fn session_list_relax_surfaces_notice_once() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation,
             scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-here-1", "/here")],
             partial: None,
@@ -3733,7 +3742,7 @@ fn session_list_relax_surfaces_notice_once() {
         }),
         &mut app,
     );
-    let _ = dispatch(relax_response(), &mut app);
+    let _ = dispatch(relax_response(generation), &mut app);
     assert!(
         read_toast(&app).contains("this repo"),
         "a scope change back to relaxed must notify again"
@@ -3747,6 +3756,8 @@ fn session_list_relax_on_welcome_does_not_latch() {
     assert!(matches!(app.active_view, ActiveView::Welcome));
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Welcome,
+            generation: app.session_picker_generation,
             scope: ListScope::All,
             sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
             partial: None,
@@ -3765,8 +3776,10 @@ fn session_list_relax_on_welcome_does_not_latch() {
 /// though the prior latch is set.
 #[test]
 fn session_list_relax_renotifies_when_cwd_changes() {
-    let relax = || {
+    let relax = |generation| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation,
             scope: ListScope::Repo,
             sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
             partial: None,
@@ -3777,9 +3790,10 @@ fn session_list_relax_renotifies_when_cwd_changes() {
 
     let mut app = test_app_with_agent();
     open_session_picker_with(&mut app, vec![]);
+    let generation = modal_picker_generation(&app);
 
     app.cwd = std::path::PathBuf::from("/repo/a");
-    let _ = dispatch(relax(), &mut app);
+    let _ = dispatch(relax(generation), &mut app);
     assert!(
         read_toast(&app).contains("this repo"),
         "the first cwd must notify"
@@ -3787,7 +3801,7 @@ fn session_list_relax_renotifies_when_cwd_changes() {
 
     app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
     app.cwd = std::path::PathBuf::from("/repo/b");
-    let _ = dispatch(relax(), &mut app);
+    let _ = dispatch(relax(generation), &mut app);
     assert!(
         read_toast(&app).contains("this repo"),
         "a different cwd must re-notify even with the prior latch set"
@@ -3801,6 +3815,8 @@ fn session_list_empty_without_partial_keeps_generic_toast() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
             sessions: vec![],
             partial: None,
@@ -3820,6 +3836,8 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     app.chat_mode = true;
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Welcome,
+            generation: app.session_picker_generation,
             scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-part-1")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
@@ -3841,6 +3859,8 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     let mut app = test_app_with_agent();
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Welcome,
+            generation: app.session_picker_generation,
             scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-part-1", "/r")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
@@ -3865,6 +3885,8 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-part-m1")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
@@ -3894,6 +3916,8 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::AgentModal,
+            generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-part-m1", "/r")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),

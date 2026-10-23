@@ -307,6 +307,12 @@ impl SettingsModalState {
         }
     }
 
+    /// The expanded-row text: a lock reason replaces the description.
+    pub fn detail_text(&self, key: SettingKey, meta: &SettingMeta) -> &'static str {
+        self.row_lock(key)
+            .map_or(meta.description, CodingDataSharingLock::reason)
+    }
+
     /// The currently-focused setting row, if any.
     pub fn focused_setting(&self) -> Option<(SettingKey, &SettingMeta)> {
         match self.rows.get(self.selected)? {
@@ -1027,14 +1033,12 @@ pub(super) fn compute_filtered(
 }
 
 /// Row visibility: voice rows need the voice gate; capture needs key releases;
-/// `hidden_in_minimal` rows are dropped in minimal mode; the antigravity row
-/// needs the CLI installed. Pure for unit tests.
+/// `hidden_in_minimal` rows are dropped in minimal mode. Pure for unit tests.
 pub(super) fn setting_row_visible(
     meta: &SettingMeta,
     kitty_releases: bool,
     minimal: bool,
     voice_mode: bool,
-    antigravity_cli: bool,
 ) -> bool {
     if !voice_mode
         && matches!(
@@ -1047,13 +1051,6 @@ pub(super) fn setting_row_visible(
     if meta.key == "voice_capture_mode" && !kitty_releases {
         return false;
     }
-    if matches!(
-        meta.key,
-        "antigravity_subagents" | "antigravity_skip_permissions"
-    ) && !antigravity_cli
-    {
-        return false;
-    }
     if minimal && meta.hidden_in_minimal {
         return false;
     }
@@ -1064,7 +1061,6 @@ fn build_rows(registry: &SettingsRegistry) -> Vec<RowEntry> {
     let kitty_releases = crate::app::kitty_releases_reported();
     let minimal = crate::app::minimal_mode_active();
     let voice_mode = crate::app::voice_mode_enabled();
-    let antigravity_cli = crate::app::antigravity_cli_present();
     // Keys that belong to a group sub-sheet are rendered only inside that
     // sheet, never as their own top-level rows.
     let group_children: std::collections::HashSet<SettingKey> = registry
@@ -1084,7 +1080,7 @@ fn build_rows(registry: &SettingsRegistry) -> Vec<RowEntry> {
             if meta.category != *cat {
                 continue;
             }
-            if !setting_row_visible(meta, kitty_releases, minimal, voice_mode, antigravity_cli) {
+            if !setting_row_visible(meta, kitty_releases, minimal, voice_mode) {
                 continue;
             }
             if group_children.contains(meta.key) {
@@ -1121,11 +1117,14 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "vim_mode" => Some(Action::SetVimMode(new)),
         "voice_keybind_enabled" => Some(Action::SetVoiceKeybindEnabled(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
+        "codex_persistent_mode" => Some(Action::SetCodexPersistentMode(new)),
+        "codex_guardian_review" => Some(Action::SetCodexGuardianReview(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
         }
         "toolset.perplexity_web_search.enabled" => Some(Action::SetPerplexityWebSearch(new)),
         "toolset.x_search.enabled" => Some(Action::SetXSearchEnabled(new)),
+        "subagent_model_inheritance" => Some(Action::SetSubagentModelInheritance(new)),
         "show_thinking_blocks" => Some(Action::SetShowThinkingBlocks(new)),
         "stream_tool_calls" => Some(Action::SetStreamToolCalls(new)),
         "group_tool_verbs" => Some(Action::SetGroupToolVerbs(new)),
@@ -1136,10 +1135,9 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
             trigger: "manual",
             persist: true,
         }),
-        "antigravity_subagents" => Some(Action::SetAntigravitySubagents(new)),
-        "antigravity_skip_permissions" => Some(Action::SetAntigravitySkipPermissions(new)),
         "respect_manual_folds" => Some(Action::SetRespectManualFolds(new)),
         "page_flip_on_send" => Some(Action::SetPageFlipOnSend(new)),
+        "dashboard_preview" => Some(Action::SetDashboardPreview(new)),
         "confirm_before_rewind" => Some(Action::SetConfirmBeforeRewind(new)),
         "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),
         "enter_steers" => Some(Action::SetEnterSteers(new)),
@@ -1149,6 +1147,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "auto_update" => Some(Action::SetAutoUpdate(new)),
         "display_refresh_auto_cadence" => Some(Action::SetDisplayRefreshAutoCadence(new)),
         "custom_model_save" => Some(Action::SetCustomModelSave(new)),
+        "custom_provider_wizard" => Some(Action::SetCustomProviderWizard(new)),
         _ if crate::settings::is_local_feature_flag(key) => {
             Some(Action::SetLocalFeatureFlag { key, enabled: new })
         }
@@ -1316,6 +1315,7 @@ pub(super) fn action_for_int(key: SettingKey, value: i64) -> Option<Action> {
         "max_thoughts_width" => Some(Action::SetMaxThoughtsWidth(value)),
         "scroll_speed" => Some(Action::SetScrollSpeed(value)),
         "scroll_lines" => Some(Action::SetScrollLines(value)),
+        "custom_model_max_context_window" => Some(Action::SetCustomModelMaxContextWindow(value)),
         "custom_model_context_window" => Some(Action::SetCustomModelContextWindow(value)),
         _ => None,
     }

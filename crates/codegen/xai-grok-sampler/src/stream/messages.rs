@@ -19,24 +19,7 @@ use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
 
-/// The verbatim wire string for a Messages API stop reason, before it collapses
-/// into the internal [`StopReason`]. Uses the enum's serde `snake_case`
-/// renaming so it cannot drift from the wire contract.
-fn messages_stop_reason_wire(sr: &messages::StopReason) -> String {
-    match serde_json::to_value(sr) {
-        Ok(serde_json::Value::String(s)) => s,
-        other => {
-            debug_assert!(
-                false,
-                "StopReason must serialize to a string, got {other:?}"
-            );
-            "end_turn".to_string()
-        }
-    }
-}
-
-/// Returns whether a Messages API event reflects real model progress
-/// rather than a liveness-only heartbeat (Ping).
+/// Returns whether a Messages API event reflects real model progress rather than a liveness-only heartbeat (Ping).
 pub(crate) fn messages_event_has_meaningful_content(event: &MessageStreamEvent) -> bool {
     match event {
         MessageStreamEvent::Ping => false,
@@ -62,6 +45,8 @@ struct BlockState {
     args_acc: String,
     thinking_acc: String,
     signature: String,
+    /// The first `SignatureDelta` replaces a start-seeded signature (no doubling); later deltas append.
+    signature_delta_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +63,8 @@ enum BlockType {
 /// [`SamplingEvent::Failed`]) per request. Server-side `Error` events
 /// translate to `SamplingError::Api { status: 500, .. }` so the actor's
 /// retry loop treats them as retryable transport-level errors.
+/// Empty tool-input placeholders are finalized only after a non-truncated
+/// stop is known; populated JSON inputs may complete at their block stop.
 pub fn stream_messages<'a>(
     raw_stream: BoxStream<'a, Result<MessageStreamEvent, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
@@ -122,13 +109,12 @@ pub fn stream_messages<'a>(
         // headless `streaming-messages-json` consumer can echo it.
         let mut final_stop_sequence: Option<String> = None;
 
-        // Assistant-response accumulators (built up as ContentBlockStop
-        // events fire). Reasoning is collected into a synthesized
-        // `rs::ReasoningItem` and emitted as a sibling
-        // `ConversationItem::Reasoning` before the trailing Assistant.
+        // Assistant-response accumulators (built up as ContentBlockStop events fire)
+        // Each thinking block becomes its own `rs::ReasoningItem`, emitted as sibling `ConversationItem::Reasoning`s before the trailing Assistant
+        // Keeping every block matters: a narration block after real reasoning must not evict it from passback
         let mut assistant_text = String::new();
         let mut assistant_tool_calls: BTreeMap<u32, ToolCall> = BTreeMap::new();
-        let mut assistant_reasoning: Option<rs::ReasoningItem> = None;
+        let mut assistant_reasoning: Vec<rs::ReasoningItem> = Vec::new();
 
         // Index counters
         let mut chunk_index: u64 = 0;
@@ -214,6 +200,7 @@ pub fn stream_messages<'a>(
                                 args_acc: String::new(),
                                 thinking_acc: thinking.clone(),
                                 signature: signature.clone(),
+                                signature_delta_seen: false,
                             },
                         );
                         if !first_token_emitted {
@@ -234,6 +221,7 @@ pub fn stream_messages<'a>(
                                 args_acc: String::new(),
                                 thinking_acc: String::new(),
                                 signature: String::new(),
+                                signature_delta_seen: false,
                             },
                         );
                         if !first_token_emitted {
@@ -262,6 +250,7 @@ pub fn stream_messages<'a>(
                                 args_acc: initial_arguments.clone().unwrap_or_default(),
                                 thinking_acc: String::new(),
                                 signature: String::new(),
+                                signature_delta_seen: false,
                             },
                         );
 
@@ -312,7 +301,13 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             StreamDelta::SignatureDelta { signature } => {
-                                state.signature = signature;
+                                // The first delta replaces any start-seeded signature so a gateway sending both never doubles it
+                                // Later deltas append: a signature split across deltas must survive whole
+                                if !state.signature_delta_seen {
+                                    state.signature_delta_seen = true;
+                                    state.signature.clear();
+                                }
+                                state.signature.push_str(&signature);
                             }
                             StreamDelta::TextDelta { text } => {
                                 if !text.is_empty() {
@@ -371,6 +366,19 @@ pub fn stream_messages<'a>(
                                         signature: state.signature.clone(),
                                     };
                                 }
+                                // The block's deltas already streamed on the Reasoning channel
+                                // The reasoning item below carries the text back to the API, not `assistant_text`
+                                if !state.thinking_acc.is_empty()
+                                    && signature_marks_narration(&state.signature)
+                                {
+                                    chunk_index += 1;
+                                    yield SamplingEvent::ChannelToken {
+                                        request_id: request_id.clone(),
+                                        channel: SamplingChannel::Narration,
+                                        text: state.thinking_acc.clone(),
+                                        chunk_index,
+                                    };
+                                }
                                 if !state.thinking_acc.is_empty() || !state.signature.is_empty() {
                                     // Anthropic Messages API `Thinking` blocks uniquely
                                     // carry an encrypted `signature` distinct
@@ -392,7 +400,7 @@ pub fn stream_messages<'a>(
                                     } else {
                                         Some(state.signature)
                                     };
-                                    assistant_reasoning = Some(rs::ReasoningItem {
+                                    assistant_reasoning.push(rs::ReasoningItem {
                                         id: String::new(),
                                         summary,
                                         content: None,
@@ -402,33 +410,16 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             BlockType::ToolUse => {
-                                let mut arguments = state.args_acc;
-                                if arguments.is_empty() {
-                                    arguments.push_str("{}");
-                                    if let Some(&tool_index) = block_to_tool_index.get(&index) {
-                                        yield SamplingEvent::ToolCallDelta {
+                                let arguments = state.args_acc;
+                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
+                                    if serde_json::from_str::<serde::de::IgnoredAny>(&arguments).is_ok() {
+                                        yield SamplingEvent::ToolCallArgumentsComplete {
                                             request_id: request_id.clone(),
                                             tool_index,
-                                            id: None,
-                                            name: None,
-                                            arguments_delta: Some(arguments.clone()),
+                                            id: Some(state.tool_id.clone()),
+                                            name: Some(state.tool_name.clone()),
                                         };
                                     }
-                                }
-                                // The block's arguments are final. Emit before
-                                // assembling the canonical call so consumers
-                                // accumulating fragments can act mid-stream;
-                                // exactly once per block because the state is
-                                // removed above.
-                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
-                                    yield SamplingEvent::ToolCallArgumentsComplete {
-                                        request_id: request_id.clone(),
-                                        tool_index,
-                                        id: Some(state.tool_id.clone()),
-                                        name: Some(state.tool_name.clone()),
-                                    };
-                                }
-                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
                                     assistant_tool_calls.insert(tool_index, ToolCall {
                                         id: std::sync::Arc::<str>::from(state.tool_id),
                                         name: state.tool_name,
@@ -447,10 +438,11 @@ pub fn stream_messages<'a>(
                         final_stop_message = details.explanation;
                     }
                     // Keep the exact wire string so consumers can echo it.
-                    final_raw_stop_reason =
-                        delta.stop_reason.as_ref().map(messages_stop_reason_wire);
-                    // The matched stop sequence rides the same terminal delta
-                    // (present only on a `stop_sequence` stop); carry it verbatim.
+                    final_raw_stop_reason = delta
+                        .stop_reason
+                        .as_ref()
+                        .map(messages::StopReason::wire_str)
+                        .or(final_raw_stop_reason);
                     if delta.stop_sequence.is_some() {
                         final_stop_sequence = delta.stop_sequence.clone();
                     }
@@ -478,7 +470,7 @@ pub fn stream_messages<'a>(
                             // overflow, neither of which exists here.
                             tracing::warn!(
                                 wire_stop_reason = "model_context_window_exceeded",
-                                "context window hit mid-generation; surfacing as max_tokens truncation"
+                                "context window hit mid-generation; mapping to the Length stop class"
                             );
                             StopReason::Length
                         }
@@ -489,7 +481,7 @@ pub fn stream_messages<'a>(
                             );
                             StopReason::Stop
                         }
-                    });
+                    }).or(final_stop_reason);
                     final_output_tokens = usage.output_tokens;
                     // Optional on the delta; preserve message_start values when omitted.
                     if let Some(input) = usage.input_tokens {
@@ -546,12 +538,25 @@ pub fn stream_messages<'a>(
             }
         }
 
-        if final_stop_reason == Some(StopReason::Length) {
-            yield SamplingEvent::Failed {
-                request_id: request_id.clone(),
-                error: SamplingErrorInfo::from(&SamplingError::MaxTokensTruncation),
-            };
-            return;
+        if matches!(final_stop_reason, Some(StopReason::Stop | StopReason::ToolCalls)) {
+            for (&tool_index, call) in &mut assistant_tool_calls {
+                if call.arguments.is_empty() {
+                    call.arguments = std::sync::Arc::from("{}");
+                    yield SamplingEvent::ToolCallDelta {
+                        request_id: request_id.clone(),
+                        tool_index,
+                        id: None,
+                        name: None,
+                        arguments_delta: Some(call.arguments.to_string()),
+                    };
+                    yield SamplingEvent::ToolCallArgumentsComplete {
+                        request_id: request_id.clone(),
+                        tool_index,
+                        id: Some(call.id.to_string()),
+                        name: Some(call.name.clone()),
+                    };
+                }
+            }
         }
 
         // ── Build the final response ─────────────────────────────────
@@ -573,9 +578,9 @@ pub fn stream_messages<'a>(
             None
         };
 
-        let stop_reason = if !assistant_tool_calls.is_empty() {
-            // Completed tool_use blocks win even over Refusal: the calls are
-            // real model output the agent loop must resolve.
+        let stop_reason = if final_stop_reason == Some(StopReason::Length) {
+            final_stop_reason
+        } else if !assistant_tool_calls.is_empty() {
             Some(StopReason::ToolCalls)
         } else {
             final_stop_reason
@@ -591,9 +596,7 @@ pub fn stream_messages<'a>(
         });
 
         let mut items: Vec<ConversationItem> = Vec::new();
-        if let Some(r) = assistant_reasoning {
-            items.push(ConversationItem::Reasoning(r));
-        }
+        items.extend(assistant_reasoning.into_iter().map(ConversationItem::Reasoning));
         items.push(assistant_item);
 
         let stream_end = Instant::now();
@@ -620,6 +623,30 @@ pub fn stream_messages<'a>(
             metrics,
         };
     }
+}
+
+/// Whether a thinking block's signature marks it as narration, a progress update for the user.
+///
+/// Models that write progress updates over the Anthropic Messages API send those mid-turn notes as thinking blocks.
+/// Under `display: "summarized"` the API gives no documented way to tell them from reasoning.
+/// The signature, however, begins with a readable header naming the block kind, `"thinking"` or `"narration"`, ahead of the opaque payload; this checks the decoded prefix for that word.
+/// If the header layout ever changes, the block falls back to plain reasoning display.
+fn signature_marks_narration(signature: &str) -> bool {
+    use base64::Engine as _;
+    // The kind string sits about 15 bytes into the decoded header
+    // 48 base64 chars decode to 36 bytes, enough to cover the header's variable-width length varints
+    let prefix_len = signature.len().min(48);
+    let Some(prefix) = signature.get(..prefix_len) else {
+        return false;
+    };
+    let aligned_len = prefix.len() - prefix.len() % 4;
+    let Some(aligned) = prefix.get(..aligned_len) else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(aligned) else {
+        return false;
+    };
+    bytes.windows(b"narration".len()).any(|w| w == b"narration")
 }
 
 #[cfg(test)]

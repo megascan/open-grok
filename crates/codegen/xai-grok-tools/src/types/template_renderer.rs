@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use crate::types::context::WholeReadPolicy;
 use crate::types::description::make_desc_env;
 use crate::types::tool::ToolKind;
 
@@ -70,6 +71,10 @@ struct TemplateContext {
     /// on this so the promise is only made when it can be kept. Defaults
     /// to `true` (prod CLI behavior).
     system_reminders_enabled: bool,
+    /// Absolute path to this session's drafts file, when known.
+    feedback_drafts_path: String,
+    /// Which file classes `read_file` returns whole; read descriptions only promise it for classes that are on.
+    whole_read: WholeReadPolicy,
 }
 
 /// Shared render implementation: fast-path check + MiniJinja render.
@@ -218,8 +223,25 @@ impl TemplateRenderer {
                 shell_uses_semicolon: xai_grok_config::shell::chain_separator() == ";",
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
+                feedback_drafts_path: String::new(),
+                whole_read: WholeReadPolicy::default(),
             },
         }
+    }
+
+    /// Set from the finalized `TruncationConfig`; every other construction site keeps the default (both on).
+    #[must_use]
+    pub fn with_whole_read(mut self, policy: WholeReadPolicy) -> Self {
+        self.ctx.whole_read = policy;
+        self
+    }
+
+    /// Set the absolute drafts-file path advertised in `send_feedback`.
+    /// An empty path omits the drafts-file sentence from the description.
+    #[must_use]
+    pub fn with_feedback_drafts_path(mut self, path: impl Into<String>) -> Self {
+        self.ctx.feedback_drafts_path = path.into();
+        self
     }
 
     /// Override whether templates see `system_reminders_enabled` as true.
@@ -609,6 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn read_description_whole_read_note_follows_policy_and_param_names() {
+        let base = make_renderer(
+            &[(ToolKind::Read, "read_file")],
+            &[(
+                ToolKind::Read,
+                &[("offset", "start_line"), ("limit", "num_lines")],
+            )],
+        );
+        let template = crate::implementations::grok_build::read_file::DESCRIPTION_FULL;
+
+        let on = base.clone().render(template).unwrap();
+        assert!(
+            on.contains("start_line and num_lines are ignored for them"),
+            "note must use the client-facing param names, got: {on}"
+        );
+
+        let off = base
+            .with_whole_read(WholeReadPolicy {
+                skill_markdown: false,
+                instruction_files: false,
+            })
+            .render(template)
+            .unwrap();
+        assert!(
+            !off.contains("returned whole"),
+            "note must vanish with both bits off, got: {off}"
+        );
+        assert!(
+            off.contains("beginning of the file\n"),
+            "bullet must end cleanly, got: {off}"
+        );
+    }
+
+    #[test]
     fn render_conditional_absent() {
         let r = make_renderer(&[], &[]);
         let result = r
@@ -689,7 +745,7 @@ mod tests {
 
 Usage notes:
 - Use the task_id from a command run with ${{ params.execute.is_background }}=true, or a subagent launched with ${{ params.task.run_in_background }}=true
-- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~10 min)."#;
+- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~1 h)."#;
         let rendered = r.render(desc).expect("task_output description must render");
         let _ = std::fs::write("/tmp/task_output_tool_description.txt", &rendered);
         assert!(
@@ -698,6 +754,18 @@ Usage notes:
         );
         assert!(rendered.contains("background=true"));
         assert!(rendered.contains("Omit timeout_ms") || rendered.contains("positive timeout_ms"));
+    }
+
+    #[test]
+    fn render_task_output_current_block_parameter() {
+        let renderer = make_renderer(
+            &[(ToolKind::Execute, "run_terminal_command")],
+            &[(ToolKind::Execute, &[("block_until_ms", "wait_ms")])],
+        );
+        let rendered = renderer
+            .render("Use ${{ params.execute.block_until_ms }}=0 for background commands")
+            .unwrap();
+        assert_eq!(rendered, "Use wait_ms=0 for background commands");
     }
 
     #[tokio::test]

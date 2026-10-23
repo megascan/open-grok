@@ -5,19 +5,15 @@
 //! surface until the snapshot is re-copied. This module re-copies refreshable
 //! local installs (under-home or trusted) at session spawn and `/plugins reload`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::git_install::{
-    copy_dir_recursive, discover_plugins_in_dir, remove_repo_path, repo_plugin_map,
+    StagingDir, copy_dir_recursive, create_staging_dir, discover_plugins_in_dir_as, repo_plugin_map,
 };
-use super::install_registry::{InstallError, InstallKind, InstallRegistry, RepoPlugin};
+use super::install_registry::{InstallError, InstallKind, InstallRegistry, InstalledRepo};
 use super::trust::TrustStore;
-
-/// Orphaned tmp/backup siblings younger than this may belong to a concurrent live
-/// refresh, so [`sweep_stale`] only reclaims entries older than this.
-const STALE_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
 /// Counts from a [`refresh_local_installs`] pass, for logging and tests.
 #[derive(Debug, Default, Clone, Copy)]
@@ -36,13 +32,7 @@ pub(crate) struct RefreshSummary {
 /// sources (install-time trust re-applies every spawn). Non-fatal on failure.
 pub(crate) fn refresh_local_installs_from_disk(trust: &TrustStore, force: bool) -> RefreshSummary {
     let mut registry = InstallRegistry::load();
-    let summary = refresh_local_installs(&mut registry, trust, force);
-    if summary.refreshed > 0
-        && let Err(e) = registry.save()
-    {
-        tracing::warn!(error = %e, "failed to save install registry after local plugin refresh");
-    }
-    summary
+    refresh_local_installs(&mut registry, trust, force)
 }
 
 /// A local install snapshotted out of the registry so the refresh loop can mutate
@@ -53,7 +43,7 @@ struct RefreshTarget {
     source_path: PathBuf,
     subdir: Option<String>,
     dest: PathBuf,
-    expected: HashMap<String, RepoPlugin>,
+    expected: InstalledRepo,
 }
 
 /// Re-copy refreshable local installs from their live `source_path` into the
@@ -61,8 +51,7 @@ struct RefreshTarget {
 ///
 /// A source is refreshable when it is under the user's home (auto-trusted, same
 /// rule as config-path plugins) or in the trust store; remote git installs are
-/// handled by `update_repo`, not here. Unless `force`, snapshots already matching
-/// the live source are skipped (a stat-walk, not a byte copy).
+/// handled by `update_repo`, not here. Unless `force`, matching snapshots are skipped.
 fn refresh_local_installs(
     registry: &mut InstallRegistry,
     trust: &TrustStore,
@@ -81,7 +70,7 @@ fn refresh_local_installs(
                 source_path: source_path.clone(),
                 subdir: subdir.clone(),
                 dest: repo.path.clone(),
-                expected: repo.plugins.clone(),
+                expected: repo.clone(),
             }),
             _ => None,
         })
@@ -101,22 +90,25 @@ fn refresh_local_installs(
             summary.skipped += 1;
             continue;
         }
-        // Skip if the snapshot already matches the source (cheap stat-walk).
+        // Skip if the snapshot already matches the source.
         // `force` (/plugins reload) bypasses the skip.
         if !force && snapshot_matches_source(&source_path, &dest) {
             summary.skipped += 1;
             continue;
         }
 
-        match recopy_local_install(&source_path, subdir.as_deref(), &dest, &expected) {
-            Ok(Some(plugins)) => {
-                if let Some(repo) = registry.get_repo_mut(&key) {
-                    repo.plugins = plugins;
-                    repo.updated_at = chrono::Utc::now().to_rfc3339();
-                }
+        match recopy_local_install(
+            registry,
+            &key,
+            &source_path,
+            subdir.as_deref(),
+            &dest,
+            &expected,
+        ) {
+            Ok(true) => {
                 summary.refreshed += 1;
             }
-            Ok(None) => {
+            Ok(false) => {
                 // Kept the snapshot: rediscovered plugin set/scope differs from
                 // recorded (e.g. legacy install without a persisted `subdir`).
                 tracing::debug!(
@@ -162,163 +154,93 @@ fn tree_file_set(root: &Path) -> Option<BTreeMap<PathBuf, u64>> {
     Some(out)
 }
 
-/// Whether the snapshot at `dest` matches the live `source` by `(relpath, len)`
-/// set. Catches add/remove/rename/resize; misses only a same-path/same-len edit.
+/// Compare file paths, lengths and contents. Copies do not preserve mtimes, so
+/// comparing timestamps cannot determine whether the snapshot is current.
 fn snapshot_matches_source(source: &Path, dest: &Path) -> bool {
     match (tree_file_set(source), tree_file_set(dest)) {
-        (Some(src), Some(dst)) => src == dst,
+        (Some(src), Some(dst)) if src == dst => src
+            .keys()
+            .all(|path| files_match(&source.join(path), &dest.join(path)).unwrap_or(false)),
         _ => false,
     }
 }
 
-/// Re-copy `source_path` into `dest`, returning the rediscovered plugins, or
-/// `Ok(None)` to keep the existing snapshot unchanged.
-///
-/// Invariant: refresh only syncs file contents within the existing plugin set;
-/// if rediscovery is empty or changes the `(name, subdir)` set, the snapshot is
-/// kept as-is (protects legacy entries whose `subdir` wasn't persisted).
-///
-/// `subdir` scopes discovery as it did at install time; symlinks in the source
-/// are skipped (see [`copy_dir_recursive`]). The swap is rename-aside (move live
-/// snapshot to backup, promote tmp, drop backup) so `dest` is never absent during
-/// a slow delete and a failed promote rolls back to the previous snapshot.
+fn files_match(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    let mut source = std::fs::File::open(source)?;
+    let mut dest = std::fs::File::open(dest)?;
+    let mut left = [0; 8192];
+    let mut right = [0; 8192];
+    loop {
+        let count = source.read(&mut left)?;
+        dest.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+        if count == 0 {
+            return Ok(dest.read(&mut right)? == 0);
+        }
+    }
+}
+
+/// Stage a re-copy without following symlinks, retaining the recorded plugin
+/// scope. The registry transaction publishes the tree and metadata together and
+/// recovers an interrupted swap before the next discovery.
 fn recopy_local_install(
+    registry: &mut InstallRegistry,
+    key: &str,
     source_path: &Path,
     subdir: Option<&str>,
     dest: &Path,
-    expected: &HashMap<String, RepoPlugin>,
-) -> Result<Option<HashMap<String, RepoPlugin>>, InstallError> {
-    let parent = dest.parent().ok_or_else(|| InstallError::InstallFailed {
-        detail: format!("install path has no parent: {}", dest.display()),
+    expected: &InstalledRepo,
+) -> Result<bool, InstallError> {
+    let stage = StagingDir(create_staging_dir(registry)?);
+    copy_dir_recursive(source_path, &stage.0).map_err(|source| InstallError::Io {
+        path: stage.0.clone(),
+        source,
     })?;
-    let file_name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("plugin");
-    // Reclaim orphaned tmp/backup dirs left by a crash in a prior run.
-    sweep_stale(parent, file_name);
-    let tmp = parent.join(format!(".{file_name}.refresh-{}", std::process::id()));
-    let backup = parent.join(format!(".{file_name}.backup-{}", std::process::id()));
-
-    let _ = remove_repo_path(&tmp);
-    copy_dir_recursive(source_path, &tmp).map_err(|e| {
-        let _ = remove_repo_path(&tmp);
-        InstallError::Io {
-            path: tmp.clone(),
-            source: e,
-        }
-    })?;
-
-    let discovered = match discover_plugins_in_dir(&tmp, subdir) {
-        Ok(plugins) => plugins,
-        Err(e) => {
-            let _ = remove_repo_path(&tmp);
-            return Err(e);
-        }
-    };
-
-    // Keep the snapshot unless the rediscovered (name, subdir) set is unchanged.
+    let discovered = discover_plugins_in_dir_as(&stage.0, subdir, dest)?;
     let discovered_ids: BTreeSet<(&str, Option<&str>)> = discovered
         .iter()
         .map(|p| (p.name.as_str(), p.subdir.as_deref()))
         .collect();
     let expected_ids: BTreeSet<(&str, Option<&str>)> = expected
+        .plugins
         .iter()
         .map(|(name, rp)| (name.as_str(), rp.subdir.as_deref()))
         .collect();
     if discovered.is_empty() || discovered_ids != expected_ids {
-        let _ = remove_repo_path(&tmp);
-        return Ok(None);
+        return Ok(false);
     }
-
-    let _ = remove_repo_path(&backup);
-    if dest.exists()
-        && let Err(e) = std::fs::rename(dest, &backup)
-    {
-        let _ = remove_repo_path(&tmp);
-        return Err(InstallError::Io {
-            path: dest.to_path_buf(),
-            source: e,
-        });
-    }
-    if let Err(e) = promote_tmp_to_dest(&tmp, dest) {
-        let _ = remove_repo_path(&tmp);
-        // Promote failed: restore the prior tree so `dest` is never left missing
-        // (rename, then copy fallback), unless a peer already repopulated `dest`.
-        if dest.exists() {
-            let _ = remove_repo_path(&backup);
-        } else if std::fs::rename(&backup, dest).is_err() {
-            match copy_dir_recursive(&backup, dest) {
-                Ok(()) => {
-                    let _ = remove_repo_path(&backup);
-                }
-                Err(restore) => tracing::error!(
-                    dest = %dest.display(),
-                    backup = %backup.display(),
-                    error = %restore,
-                    "failed to restore snapshot after refresh promote failure; prior tree kept at backup"
-                ),
-            }
-        }
-        return Err(InstallError::Io {
-            path: dest.to_path_buf(),
-            source: e,
-        });
-    }
-    let _ = remove_repo_path(&backup);
-
-    Ok(Some(repo_plugin_map(&discovered)))
-}
-
-/// Promote the freshly-copied `tmp` tree onto `dest`. A test hook can force this
-/// to fail to exercise the rename-aside rollback path.
-fn promote_tmp_to_dest(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut repo = expected.clone();
+    repo.plugins = repo_plugin_map(&discovered);
+    repo.updated_at = chrono::Utc::now().to_rfc3339();
     #[cfg(test)]
-    {
-        if std::env::var_os("XAI_GROK_TEST_FAIL_REFRESH_PROMOTE").is_some() {
-            return Err(std::io::Error::other(
-                "test-injected refresh promote failure",
-            ));
-        }
+    if std::env::var_os("XAI_GROK_TEST_FAIL_REFRESH_PROMOTE").is_some() {
+        registry.publish_staged_if_matches_checked(
+            key,
+            expected,
+            repo,
+            &stage.0,
+            |_| Ok(()),
+            |_| {
+                Err(InstallError::InstallFailed {
+                    detail: "test-injected refresh commit failure".into(),
+                })
+            },
+        )?;
+        return Ok(true);
     }
-    std::fs::rename(tmp, dest)
-}
-
-/// Best-effort removal of orphaned `.<name>.refresh-*` / `.<name>.backup-*`
-/// siblings left by a crash between copy and promote. Only entries older than
-/// [`STALE_SWEEP_AGE`] are reaped, so a concurrent live refresh's in-flight
-/// working dir (pid-named, freshly created) is never deleted out from under it.
-fn sweep_stale(parent: &Path, file_name: &str) {
-    let refresh_prefix = format!(".{file_name}.refresh-");
-    let backup_prefix = format!(".{file_name}.backup-");
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !name.starts_with(&refresh_prefix) && !name.starts_with(&backup_prefix) {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age >= STALE_SWEEP_AGE);
-        if stale {
-            let _ = remove_repo_path(&entry.path());
-        }
-    }
+    registry.publish_staged_if_matches(key, expected, repo, &stage.0)?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::git_install::{InstallResult, InstallSource, install_from_source};
-    use super::super::install_registry::InstalledRepo;
+    use super::super::install_registry::{InstalledRepo, RepoPlugin};
     use super::*;
     use serial_test::serial;
+    use std::collections::HashMap;
 
     /// RAII guard: sets an env var, restores the prior value (or unsets) on drop,
     /// so a test never leaves process-global env pointing at a dropped tempdir.
@@ -398,7 +320,75 @@ mod tests {
                 marketplace: None,
             },
         );
+        registry.save().unwrap();
         installed
+    }
+
+    #[test]
+    fn refresh_rejects_original_target_after_an_earlier_refresh_observes_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_a = tmp.path().join("source-a");
+        let source_b = tmp.path().join("source-b");
+        write_plugin_json(&source_a, "a");
+        write_plugin_json(&source_b, "b");
+        std::fs::write(source_b.join("content"), "old local").unwrap();
+        let mut refresh = InstallRegistry::empty(tmp.path().join("installed"));
+        let a = register_local_install(&mut refresh, &source_a, None);
+        let b = register_local_install(&mut refresh, &source_b, None);
+        let selected_a = refresh.get_repo(&a.repo_key).unwrap().clone();
+        let selected_b = refresh.get_repo(&b.repo_key).unwrap().clone();
+
+        let mut replacement =
+            InstallRegistry::try_load_from(refresh.install_dir().to_path_buf()).unwrap();
+        let stage = StagingDir(create_staging_dir(&replacement).unwrap());
+        write_plugin_json(&stage.0, "b");
+        std::fs::write(stage.0.join("content"), "new git").unwrap();
+        let mut git_repo = selected_b.clone();
+        git_repo.kind = InstallKind::Git {
+            url: "file:///new-origin".into(),
+            git_ref: Some("main".into()),
+            commit: "new-commit".into(),
+            subdir: None,
+        };
+        git_repo.updated_at = "new-owner".into();
+        replacement
+            .publish_staged_if_matches(&b.repo_key, &selected_b, git_repo, &stage.0)
+            .unwrap();
+
+        assert!(
+            recopy_local_install(
+                &mut refresh,
+                &a.repo_key,
+                &source_a,
+                None,
+                &a.repo_path,
+                &selected_a
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            &refresh.get_repo(&b.repo_key).unwrap().kind,
+            InstallKind::Git { .. }
+        ));
+        assert!(
+            recopy_local_install(
+                &mut refresh,
+                &b.repo_key,
+                &source_b,
+                None,
+                &b.repo_path,
+                &selected_b
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.repo_path.join("content")).unwrap(),
+            "new git"
+        );
+        let disk = InstallRegistry::try_load_from(refresh.install_dir().to_path_buf()).unwrap();
+        assert!(
+            matches!(&disk.get_repo(&b.repo_key).unwrap().kind, InstallKind::Git { commit, .. } if commit == "new-commit")
+        );
     }
 
     #[test]
@@ -432,8 +422,7 @@ mod tests {
         let mut registry = InstallRegistry::empty(home.join(".opengrok").join("installed-plugins"));
         let installed = register_local_install(&mut registry, &source, None);
 
-        // No edit to the source: snapshot matches, so refresh is a stat-walk skip
-        // with no re-copy.
+        // No edit to the source: snapshot matches, so refresh skips the re-copy.
         let snapshot = installed.repo_path.join("agents/old.md");
         let before = std::fs::metadata(&snapshot).unwrap().modified().unwrap();
         let trust = TrustStore::load_from(home.join(".opengrok").join("trusted-plugins"));
@@ -442,6 +431,35 @@ mod tests {
         assert_eq!(summary.skipped, 1, "{summary:?}");
         let after = std::fs::metadata(&snapshot).unwrap().modified().unwrap();
         assert_eq!(before, after, "unchanged snapshot must not be re-copied");
+    }
+
+    #[test]
+    #[serial(home_env)]
+    fn refresh_picks_up_same_length_skill_and_hook_edits() {
+        let (_home_tmp, home, _home_guard) = home_tempdir();
+        let source = home.join("plugin");
+        write_plugin_json(&source, "demo-plugin");
+        std::fs::create_dir_all(source.join("skills/demo")).unwrap();
+        std::fs::create_dir_all(source.join("hooks")).unwrap();
+        std::fs::write(source.join("skills/demo/SKILL.md"), "Use A").unwrap();
+        std::fs::write(source.join("hooks/check.sh"), "old").unwrap();
+
+        let mut registry = InstallRegistry::empty(home.join("installed-plugins"));
+        let installed = register_local_install(&mut registry, &source, None);
+        std::fs::write(source.join("skills/demo/SKILL.md"), "Use B").unwrap();
+        std::fs::write(source.join("hooks/check.sh"), "new").unwrap();
+
+        let trust = TrustStore::load_from(home.join("trusted-plugins"));
+        let summary = refresh_local_installs(&mut registry, &trust, false);
+        assert_eq!(summary.refreshed, 1, "{summary:?}");
+        assert_eq!(
+            std::fs::read_to_string(installed.repo_path.join("skills/demo/SKILL.md")).unwrap(),
+            "Use B"
+        );
+        assert_eq!(
+            std::fs::read_to_string(installed.repo_path.join("hooks/check.sh")).unwrap(),
+            "new"
+        );
     }
 
     #[test]

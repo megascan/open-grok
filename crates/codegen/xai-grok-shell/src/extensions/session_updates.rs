@@ -128,7 +128,7 @@ fn try_stream_tail_page(request: &Request, updates_path: &Path) -> io::Result<Op
         return Ok(None);
     }
 
-    let file = std::fs::File::open(updates_path)?;
+    let file = xai_file_utils::session_file::open(updates_path)?;
     let reader = BufReader::new(file);
 
     if is_turn_index {
@@ -400,7 +400,7 @@ pub async fn handle(
         );
     }
 
-    let raw_contents = std::fs::read_to_string(&updates_path)
+    let raw_contents = xai_file_utils::session_file::read_to_string(&updates_path)
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     let lines: Vec<&str> = raw_contents
@@ -1031,5 +1031,51 @@ mod tests {
         assert_eq!(ps, &[0, 2]);
         // Drain the chunks
         let _ = extract_chunk_params(&mut rx);
+    }
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    #[test]
+    fn gzip_tail_pages_match_plain_and_reject_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let mut contents = String::new();
+        for text in ["first", "reply", "second", "last"] {
+            let kind = if text == "first" || text == "second" {
+                "user_message_chunk"
+            } else {
+                "agent_message_chunk"
+            };
+            contents.push_str(
+                &serde_json::json!({
+                    "method": "session/update", "params": {"sessionId": "s", "update": {
+                        "sessionUpdate": kind, "content": {"type": "text", "text": text}
+                    }}
+                })
+                .to_string(),
+            );
+            contents.push('\n');
+        }
+        for request in [
+            serde_json::json!({"sessionId": "s", "cwd": "/", "offset": -2}),
+            serde_json::json!({"sessionId": "s", "cwd": "/", "turnIndex": 1}),
+        ] {
+            let request: Request = serde_json::from_value(request).unwrap();
+            std::fs::write(&path, &contents).unwrap();
+            let expected = try_stream_tail_page(&request, &path).unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(contents.as_bytes()).unwrap();
+            let mut bytes = encoder.finish().unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(try_stream_tail_page(&request, &path).unwrap(), expected);
+            bytes.truncate(bytes.len() - 4);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(try_stream_tail_page(&request, &path).is_err());
+        }
     }
 }

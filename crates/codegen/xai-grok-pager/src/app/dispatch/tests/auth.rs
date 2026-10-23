@@ -46,8 +46,8 @@ fn bare_login_opens_provider_picker_without_starting_auth() {
         panic!("bare /login should open the provider ArgPicker");
     };
     assert_eq!(command, "login");
-    assert_eq!(items.len(), 12);
-    assert_eq!(original_items.len(), 12);
+    assert_eq!(items.len(), 13);
+    assert_eq!(original_items.len(), 13);
     assert_eq!(
         items
             .iter()
@@ -66,6 +66,7 @@ fn bare_login_opens_provider_picker_without_starting_auth() {
             "runinfra",
             "gemini",
             "openrouter",
+            "antigravity",
         ]
     );
 }
@@ -105,6 +106,7 @@ fn dashboard_bare_login_opens_inline_provider_picker_without_starting_auth() {
             "runinfra",
             "gemini",
             "openrouter",
+            "antigravity",
         ]
     );
 }
@@ -316,6 +318,62 @@ fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
         }]
     ));
     assert!(last_system_text(&app, AgentId(0)).contains("OpenAI Codex"));
+}
+
+#[test]
+fn antigravity_sign_in_and_sign_out_are_independent() {
+    let mut app = test_app_with_agent();
+    assert!(matches!(
+        dispatch(Action::LoginAntigravity, &mut app).as_slice(),
+        [Effect::LoginAntigravity {
+            agent_id: Some(AgentId(0))
+        }]
+    ));
+    assert!(matches!(
+        dispatch(Action::LogoutAntigravity, &mut app).as_slice(),
+        [Effect::LogoutAntigravity {
+            agent_id: Some(AgentId(0))
+        }]
+    ));
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+}
+
+#[test]
+fn antigravity_manual_oauth_link_is_ephemeral_and_redacted_in_debug() {
+    use crate::app::actions::SensitiveAuthUrl;
+    use crate::views::modal::ActiveModal;
+
+    let url = "https://accounts.google.com/o/oauth2/auth?state=test-secret";
+    let wrapped = SensitiveAuthUrl(url.to_owned());
+    assert!(!format!("{wrapped:?}").contains("test-secret"));
+    let mut app = test_app_with_agent();
+    let (shown_tx, mut shown_rx) = tokio::sync::oneshot::channel();
+    dispatch(
+        Action::TaskComplete(TaskResult::AntigravityLoginUrlReady {
+            agent_id: Some(AgentId(0)),
+            url: Some(wrapped),
+            opened: false,
+            copied: false,
+            shown: Some(shown_tx),
+        }),
+        &mut app,
+    );
+    assert!(matches!(
+        &app.agents[&AgentId(0)].active_modal,
+        Some(ActiveModal::DocViewer { title, content, .. })
+            if title == "Antigravity sign-in" && content.contains(url)
+    ));
+    assert!(shown_rx.try_recv().is_ok());
+    dispatch(
+        Action::TaskComplete(TaskResult::AntigravityAuthComplete {
+            agent_id: Some(AgentId(0)),
+            logout: false,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(app.agents[&AgentId(0)].active_modal.is_none());
+    assert!(!last_system_text(&app, AgentId(0)).contains("test-secret"));
 }
 
 #[test]
@@ -1419,8 +1477,6 @@ fn cta_mcps_loaded_later_needs_auth_opens_handoff() {
             .any(|e| matches!(e, Effect::RetryPluginCtaMcps { .. }))
     );
 }
-
-// ── agent-bound kinds (bash) ─────────
 
 /// A bash command typed while a turn is RUNNING takes the
 /// server-authoritative immediate path (Effect + optimistic echo, no local

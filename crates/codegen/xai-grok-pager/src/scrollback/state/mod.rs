@@ -6,6 +6,7 @@
 pub mod groups;
 mod layout;
 mod nav;
+mod pin_reserve;
 mod selection;
 mod timeline;
 mod types;
@@ -133,6 +134,12 @@ pub struct ScrollbackState {
     /// prompt at the viewport top while still enabling follow for new content.
     follow_preserve_scroll: bool,
 
+    pin_reserve_active: bool,
+    pin_reserve_pad: usize,
+    pin_reserve_target: Option<usize>,
+    pin_reserve_prompt_id: Option<EntryId>,
+    pin_reserve_after_turn: bool,
+
     // Selection
     /// Currently selected entry index.
     selected: Option<usize>,
@@ -253,6 +260,11 @@ impl ScrollbackState {
             viewport_height: 0,
             follow_mode: true,
             follow_preserve_scroll: false,
+            pin_reserve_active: false,
+            pin_reserve_pad: 0,
+            pin_reserve_target: None,
+            pin_reserve_prompt_id: None,
+            pin_reserve_after_turn: false,
             selected: None,
             selection_box: None,
             turns: Vec::new(),
@@ -273,8 +285,8 @@ impl ScrollbackState {
             content_generation: 0,
             #[cfg(test)]
             layout_rebuilds: 0,
-            inline_edit_height: None,
             cwd: None,
+            inline_edit_height: None,
         }
     }
 
@@ -393,6 +405,7 @@ impl ScrollbackState {
 
     /// Update the appearance configuration.
     pub fn set_appearance(&mut self, appearance: AppearanceConfig) {
+        crate::render::bidi::set_enabled(appearance.scrollback.display.rtl_bidi);
         self.appearance = appearance;
         // Invalidate caches since appearance affects rendering
         self.layout_cache = None;
@@ -1119,6 +1132,8 @@ impl ScrollbackState {
         self.turns.clear();
         self.current_turn = None;
         self.scroll_offset = 0;
+        self.clear_pin_reserve();
+        self.pin_reserve_pad = 0;
         self.commit_scan_cursor = 0;
         self.commit_expand_ring.clear();
         self.invalidate_layout_cache();
@@ -1250,9 +1265,9 @@ impl ScrollbackState {
     /// the display-mode policy for lifecycle swaps (tracker refinement and
     /// completion):
     ///
-    /// - Edit-to-Edit swaps keep the entry's current mode, so a manual
-    ///   expand of the one-liner survives later refinements and completion.
-    ///   Exception: when the swap first turns the summary untrusted (a later
+    /// - Same-kind tool swaps keep the entry's current mode, so a manual
+    ///   expand survives later refinements and completion.
+    ///   Exception: when an Edit swap first turns the summary untrusted (a later
     ///   Diff revealed a multi-file call), the entry escalates to Expanded —
     ///   the one-liner it was collapsed to no longer tells the truth. The
     ///   escalation fires only on that rising edge, so a user's collapse of
@@ -1288,7 +1303,7 @@ impl ScrollbackState {
             new_tc.set_started_at(t);
         }
         let kind_changed = verb_group::verb_group_kind_changed(&entry.block, &block);
-        let (edit_to_edit, untrusted_rising) = match (&entry.block, &block) {
+        let (is_same_kind, untrusted_rising) = match (&entry.block, &block) {
             (
                 RenderBlock::ToolCall(ToolCallBlock::Edit(old)),
                 RenderBlock::ToolCall(ToolCallBlock::Edit(new)),
@@ -1296,14 +1311,14 @@ impl ScrollbackState {
                 true,
                 new.is_success() && new.summary_untrusted && !old.summary_untrusted,
             ),
+            (RenderBlock::ToolCall(old), RenderBlock::ToolCall(new)) => (
+                std::mem::discriminant(old) == std::mem::discriminant(new),
+                false,
+            ),
             _ => (false, false),
         };
         entry.block = block;
-        if edit_to_edit {
-            // Keep the current mode: the entry was already an Edit, so any
-            // change since materialization is a user gesture — except on the
-            // untrusted rising edge, where the collapsed one-liner became a
-            // lie and Expanded is the only truthful default. Pins still win.
+        if is_same_kind {
             if untrusted_rising && !(respect_manual_folds && entry.display_mode_pinned) {
                 entry.display_mode = DisplayMode::Expanded;
             }
@@ -1328,21 +1343,9 @@ impl ScrollbackState {
         true
     }
 
-    /// Apply a live `collapsed_edit_blocks` flag flip (settings toggle or
-    /// remote settings update; the cache is already set to the new value).
-    ///
-    /// Entries still sitting on their old policy default re-materialize under
-    /// the new one, so the toggle is visible on the existing transcript; any
-    /// other mode is a user gesture and survives (an explicit fold back to
-    /// the old default is indistinguishable and flips too — same caveat as
-    /// `push`'s materialize gate). Pins win under `respect_manual_folds`. An
-    /// explicit pager.toml `expanded_by_default` makes both defaults equal,
-    /// so the walk naturally no-ops. Heights are rebuilt afterwards: Edit
-    /// rows change height on a mode flip, and the collapsed header's `+N/-M`
-    /// suffix (read live via `effective_line_summary`) needs a repaint even
-    /// without one. Stale group-expansion ids describe the old dense-run
-    /// shape (collapsed Edits participate), so they are dropped like the
-    /// `group_tool_verbs` flip does.
+    /// Entries still on their old policy default re-materialize under the new one.
+    /// Flag off to on collapses rows open only because `expanded_by_default` was `Some(true)`.
+    /// `Some(false)` is collapsed on both sides, so that walk no-ops.
     pub fn apply_collapsed_edit_blocks_flip(&mut self, old_flag: bool, new_flag: bool) {
         let edit_cfg = &self.appearance.scrollback.blocks.edit;
         let old_expanded = edit_cfg.effective_expanded(old_flag);
@@ -1470,6 +1473,7 @@ impl ScrollbackState {
                 RenderBlock::ToolCall(ToolCallBlock::WebFetch(b)) => b.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::WebSearch(b)) => b.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::MemorySearch(b)) => b.finish(),
+                RenderBlock::ToolCall(ToolCallBlock::SentMessage(message)) => message.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::Other(b)) => b.finish(),
                 _ => {}
             }
@@ -1674,6 +1678,12 @@ impl ScrollbackState {
             }
             // Full rebuild produces cheap height ESTIMATES for every entry.
             self.ensure_layout_cache(width);
+            if resized && self.pin_reserve_active {
+                self.pin_reserve_target = self.pin_reserve_prompt_scroll_target();
+                if let Some(target) = self.pin_reserve_target {
+                    self.scroll_offset = target;
+                }
+            }
             self.compute_total_height_from_cache();
             // Re-pin the anchored content to the viewport top now that virtual_y
             // is rebuilt at the new width (before settle clamps / re-pins to it).
@@ -1716,6 +1726,7 @@ impl ScrollbackState {
             let top_anchor = self.viewport_top_anchor_point();
             let changes = self.update_dirty_entry_heights(width);
             self.dirty_heights.clear();
+            self.shift_pin_reserve_target_for_changes(&changes);
 
             if !changes.is_empty() {
                 if self.gaps_may_be_dirty {
@@ -1728,12 +1739,10 @@ impl ScrollbackState {
                     // Fast path (streaming): only heights changed, gaps are stable.
                     // Patch virtual_y in O(n-k) where k is the earliest dirty index.
                     // For streaming (dirty entry at end), this is O(1).
-                    let total_delta = self.patch_virtual_y_for_dirty(&changes);
-                    // Apply delta directly instead of re-summing entire visible range.
-                    // Clamp at 0 to avoid underflow; no upper cap (total_height is
-                    // usize, so tall sessions are not truncated).
-                    let new_total = (self.total_height as i64 + total_delta as i64).max(0);
-                    self.total_height = new_total as usize;
+                    self.patch_virtual_y_for_dirty(&changes);
+                    // The visible turn may also have changed since the previous
+                    // frame. Recompute its total from prefix positions in O(1).
+                    self.compute_total_height_from_cache();
                 }
             } else if self.gaps_may_be_dirty {
                 // Heights didn't change, but structural state is dirty (e.g.,
@@ -1861,6 +1870,7 @@ impl ScrollbackState {
             .saturating_sub(self.viewport_height as usize);
         self.scroll_offset = offset.min(max_offset);
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         self.bump_generation();
     }
 
@@ -2113,8 +2123,7 @@ mod tests {
         assert_eq!(state.turn_count(), 0);
     }
 
-    /// State with an explicit pager.toml-shaped `expanded_by_default`
-    /// override — flag-independent (the `Some` wins over the cache).
+    /// State with pager.toml `expanded_by_default` set. A true flag still collapses over `Some(true)`.
     fn edit_state(expanded_by_default: bool) -> ScrollbackState {
         let mut state = ScrollbackState::new();
         let mut appearance = AppearanceConfig::default();
@@ -2127,47 +2136,62 @@ mod tests {
         RenderBlock::ToolCall(ToolCallBlock::Edit(block))
     }
 
-    /// `push` owns the Edit materialize policy: the explicit
-    /// `expanded_by_default` shape override, the untrusted-summary escape,
-    /// error collapse, and survival of an explicitly set mode.
+    /// `push` owns the Edit materialize policy.
+    /// It covers the explicit `expanded_by_default` shape, a true flag collapsing `Some(true)`, the untrusted-summary escape, error collapse, and survival of an explicit mode.
     #[test]
     fn push_applies_edit_materialize_policy() {
-        let ok = || EditToolCallBlock::new("f.rs", vec![]);
+        std::thread::spawn(|| {
+            // Seed off on this thread. A machine `[ui]` pin must not collapse `Some(true)`.
+            crate::appearance::cache::set_collapsed_edit_blocks(false);
+            let ok = || EditToolCallBlock::new("f.rs", vec![]);
 
-        let mut state = edit_state(false);
-        let id = state.push_block(edit_block(ok()));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Collapsed
-        );
-        let id = state.push_block(edit_block(ok().with_untrusted_summary()));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Expanded,
-            "untrusted summaries expand even with an explicit collapse override"
-        );
+            let mut state = edit_state(false);
+            let id = state.push_block(edit_block(ok()));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed
+            );
+            let id = state.push_block(edit_block(ok().with_untrusted_summary()));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Expanded,
+                "untrusted summaries expand even with an explicit collapse override"
+            );
 
-        let mut state = edit_state(true);
-        let id = state.push_block(edit_block(ok()));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Expanded
-        );
-        let id = state.push_block(edit_block(ok().with_error("boom")));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Collapsed,
-            "failed edits collapse regardless of the expanded override"
-        );
+            let mut state = edit_state(true);
+            let id = state.push_block(edit_block(ok()));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Expanded
+            );
+            let id = state.push_block(edit_block(ok().with_error("boom")));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "failed edits collapse regardless of the expanded override"
+            );
 
-        let mut state = edit_state(false);
-        let id = state
-            .push(ScrollbackEntry::new(edit_block(ok())).with_display_mode(DisplayMode::Expanded));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Expanded,
-            "an explicitly set mode survives push"
-        );
+            let mut state = edit_state(false);
+            let id = state.push(
+                ScrollbackEntry::new(edit_block(ok())).with_display_mode(DisplayMode::Expanded),
+            );
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Expanded,
+                "an explicitly set mode survives push"
+            );
+
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            let mut state = edit_state(true);
+            let id = state.push_block(edit_block(ok()));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "flag on collapses even when expanded_by_default is Some(true)"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// `replace_tool_block` applies the materialize policy on a genuine kind
@@ -2175,56 +2199,62 @@ mod tests {
     /// user's manual expand survives refinement/completion).
     #[test]
     fn replace_tool_block_edit_policy() {
-        let mut state = edit_state(false);
-        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
-        assert!(state.replace_tool_block(
-            id,
-            edit_block(EditToolCallBlock::new("f.rs", vec![])),
-            None
-        ));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Collapsed,
-            "kind transition adopts the policy default"
-        );
-
-        // User opens the one-liner; the Edit-to-Edit completion swap keeps it.
-        state
-            .get_by_id_mut(id)
-            .unwrap()
-            .set_display_mode(DisplayMode::Expanded);
-        assert!(state.replace_tool_block(
-            id,
-            edit_block(EditToolCallBlock::new("f.rs", vec![])),
-            None
-        ));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Expanded,
-            "Edit-to-Edit swap must preserve the user's mode"
-        );
-
-        // Kind transition with the opt-in on lands Expanded.
-        let mut state = edit_state(true);
-        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
-        assert!(state.replace_tool_block(
-            id,
-            edit_block(EditToolCallBlock::new("f.rs", vec![])),
-            None
-        ));
-        assert_eq!(
-            state.get_by_id(id).unwrap().display_mode,
-            DisplayMode::Expanded
-        );
-
-        assert!(
-            !state.replace_tool_block(
-                EntryId::new(9999),
+        std::thread::spawn(|| {
+            // Seed off on this thread. A machine `[ui]` pin must not collapse `Some(true)`.
+            crate::appearance::cache::set_collapsed_edit_blocks(false);
+            let mut state = edit_state(false);
+            let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+            assert!(state.replace_tool_block(
+                id,
                 edit_block(EditToolCallBlock::new("f.rs", vec![])),
                 None
-            ),
-            "missing entry reports false"
-        );
+            ));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "kind transition adopts the policy default"
+            );
+
+            // User opens the one-liner; the Edit-to-Edit completion swap keeps it.
+            state
+                .get_by_id_mut(id)
+                .unwrap()
+                .set_display_mode(DisplayMode::Expanded);
+            assert!(state.replace_tool_block(
+                id,
+                edit_block(EditToolCallBlock::new("f.rs", vec![])),
+                None
+            ));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Expanded,
+                "Edit-to-Edit swap must preserve the user's mode"
+            );
+
+            // Kind transition with the opt-in on lands Expanded.
+            let mut state = edit_state(true);
+            let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+            assert!(state.replace_tool_block(
+                id,
+                edit_block(EditToolCallBlock::new("f.rs", vec![])),
+                None
+            ));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Expanded
+            );
+
+            assert!(
+                !state.replace_tool_block(
+                    EntryId::new(9999),
+                    edit_block(EditToolCallBlock::new("f.rs", vec![])),
+                    None
+                ),
+                "missing entry reports false"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// The untrusted rising edge overrides the Edit-to-Edit preserve rule:
@@ -2295,24 +2325,14 @@ mod tests {
                 DisplayMode::Expanded,
                 "flag off keeps the legacy expanded-diff default"
             );
-
-            // An explicit pager.toml shape beats the flag in both directions.
-            crate::appearance::cache::set_collapsed_edit_blocks(true);
-            let mut state = edit_state(true);
-            let id = state.push_block(edit_block(ok()));
-            assert_eq!(
-                state.get_by_id(id).unwrap().display_mode,
-                DisplayMode::Expanded,
-                "explicit expanded_by_default = true must beat the flag"
-            );
         })
         .join()
         .unwrap();
     }
 
-    /// A live flag flip re-materializes only entries still on their old
-    /// policy default; a user gesture away from that default survives, and
-    /// an explicit pager.toml shape makes the walk a no-op.
+    /// A live flag flip re-materializes only entries still on their old policy default.
+    /// A user gesture away from that default survives. Flag off to on collapses a row open only because
+    /// `expanded_by_default` was `Some(true)`. An explicit false stays collapsed across the flip.
     #[test]
     fn collapsed_edit_blocks_flip_rematerializes_only_default_entries() {
         std::thread::spawn(|| {
@@ -2346,15 +2366,36 @@ mod tests {
                 "user gesture must survive the flip"
             );
 
-            // Explicit shape override: both effective defaults are equal, so
-            // the flip leaves the entry alone.
+            crate::appearance::cache::set_collapsed_edit_blocks(false);
             let mut state = edit_state(true);
             let id = state.push_block(edit_block(EditToolCallBlock::new("c.rs", vec![])));
-            state.apply_collapsed_edit_blocks_flip(true, false);
             assert_eq!(
                 state.get_by_id(id).unwrap().display_mode,
                 DisplayMode::Expanded,
-                "explicit expanded_by_default pins the default across flips"
+                "flag off + expanded_by_default Some(true) starts expanded"
+            );
+            crate::appearance::cache::set_collapsed_edit_blocks(true);
+            state.apply_collapsed_edit_blocks_flip(false, true);
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "flag on must collapse a row open only because expanded_by_default was Some(true)"
+            );
+
+            // Explicit false is collapsed on both sides, so the flip leaves the row alone.
+            crate::appearance::cache::set_collapsed_edit_blocks(false);
+            let mut state = edit_state(false);
+            let id = state.push_block(edit_block(EditToolCallBlock::new("d.rs", vec![])));
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "flag off + Some(false) starts collapsed"
+            );
+            state.apply_collapsed_edit_blocks_flip(false, true);
+            assert_eq!(
+                state.get_by_id(id).unwrap().display_mode,
+                DisplayMode::Collapsed,
+                "explicit false stays collapsed when the flag turns on"
             );
         })
         .join()
@@ -2677,7 +2718,15 @@ mod tests {
         let mut state = ScrollbackState::new();
         let n = 400usize;
         for i in 0..n {
-            state.push_block(stub_block(&format!("entry {i}")));
+            let block = if i == 0 {
+                RenderBlock::agent_message(format!(
+                    "# Long reply\n\n{}",
+                    "wrapped text ".repeat(2_000)
+                ))
+            } else {
+                stub_block(&format!("entry {i}"))
+            };
+            state.push_block(block);
         }
         // Bottom-pinned viewport: the measurement window is near the tail.
         state.prepare_layout(80, 10);
@@ -2689,6 +2738,13 @@ mod tests {
         for (_, entry) in state.entries.iter() {
             entry.ensure_cached(78, &appearance, false, None);
         }
+        let first = &state.entries[0];
+        let original: Vec<_> = first
+            .cached_output_ref()
+            .lines
+            .iter()
+            .map(|line| line.content.clone())
+            .collect();
 
         let evicted = state.evict_offscreen_render_caches();
         assert!(
@@ -2712,6 +2768,19 @@ mod tests {
 
         // A second sweep with nothing re-rendered finds nothing to do.
         assert_eq!(state.evict_offscreen_render_caches(), 0);
+        let first = &state.entries[0];
+        assert!(!first.has_cached_output());
+        first.ensure_cached(78, &appearance, false, None);
+        let rebuilt: Vec<_> = first
+            .cached_output_ref()
+            .lines
+            .iter()
+            .map(|line| line.content.clone())
+            .collect();
+        assert_eq!(
+            rebuilt, original,
+            "evicted output must reconstruct identically"
+        );
     }
 
     #[test]

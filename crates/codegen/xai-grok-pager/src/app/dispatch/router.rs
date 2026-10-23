@@ -1,24 +1,36 @@
 //! Top-level action router: maps actions and action results to handlers.
+
+fn next_context_switch_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 use super::auth::{
-    dispatch_cancel_login, dispatch_choose_startup_codex, dispatch_choose_startup_xai,
-    dispatch_login, dispatch_login_codex, dispatch_logout, dispatch_logout_codex,
-    dispatch_open_login_provider_picker, dispatch_submit_auth_code, dispatch_switch_account,
+    dispatch_antigravity_auth, dispatch_cancel_login, dispatch_choose_startup_codex,
+    dispatch_choose_startup_xai, dispatch_login, dispatch_login_codex, dispatch_logout,
+    dispatch_logout_codex, dispatch_open_login_provider_picker, dispatch_submit_auth_code,
+    dispatch_switch_account,
 };
 use super::billing::dispatch_open_supergrok_url;
 use super::ctx::{
     active_agent_session_id, get_active_agent_mut, navigate_clearing_selection, open_url_or_show,
     sync_sleep_inhibitor, with_active_agent, with_scrollback,
 };
+use super::custom_provider::{
+    close_custom_provider_wizard, custom_provider_discover, custom_provider_key,
+    custom_provider_paste, custom_provider_save, open_custom_provider_wizard,
+    set_custom_provider_wizard,
+};
 use super::dashboard::{
     dispatch_dashboard_attach, dispatch_dashboard_begin_rename, dispatch_dashboard_change_location,
-    dispatch_dashboard_commit_rename, dispatch_dashboard_confirm_worktree,
-    dispatch_dashboard_create_new_agent_with_detail, dispatch_dashboard_delete,
-    dispatch_dashboard_dispatch, dispatch_dashboard_dispatch_slash,
-    dispatch_dashboard_open_location_picker, dispatch_dashboard_open_shortcuts_help,
-    dispatch_dashboard_overlay_cycle, dispatch_dashboard_overlay_exit,
-    dispatch_dashboard_overlay_stop, dispatch_dashboard_peek_cycle_mode,
-    dispatch_dashboard_peek_reply, dispatch_dashboard_permission_followup,
-    dispatch_dashboard_permission_select, dispatch_dashboard_question_answer,
+    dispatch_dashboard_close_session_picker, dispatch_dashboard_commit_rename,
+    dispatch_dashboard_confirm_worktree, dispatch_dashboard_create_new_agent_with_detail,
+    dispatch_dashboard_delete, dispatch_dashboard_dispatch, dispatch_dashboard_dispatch_slash,
+    dispatch_dashboard_open_location_picker, dispatch_dashboard_open_session_picker,
+    dispatch_dashboard_open_shortcuts_help, dispatch_dashboard_overlay_cycle,
+    dispatch_dashboard_overlay_exit, dispatch_dashboard_overlay_stop,
+    dispatch_dashboard_peek_cycle_mode, dispatch_dashboard_peek_reply,
+    dispatch_dashboard_permission_followup, dispatch_dashboard_permission_select,
+    dispatch_dashboard_pick_session, dispatch_dashboard_question_answer,
     dispatch_dashboard_reorder, dispatch_dashboard_select, dispatch_dashboard_stop,
     dispatch_dashboard_toggle_auto_approve, dispatch_dashboard_toggle_grouping,
     dispatch_dashboard_toggle_pin, dispatch_dashboard_toggle_worktree, dispatch_exit_dashboard,
@@ -35,9 +47,10 @@ use super::modes::{
     set_permission_mode, set_plan_mode, set_swarm_mode, set_yolo_mode,
 };
 use super::notes::{
-    dispatch_enter_remember_mode, dispatch_open_feedback_pane,
-    dispatch_save_remember_note_from_modal, dispatch_send_btw, dispatch_send_feedback,
-    dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_enter_remember_mode, dispatch_open_feedback_modal, dispatch_open_feedback_pane,
+    dispatch_request_feedback_draft, dispatch_save_remember_note_from_modal, dispatch_send_btw,
+    dispatch_send_feedback, dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_submit_feedback_modal,
 };
 use super::permissions::{
     dispatch_permission_cancel, dispatch_permission_followup, dispatch_permission_select,
@@ -51,9 +64,9 @@ use super::prompt::{
 use super::queue;
 use super::queue::dispatch_drain_queue;
 use super::rewind::{
-    dispatch_inline_edit_submit, dispatch_rewind, dispatch_rewind_cancel_offer,
-    dispatch_rewind_confirm, dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss,
-    dispatch_rewind_dismiss_error, dispatch_rewind_picker_select, dispatch_rewind_show_picker,
+    dispatch_rewind, dispatch_rewind_cancel_offer, dispatch_rewind_confirm,
+    dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss, dispatch_rewind_dismiss_error,
+    dispatch_rewind_picker_select, dispatch_rewind_show_picker,
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
@@ -78,32 +91,32 @@ use super::settings::setters::{
     clear_deepseek_api_key, clear_default_model, clear_fireworks_api_key,
     clear_fork_secondary_model, clear_gemini_api_key, clear_kimi_api_key, clear_memory_model,
     clear_meta_api_key, clear_opencode_go_api_key, clear_openrouter_api_key,
-    clear_perplexity_api_key, clear_recap_model, clear_runinfra_api_key, clear_wafer_api_key,
-    clear_zai_api_key, delete_custom_model, preview_auto_dark_theme, preview_auto_light_theme,
-    preview_theme, refresh_custom_models, refresh_opencode_go_models, refresh_openrouter_models,
-    set_antigravity_skip_permissions, set_antigravity_subagents,
-    set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
-    set_auto_update, set_code_mode, set_collapsed_edit_blocks, set_combine_queued_prompts,
-    set_compact_mode, set_confirm_before_rewind, set_contextual_hint_image_input,
-    set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
-    set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
-    set_custom_model_backend, set_custom_model_base_url, set_custom_model_context_window,
-    set_custom_model_env_key, set_custom_model_id, set_custom_model_name,
-    set_custom_model_provider, set_custom_model_save, set_custom_model_slug, set_deepseek_api_key,
-    set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
-    set_enter_steers, set_fireworks_api_key, set_follow_up_behavior, set_fork_secondary_model,
-    set_gemini_api_key, set_group_tool_verbs, set_hunk_tracker_mode, set_image_generation_provider,
-    set_invert_scroll, set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key,
-    set_local_feature_flag, set_max_thoughts_width, set_memory_model, set_meta_api_key,
-    set_multiline_mode, set_opencode_go_api_key, set_opencode_go_enabled_models,
-    set_openrouter_api_key, set_openrouter_enabled_models, set_page_flip_on_send,
-    set_perplexity_api_key, set_perplexity_web_search, set_prompt_suggestions, set_recap_model,
+    clear_perplexity_api_key, clear_recap_model, clear_runinfra_api_key,
+    clear_subagent_model_inheritance, clear_wafer_api_key, clear_zai_api_key, delete_custom_model,
+    preview_auto_dark_theme, preview_auto_light_theme, preview_theme, refresh_custom_models,
+    refresh_opencode_go_models, refresh_openrouter_models, set_ask_user_question_timeout_enabled,
+    set_auto_dark_theme, set_auto_light_theme, set_auto_update, set_code_mode,
+    set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
+    set_confirm_before_rewind, set_contextual_hint_image_input, set_contextual_hint_plan_mode,
+    set_contextual_hint_send_now, set_contextual_hint_small_screen, set_contextual_hint_ssh_wrap,
+    set_contextual_hint_undo, set_contextual_hint_word_select, set_custom_model_backend,
+    set_custom_model_base_url, set_custom_model_context_window, set_custom_model_env_key,
+    set_custom_model_id, set_custom_model_name, set_custom_model_provider, set_custom_model_save,
+    set_custom_model_slug, set_deepseek_api_key, set_default_model,
+    set_default_selected_permission, set_display_refresh_auto_cadence, set_enter_steers,
+    set_fireworks_api_key, set_follow_up_behavior, set_fork_secondary_model, set_gemini_api_key,
+    set_group_tool_verbs, set_hunk_tracker_mode, set_image_generation_provider, set_invert_scroll,
+    set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key, set_local_feature_flag,
+    set_max_thoughts_width, set_memory_model, set_meta_api_key, set_multiline_mode,
+    set_opencode_go_api_key, set_opencode_go_enabled_models, set_openrouter_api_key,
+    set_openrouter_enabled_models, set_page_flip_on_send, set_perplexity_api_key,
+    set_perplexity_web_search, set_prompt_suggestions, set_recap_model,
     set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds,
     set_runinfra_api_key, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
-    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_stream_tool_calls, set_theme,
-    set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
-    set_voice_stt_language, set_wafer_api_key, set_web_search_source, set_x_search_enabled,
-    set_zai_api_key,
+    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_stream_tool_calls,
+    set_subagent_model_inheritance, set_theme, set_timeline, set_timestamps, set_vim_mode,
+    set_voice_capture_mode, set_voice_keybind_enabled, set_voice_stt_language, set_wafer_api_key,
+    set_web_search_source, set_x_search_enabled, set_zai_api_key,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette,
@@ -170,7 +183,20 @@ pub(super) fn dispatch_copy_auth_url(
 /// arm into a handler: as a delegation its `return`s become plain arm values
 /// and start flowing through the tail. The fat inline arms stayed inline for
 /// this reason; audit an arm's `return`s before moving it.
+/// Every action enters here, including the nested dispatches a slash command or task result issues.
+/// Only the outermost call shows the image notices the whole tree queued, so a nested action's own
+/// toast cannot bury them and one submission yields one message.
 pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
+    app.dispatch_depth = app.dispatch_depth.saturating_add(1);
+    let effects = dispatch_inner(action, app);
+    app.dispatch_depth = app.dispatch_depth.saturating_sub(1);
+    if app.dispatch_depth == 0 {
+        flush_image_notices(app);
+    }
+    effects
+}
+
+fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
     app.reconcile_foreign_resume_launch();
     let effects = match action {
         Action::Quit | Action::QuitConfirmed => {
@@ -206,6 +232,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             super::dispatch_initial_prompt(app, prompt)
         }
         Action::RelaunchInScreenMode { minimal } => {
+            if !crate::app::screen_mode_relaunch::exec_switch_forced() {
+                app.pending_screen_mode_switch = Some(if minimal {
+                    crate::app::ScreenMode::Minimal
+                } else {
+                    crate::app::ScreenMode::Fullscreen
+                });
+                return vec![];
+            }
             if let Some(session_id) = app.active_session_id().map(str::to_owned) {
                 app.relaunch = Some(crate::app::app_view::ScreenModeRelaunch {
                     minimal,
@@ -296,7 +330,24 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         } => dispatch_startup_fork_session(app, parent_session_id, parent_cwd, new_session_id),
         Action::FetchSessionList => dispatch_fetch_session_list(app),
         Action::CycleSessionSourceFilter => dispatch_cycle_session_source_filter(app),
-        Action::ShowSessionPicker => dispatch_show_session_picker(app),
+        Action::ShowSessionPicker => {
+            if app.workspace_dashboard_enabled
+                && matches!(app.active_view, ActiveView::AgentDashboard)
+            {
+                dispatch_dashboard_open_session_picker(app)
+            } else {
+                dispatch_show_session_picker(app)
+            }
+        }
+        Action::ShowSessionPickerFor(argument) => {
+            if app.workspace_dashboard_enabled
+                && matches!(app.active_view, ActiveView::AgentDashboard)
+            {
+                super::dashboard::dispatch_dashboard_open_session_picker_for(app, argument)
+            } else {
+                super::session::load::dispatch_show_session_picker_for(app, argument)
+            }
+        }
         Action::SessionPickerClosed => dispatch_session_picker_closed(app),
         Action::PickSession(index) => dispatch_pick_session(app, index),
         Action::PickSessionInWorktree(index) => dispatch_pick_session_in_worktree(app, index),
@@ -311,12 +362,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             }
             use crate::views::modal::ActiveModal;
-            let detail_generation = app.session_picker_detail_generation;
+            use crate::views::session_picker_surface::SessionPickerHost;
             let from_modal = if let Some(agent) = get_active_agent_mut(app) {
                 if let Some(ActiveModal::SessionPicker {
                     entries: Some(ref entries),
                     ref mut state,
                     ref content_results,
+                    generation,
+                    detail_seq,
                     ..
                 }) = agent.active_modal
                 {
@@ -332,10 +385,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                         let entry = &entries[idx];
                         if native_source && entry.card_detail.is_none() {
                             return vec![Effect::LoadCardDetail {
+                                host: SessionPickerHost::AgentModal,
+                                generation,
                                 source: entry.source.clone(),
                                 session_id: entry.id.clone(),
                                 cwd: entry.cwd.clone(),
-                                generation: detail_generation,
+                                seq: detail_seq,
                             }];
                         }
                         return vec![];
@@ -380,10 +435,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     && entry.card_detail.is_none()
                 {
                     return vec![Effect::LoadCardDetail {
+                        host: SessionPickerHost::Welcome,
+                        generation: app.session_picker_generation,
                         source: entry.source.clone(),
                         session_id: entry.id.clone(),
                         cwd: entry.cwd.clone(),
-                        generation: detail_generation,
+                        seq: app.session_picker_detail_seq,
                     }];
                 }
             } else if native_source
@@ -405,10 +462,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SendSlashCommandPreservingDraft(text) => {
             dispatch_send_prompt_inner(app, text, false, false, false)
         }
-        Action::Interject { text, images } => dispatch_interject(app, text, images),
-        Action::SendPromptNow { text, images } => {
-            super::interject::dispatch_send_prompt_now(app, text, images)
+        Action::Interject { text, images } => {
+            super::queue::with_held_queue_flush(app, |app| dispatch_interject(app, text, images))
         }
+        Action::SendPromptNow {
+            text,
+            images,
+            image_notice,
+        } => super::interject::dispatch_send_prompt_now(app, text, images, image_notice),
         Action::EnableVoiceMode => dispatch_enable_voice_mode(app, true),
         Action::VoiceToggle => dispatch_voice_toggle(app),
         Action::VoiceStop => dispatch_voice_stop(app),
@@ -418,6 +479,24 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowWordSelectTip => dispatch_show_word_select_tip(app),
         Action::AcceptWordSelectTip => dispatch_accept_word_select_tip(app),
         Action::DrainQueue => dispatch_drain_queue(app),
+        Action::PromptBlockAnswered { row_id, choice } => {
+            with_active_agent(app, |agent| match choice {
+                crate::app::actions::PromptBlockChoice::Edit => {
+                    agent.enter_queue_edit(row_id, false, None);
+                }
+                crate::app::actions::PromptBlockChoice::Resend => {
+                    agent.release_hook_block_hold();
+                }
+                crate::app::actions::PromptBlockChoice::Discard => {
+                    if let Some(removed) = agent.remove_local_queue_row(row_id) {
+                        for image in &removed.images {
+                            crate::prompt_images::cleanup_temp_file(image);
+                        }
+                    }
+                }
+            });
+            dispatch_drain_queue(app)
+        }
         Action::QueueRemoveShared {
             id,
             expected_version,
@@ -751,17 +830,22 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
-            if let Some(ref mut modal) = agent.extensions_modal {
-                modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-                modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
-            }
             let Some(session_id) = agent.session.session_id.clone() else {
                 return vec![];
             };
+            let Some(ref mut modal) = agent.extensions_modal else {
+                return vec![];
+            };
+            modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
+            modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
+            let refresh = modal.active_tab == crate::views::extensions_modal::ExtensionsTab::Skills;
+            let fetch = modal.next_skills_fetch();
             vec![
                 Effect::FetchSkillsList {
                     agent_id: id,
                     session_id: session_id.clone(),
+                    refresh,
+                    fetch,
                 },
                 Effect::FetchWorkflowsList {
                     agent_id: id,
@@ -876,15 +960,20 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
             };
-            let Some(agent) = app.agents.get(&id) else {
+            let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
             let Some(session_id) = agent.session.session_id.clone() else {
                 return vec![];
             };
+            let Some(modal) = agent.extensions_modal.as_mut() else {
+                return vec![];
+            };
+            let fetch = modal.next_skills_fetch();
             vec![Effect::ToggleSkill {
                 agent_id: id,
                 session_id,
+                fetch,
                 skill_name,
                 enabled,
             }]
@@ -943,6 +1032,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if agent.session.pending_context_switch.is_some() {
+                agent.show_toast("Finishing the context-window change before switching models…");
+                return vec![];
+            }
             if agent.session.model_switch_pending && agent.session.provider_rebind_pending {
                 agent.show_toast("Finishing the Kimi service change before switching models…");
                 return vec![];
@@ -983,6 +1076,89 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 effort,
                 service_tier,
                 prev_model_id: None,
+            }]
+        }
+        Action::SwitchModelWithWindow {
+            model_id,
+            effort,
+            window,
+        } => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get_mut(&id) else {
+                return vec![];
+            };
+            if agent.session.model_switch_pending || agent.session.provider_rebind_pending {
+                agent.show_toast("Wait for the current model change to finish.");
+                return vec![];
+            }
+            let Some(session_id) = agent.session.session_id.clone() else {
+                agent.show_toast("No active session yet; retry once it starts.");
+                return vec![];
+            };
+            if !agent
+                .session
+                .models
+                .context_window_options_for(&model_id)
+                .contains(&window.get())
+            {
+                agent.show_toast("This model does not support that context window.");
+                return vec![];
+            }
+            let source_model_id = agent.session.models.current.clone();
+            agent.session.model_switch_pending = true;
+            let request_id = next_context_switch_id();
+            agent.session.pending_context_switch =
+                Some((session_id.clone(), model_id.clone(), window, request_id));
+            vec![Effect::SwitchModelWithWindow {
+                agent_id: id,
+                request_id,
+                session_id,
+                model_id,
+                source_model_id,
+                effort,
+                window,
+            }]
+        }
+        Action::SwitchContextWindow { window } => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get_mut(&id) else {
+                return vec![];
+            };
+            if agent.session.model_switch_pending || agent.session.provider_rebind_pending {
+                agent.show_toast("Wait for the current model change to finish.");
+                return vec![];
+            }
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return vec![];
+            };
+            let Some(model_id) = agent.session.models.current.clone() else {
+                return vec![];
+            };
+            if !agent
+                .session
+                .models
+                .context_window_options()
+                .contains(&window.get())
+            {
+                agent.show_toast("This model does not support that context window.");
+                return vec![];
+            }
+            let effort = agent.session.models.reasoning_effort;
+            agent.session.model_switch_pending = true;
+            let request_id = next_context_switch_id();
+            agent.session.pending_context_switch =
+                Some((session_id.clone(), model_id.clone(), window, request_id));
+            vec![Effect::SwitchContextWindow {
+                agent_id: id,
+                request_id,
+                session_id,
+                model_id,
+                effort,
+                window,
             }]
         }
         Action::AnnouncementsHide => {
@@ -1113,8 +1289,17 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             }
             effects
         }
-        Action::OpenFeedbackPane => dispatch_open_feedback_pane(app),
-        Action::SendFeedback(text) => dispatch_send_feedback(app, text),
+        Action::OpenFeedbackPane { prefill, images } => {
+            dispatch_open_feedback_pane(app, prefill, images)
+        }
+        Action::OpenFeedbackModal(open) => dispatch_open_feedback_modal(app, open),
+        Action::SubmitFeedbackModal { modal_id } => dispatch_submit_feedback_modal(app, modal_id),
+        Action::RequestFeedbackDraft { request } => dispatch_request_feedback_draft(app, request),
+        Action::SendFeedback {
+            text,
+            images,
+            trace: _,
+        } => dispatch_send_feedback(app, text, images),
         Action::EnterRememberMode => dispatch_enter_remember_mode(app),
         Action::SendRememberNote(text) => dispatch_send_remember_note(app, text),
         Action::SaveRememberNoteFromModal => dispatch_save_remember_note_from_modal(app),
@@ -1132,12 +1317,20 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetAskUserQuestionTimeoutEnabled(v) => {
             set_ask_user_question_timeout_enabled(app, v)
         }
+        Action::SetSubagentModelInheritance(v) => set_subagent_model_inheritance(app, v),
+        Action::ClearSubagentModelInheritance => clear_subagent_model_inheritance(app),
         Action::SetKeepTextSelection(v) => set_keep_text_selection(app, v),
         Action::SetScrollSpeed(v) => set_scroll_speed(app, v),
         Action::SetScrollMode(v) => set_scroll_mode(app, v),
         Action::SetInvertScroll(v) => set_invert_scroll(app, v),
         Action::SetScrollLines(v) => set_scroll_lines(app, v),
         Action::SetShowThinkingBlocks(v) => set_show_thinking_blocks(app, v),
+        Action::SetCodexPersistentMode(value) => {
+            super::settings::setters::set_codex_behavior(app, "codex_persistent_mode", value)
+        }
+        Action::SetCodexGuardianReview(value) => {
+            super::settings::setters::set_codex_behavior(app, "codex_guardian_review", value)
+        }
         Action::SetStreamToolCalls(v) => set_stream_tool_calls(app, v),
         Action::SetGroupToolVerbs(v) => set_group_tool_verbs(app, v),
         Action::SetCollapsedEditBlocks(v) => set_collapsed_edit_blocks(app, v),
@@ -1158,6 +1351,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetTimestamps(v) => set_timestamps(app, v),
         Action::SetTimeline(v) => set_timeline(app, v),
         Action::SetPageFlipOnSend(v) => set_page_flip_on_send(app, v),
+        Action::SetDashboardPreview(enabled) => {
+            crate::app::dispatch::settings::dashboard::set_dashboard_preview(app, enabled)
+        }
         Action::SetConfirmBeforeRewind(v) => set_confirm_before_rewind(app, v),
         Action::SetCombineQueuedPrompts(v) => set_combine_queued_prompts(app, v),
         Action::SetFollowUpBehavior(v) => set_follow_up_behavior(app, v),
@@ -1209,10 +1405,20 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetCustomModelName(value) => set_custom_model_name(app, value),
         Action::SetCustomModelProvider(value) => set_custom_model_provider(app, value),
         Action::SetCustomModelBaseUrl(value) => set_custom_model_base_url(app, value),
+        Action::SetCustomModelMaxContextWindow(value) => {
+            super::settings::setters::set_custom_model_max_context_window(app, value)
+        }
         Action::SetCustomModelContextWindow(value) => set_custom_model_context_window(app, value),
         Action::SetCustomModelBackend(value) => set_custom_model_backend(app, value),
         Action::SetCustomModelEnvKey(value) => set_custom_model_env_key(app, value),
         Action::SetCustomModelSave(save) => set_custom_model_save(app, save),
+        Action::SetCustomProviderWizard(open) => set_custom_provider_wizard(app, open),
+        Action::OpenCustomProviderWizard => open_custom_provider_wizard(app),
+        Action::CloseCustomProviderWizard => close_custom_provider_wizard(app),
+        Action::CustomProviderDiscover => custom_provider_discover(app),
+        Action::CustomProviderSave => custom_provider_save(app),
+        Action::CustomProviderWizardKey(key) => custom_provider_key(app, key),
+        Action::CustomProviderWizardPaste(text) => custom_provider_paste(app, &text),
         Action::DeleteCustomModel { key } => delete_custom_model(app, key),
         Action::RefreshCustomModels => refresh_custom_models(app),
         Action::SetPerplexityWebSearch(enabled) => set_perplexity_web_search(app, enabled),
@@ -1229,8 +1435,6 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetShowTips(v) => set_show_tips(app, v),
         Action::SetAutoUpdate(v) => set_auto_update(app, v),
         Action::SetDisplayRefreshAutoCadence(v) => set_display_refresh_auto_cadence(app, v),
-        Action::SetAntigravitySubagents(v) => set_antigravity_subagents(app, v),
-        Action::SetAntigravitySkipPermissions(v) => set_antigravity_skip_permissions(app, v),
         Action::PreviewTheme(v) => preview_theme(app, v),
         Action::PreviewAutoDarkTheme(v) => preview_auto_dark_theme(app, v),
         Action::PreviewAutoLightTheme(v) => preview_auto_light_theme(app, v),
@@ -1248,9 +1452,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PermissionCancel => dispatch_permission_cancel(app),
         Action::Logout => dispatch_logout(app),
         Action::LogoutCodex => dispatch_logout_codex(app),
+        Action::LogoutAntigravity => dispatch_antigravity_auth(app, true),
         Action::SwitchAccount => dispatch_switch_account(app),
         Action::CheckSubscription => vec![Effect::CheckSubscription { verify: None }],
         Action::OpenSupergrokUrl => dispatch_open_supergrok_url(app),
+        Action::RetryCreditLimitPrompt => super::billing::dispatch_retry_credit_limit_prompt(app),
         Action::OpenUrl(url) => {
             if url.starts_with("file://") {
                 let opened = url::Url::parse(&url)
@@ -1311,6 +1517,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenGeminiApiKeyEditor => dispatch_open_gemini_api_key_editor(app),
         Action::Login => dispatch_login(app),
         Action::LoginCodex => dispatch_login_codex(app),
+        Action::LoginAntigravity => dispatch_antigravity_auth(app, false),
         Action::ChooseStartupCodex => dispatch_choose_startup_codex(app),
         Action::ChooseStartupXai => dispatch_choose_startup_xai(app),
         Action::CancelLogin => dispatch_cancel_login(app),
@@ -1371,12 +1578,19 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             persist_mode,
         } => {
             let mut effects = dispatch_fork_resolved(app, worktree, directive);
-            apply_persist_worktree_mode(
-                &mut app.fork_worktree_mode,
-                &mut effects,
-                persist_mode,
-                "fork_worktree_mode",
-            );
+            if effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::ForkSession { .. } | Effect::CreateWorktreeSession { .. }
+                )
+            }) {
+                apply_persist_worktree_mode(
+                    &mut app.fork_worktree_mode,
+                    &mut effects,
+                    persist_mode,
+                    "fork_worktree_mode",
+                );
+            }
             effects
         }
         Action::NewSessionAnswered {
@@ -1432,19 +1646,57 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PersistMemoryFullscreen(fs) => {
             vec![Effect::PersistMemoryFullscreen { fullscreen: fs }]
         }
+        Action::MemoryForget {
+            path,
+            expected_content_hash,
+        } => {
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get(&id)
+                && let Some(session_id) = agent.session.session_id.clone()
+            {
+                return vec![Effect::MemoryForget {
+                    agent_id: id,
+                    session_id,
+                    path,
+                    expected_content_hash,
+                }];
+            }
+            vec![]
+        }
         Action::OpenMemoryModal => {
             if let ActiveView::Agent(id) = app.active_view
                 && let Some(agent) = app.agents.get(&id)
                 && let Some(session_id) = agent.session.session_id.clone()
             {
-                return vec![Effect::SendPrompt {
+                return vec![Effect::FetchMemoryList {
                     agent_id: id,
                     session_id,
-                    text: "/memory".to_string(),
-                    prompt_id: uuid::Uuid::new_v4().to_string(),
-                    skill_token_ranges: Vec::new(),
                 }];
             }
+            vec![]
+        }
+        Action::MemoryToggle { enabled } => {
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get(&id)
+                && let Some(session_id) = agent.session.session_id.clone()
+            {
+                return vec![Effect::MemoryToggle {
+                    agent_id: id,
+                    session_id,
+                    enabled,
+                }];
+            }
+            vec![]
+        }
+        Action::MemoryCopy { text } => {
+            let delivery = crate::clipboard::copy_text_or_file(&text);
+            with_active_agent(app, |agent| {
+                if let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+                {
+                    state.report_copy(&delivery);
+                }
+            });
             vec![]
         }
         Action::OpenGboom => dispatch_open_gboom(app),
@@ -1492,11 +1744,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::DashboardCycleMode => {
             let policy_block = app.yolo_policy_block;
             if let Some(d) = app.dashboard.as_mut() {
-                d.pending_mode = d.pending_mode.cycle();
+                d.pending_mode = d.pending_mode.cycle(app.auto_mode_gate);
                 if d.pending_mode == crate::views::dashboard::DashboardDispatchMode::AlwaysApprove
                     && let Some(warning) = policy_block
                 {
-                    d.pending_mode = d.pending_mode.cycle();
+                    d.pending_mode = d.pending_mode.cycle(app.auto_mode_gate);
                     d.set_error_toast(warning);
                 }
             }
@@ -1548,6 +1800,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             dispatch_dashboard_create_new_agent_with_detail(app)
         }
         Action::DashboardOpenLocationPicker => dispatch_dashboard_open_location_picker(app),
+        Action::DashboardCloseSessionPicker => dispatch_dashboard_close_session_picker(app),
+        Action::DashboardPickSession(index) => dispatch_dashboard_pick_session(app, index),
         Action::DashboardCloseLocationPicker => {
             if let Some(d) = app.dashboard.as_mut() {
                 if let Some(wt) = d.location_picker.as_ref().map(|lp| lp.worktree_mode) {
@@ -1613,14 +1867,69 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RewindCancelOffer => dispatch_rewind_cancel_offer(app),
         Action::RewindDismiss => dispatch_rewind_dismiss(app),
         Action::RewindDismissError => dispatch_rewind_dismiss_error(app),
-        Action::InlineEditSubmit => dispatch_inline_edit_submit(app),
         Action::JumpShowPicker => dispatch_jump_show_picker(app),
         Action::JumpPickerSelect(entry_id) => dispatch_jump_picker_select(app, entry_id),
         Action::JumpDismiss => dispatch_jump_dismiss(app),
     };
+    restore_stash_where_the_draft_was_consumed(app);
     app.reconcile_foreign_resume_launch();
     sync_sleep_inhibitor(app);
     effects
+}
+
+/// Show the image notices queued so far as one message on the visible surface; true when a surface
+/// changed. The command that queued them may have navigated away (`/home`, `/new`), so the
+/// originating agent's own toast could be off-screen or gone.
+pub(crate) fn flush_image_notices(app: &mut AppView) -> bool {
+    if app.pending_image_notices.is_empty() {
+        return false;
+    }
+    if !app.screen_mode.is_minimal() {
+        let message = join_image_notices(&mut app.pending_image_notices);
+        app.show_toast(&message);
+        return true;
+    }
+    let target = match app.active_view {
+        ActiveView::Agent(id) => app.agents.get_mut(&id),
+        _ => app.agents.values_mut().next(),
+    };
+    let Some(agent) = target else {
+        return false;
+    };
+    let message = join_image_notices(&mut app.pending_image_notices);
+    agent
+        .scrollback
+        .push_block(crate::scrollback::block::RenderBlock::system(message));
+    true
+}
+
+/// Drain the queued notices into one `; `-joined message, dropping repeats.
+fn join_image_notices(pending: &mut Vec<String>) -> String {
+    let mut notices: Vec<String> = Vec::new();
+    for notice in pending.drain(..) {
+        if !notices.contains(&notice) {
+            notices.push(notice);
+        }
+    }
+    notices.join("; ")
+}
+
+fn restore_stash_where_the_draft_was_consumed(app: &mut AppView) {
+    let ActiveView::Agent(id) = app.active_view else {
+        return;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return;
+    };
+    if let Some(child_sid) = agent.active_subagent.clone()
+        && let Some(child) = agent.subagent_views.get_mut(&child_sid)
+        && child.take_draft_consumed()
+    {
+        child.auto_restore_stash_after_send();
+    }
+    if agent.take_draft_consumed() {
+        agent.auto_restore_stash_after_send();
+    }
 }
 pub(super) fn dispatch_action_result(
     app: &mut AppView,
@@ -1729,6 +2038,11 @@ pub(super) fn dispatch_action_result(
             | OutcomeStatus::NotFound
             | OutcomeStatus::InternalError
             | OutcomeStatus::Unsupported => {
+                let reload_session = if outcome.requires_reload {
+                    agent.session.session_id.clone()
+                } else {
+                    None
+                };
                 if let Some(ref mut modal) = agent.extensions_modal {
                     modal.pending_action = None;
                     modal.pending_entry_index = None;
@@ -1736,7 +2050,14 @@ pub(super) fn dispatch_action_result(
                         crate::views::extensions_modal::ModalMessage::Error(outcome.message),
                     );
                 }
-                vec![]
+                reload_session
+                    .into_iter()
+                    .map(|session_id| Effect::PluginsAction {
+                        agent_id,
+                        session_id,
+                        action: xai_hooks_plugins_types::PluginsAction::Reload,
+                    })
+                    .collect()
             }
         },
     }

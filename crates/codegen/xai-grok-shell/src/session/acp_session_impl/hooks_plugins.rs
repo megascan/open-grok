@@ -1,5 +1,191 @@
 use super::*;
 
+pub(super) const MANAGED_HOOKS_ONLY_REFUSAL: &str =
+    "Hooks outside managed policy are disabled by your organization.";
+
+fn plugin_update_action(plugin_id: Option<&str>) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::update_plugins;
+    plugin_update_action_with(plugin_id, update_plugins)
+}
+
+fn plugin_update_action_with(
+    plugin_id: Option<&str>,
+    update: impl FnOnce(
+        Option<&str>,
+    )
+        -> Result<Vec<crate::plugin::RepoUpdateOutcome>, crate::plugin::UpdateError>,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    use crate::plugin::RepoUpdateOutcome;
+    use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
+
+    let name = plugin_id.map(|id| id.rsplit('/').next().unwrap_or(id));
+    let outcomes = match update(name) {
+        Ok(outcomes) if !outcomes.is_empty() => outcomes,
+        Ok(_) => {
+            return ActionOutcome {
+                status: OutcomeStatus::NotFound,
+                message: "No installed plugins to update.".into(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+        Err(error) => {
+            return ActionOutcome {
+                status: OutcomeStatus::NotFound,
+                message: error.to_string(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
+    let mut messages = Vec::new();
+    let mut any_updated = false;
+    let mut any_failed = false;
+    for outcome in outcomes {
+        match outcome {
+            RepoUpdateOutcome::Updated { repo_key, .. } => {
+                any_updated = true;
+                messages.push(format!("{repo_key}: updated"));
+            }
+            RepoUpdateOutcome::AlreadyUpToDate { repo_key } => {
+                messages.push(format!("{repo_key}: already up to date"))
+            }
+            RepoUpdateOutcome::Pinned { repo_key, ref_name } => {
+                messages.push(format!("{repo_key}: pinned to {ref_name}"))
+            }
+            RepoUpdateOutcome::LiveLocal { repo_key } => {
+                messages.push(format!("{repo_key}: local install (already current)"))
+            }
+            RepoUpdateOutcome::Failed { repo_key, error } => {
+                any_failed = true;
+                messages.push(format!("{repo_key}: update failed: {error}"));
+            }
+        }
+    }
+    ActionOutcome {
+        status: if any_failed {
+            OutcomeStatus::InternalError
+        } else {
+            OutcomeStatus::Success
+        },
+        message: messages.join("\n"),
+        requires_reload: any_updated,
+        requires_restart: false,
+    }
+}
+
+#[cfg(test)]
+mod plugin_update_tests {
+    use super::*;
+    use crate::plugin::{PluginUpdateSelector, update_plugins_from_registry};
+    use xai_grok_agent::plugins::git_install::{InstallSource, install_and_register};
+    use xai_grok_agent::plugins::install_registry::{InstallKind, InstallRegistry};
+    use xai_hooks_plugins_types::OutcomeStatus;
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_update_persists_git_commit_and_reports_up_to_date_on_retry() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "--initial-branch=main", "--quiet"]);
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"demo","version":"1"}"#,
+        )
+        .unwrap();
+        git(origin.path(), &["add", "-A"]);
+        git(origin.path(), &["commit", "-m", "one", "--quiet"]);
+        let store = tempfile::tempdir().unwrap();
+        let mut registry = InstallRegistry::empty(store.path().to_path_buf());
+        let source = InstallSource::Git {
+            url: format!("file://{}", origin.path().display()),
+            git_ref: Some("main".into()),
+            git_sha: None,
+            subdir: None,
+        };
+        let installed = install_and_register(&source, &mut registry, false, None, None).unwrap();
+        let old = registry.get_repo(&installed.repo_key).unwrap().clone();
+        std::fs::write(
+            origin.path().join("plugin.json"),
+            r#"{"name":"demo","version":"2"}"#,
+        )
+        .unwrap();
+        git(origin.path(), &["add", "-A"]);
+        git(origin.path(), &["commit", "-m", "two", "--quiet"]);
+        let outcome = plugin_update_action_with(Some("demo"), |name| {
+            update_plugins_from_registry(
+                &mut registry,
+                name.map(|n| PluginUpdateSelector::PluginName(n.to_owned())),
+                false,
+            )
+        });
+        assert_eq!(outcome.status, OutcomeStatus::Success);
+        assert!(outcome.requires_reload);
+        let disk = InstallRegistry::try_load_from(store.path().to_path_buf()).unwrap();
+        let current = disk.get_repo(&installed.repo_key).unwrap();
+        assert!(
+            matches!((&old.kind, &current.kind), (InstallKind::Git { commit: old, .. }, InstallKind::Git { commit: new, .. }) if old != new)
+        );
+        assert_eq!(
+            current.plugins.get("demo").unwrap().version.as_deref(),
+            Some("2")
+        );
+        let outcome = plugin_update_action_with(Some("demo"), |name| {
+            update_plugins_from_registry(
+                &mut registry,
+                name.map(|n| PluginUpdateSelector::PluginName(n.to_owned())),
+                false,
+            )
+        });
+        assert_eq!(outcome.status, OutcomeStatus::Success);
+        assert!(!outcome.requires_reload);
+        assert!(outcome.message.contains("already up to date"));
+    }
+
+    #[test]
+    fn partial_failure_still_requests_reload() {
+        use crate::plugin::RepoUpdateOutcome;
+        let outcome = plugin_update_action_with(None, |_| {
+            Ok(vec![
+                RepoUpdateOutcome::Updated {
+                    repo_key: "a".into(),
+                    old_commit: None,
+                    new_commit: None,
+                },
+                RepoUpdateOutcome::Failed {
+                    repo_key: "b".into(),
+                    error: "failure".into(),
+                },
+            ])
+        });
+        assert_eq!(outcome.status, OutcomeStatus::InternalError);
+        assert!(outcome.requires_reload);
+    }
+}
+
 impl SessionActor {
     // ── Shared hook/plugin operation functions ────────────────────────
 
@@ -12,7 +198,7 @@ impl SessionActor {
                     "Not in a git repository. Project hooks require a git worktree root."
                         .to_string()
                 })?;
-        crate::agent::folder_trust::grant_folder_trust(&root);
+        xai_grok_workspace::folder_trust::grant_folder_trust(&root);
         Ok(root)
     }
 
@@ -80,6 +266,37 @@ impl SessionActor {
         } else {
             p.to_path_buf()
         }
+    }
+
+    pub(super) fn is_managed_policy_hook(&self, name: &str) -> bool {
+        self.hook_registry
+            .borrow()
+            .as_ref()
+            .is_some_and(|registry| {
+                registry
+                    .find_by_name(name)
+                    .is_some_and(|spec| spec.is_managed_policy())
+            })
+    }
+
+    /// Under `allow_managed_hooks_only`, enabling anything outside managed policy is refused; the one rule for the per-hook and per-source enable.
+    /// Managed hooks pass: the pin never blocks them, so enabling one changes nothing at dispatch.
+    fn refuse_enable_under_managed_only<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<xai_hooks_plugins_types::ActionOutcome> {
+        if !self.hook_disabled.borrow().managed_only() {
+            return None;
+        }
+        names
+            .into_iter()
+            .any(|name| !self.is_managed_policy_hook(name))
+            .then(|| xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::ValidationError,
+                message: MANAGED_HOOKS_ONLY_REFUSAL.to_owned(),
+                requires_reload: false,
+                requires_restart: false,
+            })
     }
 
     // ── Hooks/plugins action handlers (pager modal) ──────────────────
@@ -188,12 +405,18 @@ impl SessionActor {
                     };
                 }
                 match crate::config::remove_hooks_path(&path) {
-                    Ok(()) => ActionOutcome {
+                    Ok(true) => ActionOutcome {
                         status: OutcomeStatus::Success,
                         message: {
                             let reload_msg = self.reload_hooks_impl().await;
                             format!("Removed hook path: {path}.\n{reload_msg}")
                         },
+                        requires_reload: false,
+                        requires_restart: false,
+                    },
+                    Ok(false) => ActionOutcome {
+                        status: OutcomeStatus::NotFound,
+                        message: "Only user-added hook directories can be removed here.".to_owned(),
                         requires_reload: false,
                         requires_restart: false,
                     },
@@ -206,10 +429,19 @@ impl SessionActor {
                 }
             }
             HooksAction::Disable { hook_name } => {
+                if self.is_managed_policy_hook(&hook_name) {
+                    return ActionOutcome {
+                        status: OutcomeStatus::ValidationError,
+                        message: "This hook is enforced by managed policy and cannot be disabled."
+                            .to_owned(),
+                        requires_reload: false,
+                        requires_restart: false,
+                    };
+                }
                 match xai_grok_hooks::trust::disable_hook(&hook_name) {
                     Ok(()) => ActionOutcome {
                         status: OutcomeStatus::Success,
-                        message: format!("Disabled hook: {hook_name}"),
+                        message: "Hook disabled.".to_owned(),
                         requires_reload: false,
                         requires_restart: false,
                     },
@@ -222,16 +454,19 @@ impl SessionActor {
                 }
             }
             HooksAction::Enable { hook_name } => {
+                if let Some(refused) = self.refuse_enable_under_managed_only([hook_name.as_str()]) {
+                    return refused;
+                }
                 match xai_grok_hooks::trust::enable_hook(&hook_name) {
                     Ok(true) => ActionOutcome {
                         status: OutcomeStatus::Success,
-                        message: format!("Enabled hook: {hook_name}"),
+                        message: "Hook enabled.".to_owned(),
                         requires_reload: false,
                         requires_restart: false,
                     },
                     Ok(false) => ActionOutcome {
                         status: OutcomeStatus::NotFound,
-                        message: format!("Hook was not disabled: {hook_name}"),
+                        message: "Hook was not disabled.".to_owned(),
                         requires_reload: false,
                         requires_restart: false,
                     },
@@ -247,21 +482,38 @@ impl SessionActor {
                 hook_names,
                 disable,
             } => {
+                if !disable
+                    && let Some(refused) =
+                        self.refuse_enable_under_managed_only(hook_names.iter().map(String::as_str))
+                {
+                    return refused;
+                }
                 let mut toggled = 0usize;
+                let mut managed_skipped = 0usize;
                 for name in &hook_names {
+                    if disable && self.is_managed_policy_hook(name) {
+                        managed_skipped += 1;
+                        continue;
+                    }
                     let ok = if disable {
                         xai_grok_hooks::trust::disable_hook(name).is_ok()
                     } else {
-                        xai_grok_hooks::trust::enable_hook(name).is_ok()
+                        xai_grok_hooks::trust::enable_hook(name) == Ok(true)
                     };
                     if ok {
                         toggled += 1;
                     }
                 }
                 let action = if disable { "Disabled" } else { "Enabled" };
+                let mut message = format!("{action} {toggled}/{} hooks", hook_names.len());
+                if managed_skipped > 0 {
+                    message.push_str(&format!(
+                        " ({managed_skipped} enforced by managed policy, not disabled)"
+                    ));
+                }
                 ActionOutcome {
                     status: OutcomeStatus::Success,
-                    message: format!("{action} {toggled}/{} hooks", hook_names.len()),
+                    message,
                     requires_reload: false,
                     requires_restart: false,
                 }
@@ -305,26 +557,10 @@ impl SessionActor {
                     };
                 }
                 let cwd = std::path::Path::new(&self.session_info.cwd);
-                let install_source =
-                    xai_grok_agent::plugins::git_install::parse_install_source(&source, cwd);
-                let registry = xai_grok_agent::plugins::InstallRegistry::load();
-                match xai_grok_agent::plugins::git_install::install_from_source(
-                    &install_source,
-                    &registry,
-                    crate::plugin::marketplace_require_sha(),
-                ) {
+                match crate::plugin::install_plugin(&source, cwd) {
                     Ok(result) => {
-                        let repo = xai_grok_agent::plugins::git_install::build_installed_repo(
-                            &result,
-                            &install_source,
-                        );
-                        let mut registry = registry;
-                        registry.insert(result.repo_key.clone(), repo);
-                        if let Err(e) = registry.save() {
-                            tracing::warn!("Failed to save install registry: {e}");
-                        }
-                        let (names, post_warnings) =
-                            crate::config::post_install_plugin(&result.repo_key);
+                        let names = result.plugin_names;
+                        let post_warnings = result.warnings;
                         let count = names.len();
                         let mut msg = format!(
                             "Installed {count} plugin(s) from {source}: {}",
@@ -372,7 +608,6 @@ impl SessionActor {
                     },
                     Some((repo_key, repo, _plugin)) => {
                         let repo_key = repo_key.to_string();
-                        let repo_path = repo.path.clone();
                         let plugin_names: Vec<String> = repo.plugins.keys().cloned().collect();
                         let count = plugin_names.len();
 
@@ -390,14 +625,13 @@ impl SessionActor {
                         }
 
                         // Proceed with removal.
-                        if let Err(e) =
-                            xai_grok_agent::plugins::git_install::remove_repo_path(&repo_path)
-                        {
-                            tracing::warn!("Failed to remove repo path: {e}");
-                        }
-                        registry.remove(&repo_key);
-                        if let Err(e) = registry.save() {
-                            tracing::warn!("Failed to save install registry: {e}");
+                        if let Err(e) = registry.uninstall_registered(&repo_key) {
+                            return ActionOutcome {
+                                status: OutcomeStatus::InternalError,
+                                message: format!("Failed to uninstall plugin: {e}"),
+                                requires_reload: false,
+                                requires_restart: false,
+                            };
                         }
                         ActionOutcome {
                             status: OutcomeStatus::Success,
@@ -411,83 +645,7 @@ impl SessionActor {
                     }
                 }
             }
-            PluginsAction::Update { plugin_id } => {
-                let registry = xai_grok_agent::plugins::InstallRegistry::load();
-                let all_repos = registry.list();
-                if all_repos.is_empty() {
-                    return ActionOutcome {
-                        status: OutcomeStatus::NotFound,
-                        message: "No installed plugins to update.".into(),
-                        requires_reload: false,
-                        requires_restart: false,
-                    };
-                }
-
-                let repos_to_update: Vec<(
-                    String,
-                    xai_grok_agent::plugins::install_registry::InstalledRepo,
-                )> = if let Some(ref id) = plugin_id {
-                    let name = id.rsplit('/').next().unwrap_or(id);
-                    match registry.find_plugin(name) {
-                        Some((key, repo, _plugin)) => vec![(key.to_string(), repo.clone())],
-                        None => {
-                            return ActionOutcome {
-                                status: OutcomeStatus::NotFound,
-                                message: format!("Plugin \"{name}\" not found."),
-                                requires_reload: false,
-                                requires_restart: false,
-                            };
-                        }
-                    }
-                } else {
-                    all_repos
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v.clone()))
-                        .collect()
-                };
-
-                let mut messages = Vec::new();
-                let mut any_updated = false;
-                for (key, repo) in &repos_to_update {
-                    match xai_grok_agent::plugins::git_install::update_repo(
-                        key,
-                        repo,
-                        crate::plugin::marketplace_require_sha(),
-                    ) {
-                        Ok(status) => {
-                            use xai_grok_agent::plugins::git_install::UpdateStatus;
-                            match status {
-                                UpdateStatus::Updated(result) => {
-                                    if result.changed {
-                                        any_updated = true;
-                                        messages.push(format!("{key}: updated"));
-                                    } else {
-                                        messages.push(format!("{key}: already up to date"));
-                                    }
-                                }
-                                UpdateStatus::Pinned { ref_name } => {
-                                    messages.push(format!("{key}: pinned to {ref_name}"));
-                                }
-                                UpdateStatus::LiveLocal => {
-                                    messages.push(format!("{key}: local symlink (already live)"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            messages.push(format!("{key}: update failed: {e}"));
-                        }
-                    }
-                }
-                if let Err(e) = registry.save() {
-                    tracing::warn!("Failed to save install registry after update: {e}");
-                }
-                ActionOutcome {
-                    status: OutcomeStatus::Success,
-                    message: messages.join("\n"),
-                    requires_reload: any_updated,
-                    requires_restart: false,
-                }
-            }
+            PluginsAction::Update { plugin_id } => plugin_update_action(plugin_id.as_deref()),
             PluginsAction::Add { path } => {
                 if path.is_empty() {
                     return ActionOutcome {
@@ -694,18 +852,9 @@ impl SessionActor {
         // Extract all RefCell borrows into locals before the .await so
         // no Ref guard is alive across the suspension point.
         {
-            use crate::extensions::hooks::hook_spec_to_info;
-            let hooks = {
-                let reg = self.hook_registry.borrow();
-                match &*reg {
-                    Some(registry) => registry
-                        .all_hooks()
-                        .iter()
-                        .map(|s| hook_spec_to_info(s))
-                        .collect(),
-                    None => Vec::new(),
-                }
-            };
+            let hooks = crate::extensions::hooks::current_hook_infos(
+                self.hook_registry.borrow().as_deref(),
+            );
             let load_errors = self.hook_load_errors.borrow().clone();
             let project_trusted = is_trusted;
             self.send_xai_notification(XaiSessionUpdate::HooksChanged {
@@ -923,11 +1072,16 @@ impl SessionActor {
         // the order-sensitive `update_configs` would cause (merge order is
         // non-deterministic). Mirrors the `UpdateMcpServers` command handler.
         let t_mcp = std::time::Instant::now();
-        let new_mcp_servers = crate::session::managed_mcp::merge_managed_mcp_servers(
-            self.initial_client_mcp_servers.clone(),
-            session_cwd,
-            new_registry_snapshot.as_deref(),
-            &self.rebuild_spec.compat,
+        let client_seed = self.initial_client_mcp_servers.borrow().clone();
+        let new_mcp_servers = crate::session::agent_mcp::rematerialize_with_agent_overlay(
+            crate::session::agent_mcp::RematerializeParams {
+                initial_client_mcp_servers: client_seed,
+                cwd: session_cwd,
+                parent_cwd: self.startup_hints.parent_cwd.as_deref(),
+                plugin_registry: new_registry_snapshot.as_deref(),
+                compat: &self.rebuild_spec.compat,
+                definition: self.agent.borrow().definition(),
+            },
         );
         let (mcp_diff, dispatch_event_tx) = {
             let mut mcp_state = self.mcp_state.lock().await;
@@ -995,19 +1149,9 @@ impl SessionActor {
         // Notification hooks that also borrow these RefCells).
         let t_notify = std::time::Instant::now();
         {
-            use crate::extensions::hooks::hook_spec_to_info;
-
-            let hooks = {
-                let reg = self.hook_registry.borrow();
-                match &*reg {
-                    Some(registry) => registry
-                        .all_hooks()
-                        .iter()
-                        .map(|s| hook_spec_to_info(s))
-                        .collect(),
-                    None => Vec::new(),
-                }
-            };
+            let hooks = crate::extensions::hooks::current_hook_infos(
+                self.hook_registry.borrow().as_deref(),
+            );
             let load_errors = self.hook_load_errors.borrow().clone();
             // Report the folder-trust verdict so the flag matches the gated registry.
             let project_trusted = crate::agent::folder_trust::project_scope_allowed(

@@ -333,21 +333,9 @@ fn setting_row_visible_gates_voice_capture_on_key_releases() {
     let voice = meta_for(&reg, "voice_capture_mode");
     let vim = meta_for(&reg, "vim_mode");
     // voice_mode = true; kitty_releases varies.
-    assert!(!setting_row_visible(voice, false, false, true, true));
-    assert!(setting_row_visible(voice, true, false, true, true));
-    assert!(setting_row_visible(vim, false, false, true, true));
-}
-
-/// The `antigravity_subagents` row is hidden without the CLI installed and
-/// shown with it. Other settings are unaffected by the gate.
-#[test]
-fn setting_row_visible_gates_antigravity_on_cli_presence() {
-    let reg = SettingsRegistry::defaults();
-    let antigravity = meta_for(&reg, "antigravity_subagents");
-    let vim = meta_for(&reg, "vim_mode");
-    assert!(!setting_row_visible(antigravity, true, false, true, false));
-    assert!(setting_row_visible(antigravity, true, false, true, true));
-    assert!(setting_row_visible(vim, true, false, true, false));
+    assert!(!setting_row_visible(voice, false, false, true));
+    assert!(setting_row_visible(voice, true, false, true));
+    assert!(setting_row_visible(vim, false, false, true));
 }
 
 #[test]
@@ -358,47 +346,17 @@ fn setting_row_visible_hides_voice_rows_when_voice_mode_off() {
     let language = meta_for(&reg, "voice_stt_language");
     let vim = meta_for(&reg, "vim_mode");
     // Gate off: all voice rows gone even with kitty releases + full TUI.
-    assert!(!setting_row_visible(keybind, true, false, false, true));
-    assert!(!setting_row_visible(capture, true, false, false, true));
-    assert!(!setting_row_visible(language, true, false, false, true));
+    assert!(!setting_row_visible(keybind, true, false, false));
+    assert!(!setting_row_visible(capture, true, false, false));
+    assert!(!setting_row_visible(language, true, false, false));
     // Non-voice rows unaffected.
-    assert!(setting_row_visible(vim, true, false, false, true));
+    assert!(setting_row_visible(vim, true, false, false));
     // Gate on: all visible (kitty releases for capture).
-    assert!(setting_row_visible(keybind, true, false, true, true));
-    assert!(setting_row_visible(capture, true, false, true, true));
-    assert!(setting_row_visible(language, true, false, true, true));
+    assert!(setting_row_visible(keybind, true, false, true));
+    assert!(setting_row_visible(capture, true, false, true));
+    assert!(setting_row_visible(language, true, false, true));
     // The keybind row (unlike capture) doesn't need key-release reporting.
-    assert!(setting_row_visible(keybind, false, false, true, true));
-}
-
-#[test]
-fn rebuild_rows_drops_antigravity_row_when_cli_absent() {
-    let prev = crate::app::antigravity_cli_present();
-    crate::app::set_antigravity_cli_present_for_test(true);
-    let mut state = make_state();
-    let has_antigravity = |s: &SettingsModalState| {
-        s.rows.iter().any(|r| {
-            matches!(
-                r,
-                RowEntry::Setting {
-                    key: "antigravity_subagents",
-                    ..
-                }
-            )
-        })
-    };
-    assert!(
-        has_antigravity(&state),
-        "antigravity_subagents should be listed with the CLI present"
-    );
-
-    crate::app::set_antigravity_cli_present_for_test(false);
-    state.rebuild_rows();
-    assert!(
-        !has_antigravity(&state),
-        "rebuild after CLI-absent must hide antigravity_subagents"
-    );
-    crate::app::set_antigravity_cli_present_for_test(prev);
+    assert!(setting_row_visible(keybind, false, false, true));
 }
 
 #[test]
@@ -443,17 +401,16 @@ fn setting_row_visible_hides_theme_rows_in_minimal() {
         let meta = meta_for(&reg, key);
         assert!(meta.hidden_in_minimal, "{key} must declare the flag");
         assert!(
-            !setting_row_visible(meta, true, true, true, true),
+            !setting_row_visible(meta, true, true, true),
             "{key} in minimal"
         );
         assert!(
-            setting_row_visible(meta, true, false, true, true),
+            setting_row_visible(meta, true, false, true),
             "{key} in full TUI"
         );
     }
     assert!(setting_row_visible(
         meta_for(&reg, "vim_mode"),
-        true,
         true,
         true,
         true
@@ -754,15 +711,21 @@ fn save_custom_model_with_empty_id_or_slug_does_not_dispatch_upsert() {
     focus_setting(&mut s, "custom_models");
     let entered = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(entered, SettingsKeyOutcome::Changed));
-    // last child is Save custom model
-    for _ in 0..20 {
+    // Walk to the Save toggle by key — the sub-sheet's child list grows with
+    // new draft fields (e.g. the custom-provider wizard trigger), so a
+    // hardcoded index goes stale.
+    let save_idx = group_children(&s, "custom_models")
+        .iter()
+        .position(|key| *key == "custom_model_save")
+        .expect("custom_model_save is a custom_models child");
+    for _ in 0..30 {
         let _ = handle_settings_key(
             &mut s,
             &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         );
         if matches!(
             s.mode(),
-            SettingsModalMode::PickingGroup { child_idx: 9, .. }
+            SettingsModalMode::PickingGroup { child_idx, .. } if child_idx == save_idx
         ) {
             break;
         }
@@ -888,14 +851,14 @@ fn default_registry_contains_meta_api_key_secret() {
     assert!(matches!(meta.kind, SettingKind::Secret));
 }
 
-/// Exhaustive visible-row contract for the default (non-minimal, voice-off,
-/// no-antigravity) settings modal. Pins category headers and every top-level
+/// Exhaustive visible-row contract for the default (non-minimal, voice-off)
+/// settings modal. Pins category headers and every top-level
 /// setting key in registry order, including Open Grok provider/Code Mode
 /// rows and Advanced opt-in feature flags (telemetry, web_fetch localhost,
 /// remember-mode, crash handler, mouse reporting toggle, shell/AI
 /// suggestions, sandbox auto-allow bash, respect gitignore).
 /// `default_reasoning_effort` and `auto_compact_threshold_percent` stay
-/// unexposed; voice and antigravity rows stay gated out of this fixture.
+/// unexposed; voice rows stay gated out of this fixture.
 #[test]
 fn rows_contain_categories_and_settings_through_pr_14() {
     let prev_voice = crate::app::voice_mode_enabled();
@@ -949,6 +912,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "screen_mode",
             "show_timestamps",
             "show_timeline",
+            "dashboard_preview",
             // PAGER-owned page_flip_on_send (Appearance).
             "page_flip_on_send",
             "simple_mode",
@@ -1006,6 +970,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHELL-owned remember_tool_approvals (Agent category,
             // registered right after permission_mode).
             "remember_tool_approvals",
+            // SHELL-owned Codex session controls (Agent category).
+            "codex_persistent_mode",
+            "codex_guardian_review",
             // SHELL-owned code_mode (Agent category, restart-required).
             "code_mode",
             // SHELL-owned default_selected_permission (Agent category,
@@ -1022,6 +989,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "image_generation_provider",
             // SHELL-owned default_model (Models category).
             "default_model",
+            // SHELL-owned `[features]` row (Models category, registered right after default_model)
+            "subagent_model_inheritance",
+            // Models category. `default_reasoning_effort`, `web_search_model`, and `session_summary_model` are not exposed in the modal.
             // Kimi service selector and isolated credentials.
             "kimi_api_endpoint",
             "kimi_api_key",
@@ -1060,9 +1030,6 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",
             "memory_model",
-            // Models category. `default_reasoning_effort`,
-            // `web_search_model`, and `session_summary_model` are
-            // not exposed in the modal.
             "fork_secondary_model",
             // `auto_compact_threshold_percent` (Session category) is
             // not exposed in the modal.
@@ -1086,6 +1053,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "features.web_fetch",
             "toolset.web_fetch.allow_local",
             "features.two_pass_compaction",
+            "features.context_management.experimental_mode",
             "features.non_git_warning",
             "features.remember_mode",
             "doom_loop_recovery.enabled",
@@ -1094,6 +1062,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "ui.mouse_reporting_toggle",
             "suggestions.enabled",
             "suggestions.ai_enabled",
+            "sandbox.profile",
             "sandbox.auto_allow_bash",
             "tools.respect_gitignore",
         ]
@@ -8148,8 +8117,57 @@ fn locked_coding_data_sharing_row_renders_locked_value_without_chevron() {
     );
 }
 
-/// Expanding a locked row replaces the registry description with the lock
-/// reason; the unlocked expansion shows the description.
+/// A `\n` in a description starts a new painted line in the expanded detail instead of rendering as a control cell.
+#[test]
+fn expanded_description_newlines_start_new_lines() {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 80,
+    };
+    let mut s = make_state();
+    let description = s
+        .registry
+        .find("subagent_model_inheritance")
+        .expect("registered")
+        .description;
+    let paragraph_heads: Vec<String> = description
+        .split('\n')
+        .map(|paragraph| {
+            paragraph
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    assert!(
+        paragraph_heads.len() > 1,
+        "the row's description is multi-line"
+    );
+    s.selected = s
+        .rows
+        .iter()
+        .position(
+            |r| matches!(r, RowEntry::Setting { key, .. } if *key == "subagent_model_inheritance"),
+        )
+        .expect("row present");
+    s.expanded_keys.insert("subagent_model_inheritance");
+    let mut buf = Buffer::empty(area);
+    render_rows(&mut buf, area, &mut s, &Theme::current());
+    let rows: Vec<String> = (0..area.height)
+        .map(|y| buf_row_text(&buf, y, area.x, area.width).trim().to_owned())
+        .collect();
+    for head in &paragraph_heads {
+        assert!(
+            rows.iter().any(|row| row.starts_with(head.as_str())),
+            "paragraph {head:?} must begin a painted line: {rows:?}"
+        );
+    }
+}
+
+/// Expanding a locked row replaces the registry description with the lock reason; the unlocked expansion shows the description.
 #[test]
 fn locked_coding_data_sharing_expanded_description_replaces_with_reason() {
     let area = Rect {
@@ -8631,13 +8649,21 @@ fn seed_openrouter_catalog(state: &mut SettingsModalState) {
         api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
     };
     state.pager_snapshot.openrouter_models = vec![
-        model("openrouter:openai/gpt-4o", "openai/gpt-4o", "OpenAI: GPT-4o"),
+        model(
+            "openrouter:openai/gpt-4o",
+            "openai/gpt-4o",
+            "OpenAI: GPT-4o",
+        ),
         model(
             "openrouter:anthropic/claude",
             "anthropic/claude-sonnet-4",
             "Anthropic: Claude Sonnet 4",
         ),
-        model("openrouter:deepseek/v4", "deepseek/deepseek-v4", "DeepSeek: V4"),
+        model(
+            "openrouter:deepseek/v4",
+            "deepseek/deepseek-v4",
+            "DeepSeek: V4",
+        ),
     ];
     state.pager_snapshot.openrouter_enabled_models.clear();
 }
@@ -8658,7 +8684,10 @@ fn openrouter_sheet_slash_search_filters_and_toggles_matched_model() {
     enter_openrouter_sheet(&mut s);
 
     // `/` focuses the sub-sheet search box.
-    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    let out = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
     assert!(matches!(out, SettingsKeyOutcome::Changed));
     assert!(s.group_filter_focused);
 
@@ -8678,13 +8707,20 @@ fn openrouter_sheet_slash_search_filters_and_toggles_matched_model() {
     assert!(!s.group_filter_focused);
 
     // Space toggles the focused (filtered) model — the Claude one, not row
-    // 0 of the unfiltered catalog.
-    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    // 0 of the unfiltered catalog. An empty allowlist means every model is
+    // selected, so the toggle deselects Claude and keeps the rest.
+    let out = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    );
     assert!(
         matches!(
             out,
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
-                if models == &["anthropic/claude-sonnet-4".to_string()]
+                if models == &[
+                    "deepseek/deepseek-v4".to_string(),
+                    "openai/gpt-4o".to_string(),
+                ]
         ),
         "Space must toggle the filtered model, got {out:?}"
     );
@@ -8696,7 +8732,10 @@ fn openrouter_sheet_esc_clears_query_before_exiting() {
     seed_openrouter_catalog(&mut s);
     enter_openrouter_sheet(&mut s);
 
-    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    let _ = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
     for c in "zzz-no-match".chars() {
         let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
@@ -8759,7 +8798,11 @@ fn group_sheet_click_maps_through_active_filter() {
         matches!(
             out,
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
-                if models == &["deepseek/deepseek-v4".to_string()]
+                // Empty allowlist = all selected; the click deselects DeepSeek.
+                if models == &[
+                    "anthropic/claude-sonnet-4".to_string(),
+                    "openai/gpt-4o".to_string(),
+                ]
         ),
         "click through the filter must toggle the matched model, got {out:?}"
     );
@@ -8777,11 +8820,17 @@ fn static_group_sheet_keeps_plain_typing_unfiltered() {
         .expect("contextual_hints row present");
     assert!(s.try_enter_picking_group());
 
-    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    let out = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
     assert!(matches!(out, SettingsKeyOutcome::Unchanged));
     assert!(!s.group_filter_focused);
 
-    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let out = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
     assert!(matches!(out, SettingsKeyOutcome::Changed));
     assert!(matches!(
         s.mode(),

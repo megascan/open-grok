@@ -3,7 +3,11 @@
 //! See the module-level docs in `mod.rs` for the architectural rationale.
 
 use agent_client_protocol as acp;
-use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::agent::config::{
+    ConfigSource, Feature, FeatureConfigLayers, FeatureSources, Resolved, UiConfig,
+};
+use xai_grok_shell::config::EffectiveConfigLayers;
+use xai_grok_shell::util::config::RemoteSettings;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -124,7 +128,14 @@ pub struct CustomModelRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
+    /// Credential header written by the custom-provider wizard: `bearer` or
+    /// `x_api_key`. Unset for entries that inherit a built-in provider, whose
+    /// identity already fixes the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
     #[serde(default)]
@@ -143,9 +154,29 @@ impl CustomModelRecord {
     pub fn description_line(&self) -> String {
         let provider = self.provider.as_deref().unwrap_or("inherit");
         let backend = self.api_backend.as_deref().unwrap_or("chat_completions");
+        // The credential header rides next to the backend: it is part of the
+        // endpoint identity, and a wrong one is the usual reason a custom
+        // server answers 401.
+        let auth = self
+            .auth_scheme
+            .as_deref()
+            .filter(|scheme| !scheme.trim().is_empty())
+            .map(|scheme| format!(" · {scheme}"))
+            .unwrap_or_default();
+        if let Some(raw) = self.max_context_window {
+            return format!(
+                "{} · {provider} · {backend}{auth} · {raw} raw context",
+                self.model
+            );
+        }
         match self.context_window {
-            Some(window) => format!("{} · {provider} · {backend} · {window} ctx", self.model),
-            None => format!("{} · {provider} · {backend}", self.model),
+            Some(window) => {
+                format!(
+                    "{} · {provider} · {backend}{auth} · {window} ctx",
+                    self.model
+                )
+            }
+            None => format!("{} · {provider} · {backend}{auth}", self.model),
         }
     }
 }
@@ -396,6 +427,103 @@ pub enum SettingValue {
     Int(i64),
 }
 
+/// The one write of the user key on disk right now, and the newest intent waiting behind it.
+/// Writing one key at a time keeps the disk in toggle order whatever the runtime does with the tasks; a failed write settles the mirror back on `persisted`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingWrite {
+    /// What the disk held when the write was issued, then what each completed write left there.
+    pub persisted: Option<bool>,
+    /// The newest value toggled while the write was pending; its completion issues it unless it already matches `persisted`.
+    pub queued: Option<Option<bool>>,
+}
+
+/// A registry `[features]` row as the settings modal sees it.
+/// The user `config.toml` key is the only layer the modal writes; the other tiers are seeded once so the effective value can be re-resolved after a local write without re-reading disk.
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureOverrideState {
+    pub feature: Feature,
+    /// The pin and the config tier split around the user key (`config.user` is the saved override, `None` when no key is saved).
+    pub config: FeatureConfigLayers,
+    /// Environment and remote; `resolve` takes the pin and config tiers from `config`.
+    pub other_tiers: FeatureSources,
+    /// `None` while no write of the user key is pending.
+    pub writes: Option<PendingWrite>,
+}
+
+impl FeatureOverrideState {
+    /// Every tier unset: the compiled default applies.
+    pub fn new(feature: Feature) -> Self {
+        FeatureOverrideState {
+            feature,
+            config: FeatureConfigLayers::default(),
+            other_tiers: FeatureSources::default(),
+            writes: None,
+        }
+    }
+
+    /// Seed from the layers and campaign patches the shell's `Config` is merged from, so the config tier here is the one
+    /// the next agent latches. A layer that fails to load leaves the pin and the config tier unset.
+    pub fn from_layers(
+        feature: Feature,
+        layers: Option<&EffectiveConfigLayers>,
+        remote: Option<&RemoteSettings>,
+    ) -> Self {
+        let mut state = FeatureOverrideState {
+            feature,
+            config: FeatureConfigLayers::default(),
+            other_tiers: FeatureSources {
+                remote: feature.remote_value(remote),
+                ..FeatureSources::from_process_env(feature)
+            },
+            writes: None,
+        };
+        if let Some(layers) = layers {
+            state.reseed_config_layers(layers);
+        }
+        state
+    }
+
+    /// Re-read the pin and the config tier from `layers`, as after the campaign set changed.
+    /// The user key's mirror stays only while a write is pending, since the disk is then behind it.
+    pub fn reseed_config_layers(&mut self, layers: &EffectiveConfigLayers) {
+        let pending_user = self.writes.is_some().then_some(self.config.user);
+        self.config = self
+            .feature
+            .config_layers(&layers.layers, &layers.active_campaigns);
+        if let Some(user) = pending_user {
+            self.config.user = user;
+        }
+    }
+
+    /// What the feature resolves to at the next start, given the saved override.
+    pub fn resolve(&self) -> Resolved<bool> {
+        self.feature.resolve(FeatureSources {
+            pin: self.config.pin,
+            config: self.config.merged(),
+            ..self.other_tiers
+        })
+    }
+
+    /// Names the tier that outranks the user key: a pin, the environment, or a config layer above the user file.
+    /// A layer below it never forces the row: a saved key would decide.
+    pub fn forced_by(&self) -> Option<String> {
+        let source = self.resolve().source;
+        match source {
+            ConfigSource::Requirement | ConfigSource::Env => {
+                Some(self.feature.source_label(source))
+            }
+            ConfigSource::Config => Some(self.config.above_user?.layer.label().to_owned()),
+            ConfigSource::Remote
+            | ConfigSource::Default
+            | ConfigSource::Cli
+            | ConfigSource::UserConfig
+            | ConfigSource::ManagedConfig
+            | ConfigSource::SystemManagedConfig
+            | ConfigSource::EnvOverlay => None,
+        }
+    }
+}
+
 /// Why `coding_data_sharing` cannot be changed in the settings modal.
 /// Computed by `AppView::coding_data_sharing_lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,18 +599,19 @@ pub struct PagerLocalSnapshot {
     pub custom_model_provider: String,
     pub custom_model_base_url: String,
     pub custom_model_context_window: i64,
+
+    pub custom_model_max_context_window: i64,
     pub custom_model_backend: String,
     pub custom_model_env_key: String,
     pub custom_model_save: bool,
+    /// Trigger row: Enter opens the custom-provider wizard. Never persisted;
+    /// the row always reads back as off.
+    pub custom_provider_wizard: bool,
     pub perplexity_web_search_enabled: bool,
     /// `[toolset.web_search_source]` selections (effective TOML merge).
     pub web_search_source: xai_grok_shell::tools::config::WebSearchSourceConfig,
     /// `[toolset.x_search].enabled` (effective TOML merge; default on).
     pub x_search_enabled: bool,
-    /// `[antigravity].skip_permissions` (effective TOML merge). Full access is
-    /// the default (`unwrap_or(true)`); `false` is the read-only opt-out. Read
-    /// fresh from disk at snapshot time — no `UiConfig` mirror.
-    pub antigravity_skip_permissions: bool,
     pub perplexity_api_key_status: SecretStatus,
     /// Active Kimi service profile (`platform` | `code`).
     pub kimi_api_endpoint: String,
@@ -524,6 +653,8 @@ pub struct PagerLocalSnapshot {
     /// language actually in effect when `[ui].voice_stt_language` is unset but
     /// an explicit `[voice].language` applies.
     pub voice_stt_language: String,
+    /// Mirrors `AppView::subagent_model_inheritance` at snapshot time.
+    pub subagent_model_inheritance: FeatureOverrideState,
     /// Restart-required local feature flags read from effective config.toml.
     /// The settings setter updates this map optimistically while persistence
     /// runs, then the success/failure path refreshes it from disk.
@@ -567,14 +698,15 @@ impl Default for PagerLocalSnapshot {
             custom_model_provider: String::new(),
             custom_model_base_url: String::new(),
             custom_model_context_window: crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+
+            custom_model_max_context_window: 0,
             custom_model_backend: "chat_completions".to_owned(),
             custom_model_env_key: String::new(),
             custom_model_save: false,
+            custom_provider_wizard: false,
             perplexity_web_search_enabled: false,
             web_search_source: Default::default(),
             x_search_enabled: true,
-            // Matches the runner's `unwrap_or(true)` full-access default.
-            antigravity_skip_permissions: true,
             perplexity_api_key_status: SecretStatus::Missing,
             kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: true,
@@ -592,6 +724,9 @@ impl Default for PagerLocalSnapshot {
             auto_mode_gate: false,
             ask_user_question_timeout_enabled: None,
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
+            subagent_model_inheritance: FeatureOverrideState::new(
+                Feature::SubagentModelInheritance,
+            ),
             local_feature_flags: xai_grok_shell::util::config::LOCAL_FEATURE_FLAG_SPECS
                 .iter()
                 .map(|spec| (spec.key, spec.default))
@@ -728,6 +863,7 @@ impl PagerLocalSnapshot {
         self.custom_model_base_url
             .clone_from(&other.custom_model_base_url);
         self.custom_model_context_window = other.custom_model_context_window;
+        self.custom_model_max_context_window = other.custom_model_max_context_window;
         self.custom_model_backend
             .clone_from(&other.custom_model_backend);
         self.custom_model_env_key
@@ -736,6 +872,7 @@ impl PagerLocalSnapshot {
     }
 
     pub fn clear_custom_model_draft(&mut self) {
+        self.custom_model_max_context_window = 0;
         self.custom_model_id.clear();
         self.custom_model_slug.clear();
         self.custom_model_name.clear();
@@ -887,6 +1024,7 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        "dashboard_preview" => Some(SettingValue::Bool(ui.dashboard_preview_enabled())),
         // Cache is the send-path source of truth (same pattern as group_tool_verbs).
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
@@ -904,9 +1042,6 @@ pub fn current_value_for(
         )),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         "swarm_mode" => Some(SettingValue::Bool(ui.swarm_mode.unwrap_or(false))),
-        "antigravity_subagents" => Some(SettingValue::Bool(
-            ui.antigravity_subagents.unwrap_or(false),
-        )),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
             Some(SettingValue::Bool(ui.contextual_hints.undo.unwrap_or(true)))
@@ -958,6 +1093,12 @@ pub fn current_value_for(
         // Live cache (like `render_mermaid`).
         "show_thinking_blocks" => Some(SettingValue::Bool(
             crate::appearance::cache::load_show_thinking_blocks(),
+        )),
+        "codex_persistent_mode" => Some(SettingValue::Bool(
+            ui.codex_persistent_mode.unwrap_or(false),
+        )),
+        "codex_guardian_review" => Some(SettingValue::Bool(
+            ui.codex_guardian_review.unwrap_or(false),
         )),
         "stream_tool_calls" => Some(SettingValue::Bool(
             crate::appearance::cache::load_stream_tool_calls(),
@@ -1062,6 +1203,10 @@ pub fn current_value_for(
                 .ask_user_question_timeout_enabled
                 .unwrap_or(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED),
         )),
+        // The value the shell latches at the next start, every tier included; the detail text separates the saved key from it
+        "subagent_model_inheritance" => Some(SettingValue::Bool(
+            pager.subagent_model_inheritance.resolve().value,
+        )),
         // default_selected_permission: maps `[ui].default_selected_permission`
         // onto one of the four registry canonicals. `None` / unrecognised on
         // disk → `always_allow_all_sessions` (the effective default — the
@@ -1108,12 +1253,16 @@ pub fn current_value_for(
             &pager.custom_model_provider,
         ))),
         "custom_model_base_url" => Some(SettingValue::String(pager.custom_model_base_url.clone())),
+        "custom_model_max_context_window" => {
+            Some(SettingValue::Int(pager.custom_model_max_context_window))
+        }
         "custom_model_context_window" => Some(SettingValue::Int(pager.custom_model_context_window)),
         "custom_model_backend" => Some(SettingValue::Enum(canonical_custom_model_backend(
             &pager.custom_model_backend,
         ))),
         "custom_model_env_key" => Some(SettingValue::String(pager.custom_model_env_key.clone())),
         "custom_model_save" => Some(SettingValue::Bool(pager.custom_model_save)),
+        "custom_provider_wizard" => Some(SettingValue::Bool(pager.custom_provider_wizard)),
         "toolset.perplexity_web_search.enabled" => {
             Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
         }
@@ -1141,9 +1290,6 @@ pub fn current_value_for(
             ))
         }
         "toolset.x_search.enabled" => Some(SettingValue::Bool(pager.x_search_enabled)),
-        "antigravity_skip_permissions" => {
-            Some(SettingValue::Bool(pager.antigravity_skip_permissions))
-        }
         "perplexity_api_key" => Some(SettingValue::SecretStatus(pager.perplexity_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
@@ -1182,7 +1328,7 @@ pub fn current_value_for(
     }
 }
 
-/// Consent chooser: no docs tip, and no `d` reset (hint or key).
+/// Consent chooser: no docs tip, and no `d` reset inside the chooser (hint or key).
 pub fn is_consent_chooser(key: &str) -> bool {
     key == "coding_data_sharing"
 }
@@ -1346,6 +1492,9 @@ mod tests {
                         ui.show_timeline_enabled(),
                         "show_timeline default drifts from UiConfig::default()"
                     );
+                }
+                ("dashboard_preview", SettingKind::Bool { default }) => {
+                    assert_eq!(ui.dashboard_preview_enabled(), *default);
                 }
                 ("page_flip_on_send", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -1605,6 +1754,20 @@ mod tests {
                          shared resolver const in xai-grok-tools"
                     );
                 }
+                // subagent_model_inheritance: no UiConfig mirror (a `[features]` row); anchored on the FEATURES row
+                ("subagent_model_inheritance", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        Feature::SubagentModelInheritance.default_enabled(),
+                        "subagent_model_inheritance default drifts from the FEATURES row"
+                    );
+                }
+                ("codex_persistent_mode", SettingKind::Bool { default }) => {
+                    assert_eq!(*default, ui.codex_persistent_mode.unwrap_or(false));
+                }
+                ("codex_guardian_review", SettingKind::Bool { default }) => {
+                    assert_eq!(*default, ui.codex_guardian_review.unwrap_or(false));
+                }
                 // show_thinking_blocks: Option<bool>; None → true (client default).
                 ("show_thinking_blocks", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -1645,15 +1808,6 @@ mod tests {
                         ui.prompt_suggestions.unwrap_or(true),
                         "prompt_suggestions default drifts from UiConfig::default()"
                     );
-                }
-                // antigravity_subagents: Option<bool>; None → false (opt-in).
-                ("antigravity_subagents", SettingKind::Bool { default }) => {
-                    assert_eq!(
-                        *default,
-                        ui.antigravity_subagents.unwrap_or(false),
-                        "antigravity_subagents default drifts from UiConfig::default()"
-                    );
-                    assert!(!*default, "antigravity_subagents must default OFF");
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
                     // The compile-time default is flash; the `word_select`
@@ -1850,16 +2004,6 @@ mod tests {
                         "X search defaults on (registered only when xAI signed in)"
                     );
                 }
-                // antigravity_skip_permissions: no UiConfig mirror (lives under
-                // `[antigravity]`); default anchored on the runner's full-access
-                // `unwrap_or(true)` semantics.
-                ("antigravity_skip_permissions", SettingKind::Bool { default }) => {
-                    assert!(
-                        default,
-                        "Antigravity full access defaults ON (agy skip-permissions); \
-                         the row is the read-only opt-out"
-                    );
-                }
                 ("toolset.web_search_source.deepseek", SettingKind::Enum { default, .. }) => {
                     assert_eq!(*default, "xai", "DeepSeek sessions default to xAI search");
                 }
@@ -1966,9 +2110,15 @@ mod tests {
                         crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
                     );
                 }
-                ("custom_model_save", SettingKind::Bool { default }) => {
+                ("custom_model_max_context_window", SettingKind::Int { default, .. }) => {
+                    assert_eq!(*default, 0);
+                    assert_eq!(pager.custom_model_max_context_window, 0);
+                }
+                ("custom_model_save", SettingKind::Bool { default })
+                | ("custom_provider_wizard", SettingKind::Bool { default }) => {
                     assert!(!*default);
                     assert!(!pager.custom_model_save);
+                    assert!(!pager.custom_provider_wizard);
                 }
                 _ => panic!(
                     "settings::defs::default_settings() contains PAGER entry `{}` with no \
@@ -2246,6 +2396,60 @@ mod tests {
         );
     }
 
+    /// The row shows the next-start resolution (a saved key over remote, a pin over both) and is fixed only by a layer above the user file.
+    #[test]
+    fn feature_override_state_resolves_saved_over_remote_and_is_fixed_by_layers_above_the_user() {
+        use xai_grok_shell::agent::config::{FeatureConfigLayer, FeatureLayerValue};
+        let feature = Feature::SubagentModelInheritance;
+        let mut state = FeatureOverrideState::new(feature);
+        assert!(!state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        state.other_tiers.remote = Some(true);
+        assert!(state.resolve().value);
+        state.config.user = Some(false);
+        assert!(!state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        // A managed layer shows through while no user key exists, but a key would decide, so it never fixes the row
+        state.config.below_user = Some(FeatureLayerValue {
+            layer: FeatureConfigLayer::SystemManaged,
+            value: true,
+        });
+        assert_eq!(None, state.forced_by());
+        state.config.user = None;
+        assert!(state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        // The overlay beats a user key, so it fixes the row even with one saved
+        state.config.user = Some(true);
+        state.config.above_user = Some(FeatureLayerValue {
+            layer: FeatureConfigLayer::Overlay,
+            value: false,
+        });
+        assert!(!state.resolve().value);
+        assert_eq!(
+            Some(FeatureConfigLayer::Overlay.label().to_owned()),
+            state.forced_by()
+        );
+
+        state.config.pin = Some(true);
+        assert!(state.resolve().value);
+        assert_eq!(
+            Some(feature.source_label(ConfigSource::Requirement)),
+            state.forced_by()
+        );
+
+        let pager = PagerLocalSnapshot {
+            subagent_model_inheritance: state,
+            ..Default::default()
+        };
+        assert_eq!(
+            Some(SettingValue::Bool(true)),
+            current_value_for("subagent_model_inheritance", &UiConfig::default(), &pager)
+        );
+    }
+
     /// Keywords must be lowercase and non-empty.
     #[test]
     fn keywords_lowercase_and_non_empty() {
@@ -2445,9 +2649,11 @@ mod tests {
                 "custom_model_provider",
                 "custom_model_base_url",
                 "custom_model_context_window",
+                "custom_model_max_context_window",
                 "custom_model_backend",
                 "custom_model_env_key",
                 "custom_model_save",
+                "custom_provider_wizard",
             ],
         );
         assert!(matches!(

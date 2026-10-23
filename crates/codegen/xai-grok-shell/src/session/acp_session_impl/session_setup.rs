@@ -126,11 +126,24 @@ impl SessionActor {
                         == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
             )
         });
-        let effects = bridge.apply_pending_skill_update().await?;
-        if let Some(item) = self.wrap_skill_reminder(&effects) {
-            conversation.push(item);
+        let effects = bridge.apply_pending_skill_update().await;
+        let skill_text = effects.as_ref().and_then(|update| {
+            if is_cursor && update.kind == xai_grok_tools::types::skill_discovery_tracker::SkillUpdateKind::BaselineChange {
+                None
+            } else {
+                update.system_reminder.as_deref()
+            }
+        });
+        if let Some(body) = crate::session::workflow::listing::merge_listing_sections(
+            skill_text,
+            self.workflow_listing_for_prompt().as_deref(),
+        ) {
+            let tag = self.reminder_wrapper_tag();
+            conversation.push(ConversationItem::system_reminder(format!(
+                "<{tag}>\n{body}\n</{tag}>"
+            )));
         }
-        Some(effects)
+        effects
     }
     pub(super) async fn build_prefix_background(&self) -> String {
         let start = std::time::Instant::now();
@@ -243,13 +256,21 @@ impl SessionActor {
         }
         skill_count
     }
+    pub(crate) async fn slash_skills_for_resolve(
+        &self,
+    ) -> Vec<xai_grok_tools::implementations::skills::types::SkillInfo> {
+        #[cfg(test)]
+        crate::session::slash_authority::record_skill_catalog_call();
+        let bridge = self.tool_bridge_handle();
+        bridge.slash_skills().await
+    }
     /// Send `AvailableCommandsUpdate` to the client.
     ///
     /// Reads the current slash-command skill list from the tools layer
     /// (`SkillManager`), NOT from `PromptContext`.
     pub(super) async fn send_available_commands_update(&self) {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let skills = bridge.slash_skills().await;
+        let skills = self.slash_skills_for_resolve().await;
         let tool_names: Vec<String> = bridge
             .tool_definitions()
             .await
@@ -345,6 +366,11 @@ impl SessionActor {
         }
     }
     pub(super) async fn flush_pending_skill_reminders(&self) {
+        // A native carrier is accepted agent mail. Once committed to chat,
+        // rewinding the pre-turn snapshot must not erase it.
+        if !self.pending_native_agent_messages.lock().is_empty() {
+            self.close_rewind_window().await;
+        }
         self.flush_native_agent_messages();
         let activation = self.plan_mode.lock().take_pending_activation();
         if let Some(text) = activation {
@@ -512,7 +538,7 @@ impl SessionActor {
         let mut config_changed = false;
         let mut updated_config = current_config.clone();
         if current_config.context_window != new_context_window
-            && self.compaction.context_window_override.is_none()
+            && !self.is_context_window_fixed(current_config.context_window)
         {
             tracing::info!(
                 old_context_window = current_config.context_window.get(),
@@ -555,7 +581,7 @@ impl SessionActor {
         let mut new_max_completion_tokens = current_config.max_completion_tokens;
         if let Some(new_cw) = metadata.context_window.and_then(std::num::NonZeroU64::new)
             && current_config.context_window != new_cw
-            && self.compaction.context_window_override.is_none()
+            && !self.is_context_window_fixed(current_config.context_window)
         {
             if new_cw < current_config.context_window {
                 tracing::warn!(
@@ -598,6 +624,44 @@ impl SessionActor {
     /// Inject the actor's managed Read-deny globs into the current ToolBridge so
     /// the Grep tool excludes policy-forbidden paths. No-op when empty. Called on
     /// session setup and re-called after an agent rebuild (the rebuilt bridge
+    fn is_context_window_fixed(&self, current: std::num::NonZeroU64) -> bool {
+        self.compaction.context_window_override.is_some()
+            || std::num::NonZeroU64::new(
+                self.compaction
+                    .context_window_selection
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) == Some(current)
+    }
+
+    pub(super) async fn apply_supported_context_window_selection(&self) {
+        let Some(selection) = std::num::NonZeroU64::new(
+            self.compaction
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) else {
+            return;
+        };
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return;
+        };
+        if cfg.context_window == selection || self.compaction.context_window_override.is_some() {
+            return;
+        }
+        let supported = self.models_manager.models().values().any(|entry| {
+            entry.info.provider == cfg.provider
+                && entry.info.has_model_id(&cfg.model)
+                && entry.info.supports_context_window(selection)
+        });
+        if supported {
+            self.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    context_window: selection,
+                    ..cfg
+                },
+            );
+        }
+    }
+
     pub(super) async fn inject_deny_read_globs(&self) {
         if self.deny_read_globs.is_empty() {
             return;
@@ -622,10 +686,13 @@ impl SessionActor {
         let turn_index = self.chat_state_handle.get_prompt_index().await as u64;
         tracing::info!(turn_index, turns, resolved_model_id = ?model_metadata.resolved_model_id, model_fingerprint = ?model_metadata.model_fingerprint, "build_session_info");
         let model_fingerprint = model_metadata.model_fingerprint;
+        let show_checkpoint_identity = model
+            .as_ref()
+            .is_some_and(|model| self.models_manager.model_show_model_fingerprint(model));
         let resolved_model_id = model_metadata.resolved_model_id.filter(|resolved| {
-            model
-                .as_deref()
-                .is_some_and(|m| should_show_resolved_model(m, resolved))
+            model.as_deref().is_some_and(|model| {
+                should_show_resolved_model(model, resolved, show_checkpoint_identity)
+            })
         });
         let signals = self.signals_handle().snapshot().await;
         let compaction_count = signals.as_ref().map(|s| s.compaction_count).unwrap_or(0);

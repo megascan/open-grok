@@ -103,18 +103,18 @@ fn external_stream_gates_on_end_to_end() {
         completion_tokens: Some(7),
         reasoning_tokens: Some(3),
         cached_prompt_tokens: Some(9),
+        cache_creation_tokens: None,
+        cost_usd_ticks: None,
     });
-    xai_grok_telemetry::log_event(xai_grok_telemetry::events::ToolCallCompleted {
-        tool_name: "github__create_issue".into(),
-        outcome: xai_grok_session_events::types::ToolOutcome::Success,
-        duration_ms: 12,
-        file_path: Some("/tmp/projectdir/config.toml".into()),
-        parameters: Some(serde_json::json!({
-            "marker": PARAM_MARK,
-            "token": SECRET_KEY,
-            "deep": {"a": {"b": "c"}},
-        })),
-    });
+    let mut github = xai_grok_telemetry::events::completed_for_test("github__create_issue", "grok");
+    github.duration_ms = 12;
+    github.file_path = Some("/tmp/projectdir/config.toml".into());
+    github.parameters = Some(serde_json::json!({
+        "marker": PARAM_MARK,
+        "token": SECRET_KEY,
+        "deep": {"a": {"b": "c"}},
+    }));
+    xai_grok_telemetry::log_event(github);
 
     external::flush();
     assert!(

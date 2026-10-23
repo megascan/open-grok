@@ -29,6 +29,25 @@ use super::protocol::{
 /// 10 minutes is long enough for users who step away briefly during login.
 const AUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+fn write_oidc_login_prompt(
+    writer: &mut impl std::io::Write,
+    provider_label: &str,
+    auth_url: &str,
+    use_stdin: bool,
+) -> std::io::Result<()> {
+    let paste_hint = if use_stdin {
+        "\nPaste the URL here if it doesn't connect:\n"
+    } else {
+        ""
+    };
+    crate::auth::device_code::write_required_login_prompt(
+        writer,
+        format_args!(
+            "\nSigning in with {provider_label}...\n\nOpen this URL to sign in:\n  {auth_url}\n{paste_hint}"
+        ),
+    )
+}
+
 /// Parse user-pasted input into `(code, state)`.
 ///
 /// Accepts two formats:
@@ -231,7 +250,15 @@ fn spawn_stdin_reader(tx: tokio::sync::mpsc::Sender<CallbackResult>) {
                 }
                 Err(OidcError::InvalidPastedInput(msg)) => {
                     tracing::debug!(input = %msg, "OIDC: invalid stdin paste, retrying");
-                    eprintln!("  Invalid input: {msg}. Try again:");
+                    if let Err(error) = crate::auth::device_code::write_required_login_prompt(
+                        &mut std::io::stderr().lock(),
+                        format_args!("  Invalid input: {msg}. Try again:\n"),
+                    ) {
+                        let _ = tx.blocking_send(Err(format!(
+                            "Could not write sign-in instructions: {error}"
+                        )));
+                        return;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OIDC: stdin paste returned auth error");
@@ -417,6 +444,7 @@ pub async fn run_login_flow_with_config(
         None => (None, None),
     };
     let has_client_ui = code_rx.is_some();
+    let use_stdin = !has_client_ui && std::io::stdin().is_terminal();
 
     if has_client_ui {
         // Client provides its own auth UI; just open the browser.
@@ -425,25 +453,21 @@ pub async fn run_login_flow_with_config(
         }
     } else {
         // No client UI — print to stderr.
-        eprintln!();
         let provider_label = if oidc.issuer == super::super::config::XAI_OAUTH2_ISSUER {
             "Grok".to_owned()
         } else {
             oidc.issuer.clone()
         };
-        eprintln!("Signing in with {}...", provider_label);
-        eprintln!();
+        write_oidc_login_prompt(
+            &mut std::io::stderr().lock(),
+            &provider_label,
+            &auth_url,
+            use_stdin,
+        )
+        .map_err(|e| anyhow::anyhow!("Could not write sign-in instructions: {e}"))?;
         if let Err(e) = webbrowser::open(&auth_url) {
             tracing::debug!(error = %e, "OIDC: failed to open browser");
         }
-        eprintln!("Open this URL to sign in:");
-        eprintln!("  {}", auth_url);
-    }
-
-    let use_stdin = !has_client_ui && std::io::stdin().is_terminal();
-    if use_stdin {
-        eprintln!();
-        eprintln!("Paste the URL here if it doesn't connect:");
     }
 
     // Push auth URL to the TUI via oneshot.
@@ -556,6 +580,31 @@ type CallbackResult = Result<Callback, String>;
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+
+    #[test]
+    fn oidc_required_prompt_propagates_closed_pipe() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let url = "https://example.invalid/login";
+        assert_eq!(
+            write_oidc_login_prompt(&mut Closed, "Example", url, true)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let mut bytes = Vec::new();
+        write_oidc_login_prompt(&mut bytes, "Example", url, true).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(url));
+        assert!(text.contains("Paste the URL"));
+    }
 
     #[test]
     fn successful_callback_returns_to_open_grok() {

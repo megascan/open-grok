@@ -11,7 +11,7 @@ use crate::appearance::ScrollMode;
 use crate::appearance::TextSelection;
 use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
-use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::agent::config::{Feature, UiConfig};
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -595,9 +595,11 @@ const CUSTOM_MODELS_CHILDREN: &[&str] = &[
     "custom_model_provider",
     "custom_model_base_url",
     "custom_model_context_window",
+    "custom_model_max_context_window",
     "custom_model_backend",
     "custom_model_env_key",
     "custom_model_save",
+    "custom_provider_wizard",
 ];
 
 pub(crate) const CUSTOM_MODEL_CONTEXT_WINDOW_MIN: i64 = 1_000;
@@ -609,6 +611,11 @@ const CUSTOM_MODEL_PROVIDER_CHOICES: &[EnumChoice] = &[
         canonical: "",
         display: "(inherit)",
         description: "Use the default provider for this catalog key.",
+    },
+    EnumChoice {
+        canonical: "custom",
+        display: "Custom endpoint",
+        description: "A server address you supplied (base_url plus an explicit auth_scheme).",
     },
     EnumChoice {
         canonical: "zai",
@@ -799,6 +806,21 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: true,
         },
         SettingMeta {
+            key: "dashboard_preview",
+            category: SettingCategory::Appearance,
+            owner: SettingOwner::Shared,
+            label: "Dashboard preview",
+            description: "Show the selected session's preview and reply panel in the dashboard. \
+                          Turn off to give the session list more space. Open a session to reply \
+                          or answer permissions when the preview is off.",
+            keywords: &["dashboard", "peek", "preview", "prompt", "reply", "panel"],
+            kind: SettingKind::Bool {
+                default: ui_default.dashboard_preview_enabled(),
+            },
+            restart_required: false,
+            hidden_in_minimal: true,
+        },
+        SettingMeta {
             key: "page_flip_on_send",
             category: SettingCategory::Appearance,
             owner: SettingOwner::Shared,
@@ -937,56 +959,6 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 default: ui_default.swarm_mode.unwrap_or(false),
             },
             restart_required: false,
-            hidden_in_minimal: false,
-        },
-        // Row is hidden entirely when the Antigravity CLI is not installed
-        // (see `setting_row_visible`); the gate is seeded once at startup.
-        SettingMeta {
-            key: "antigravity_subagents",
-            category: SettingCategory::Agent,
-            owner: SettingOwner::Shell,
-            label: "Antigravity subagents",
-            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools (e.g. antigravity:gemini-3.6-flash, the reference model). Requires being signed in to agy. Subagents run with full access (agy skip-permissions) by default; set [antigravity] skip_permissions = false to force read-only, and callers that pin a read-only capability mode stay read-only either way. Restart required.",
-            keywords: &[
-                "antigravity",
-                "agy",
-                "gemini",
-                "subagent",
-                "delegate",
-                "cli",
-                "swarm",
-                "workflow",
-            ],
-            kind: SettingKind::Bool {
-                default: ui_default.antigravity_subagents.unwrap_or(false),
-            },
-            restart_required: true,
-            hidden_in_minimal: false,
-        },
-        // Shares the antigravity_subagents row's visibility gate — hidden when
-        // the `agy` CLI is absent (see `setting_row_visible`). SHELL-owned,
-        // persisted to `[antigravity].skip_permissions`.
-        SettingMeta {
-            key: "antigravity_skip_permissions",
-            category: SettingCategory::Agent,
-            owner: SettingOwner::Shell,
-            label: "Antigravity full access",
-            description: "Antigravity (agy) subagents run with agy's skip-permissions flag by default — they may write to the workspace and execute commands. Toggle OFF to force read-only researcher subagents; callers that pin a read-only capability mode (e.g. review/audit stages) stay read-only either way. Restart required.",
-            keywords: &[
-                "antigravity",
-                "agy",
-                "permissions",
-                "skip",
-                "full access",
-                "read-only",
-                "safety",
-            ],
-            kind: SettingKind::Bool {
-                // No UiConfig mirror; the effective default mirrors the runner's
-                // `[antigravity].skip_permissions.unwrap_or(true)` (full access).
-                default: true,
-            },
-            restart_required: true,
             hidden_in_minimal: false,
         },
         // SHELL-owned, persisted to `[ui].vim_mode` in config.toml.
@@ -1162,6 +1134,28 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: true,
             hidden_in_minimal: false,
         },
+        SettingMeta {
+            key: "codex_persistent_mode",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Codex persistent work",
+            description: "Continue relevant follow-ups and monitoring while sending progress messages. Uses Codex persistent mode (reasoning disabled); Escape still cancels. Requires async user messaging. Restart to apply.",
+            keywords: &["codex", "persistent", "follow", "monitor", "astra"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "codex_guardian_review",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Codex browser action review",
+            description: "Use the model's Guardian guidance to review browser and computer MCP actions before execution. Existing permission rules still apply. Restart to apply.",
+            keywords: &["codex", "guardian", "browser", "computer", "review"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned `[ui].code_mode`. The running session keeps its mode;
         // this user preference is resolved only when a new session starts.
         SettingMeta {
@@ -1240,6 +1234,41 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 supports_preview: false,
             },
             restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned `[features].subagent_model_inheritance`, a registry feature row rather than a `[ui]` key
+        // `restart_required` because each agent latches the mode when it is built; the row's value is the next-start resolution
+        // Each `\n` starts a new line in the expanded detail (a Bool row never reaches the single-line sub-pane header)
+        SettingMeta {
+            key: "subagent_model_inheritance",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Subagent model inheritance",
+            description: "On: Open Grok cannot set models for subagents\n\
+                          Off: Open Grok may choose a different model for a subagent. Takes effect \
+                          after restart.\n\
+                          NOTE: This setting only applies when all models are xAI \
+                          \"model_family\". You likely don't need to configure this setting.",
+            keywords: &[
+                "subagent",
+                "subagents",
+                "subagent model",
+                "same model",
+                "model",
+                "parent",
+                "inherit",
+                "inheritance",
+                "picker",
+                "argument",
+                "task",
+                "spawn",
+                "xai",
+                "features",
+            ],
+            kind: SettingKind::Bool {
+                default: Feature::SubagentModelInheritance.default_enabled(),
+            },
+            restart_required: true,
             hidden_in_minimal: false,
         },
         // Kimi Platform and Kimi Code are separate services with distinct,
@@ -1610,13 +1639,28 @@ pub fn default_settings() -> Vec<SettingMeta> {
             key: "custom_model_context_window",
             category: SettingCategory::Models,
             owner: SettingOwner::Pager,
-            label: "Context window",
-            description: "Token context window written to [model.<key>].context_window (1,000–4,000,000).",
+            label: "Usable context window",
+            description: "Usable token budget. For Codex, this already includes context headroom. A nonzero raw context override below takes precedence when saving.",
             keywords: &["custom", "model", "context", "window", "tokens"],
             kind: SettingKind::Int {
                 default: CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
                 min: CUSTOM_MODEL_CONTEXT_WINDOW_MIN,
                 max: CUSTOM_MODEL_CONTEXT_WINDOW_MAX,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_max_context_window",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Codex raw context override",
+            description: "Raw Codex context budget, including headroom. May exceed the catalog maximum. 1,000,000 gives 950,000 usable tokens at 95% and compacts at 900,000. Zero uses the usable context field.",
+            keywords: &["codex", "context", "maximum", "override", "tokens"],
+            kind: SettingKind::Int {
+                default: 0,
+                min: 0,
+                max: 100_000_000,
             },
             restart_required: false,
             hidden_in_minimal: false,
@@ -1657,6 +1701,19 @@ pub fn default_settings() -> Vec<SettingMeta> {
             label: "Save custom model",
             description: "Write the draft as [model.<key>] and refresh the catalog. Requires a catalog key and model id.",
             keywords: &["custom", "model", "save", "add", "upsert"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_provider_wizard",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Add a custom provider...",
+            description: "Point Open Grok at any OpenAI- or Anthropic-compatible server: enter the address, optionally a key, pick the wire format, and choose which models to keep.",
+            keywords: &[
+                "custom", "provider", "endpoint", "wizard", "base", "url", "add",
+            ],
             kind: SettingKind::Bool { default: false },
             restart_required: false,
             hidden_in_minimal: false,
@@ -2742,6 +2799,24 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: false,
         },
         SettingMeta {
+            key: "features.context_management.experimental_mode",
+            category: SettingCategory::Advanced,
+            owner: SettingOwner::Shell,
+            label: "Experimental context management",
+            description: "Let Codex models start fresh context windows and recover work from local session history and private notes. Preserves the running environment. Restart required.",
+            keywords: &[
+                "codex",
+                "context",
+                "history",
+                "notes",
+                "experimental",
+                "window",
+            ],
+            kind: SettingKind::Bool { default: false },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
             key: "features.non_git_warning",
             category: SettingCategory::Advanced,
             owner: SettingOwner::Shell,
@@ -2862,6 +2937,21 @@ pub fn default_settings() -> Vec<SettingMeta> {
                           command completions. Uses extra tokens; leave off if you only want \
                           history/path matches. Restart required.",
             keywords: &["suggestions", "ai", "shell", "completion", "flag"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "sandbox.profile",
+            category: SettingCategory::Advanced,
+            owner: SettingOwner::Shell,
+            label: "OS sandbox",
+            description: "Off by default. Enable the workspace sandbox for new sessions: \
+                          read everywhere, write only to the workspace, Open Grok state, \
+                          and temporary directories. Restart Open Grok to apply. Existing \
+                          sessions keep their saved profile; CLI, environment, and managed \
+                          profiles take precedence over this preference.",
+            keywords: &["sandbox", "workspace", "isolation", "permissions"],
             kind: SettingKind::Bool { default: false },
             restart_required: true,
             hidden_in_minimal: false,

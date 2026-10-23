@@ -4,11 +4,15 @@ use super::session::lifecycle::dispatch_new_session;
 use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView, VoiceState, VoiceTarget};
 
-/// Promote live interim into the bound prompt, then hard-reset (no trailing
-/// final). Returns the fragment for callers that captured text earlier.
+/// Promote live interim into the bound prompt and stop capture. Retain an
+/// outstanding clip final when one is owed. Returns the promoted fragment.
 pub(super) fn voice_stop_on_submit(app: &mut AppView) -> Option<String> {
     let interim = crate::voice::commit_interim_into_prompt(app);
-    app.voice_reset();
+    if app.voice_state.owes_final() {
+        app.voice_stop_keeping_final();
+    } else {
+        app.voice_reset();
+    }
     interim
 }
 
@@ -98,6 +102,10 @@ fn open_voice_tier_upsell(app: &mut AppView) -> Vec<Effect> {
 /// and only this one; `/voice` and the toggle pass `false` so a Ctrl+Space
 /// release can't stop them.
 pub(super) fn dispatch_enable_voice_mode(app: &mut AppView, from_hold: bool) -> Vec<Effect> {
+    if app.voice_state.blocks_new_capture() {
+        app.show_toast("Voice: still transcribing the last recording… (Esc to discard)");
+        return vec![];
+    }
     // Remote-flag gate only. Silent when unavailable.
     if !app.voice_mode_enabled || !xai_grok_voice::AUDIO_SUPPORTED {
         return vec![];
@@ -154,6 +162,10 @@ pub(super) fn dispatch_enable_voice_mode(app: &mut AppView, from_hold: bool) -> 
 /// recording this stops; otherwise it starts — enabling voice mode and spawning
 /// the pipeline if needed, exactly like `/voice`. No `/voice`-first prerequisite.
 pub(super) fn dispatch_voice_toggle(app: &mut AppView) -> Vec<Effect> {
+    if app.voice_state.blocks_new_capture() {
+        app.show_toast("Voice: still transcribing the last recording… (Esc to discard)");
+        return vec![];
+    }
     if app.voice_listening() {
         // Stop always succeeds — even if remote flag or `/voice` mode flipped mid-recording.
         app.voice_stop_keeping_final();

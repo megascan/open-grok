@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 ///
 /// These invariants are upheld by construction: `LocalRef` is `!Send`
 /// (via `*const T`) and only used inside `spawn_local` closures on the
-/// agent's `LocalSet`.
+/// agent's `LocalSet`. Every entrypoint that builds a `MvpAgent` must hold an
+/// `Rc` to it, declared before the `LocalSet`, so the agent outlives every
+/// task on the set on normal exit and unwind alike.
 pub(crate) struct LocalRef<T> {
     ptr: *const T,
 }
@@ -272,12 +274,15 @@ pub(crate) struct SessionSpawnOptions<'a> {
     /// defer this write until final catalog/fallback selection is committed.
     pub persist_initial_model: bool,
     pub session_meta: Option<&'a acp::Meta>,
+    pub persisted_agent_profile: Option<xai_grok_agent::AgentDefinition>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub session_swarm_mode: bool,
     pub prompt_display_cwd: Option<String>,
+    /// Sticky chat product kind for ACU / product skills sourcing.
+    pub is_chat_kind: bool,
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -450,12 +455,14 @@ pub(crate) fn chat_session_spawn_options<'a>(
         resolved_tool_policy_override: None,
         persist_initial_model: true,
         session_meta,
+        persisted_agent_profile: None,
         model_agent_type,
         session_model_id,
         session_yolo_mode,
         session_auto_mode: false,
         session_swarm_mode: false,
         prompt_display_cwd: None,
+        is_chat_kind: false,
     }
 }
 /// `_meta.noReplay` → skip gateway replay (client already has the transcript).
@@ -524,6 +531,8 @@ pub(crate) struct PromptResponseMeta {
     /// (e.g. doom loop). `None` for normal completions and user cancels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_context: Option<serde_json::Value>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
     /// `"esc"`); surfaced as `cancelTrigger`. `None` for non-cancel completions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -550,6 +559,7 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub last_turn_usage: Option<&'a xai_grok_sampling_types::TokenUsage>,
     pub prompt_usage: Option<crate::extensions::notification::PromptUsage>,
     pub cancellation_category: Option<String>,
+    pub cancellation_context: Option<serde_json::Value>,
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
@@ -568,6 +578,7 @@ pub(crate) fn build_prompt_response_meta(
         last_turn_usage,
         prompt_usage,
         cancellation_category,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         tool_overrides,
@@ -589,6 +600,7 @@ pub(crate) fn build_prompt_response_meta(
         reasoning_tokens: last_turn_usage.map(|u| u.reasoning_tokens),
         usage: prompt_usage,
         cancellation_category,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         structured_output_error,
@@ -629,6 +641,10 @@ struct SettingsUpdateNotification {
     group_tool_verbs: Option<bool>,
     collapsed_edit_blocks: Option<bool>,
     subscription_watch_interval_secs: Option<u64>,
+    /// The remote tier the pager's settings row shows beside the saved `[features]` key.
+    /// Omitted while the agent has no settings (the pager keeps the tier it seeded itself); `null` once fetched settings lack the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_model_inheritance_enabled: Option<Option<bool>>,
 }
 /// When the announcements push gate emits despite an unchanged visible list.
 #[derive(Clone, Copy, Debug)]
@@ -897,13 +913,14 @@ pub struct MvpAgent {
     subagent_event_tx: tokio::sync::mpsc::UnboundedSender<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >,
+    subagent_coordinator_sender:
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    subagent_sampling_semaphore: Arc<tokio::sync::Semaphore>,
     /// Receiver for subagent events. Taken once by `start_subagent_coordinator()`.
     /// `None` after the coordinator drain task has been spawned.
     subagent_event_rx: RefCell<
         Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
-            >,
+            xai_grok_tools::implementations::grok_build::task::coordinator::SubagentCoordinatorReceiver,
         >,
     >,
     /// Shell-only presentation state; lifecycle lives in the channel actor.
@@ -1339,53 +1356,6 @@ impl AuthRequestMeta {
             .unwrap_or_default()
     }
 }
-/// Inject standard proxy headers into an `extra_headers` map.
-///
-/// Every authenticated request to cli-chat-proxy (web search, image gen, and
-/// any future tools that go through the proxy) must carry these headers.
-/// Centralising them here means new tool code paths only need one call instead
-/// of remembering which headers the proxy expects.
-///
-/// Headers injected:
-///  - `x-grok-client-version` -- required by the proxy's version-gate check.
-///    Uses `client_version` when provided, otherwise falls back to cli-chat-proxy
-///    compile-time `CARGO_PKG_VERSION`.
-///  - `X-XAI-Token-Auth` / `x-authenticateresponse` -- required by the
-///    cli-chat-proxy auth middleware when the `base_url` is a known proxy URL.
-///  - optional extra access header -- only set when the corresponding key is
-///    `Some` *and* the `base_url` points at a matching non-production host
-///    (requires the optional non-production feature).
-///
-/// Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
-    headers: &mut indexmap::IndexMap<String, String>,
-    client_version: Option<&str>,
-    alpha_test_key: Option<&str>,
-    base_url: &str,
-) {
-    headers
-        .entry("x-grok-client-version".to_string())
-        .or_insert_with(|| {
-            client_version
-                .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::version().to_string())
-        });
-    headers
-        .entry("x-grok-client-identifier".to_string())
-        .or_insert_with(crate::http::process_client_identifier);
-    if crate::util::is_cli_chat_proxy_url(base_url) {
-        headers
-            .entry("X-XAI-Token-Auth".to_string())
-            .or_insert_with(|| "xai-grok-cli".to_string());
-        headers
-            .entry("x-authenticateresponse".to_string())
-            .or_insert_with(|| "authenticate-response".to_string());
-        headers
-            .entry(crate::http::CLIENT_MODE_HEADER.to_string())
-            .or_insert_with(|| crate::http::process_client_mode().to_string());
-    }
-    let _ = (alpha_test_key, base_url);
-}
 fn resolve_inference_idle_timeout_secs(
     models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
     model: &str,
@@ -1462,6 +1432,7 @@ mod session_bus_host;
 mod agent_ops;
 mod acp_agent;
 mod session_setup;
+pub use session_setup::SessionSetupPhase;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
@@ -1659,7 +1630,7 @@ impl MvpAgent {
         let Some(updates_path) = updates_file_path else {
             return Vec::new();
         };
-        let contents = match std::fs::read_to_string(updates_path) {
+        let contents = match xai_file_utils::session_file::read_to_string(updates_path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
@@ -1733,7 +1704,9 @@ impl MvpAgent {
                 output_file: std::path::PathBuf::new(),
                 truncated: false,
                 exit_code: None,
-                signal: Some("session_restart".to_string()),
+                signal: Some(
+                    xai_grok_tools::computer::types::SESSION_RESTART_SIGNAL.to_string(),
+                ),
                 completed: true,
                 kind: xai_grok_tools::computer::types::TaskKind::Bash,
                 block_waited: false,
@@ -1775,39 +1748,60 @@ impl MvpAgent {
         }
         completions
     }
-    /// Extracts initial_total_tokens by scanning only the tail of the updates file.
+    /// Extracts initial_total_tokens from the final 64 KiB of decoded updates.
+    /// Plain files seek directly; gzip files use a bounded streaming tail.
     /// Avoids loading and deserializing all updates when replay is skipped (noReplay).
-    pub(super) fn extract_initial_tokens_from_updates(
-        updates_file_path: &Option<PathBuf>,
-    ) -> u64 {
+    pub(super) fn extract_initial_tokens_from_updates(updates_file_path: &Option<PathBuf>) -> u64 {
         use std::io::{Read, Seek, SeekFrom};
         let Some(updates_path) = updates_file_path else {
             return 0;
         };
-        let mut file = match std::fs::File::open(updates_path) {
+        let mut file = match xai_file_utils::session_file::open(updates_path) {
             Ok(f) => f,
-            Err(_) => return 0u64,
-        };
-        let file_len = match file.metadata() {
-            Ok(m) => m.len(),
             Err(_) => return 0,
         };
-        const TAIL_SIZE: u64 = 64 * 1024;
-        let start_pos = file_len.saturating_sub(TAIL_SIZE);
-        if file.seek(SeekFrom::Start(start_pos)).is_err() {
-            return 0;
-        }
-        let mut buf = String::new();
-        if file.read_to_string(&mut buf).is_err() {
-            return 0;
-        }
+        const TAIL_SIZE: usize = 64 * 1024;
+        let read_tail = (|| -> std::io::Result<Vec<u8>> {
+            if !file.is_compressed() {
+                let len = file.seek(SeekFrom::End(0))?;
+                file.seek(SeekFrom::Start(len.saturating_sub(TAIL_SIZE as u64)))?;
+                let mut tail = Vec::new();
+                file.take(TAIL_SIZE as u64).read_to_end(&mut tail)?;
+                return Ok(tail);
+            }
+            // Gzip offsets are decoded coordinates. Keep a bounded rolling
+            // tail in one pass, consuming EOF to validate the gzip trailer.
+            let mut tail = std::collections::VecDeque::with_capacity(TAIL_SIZE);
+            let mut chunk = [0u8; 8192];
+            loop {
+                let count = file.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                let excess = (tail.len() + count).saturating_sub(TAIL_SIZE);
+                tail.drain(..excess);
+                tail.extend(&chunk[..count]);
+            }
+            Ok(tail.into_iter().collect())
+        })();
+        let bytes = match read_tail {
+            Ok(bytes) => bytes,
+            Err(_) => return 0,
+        };
+        // The first retained byte may land inside a UTF-8 character. That
+        // incomplete first record must not hide valid later token records.
+        let buf = String::from_utf8_lossy(&bytes);
         let result = buf
             .lines()
             .rev()
             .filter(|line| !line.trim().is_empty())
             .find_map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).ok()?;
-                value.get("params")?.get("meta")?.get("totalTokens")?.as_u64()
+                value
+                    .get("params")?
+                    .get("meta")?
+                    .get("totalTokens")?
+                    .as_u64()
             })
             .unwrap_or(0);
         if result == 0 {
@@ -2146,6 +2140,10 @@ impl MvpAgent {
                 collapsed_edit_blocks: rs.and_then(|s| s.collapsed_edit_blocks),
                 subscription_watch_interval_secs: rs
                     .and_then(|s| s.subscription_watch_interval_secs),
+                subagent_model_inheritance_enabled: rs.map(|s| {
+                    xai_grok_config_types::Feature::SubagentModelInheritance
+                        .remote_value(Some(s))
+                }),
             }
         };
         if let Ok(params) = serde_json::value::to_raw_value(&payload) {
@@ -2690,3 +2688,92 @@ mod replay_tests;
 mod tests;
 #[cfg(test)]
 mod prompt_response_meta_tests;
+
+#[cfg(test)]
+mod gzip_history_tests {
+    use super::MvpAgent;
+    use std::io::Write;
+    use std::path::Path;
+
+    fn gzip(path: &Path, text: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        let bytes = encoder.finish().unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn gzip_initial_tokens_use_decoded_tail_and_validate_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let contents = format!(
+            "{}\n{{\"params\":{{\"meta\":{{\"totalTokens\":12345}}}}}}\n",
+            "é".repeat(100_000)
+        );
+        std::fs::write(&path, &contents).unwrap();
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            12345
+        );
+        let mut bytes = gzip(&path, &contents);
+        assert!(bytes.len() < 64 * 1024);
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            12345
+        );
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path.clone())),
+            0
+        );
+        let old_token = format!(
+            "{{\"params\":{{\"meta\":{{\"totalTokens\":999}}}}}}\n{}\n",
+            "x".repeat(70_000)
+        );
+        gzip(&path, &old_token);
+        assert_eq!(
+            MvpAgent::extract_initial_tokens_from_updates(&Some(path)),
+            0
+        );
+    }
+
+    #[test]
+    fn gzip_orphaned_tasks_match_plain_and_reject_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let mut contents = String::new();
+        for (kind, task_id) in [
+            ("task_backgrounded", "done"),
+            ("task_completed", "done"),
+            ("task_backgrounded", "pending"),
+        ] {
+            contents.push_str(
+                &serde_json::json!({"params": {"update": {
+                    "sessionUpdate": kind, "task_id": task_id, "command": "sleep 10", "cwd": "/work",
+                    "task_snapshot": {"task_id": task_id}
+                }}})
+                .to_string(),
+            );
+            contents.push('\n');
+        }
+        for compressed in [false, true] {
+            if compressed {
+                gzip(&path, &contents);
+            } else {
+                std::fs::write(&path, &contents).unwrap();
+            }
+            let tasks = MvpAgent::find_orphaned_background_tasks(&Some(path.clone()));
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].task_id, "pending");
+            assert_eq!(tasks[0].command, "sleep 10");
+            assert_eq!(tasks[0].cwd, "/work");
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(MvpAgent::find_orphaned_background_tasks(&Some(path)).is_empty());
+    }
+}

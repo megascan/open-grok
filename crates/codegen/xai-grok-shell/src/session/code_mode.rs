@@ -31,6 +31,13 @@ use super::acp_session::SessionActor;
 use crate::sampling::rs::{CustomGrammarFormatParam, CustomToolParamFormat, GrammarSyntax};
 use crate::sampling::{ClientTool, CustomToolOutputContent, CustomToolOutputImageDetail, ToolSpec};
 
+tokio::task_local! {
+    /// Cancellation belongs to an exact prompt task, not the session. A cell
+    /// retains this token after yielding so an aborted originating turn cannot
+    /// dispatch callbacks in a later turn.
+    pub(crate) static CODE_MODE_TURN_OWNER: CancellationToken;
+}
+
 pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 pub(crate) const CODE_MODE_TRANSPORT_META_KEY: &str = "open-grok/codeModeTransport";
 
@@ -68,6 +75,9 @@ pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
 /// `agent_swarm` must hold the model turn until aggregation completes instead
 /// of yielding its enclosing cell and making the model poll it.
 pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
+    if xai_grok_tools::implementations::codex::context_management::TOOL_NAMES.contains(&name) {
+        return true;
+    }
     matches!(
         name,
         "ask_user_question"
@@ -90,6 +100,7 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
             | "kill_command_or_subagent"
             | "list_agents"
             | "send_message"
+            | "send_subagent_message"
             | "followup_task"
             | "wait_agent"
             | "list_sessions"
@@ -155,6 +166,7 @@ enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        cell: LiveCell,
         progress: NestedToolProgressSink,
         response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
     },
@@ -162,8 +174,69 @@ enum DispatchMessage {
         call_id: String,
         text: String,
         cancellation_token: CancellationToken,
+        cell: LiveCell,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
+}
+
+#[derive(Clone)]
+struct LiveCell {
+    owner_cancelled: CancellationToken,
+    control_cancelled: CancellationToken,
+    closed: CancellationToken,
+}
+
+#[derive(Default)]
+struct CellRegistry {
+    live: HashMap<CellId, LiveCell>,
+    closed_before_registration: HashSet<CellId>,
+    awaiting_close: HashSet<CellId>,
+}
+
+impl LiveCell {
+    fn new(owner_cancelled: CancellationToken) -> Self {
+        Self {
+            owner_cancelled,
+            control_cancelled: CancellationToken::new(),
+            closed: CancellationToken::new(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.owner_cancelled.is_cancelled() || self.control_cancelled.is_cancelled()
+    }
+
+    async fn cancelled(&self) {
+        tokio::select! {
+            _ = self.owner_cancelled.cancelled() => {}
+            _ = self.control_cancelled.cancelled() => {}
+        }
+    }
+}
+
+/// Cancels a cell if its current exec/wait future is dropped by turn abort.
+/// Successful yields disarm this guard and may continue across turns.
+struct CellControlGuard {
+    cell: LiveCell,
+    armed: bool,
+}
+
+impl CellControlGuard {
+    fn new(cell: LiveCell) -> Self {
+        Self { cell, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CellControlGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cell.control_cancelled.cancel();
+        }
+    }
 }
 
 /// A session-scoped, lazily initialized Code Mode host.
@@ -174,7 +247,8 @@ enum DispatchMessage {
 /// session, including values written through `store()`.
 pub(crate) struct CodeModeRuntime {
     session: OnceCell<Arc<dyn CodeModeSession>>,
-    known_cells: Mutex<HashSet<CellId>>,
+    cell_namespace: String,
+    known_cells: Mutex<CellRegistry>,
     dispatch_tx: mpsc::UnboundedSender<DispatchMessage>,
     dispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<DispatchMessage>>>,
     dispatch_task: Mutex<Option<tokio::task::AbortHandle>>,
@@ -199,7 +273,8 @@ impl CodeModeRuntime {
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             session: OnceCell::new(),
-            known_cells: Mutex::new(HashSet::new()),
+            cell_namespace: uuid::Uuid::now_v7().to_string(),
+            known_cells: Mutex::new(CellRegistry::default()),
             dispatch_tx,
             dispatch_rx: Mutex::new(Some(dispatch_rx)),
             dispatch_task: Mutex::new(None),
@@ -261,9 +336,8 @@ impl CodeModeRuntime {
         let enabled_tools = collect_code_mode_tool_definitions(enabled_tools);
         let max_output_tokens = parsed.max_output_tokens;
         let started_at = Instant::now();
-        let started_cell = self
-            .session()
-            .await?
+        let session = self.session().await?;
+        let started_cell = session
             .execute(ExecuteRequest {
                 tool_call_id: call_id.to_string(),
                 enabled_tools,
@@ -272,21 +346,47 @@ impl CodeModeRuntime {
                 max_output_tokens,
             })
             .await?;
-        self.known_cells.lock().insert(started_cell.cell_id.clone());
         let cell_id = started_cell.cell_id.clone();
-        let response = match started_cell.initial_response().await {
-            Ok(response) => response,
-            Err(error) => {
-                self.known_cells.lock().remove(&cell_id);
-                return Err(error);
+        let owner = CODE_MODE_TURN_OWNER
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        let cell = LiveCell::new(owner);
+        let registered = {
+            let mut cells = self.known_cells.lock();
+            if cells.closed_before_registration.remove(&cell_id) {
+                false
+            } else {
+                cells.live.insert(cell_id.clone(), cell.clone());
+                true
             }
         };
-        let response = self.hold_yield_while_interaction_pending(response).await?;
+        let cancellation_cell = cell.clone();
+        let cancellation_id = cell_id.clone();
+        if registered {
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_cell.closed.cancelled() => return,
+                    _ = cancellation_cell.cancelled() => {}
+                }
+                if let Err(error) = session.terminate(cancellation_id.clone()).await {
+                    tracing::warn!(%error, cell_id = %cancellation_id, "failed to terminate cancelled Code Mode cell");
+                }
+            });
+        }
+        let mut control = CellControlGuard::new(cell);
+        let result = async {
+            let response = started_cell.initial_response().await?;
+            self.hold_yield_while_interaction_pending(response).await
+        }
+        .await;
+        control.disarm();
+        let response = result?;
         if is_terminal_runtime_response(&response) {
-            self.known_cells.lock().remove(&cell_id);
+            self.forget_cell(&cell_id);
         }
         Ok(format_runtime_response(
-            response,
+            self.public_response(response),
             max_output_tokens,
             started_at.elapsed(),
         ))
@@ -299,49 +399,120 @@ impl CodeModeRuntime {
         raw_arguments: &str,
     ) -> Result<CodeModeToolOutput, String> {
         let arguments = parse_wait_arguments(raw_arguments)?;
-        let cell_id = CellId::new(arguments.cell_id);
-        if !self.known_cells.lock().contains(&cell_id) {
+        let Some(cell_id) = self.private_cell_id(&arguments.cell_id) else {
             return Err(format!(
-                "code mode wait cell `{cell_id}` is not live in the current runtime generation; it belongs to a prior runtime generation or has already completed, and yielded cells cannot be resumed after session reload or timeline reset"
+                "code mode wait cell `{}` is not live in the current runtime generation; it belongs to a prior runtime generation or has already completed, and yielded cells cannot be resumed after session reload or timeline reset",
+                arguments.cell_id
             ));
-        }
-        let started_at = Instant::now();
-        let session = self.session().await?;
-        let response: RuntimeResponse = if arguments.terminate {
-            session.terminate(cell_id.clone()).await?.into()
-        } else {
-            let response = session
-                .wait(WaitRequest {
-                    cell_id: cell_id.clone(),
-                    yield_time_ms: arguments.yield_time_ms,
-                })
-                .await?
-                .into();
-            // A terminate request is exempt from the interaction hold: the
-            // model is killing the cell, not asking for more output.
-            self.hold_yield_while_interaction_pending(response).await?
         };
+        let cell = self.known_cells.lock().live.get(&cell_id).cloned();
+        let Some(cell) = cell else {
+            return Err(format!(
+                "code mode wait cell `{}` is not live in the current runtime generation; it belongs to a prior runtime generation or has already completed, and yielded cells cannot be resumed after session reload or timeline reset",
+                arguments.cell_id
+            ));
+        };
+        let mut control = CellControlGuard::new(cell);
+        let started_at = Instant::now();
+        let result = async {
+            let session = self.session().await?;
+            let response: RuntimeResponse = if arguments.terminate {
+                session.terminate(cell_id.clone()).await?.into()
+            } else {
+                let response = session
+                    .wait(WaitRequest {
+                        cell_id: cell_id.clone(),
+                        yield_time_ms: arguments.yield_time_ms,
+                    })
+                    .await?
+                    .into();
+                // A terminate request is exempt from the interaction hold.
+                self.hold_yield_while_interaction_pending(response).await?
+            };
+            Ok::<_, String>(response)
+        }
+        .await;
+        control.disarm();
+        let response = result?;
         if is_terminal_runtime_response(&response) {
-            self.known_cells.lock().remove(&cell_id);
+            self.forget_cell(&cell_id);
         }
         Ok(format_runtime_response(
-            response,
+            self.public_response(response),
             arguments.max_tokens,
             started_at.elapsed(),
         ))
     }
 
+    pub(crate) fn has_live_cells(&self) -> bool {
+        !self.known_cells.lock().live.is_empty()
+    }
+
     /// Best-effort termination of one live cell. Unknown / already-terminal
     /// cells are a no-op, so callers never need to pre-check liveness.
     pub(crate) async fn terminate_cell(self: &Arc<Self>, cell_id: &str) -> Result<(), String> {
-        let cell_id = CellId::new(cell_id.to_string());
-        if !self.known_cells.lock().contains(&cell_id) {
+        let Some(cell_id) = self.private_cell_id(cell_id) else {
+            return Ok(());
+        };
+        if !self.known_cells.lock().live.contains_key(&cell_id) {
             return Ok(());
         }
         let session = self.session().await?;
         session.terminate(cell_id.clone()).await?;
-        self.known_cells.lock().remove(&cell_id);
+        self.forget_cell(&cell_id);
         Ok(())
+    }
+
+    fn forget_cell(&self, cell_id: &CellId) {
+        let mut cells = self.known_cells.lock();
+        if let Some(cell) = cells.live.remove(cell_id) {
+            cells.awaiting_close.insert(cell_id.clone());
+            cell.closed.cancel();
+        }
+    }
+
+    fn cell_closed(&self, cell_id: &CellId) {
+        let mut cells = self.known_cells.lock();
+        if let Some(cell) = cells.live.remove(cell_id) {
+            cell.closed.cancel();
+        } else if !cells.awaiting_close.remove(cell_id) {
+            cells.closed_before_registration.insert(cell_id.clone());
+        }
+    }
+
+    fn private_cell_id(&self, public: &str) -> Option<CellId> {
+        public
+            .strip_prefix(&self.cell_namespace)?
+            .strip_prefix(':')
+            .filter(|id| !id.is_empty())
+            .map(|id| CellId::new(id.to_owned()))
+    }
+
+    fn public_response(&self, mut response: RuntimeResponse) -> RuntimeResponse {
+        let (RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. }
+        | RuntimeResponse::Result { cell_id, .. }) = &mut response;
+        *cell_id = CellId::new(format!("{}:{}", self.cell_namespace, cell_id));
+        response
+    }
+
+    /// The actor can emit a callback immediately after admission, before the
+    /// exec future has installed its tracking entry. Wait for that handoff;
+    /// callback cancellation also covers cells that close during admission.
+    async fn callback_cell(
+        &self,
+        cell_id: &CellId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<LiveCell, String> {
+        loop {
+            if let Some(cell) = self.known_cells.lock().live.get(cell_id).cloned() {
+                return Ok(cell);
+            }
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return Err("code mode callback cancelled".to_string()),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
     }
 
     /// Shuts down an initialized runtime without creating an otherwise unused
@@ -848,16 +1019,29 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
             if cancellation_token.is_cancelled() {
                 return Err("code mode nested tool call cancelled".to_string());
             }
+            let cell = self
+                .callback_cell(&invocation.cell_id, &cancellation_token)
+                .await?;
+            if cell.is_cancelled() {
+                cancellation_token.cancel();
+                return Err("code mode nested tool call cancelled".to_string());
+            }
             let (response_tx, response_rx) = oneshot::channel();
             self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation_token: cancellation_token.clone(),
+                    cell: cell.clone(),
                     progress,
                     response_tx,
                 })
                 .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
             tokio::select! {
+                biased;
+                _ = cell.cancelled() => {
+                    cancellation_token.cancel();
+                    Err("code mode nested tool call cancelled".to_string())
+                }
                 response = response_rx => response
                     .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?,
                 _ = cancellation_token.cancelled() => {
@@ -870,7 +1054,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
     fn notify<'a>(
         &'a self,
         call_id: String,
-        _cell_id: CellId,
+        cell_id: CellId,
         text: String,
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a> {
@@ -881,16 +1065,27 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
             if cancellation_token.is_cancelled() {
                 return Err("code mode notification cancelled".to_string());
             }
+            let cell = self.callback_cell(&cell_id, &cancellation_token).await?;
+            if cell.is_cancelled() {
+                cancellation_token.cancel();
+                return Err("code mode notification cancelled".to_string());
+            }
             let (response_tx, response_rx) = oneshot::channel();
             self.dispatch_tx
                 .send(DispatchMessage::Notify {
                     call_id,
                     text,
                     cancellation_token: cancellation_token.clone(),
+                    cell: cell.clone(),
                     response_tx,
                 })
                 .map_err(|_| "code mode notification dispatcher is unavailable".to_string())?;
             tokio::select! {
+                biased;
+                _ = cell.cancelled() => {
+                    cancellation_token.cancel();
+                    Err("code mode notification cancelled".to_string())
+                }
                 response = response_rx => response
                     .map_err(|_| "code mode notification dispatcher stopped".to_string())?,
                 _ = cancellation_token.cancelled() => {
@@ -901,7 +1096,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
     }
 
     fn cell_closed(&self, cell_id: &CellId) {
-        self.known_cells.lock().remove(cell_id);
+        CodeModeRuntime::cell_closed(self, cell_id);
     }
 }
 
@@ -927,25 +1122,40 @@ async fn dispatch_message(
         DispatchMessage::InvokeTool {
             invocation,
             cancellation_token,
+            cell,
             progress,
             response_tx,
         } => {
             let response = match wait_for_active_code_mode_turn(
                 &session_actor,
                 &cancellation_token,
+                &cell,
                 generation,
                 "nested tool call",
             )
             .await
             {
-                Ok(session_actor) => {
-                    session_actor
-                        .dispatch_code_mode_nested_tool(
-                            invocation,
-                            cancellation_token.clone(),
-                            progress,
-                        )
-                        .await
+                Ok((session_actor, turn_owner)) => {
+                    let dispatch = session_actor.dispatch_code_mode_nested_tool(
+                        invocation,
+                        cancellation_token.clone(),
+                        progress,
+                    );
+                    tokio::pin!(dispatch);
+                    tokio::select! {
+                        biased;
+                        _ = cell.cancelled() => {
+                            cancellation_token.cancel();
+                            // Let the nested dispatch publish its cancellation
+                            // and finish its own lifecycle bookkeeping.
+                            dispatch.await
+                        }
+                        _ = turn_owner.cancelled() => {
+                            cancellation_token.cancel();
+                            dispatch.await
+                        }
+                        response = &mut dispatch => response,
+                    }
                 }
                 Err(error) => Err(error),
             };
@@ -955,17 +1165,28 @@ async fn dispatch_message(
             call_id,
             text,
             cancellation_token,
+            cell,
             response_tx,
         } => {
             let response = match wait_for_active_code_mode_turn(
                 &session_actor,
                 &cancellation_token,
+                &cell,
                 generation,
                 "notification",
             )
             .await
             {
-                Ok(session_actor) => tokio::select! {
+                Ok((session_actor, turn_owner)) => tokio::select! {
+                    biased;
+                    _ = cell.cancelled() => {
+                        cancellation_token.cancel();
+                        Err("code mode notification cancelled".to_string())
+                    }
+                    _ = turn_owner.cancelled() => {
+                        cancellation_token.cancel();
+                        Err("code mode notification cancelled".to_string())
+                    }
                     _ = session_actor.record_code_mode_notification(call_id, text) => Ok(()),
                     _ = cancellation_token.cancelled() => {
                         Err("code mode notification cancelled".to_string())
@@ -986,16 +1207,17 @@ async fn dispatch_message(
 async fn wait_for_active_code_mode_turn(
     session_actor: &Weak<SessionActor>,
     cancellation_token: &CancellationToken,
+    cell: &LiveCell,
     generation: &RuntimeGeneration,
     operation: &str,
-) -> Result<Arc<SessionActor>, String> {
+) -> Result<(Arc<SessionActor>, CancellationToken), String> {
     loop {
         if !generation.is_current() {
             return Err(format!(
                 "code mode {operation} belongs to a superseded runtime generation"
             ));
         }
-        if cancellation_token.is_cancelled() {
+        if cancellation_token.is_cancelled() || cell.is_cancelled() {
             return Err(format!("code mode {operation} cancelled"));
         }
 
@@ -1009,11 +1231,22 @@ async fn wait_for_active_code_mode_turn(
                 | xai_grok_sampling_types::ToolMode::CodeModeOnly
         );
         if turn_active && code_mode_active {
-            return Ok(actor);
+            if let Some(turn_owner) = actor.current_code_mode_turn_owner().await {
+                if turn_owner.is_cancelled() || cell.is_cancelled() || !generation.is_current() {
+                    cancellation_token.cancel();
+                    return Err(format!("code mode {operation} cancelled"));
+                }
+                return Ok((actor, turn_owner));
+            }
         }
         drop(actor);
 
         tokio::select! {
+            biased;
+            _ = cell.cancelled() => {
+                cancellation_token.cancel();
+                return Err(format!("code mode {operation} cancelled"));
+            }
             _ = cancellation_token.cancelled() => {
                 return Err(format!("code mode {operation} cancelled"));
             }
@@ -1522,6 +1755,7 @@ mod tests {
         let error = match wait_for_active_code_mode_turn(
             &Weak::<SessionActor>::new(),
             &CancellationToken::new(),
+            &LiveCell::new(CancellationToken::new()),
             &previous_generation,
             "nested tool call",
         )
@@ -1551,16 +1785,154 @@ mod tests {
         assert!(!live_generation.is_current());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_cell_callback_is_rejected_before_later_turn_dispatch() {
+        let slot = CodeModeRuntimeSlot::new();
+        let generation = RuntimeGeneration {
+            current: Arc::clone(&slot.generation),
+            expected: slot.generation(),
+        };
+        let owner = CancellationToken::new();
+        let cell = LiveCell::new(owner.clone());
+        owner.cancel();
+        let error = match wait_for_active_code_mode_turn(
+            &Weak::<SessionActor>::new(),
+            &CancellationToken::new(),
+            &cell,
+            &generation,
+            "nested tool call",
+        )
+        .await
+        {
+            Ok(_) => panic!("cancelled cell must not reach another turn"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "code mode nested tool call cancelled");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_owner_stops_its_cell_but_preserves_a_prior_yield() {
+        let runtime = CodeModeRuntime::new();
+        let prior_owner = CancellationToken::new();
+        let prior = CODE_MODE_TURN_OWNER
+            .scope(
+                prior_owner,
+                runtime.exec(
+                    "prior",
+                    "// @exec: {\"yield_time_ms\":10}\nawait new Promise(() => {});",
+                    &[],
+                ),
+            )
+            .await
+            .expect("prior cell yields");
+        let prior_id = prior.cell_id.expect("yielded cell id");
+
+        let owner = CancellationToken::new();
+        let executing_runtime = runtime.clone();
+        let running = tokio::spawn(CODE_MODE_TURN_OWNER.scope(owner.clone(), async move {
+            executing_runtime
+                .exec("cancelled", "while (true) {}", &[])
+                .await
+        }));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.known_cells.lock().live.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new cell admitted");
+        owner.cancel();
+        let output = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("cancel stops V8")
+            .expect("exec task does not panic")
+            .expect("termination is reported");
+        assert!(output.text().contains("Script terminated"));
+
+        let args = json!({"cell_id": prior_id, "yield_time_ms": 1});
+        let still_live = runtime
+            .wait(&args.to_string())
+            .await
+            .expect("prior cell remains live");
+        assert!(still_live.text().contains("Script running"));
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_wait_cancels_only_the_cell_it_was_observing() {
+        let runtime = CodeModeRuntime::new();
+        let yielded = runtime
+            .exec(
+                "yield",
+                "// @exec: {\"yield_time_ms\":10}\nawait new Promise(() => {});",
+                &[],
+            )
+            .await
+            .expect("cell yields");
+        let id = yielded.cell_id.unwrap();
+        let args = json!({"cell_id": id, "yield_time_ms": 30_000}).to_string();
+        let waiting_runtime = runtime.clone();
+        let waiting = tokio::spawn(async move { waiting_runtime.wait(&args).await });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        let _ = waiting.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.has_live_cells() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned wait terminates its cell");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_rejects_old_cell_id_even_after_new_cell_is_admitted() {
+        let slot = CodeModeRuntimeSlot::new();
+        let source = "// @exec: {\"yield_time_ms\":10}\nawait new Promise(() => {});";
+        let old_id = slot
+            .exec("old", source, &[])
+            .await
+            .unwrap()
+            .cell_id
+            .unwrap();
+        slot.reset()
+            .await
+            .expect("replace runtime after unfinished headless cell");
+        let new_id = slot
+            .exec("new", source, &[])
+            .await
+            .unwrap()
+            .cell_id
+            .unwrap();
+        assert_ne!(old_id, new_id);
+        let error = slot
+            .wait(&json!({"cell_id": old_id}).to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("prior runtime generation"));
+        let result = slot
+            .wait(&json!({"cell_id": new_id, "terminate": true}).to_string())
+            .await
+            .expect("new cell is usable");
+        assert!(result.text().contains("Script terminated"));
+        slot.shutdown().await.expect("shutdown");
+    }
+
     #[test]
     fn runtime_cell_closed_forgets_yielded_cell() {
         let runtime = CodeModeRuntime::new();
         let cell_id = CellId::new("closed-cell".to_string());
-        runtime.known_cells.lock().insert(cell_id.clone());
+        runtime
+            .known_cells
+            .lock()
+            .live
+            .insert(cell_id.clone(), LiveCell::new(CancellationToken::new()));
 
         CodeModeSessionDelegate::cell_closed(runtime.as_ref(), &cell_id);
 
         assert!(
-            !runtime.known_cells.lock().contains(&cell_id),
+            !runtime.known_cells.lock().live.contains_key(&cell_id),
             "a runtime close callback must make later wait calls fail locally"
         );
     }
@@ -1930,6 +2302,7 @@ mod tests {
             "kill_command_or_subagent",
             "list_agents",
             "send_message",
+            "send_subagent_message",
             "followup_task",
             "wait_agent",
         ] {

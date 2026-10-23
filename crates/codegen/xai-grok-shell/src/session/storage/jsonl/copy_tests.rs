@@ -182,8 +182,8 @@ async fn copy_session_data_without_prompt_target_preserves_dead_branches() {
     );
 }
 
-/// The streaming fork copy skips torn or undecodable lines like the load
-/// path does, both with and without a prompt-index cut.
+/// Whole-history copies tolerate torn updates; point forks fail closed because
+/// a damaged line could conceal a compaction checkpoint.
 #[tokio::test]
 async fn copy_session_data_skips_torn_updates_lines() {
     use std::io::Write as _;
@@ -238,16 +238,15 @@ async fn copy_session_data_skips_torn_updates_lines() {
         target_prompt_index: Some(0),
         ..Default::default()
     };
-    let result = adapter
-        .copy_session_data(&source_info, &target_info, options)
-        .await
-        .unwrap();
-    assert_eq!(result.updates_copied, 2, "P0 + A0; torn tail and P1 cut");
+    assert!(
+        adapter
+            .copy_session_data(&source_info, &target_info, options)
+            .await
+            .is_err()
+    );
 }
 
-/// A torn line inside a multi-chunk user run ends the run during the prompt
-/// cut, so the second chunk opens a new counted turn, matching replay's
-/// raw-line semantics. Pins the boundary so a classifier change is deliberate.
+/// A torn line inside a prompt run makes its point-fork boundary uncertain.
 #[tokio::test]
 async fn torn_line_inside_user_run_splits_the_run_for_prompt_cut() {
     use std::io::Write as _;
@@ -294,13 +293,12 @@ async fn torn_line_inside_user_run_splits_the_run_for_prompt_cut() {
         target_prompt_index: Some(1),
         ..Default::default()
     };
-    let result = adapter
-        .copy_session_data(&source_info, &target_info, options)
-        .await
-        .unwrap();
-    // P1b re-counts as a turn after the torn split, so the cut lands before
-    // it: P0, A0, P1a survive. The contiguous-run cut would have kept 5.
-    assert_eq!(result.updates_copied, 3, "P0 + A0 + P1a");
+    assert!(
+        adapter
+            .copy_session_data(&source_info, &target_info, options)
+            .await
+            .is_err()
+    );
 }
 
 fn create_test_chat_messages() -> Vec<ConversationItem> {
@@ -1032,6 +1030,7 @@ async fn copy_session_data_with_model_override() {
             &default_model_id(),
             None,
             None,
+            None,
             Some(source_policy),
         )
         .await
@@ -1461,4 +1460,949 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
         collect(b"aa\nbb", 4),
         vec![(0, b"aa".to_vec()), (1, b"bb".to_vec())]
     );
+}
+
+fn worktree_target_cwd(home: &std::path::Path) -> String {
+    let cwd = home
+        .join("worktrees")
+        .join("xai")
+        .join("fix-bug")
+        .join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    cwd.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fork_with_default_kind_into_worktree_cwd_stamps_worktree_identity() {
+    let home = TempDir::new().unwrap();
+    let _env = xai_grok_test_support::EnvGuard::set("OPENGROK_HOME", home.path());
+    let adapter = JsonlStorageAdapter::with_root(home.path().join("sessions-root"));
+    let source_info = Info {
+        id: acp::SessionId::new("src-plain-fork"),
+        cwd: "/src".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("tgt-in-worktree"),
+        cwd: worktree_target_cwd(home.path()),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(&source_info, &target_info, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let summary = adapter.load_summary(&target_info).await.unwrap();
+    assert_eq!(summary.session_kind.as_deref(), Some("worktree"));
+    assert_eq!(summary.worktree_label.as_deref(), Some("fix-bug"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn explicit_subagent_fork_kind_wins_over_worktree_target_cwd() {
+    let home = TempDir::new().unwrap();
+    let _env = xai_grok_test_support::EnvGuard::set("OPENGROK_HOME", home.path());
+    let adapter = JsonlStorageAdapter::with_root(home.path().join("sessions-root"));
+    let source_info = Info {
+        id: acp::SessionId::new("src-subagent-fork"),
+        cwd: "/src".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("tgt-subagent-in-worktree"),
+        cwd: worktree_target_cwd(home.path()),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    let options = CopySessionOptions {
+        session_kind: Some("subagent_fork".to_string()),
+        ..Default::default()
+    };
+    adapter
+        .copy_session_data(&source_info, &target_info, options)
+        .await
+        .unwrap();
+
+    let summary = adapter.load_summary(&target_info).await.unwrap();
+    assert_eq!(summary.session_kind.as_deref(), Some("subagent_fork"));
+    assert!(summary.source_workspace_dir.is_none());
+    assert_eq!(summary.worktree_label.as_deref(), Some("fix-bug"));
+}
+
+#[tokio::test]
+async fn fork_restamps_usage_session_id() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    usage.apply_turn(
+        1,
+        "t1",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            model_calls: 1,
+            turn_count: 1,
+            ..Default::default()
+        },
+        None,
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("tgt-usage"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(&source, &target, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let copied = adapter.read_usage(&target).await.unwrap().unwrap();
+    assert_eq!(copied.session_id, "tgt-usage");
+    assert_eq!(copied.turns.len(), 1);
+    assert_eq!(copied.session.input_tokens, 10);
+}
+
+#[tokio::test]
+async fn truncating_fork_drops_later_usage_turns() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage-trunc"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .append_update(&source, &fork_user_chunk(&source.id.to_string(), "P0", 0))
+        .await
+        .unwrap();
+
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    let first = crate::session::usage_file::UsageSummary {
+        input_tokens: 10,
+        output_tokens: 2,
+        total_tokens: 12,
+        model_calls: 1,
+        turn_count: 1,
+        ..Default::default()
+    };
+    usage.apply_turn(1, "t1", &first, None);
+    usage.apply_turn(
+        2,
+        "t2",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 25,
+            output_tokens: 7,
+            total_tokens: 32,
+            model_calls: 2,
+            ..Default::default()
+        },
+        Some(&first),
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+    adapter
+        .write_signals(
+            &source,
+            &crate::session::signals::SessionSignals {
+                turn_count: 5,
+                user_message_count: 5,
+                assistant_message_count: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("tgt-usage-trunc"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &target,
+            CopySessionOptions {
+                target_prompt_index: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let copied = adapter.read_usage(&target).await.unwrap().unwrap();
+    assert_eq!(copied.session_id, "tgt-usage-trunc");
+    assert_eq!(copied.turns.len(), 1);
+    assert_eq!(copied.turns[0].turn_number, 1);
+    assert_eq!(copied.session.input_tokens, 10);
+    let signals = adapter
+        .load_session(&target)
+        .await
+        .unwrap()
+        .signals
+        .unwrap();
+    assert_eq!(signals.turn_count, 1);
+    assert_eq!(signals.user_message_count, 1);
+}
+
+#[tokio::test]
+async fn copy_usage_is_independent_of_copy_signals() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage-flag"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    std::fs::write(adapter.signals_file(&source), b"signals").unwrap();
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    usage.apply_turn(
+        1,
+        "t1",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 10,
+            total_tokens: 10,
+            model_calls: 1,
+            turn_count: 1,
+            ..Default::default()
+        },
+        None,
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+
+    let no_signals = Info {
+        id: acp::SessionId::new("tgt-no-signals"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &no_signals,
+            CopySessionOptions {
+                copy_signals: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let seeded = adapter
+        .load_session(&no_signals)
+        .await
+        .unwrap()
+        .signals
+        .unwrap();
+    assert_eq!(seeded.turn_count, 1);
+    assert!(adapter.read_usage(&no_signals).await.unwrap().is_some());
+
+    let no_usage = Info {
+        id: acp::SessionId::new("tgt-no-usage"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &no_usage,
+            CopySessionOptions {
+                copy_usage: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(adapter.signals_file(&no_usage).exists());
+    assert!(adapter.read_usage(&no_usage).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn fork_truncation_clears_announced_failure_episodes() {
+    use crate::session::announcement_state::{
+        AnnouncedFailure, AnnouncementState, McpServerFingerprint,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-episodes"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .append_update(&source, &fork_user_chunk(&source.id.to_string(), "P0", 0))
+        .await
+        .unwrap();
+    let mut state = serde_json::to_value(AnnouncementState {
+        mcp_server_fingerprints: std::collections::HashMap::from([(
+            "srv".to_string(),
+            McpServerFingerprint {
+                tool_count: 1,
+                description_hash: 2,
+                tool_names_hash: 3,
+            },
+        )]),
+        announced_skill_names: std::collections::HashSet::from(["commit".to_string()]),
+        announced_failed_servers: std::collections::HashMap::from([(
+            "dead".to_string(),
+            AnnouncedFailure::Transport,
+        )]),
+    })
+    .unwrap();
+    state
+        .as_object_mut()
+        .unwrap()
+        .insert("some_future_field".to_string(), true.into());
+    std::fs::write(
+        adapter.announcement_state_file(&source),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    type SetOption = fn(&mut CopySessionOptions);
+    let cases: [(&str, SetOption); 2] = [
+        ("truncating", |options| {
+            options.target_prompt_index = Some(0)
+        }),
+        ("filtering", |options| options.fork_filter = true),
+    ];
+    for (name, set) in cases {
+        let target = Info {
+            id: acp::SessionId::new(format!("tgt-episodes-{name}")),
+            cwd: "/tgt".to_string(),
+        };
+        let mut options = CopySessionOptions::default();
+        set(&mut options);
+        adapter
+            .copy_session_data(&source, &target, options)
+            .await
+            .unwrap();
+        if name == "truncating" {
+            assert!(
+                !adapter.announcement_state_file(&target).exists(),
+                "point forks must re-announce state from their own history"
+            );
+            continue;
+        }
+        let raw = std::fs::read(adapter.announcement_state_file(&target)).unwrap();
+        let copied: AnnouncementState = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            copied.announced_failed_servers.is_empty(),
+            "{name}: failure episodes must be cleared"
+        );
+        assert_eq!(
+            copied.mcp_server_fingerprints["srv"].tool_count, 1,
+            "{name}: fingerprints survive"
+        );
+        assert!(
+            copied.announced_skill_names.contains("commit"),
+            "{name}: skill names survive"
+        );
+        let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            raw["some_future_field"], true,
+            "{name}: unknown fields survive"
+        );
+    }
+
+    let target_full = Info {
+        id: acp::SessionId::new("tgt-episodes-full"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(&source, &target_full, CopySessionOptions::default())
+        .await
+        .unwrap();
+    let copied: AnnouncementState = serde_json::from_slice(
+        &std::fs::read(adapter.announcement_state_file(&target_full)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        copied.announced_failed_servers.get("dead"),
+        Some(&AnnouncedFailure::Transport),
+        "full fork keeps episodes: its context retains the announcement"
+    );
+}
+
+#[tokio::test]
+async fn fork_new_target_rejects_collisions_without_changing_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("fork-source"),
+        cwd: "/project".into(),
+    };
+    let existing = Info {
+        id: acp::SessionId::new("fork-existing"),
+        cwd: "/project".into(),
+    };
+    for info in [&source, &existing] {
+        adapter
+            .init_session(info, default_model_id())
+            .await
+            .unwrap();
+        adapter
+            .append_chat_message(info, &ConversationItem::user("chat"))
+            .await
+            .unwrap();
+        adapter
+            .append_update(info, &fork_user_chunk(&info.id.to_string(), "prompt", 0))
+            .await
+            .unwrap();
+        let dir = adapter.session_dir(info);
+        std::fs::create_dir_all(dir.join("workflows")).unwrap();
+        std::fs::create_dir_all(dir.join("goal")).unwrap();
+        std::fs::write(dir.join("workflows/run.json"), b"workflow").unwrap();
+        std::fs::write(dir.join("goal/state.json"), b"goal").unwrap();
+    }
+    let capture = |info: &Info| {
+        let dir = adapter.session_dir(info);
+        [
+            "summary.json",
+            "chat_history.jsonl",
+            "updates.jsonl",
+            "workflows/run.json",
+            "goal/state.json",
+        ]
+        .map(|file| std::fs::read(dir.join(file)).unwrap())
+    };
+    let source_before = capture(&source);
+    let existing_before = capture(&existing);
+    for target in [&source, &existing] {
+        let error = adapter
+            .copy_new_session_data_sync(&source, target, CopySessionOptions::default())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+    assert_eq!(capture(&source), source_before);
+    assert_eq!(capture(&existing), existing_before);
+
+    let missing = Info {
+        id: acp::SessionId::new("missing"),
+        cwd: "/project".into(),
+    };
+    let reserved = Info {
+        id: acp::SessionId::new("failed-copy"),
+        cwd: "/project".into(),
+    };
+    assert!(
+        adapter
+            .copy_new_session_data_sync(&missing, &reserved, CopySessionOptions::default())
+            .is_err()
+    );
+    assert!(
+        !adapter.session_dir(&reserved).exists(),
+        "only the failed copy's reservation is removed"
+    );
+    assert_eq!(capture(&source), source_before);
+    assert_eq!(capture(&existing), existing_before);
+}
+
+#[tokio::test]
+async fn fork_new_target_reservation_has_one_winner() {
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("race-source"),
+        cwd: "/project".into(),
+    };
+    let target = Info {
+        id: acp::SessionId::new("race-target"),
+        cwd: "/project".into(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .append_chat_message(&source, &ConversationItem::user("source chat"))
+        .await
+        .unwrap();
+    adapter
+        .append_update(&source, &fork_user_chunk("race-source", "source prompt", 0))
+        .await
+        .unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let run = || {
+            barrier.wait();
+            adapter.copy_new_session_data_sync(&source, &target, CopySessionOptions::default())
+        };
+        let a = scope.spawn(run);
+        let b = scope.spawn(run);
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .next()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    let loaded = adapter.load_session(&target).await.unwrap();
+    assert_eq!(loaded.chat_history[0].text_content(), "source chat");
+    assert_eq!(loaded.updates.len(), 1);
+}
+
+#[tokio::test]
+async fn fork_at_prompt_reconstructs_compacted_history() {
+    use crate::extensions::notification::{
+        CompactionCheckpointFile, CompactionCheckpointInfo, SessionNotification as XaiNotification,
+        SessionUpdate as XaiUpdate,
+    };
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("compacted-source"),
+        cwd: "/project".into(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    let checkpoint = CompactionCheckpointFile {
+        checkpoint_id: "checkpoint".into(),
+        prompt_index_at_compaction: 2,
+        compacted_history: vec![
+            ConversationItem::system("system"),
+            ConversationItem::user("original user info"),
+            ConversationItem::user("summary P0 P1"),
+        ],
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        original_user_info: Some("original user info".into()),
+        reread_file_paths: vec![],
+    };
+    adapter
+        .write_compaction_checkpoint(&source, &checkpoint)
+        .await
+        .unwrap();
+    let checkpoint_update = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+            checkpoint_id: "checkpoint".into(),
+            prompt_index_at_compaction: 2,
+            checkpoint_file: "compaction_checkpoints/checkpoint.json".into(),
+            auto_continue: None,
+            schema_version: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })),
+        meta: None,
+    }));
+    for update in [
+        fork_user_chunk("compacted-source", "P0", 0),
+        fork_agent_chunk("compacted-source", "A0"),
+        fork_user_chunk("compacted-source", "P1", 1),
+        fork_agent_chunk("compacted-source", "A1"),
+        checkpoint_update,
+        fork_user_chunk("compacted-source", "P2", 2),
+        SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            source.id.clone(),
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new(acp::ToolCallId::new("t2"), "tool")),
+        ))),
+        SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            source.id.clone(),
+            acp::SessionUpdate::UserMessageChunk(
+                acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                    "peer message",
+                )))
+                .meta(
+                    serde_json::json!({ "syntheticReason": "agent_message" })
+                        .as_object()
+                        .cloned(),
+                ),
+            ),
+        ))),
+        fork_agent_chunk("compacted-source", "A2"),
+        fork_user_chunk("compacted-source", "P3", 3),
+        fork_agent_chunk("compacted-source", "A3"),
+    ] {
+        adapter.append_update(&source, &update).await.unwrap();
+    }
+    for item in [
+        ConversationItem::system("system"),
+        ConversationItem::user("original user info"),
+        ConversationItem::user("summary P0 P1"),
+        chat_user("P2", 2),
+        ConversationItem::tool_result("t2", "tool output"),
+        ConversationItem::agent_message("peer message"),
+        ConversationItem::assistant("A2"),
+        chat_user("P3", 3),
+        ConversationItem::assistant("A3"),
+    ] {
+        adapter.append_chat_message(&source, &item).await.unwrap();
+    }
+    // The checkpoint and original rich suffix still match, so this target
+    // retains the original model-facing tool history exactly.
+    let target = Info {
+        id: acp::SessionId::new("fork-2"),
+        cwd: "/project".into(),
+    };
+    let archive = adapter.session_dir(&source).join("compaction");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::write(archive.join("INDEX.md"), "future P3").unwrap();
+    adapter
+        .copy_new_session_data_sync(
+            &source,
+            &target,
+            CopySessionOptions {
+                target_prompt_index: Some(2),
+                copy_compaction_segments: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let loaded = adapter.load_session(&target).await.unwrap();
+    let texts: Vec<_> = loaded
+        .chat_history
+        .iter()
+        .map(ConversationItem::text_content)
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "system",
+            "original user info",
+            "summary P0 P1",
+            "P2",
+            "tool output",
+            "peer message",
+            "A2"
+        ]
+    );
+    assert!(
+        adapter
+            .session_dir(&target)
+            .join("compaction_checkpoints/checkpoint.json")
+            .is_file()
+    );
+    assert!(!adapter.session_dir(&target).join("compaction").exists());
+
+    // Even plain text ACP user chunks omit model-side wrappers and expansion.
+    // A pre-checkpoint fork must therefore fail instead of inventing history.
+    let earlier = Info {
+        id: acp::SessionId::new("fork-earlier"),
+        cwd: "/project".into(),
+    };
+    assert!(
+        adapter
+            .copy_new_session_data_sync(
+                &source,
+                &earlier,
+                CopySessionOptions {
+                    target_prompt_index: Some(0),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    assert!(!adapter.session_dir(&earlier).exists());
+
+    // Referencing the source archive can expose content after the fork point.
+    let source_path = adapter.session_dir(&source).to_string_lossy().into_owned();
+    let mut unsafe_checkpoint = checkpoint.clone();
+    unsafe_checkpoint.original_user_info = Some(format!("Read {source_path}/compaction/INDEX.md"));
+    adapter
+        .write_compaction_checkpoint(&source, &unsafe_checkpoint)
+        .await
+        .unwrap();
+    let unsafe_target = Info {
+        id: acp::SessionId::new("fork-source-path"),
+        cwd: "/project".into(),
+    };
+    let err = adapter
+        .copy_new_session_data_sync(
+            &source,
+            &unsafe_target,
+            CopySessionOptions {
+                target_prompt_index: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("references the source session"));
+    assert!(!adapter.session_dir(&unsafe_target).exists());
+    unsafe_checkpoint.original_user_info = Some("working directory: /project".into());
+    adapter
+        .write_compaction_checkpoint(&source, &unsafe_checkpoint)
+        .await
+        .unwrap();
+    let moved_target = Info {
+        id: acp::SessionId::new("fork-old-cwd"),
+        cwd: "/new-project".into(),
+    };
+    let err = adapter
+        .copy_new_session_data_sync(
+            &source,
+            &moved_target,
+            CopySessionOptions {
+                target_prompt_index: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("old working directory"));
+    assert!(!adapter.session_dir(&moved_target).exists());
+    adapter
+        .write_compaction_checkpoint(&source, &checkpoint)
+        .await
+        .unwrap();
+
+    // A replacement branch crossing the checkpoint cannot reuse the old
+    // summary, even if a raw replay encounters the old checkpoint first.
+    let updates_path = adapter.updates_file(&source);
+    let updates = std::fs::read(&updates_path).unwrap();
+    for update in [
+        fork_rewind_marker("compacted-source", 1),
+        fork_user_chunk("compacted-source", "P1 replacement", 1),
+        fork_agent_chunk("compacted-source", "A1 replacement"),
+        fork_user_chunk("compacted-source", "P2 replacement", 2),
+    ] {
+        adapter.append_update(&source, &update).await.unwrap();
+    }
+    let branched = Info {
+        id: acp::SessionId::new("fork-replaced-branch"),
+        cwd: "/project".into(),
+    };
+    assert!(
+        adapter
+            .copy_new_session_data_sync(
+                &source,
+                &branched,
+                CopySessionOptions {
+                    target_prompt_index: Some(2),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    assert!(!adapter.session_dir(&branched).exists());
+    std::fs::write(&updates_path, &updates).unwrap();
+
+    // A tool call in a pre-checkpoint turn cannot be recovered from the
+    // compacted chat or text-only replay. Do not save a misleading fork.
+    let first_line_end = updates.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let tool_update = SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        source.id.clone(),
+        acp::SessionUpdate::ToolCall(acp::ToolCall::new(acp::ToolCallId::new("t0"), "tool")),
+    )));
+    let envelope =
+        crate::session::storage::SessionUpdateEnvelope::from_update(&tool_update).unwrap();
+    let mut with_tool = updates[..first_line_end].to_vec();
+    with_tool.extend(serde_json::to_vec(&envelope).unwrap());
+    with_tool.push(b'\n');
+    with_tool.extend(&updates[first_line_end..]);
+    std::fs::write(&updates_path, with_tool).unwrap();
+    let lossy_target = Info {
+        id: acp::SessionId::new("fork-lossy"),
+        cwd: "/project".into(),
+    };
+    let error = adapter
+        .copy_new_session_data_sync(
+            &source,
+            &lossy_target,
+            CopySessionOptions {
+                target_prompt_index: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be reconstructed"));
+    assert!(!adapter.session_dir(&lossy_target).exists());
+
+    std::fs::remove_file(
+        adapter
+            .session_dir(&source)
+            .join("compaction_checkpoints/checkpoint.json"),
+    )
+    .unwrap();
+    let missing_checkpoint_target = Info {
+        id: acp::SessionId::new("fork-missing-checkpoint"),
+        cwd: "/project".into(),
+    };
+    assert!(
+        adapter
+            .copy_new_session_data_sync(
+                &source,
+                &missing_checkpoint_target,
+                CopySessionOptions {
+                    target_prompt_index: Some(0),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+    );
+    assert!(!adapter.session_dir(&missing_checkpoint_target).exists());
+}
+
+#[tokio::test]
+async fn point_fork_omits_unversioned_future_state_and_rejects_missing_prompt() {
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("future-source"),
+        cwd: "/project".into(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .append_update(&source, &fork_user_chunk("future-source", "P0", 0))
+        .await
+        .unwrap();
+    adapter
+        .append_chat_message(&source, &chat_user("P0", 0))
+        .await
+        .unwrap();
+    let mut summary = adapter.read_summary_sync(&source).unwrap();
+    summary.session_summary = "future title".into();
+    summary.generated_title = Some("future title".into());
+    summary.title_is_manual = true;
+    super::super::super::write_bytes_atomic(
+        &adapter.summary_file(&source),
+        &serde_json::to_vec(&summary).unwrap(),
+    )
+    .unwrap();
+    for (path, bytes) in [
+        (adapter.plan_file(&source), b"future plan".as_slice()),
+        (
+            adapter.plan_mode_state_file(&source),
+            br#"{"state":"Active","was_previously_active":true,"reminder_count":12,"pending_exit_reminder":true,"awaiting_plan_approval":true}"#.as_slice(),
+        ),
+        (
+            adapter.session_dir(&source).join("tool_state.json"),
+            b"future tool state".as_slice(),
+        ),
+        (
+            adapter.announcement_state_file(&source),
+            b"future announcements".as_slice(),
+        ),
+        (adapter.signals_file(&source), b"future signals".as_slice()),
+    ] {
+        std::fs::write(path, bytes).unwrap();
+    }
+    let target = Info {
+        id: acp::SessionId::new("point-clean"),
+        cwd: "/project".into(),
+    };
+    let result = adapter
+        .copy_new_session_data_sync(
+            &source,
+            &target,
+            CopySessionOptions {
+                target_prompt_index: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !result.plan_state_copied
+            && result.plan_mode_state_copied
+            && !result.tool_state_copied
+            && !result.announcement_state_copied
+            && !result.signals_copied
+    );
+    for path in [
+        adapter.plan_file(&target),
+        adapter.session_dir(&target).join("tool_state.json"),
+        adapter.announcement_state_file(&target),
+        adapter.signals_file(&target),
+    ] {
+        assert!(!path.exists());
+    }
+    let mode: crate::session::plan_mode::PlanModeSnapshot =
+        serde_json::from_slice(&std::fs::read(adapter.plan_mode_state_file(&target)).unwrap())
+            .unwrap();
+    assert_eq!(mode.state, crate::session::plan_mode::PlanModeState::Active);
+    assert!(!mode.awaiting_plan_approval);
+    assert_eq!(mode.reminder_count, 0);
+    let fork_summary = adapter.read_summary_sync(&target).unwrap();
+    assert!(fork_summary.session_summary.is_empty());
+    assert!(fork_summary.generated_title.is_none());
+    assert!(!fork_summary.title_is_manual);
+    let absent = Info {
+        id: acp::SessionId::new("missing-prompt"),
+        cwd: "/project".into(),
+    };
+    assert!(
+        adapter
+            .copy_new_session_data_sync(
+                &source,
+                &absent,
+                CopySessionOptions {
+                    target_prompt_index: Some(99),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    assert!(!adapter.session_dir(&absent).exists());
+}
+
+#[test]
+fn point_fork_plan_restriction_handles_transitions_and_corruption() {
+    use super::copy_point_fork_plan_restriction;
+    use crate::session::plan_mode::{PlanModeSnapshot, PlanModeState};
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source.json");
+    for state in [
+        PlanModeState::Active,
+        PlanModeState::Pending,
+        PlanModeState::ExitPending,
+        PlanModeState::Inactive,
+    ] {
+        let target = tmp.path().join(format!("{state:?}.json"));
+        let snapshot = PlanModeSnapshot {
+            state,
+            was_previously_active: true,
+            reminder_count: 3,
+            pending_exit_reminder: true,
+            awaiting_plan_approval: true,
+        };
+        std::fs::write(&source, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let copied = copy_point_fork_plan_restriction(&source, &target).unwrap();
+        if state == PlanModeState::Inactive {
+            assert!(!copied && !target.exists());
+        } else {
+            assert!(copied);
+            let restored: PlanModeSnapshot =
+                serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+            assert_eq!(restored.state, PlanModeState::Active);
+            assert_eq!(restored.reminder_count, 0);
+            assert!(!restored.awaiting_plan_approval && !restored.pending_exit_reminder);
+        }
+    }
+    std::fs::write(&source, b"{truncated").unwrap();
+    assert!(copy_point_fork_plan_restriction(&source, &tmp.path().join("invalid.json")).is_err());
 }

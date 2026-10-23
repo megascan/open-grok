@@ -221,6 +221,10 @@ pub trait ToolRegistry: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Bind-time policy keys on the stamped [`ServerRecord::host_kind`]; the
+/// type lives in the protocol crate because `servers.list` carries it.
+pub use xai_tool_protocol::HostKind;
+
 /// Server identity captured at `register_server` time.
 #[derive(Debug, Clone)]
 pub struct ServerRecord {
@@ -233,6 +237,9 @@ pub struct ServerRecord {
     /// Monotonic registration stamp ([`next_registration_seq`]) — the
     /// stale-vs-revived discriminator for newest-wins (`registered_at` is display-only).
     pub registration_seq: u64,
+    /// Resolved from the credential's minter at upgrade; `None` for a minter
+    /// the hub does not know. Stamped right after registration.
+    pub host_kind: Option<HostKind>,
 }
 
 /// Process-global hybrid logical clock: per-process strictly-increasing (no ties,
@@ -242,13 +249,23 @@ pub struct ServerRecord {
 /// The recency key for bind newest-wins and strictly-older eviction.
 static REGISTRATION_CLOCK: AtomicU64 = AtomicU64::new(0);
 
+pub const REGISTRATION_SEQ_SHIFT: u32 = 10;
+
+pub fn seq_from_wall_ms(wall_ms: u64) -> u64 {
+    wall_ms << REGISTRATION_SEQ_SHIFT
+}
+
+pub fn seq_wall_ms(sequence: u64) -> u64 {
+    sequence >> REGISTRATION_SEQ_SHIFT
+}
+
 /// Issue the next monotonic registration stamp. See [`REGISTRATION_CLOCK`].
 pub fn next_registration_seq() -> u64 {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let candidate = now_ms << 10;
+    let candidate = seq_from_wall_ms(now_ms);
     let mut prev = REGISTRATION_CLOCK.load(Ordering::Relaxed);
     loop {
         let next = candidate.max(prev + 1);

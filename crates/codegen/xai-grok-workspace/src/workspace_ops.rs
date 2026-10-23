@@ -22,13 +22,16 @@ use crate::file_system::ContentSearchRequest;
 use crate::handle::WorkspaceHandle;
 use crate::worktree::{ApplyWorktreeRequest, CreateWorktreeRequest, RemoveWorktreeRequest};
 use async_trait::async_trait;
+use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use xai_computer_hub_sdk::ToolHarness;
 use xai_grok_tools::types::output::ToolRunResult;
+use xai_grok_tools::types::resources::SessionFolder;
 use xai_grok_workspace_client::{WorkspaceClient, is_transport_fatal};
 pub use xai_grok_workspace_types::rpc::agents_md::DiscoverAgentsMdReq;
 pub use xai_grok_workspace_types::rpc::code_nav::{
@@ -38,8 +41,9 @@ pub use xai_grok_workspace_types::rpc::code_nav::{
 pub use xai_grok_workspace_types::rpc::export_github::ExportGithubReq;
 pub use xai_grok_workspace_types::rpc::fs::{
     ClientFsListNode, ClientFsListReq, ClientFsListRes, ClientFsReadFileReq, ClientFsReadFileRes,
-    ClientFsStatReq, ClientFsStatRes, GetFileEntry, GetFileResult, GetFilesReq, GetFilesRes,
-    PutFileEntry, PutFileResult, PutFilesReq, PutFilesRes,
+    ClientFsStatReq, ClientFsStatRes, ClientFsWriteFileReq, ClientFsWriteFileRes, GetFileEntry,
+    GetFileResult, GetFilesReq, GetFilesRes, PutFileEntry, PutFileResult, PutFilesReq, PutFilesRes,
+    StoreSessionImageReq, StoreSessionImageRes,
 };
 pub use xai_grok_workspace_types::rpc::git::{
     BinaryFileInfoData, CheckoutCommitResponse, CommitWithPatchData, DetectVcsKindReq,
@@ -70,8 +74,9 @@ pub use xai_grok_workspace_types::rpc::skills::DiscoverSkillsReq;
 pub use xai_grok_workspace_types::rpc::workspace::WorkspaceInfoReq;
 pub use xai_grok_workspace_types::rpc::worktree::{
     CreateWorktreeFromWorktreeRequestWire, CreateWorktreeFromWorktreeSyncReq,
-    PrepareWorktreeFromWorktreeResponse, WorktreeDbPathReq, WorktreeDbPathResponse,
-    WorktreeDbRebuildReq, WorktreeDbStatsReq, WorktreeGcReq, WorktreeListReq, WorktreeShowReq,
+    PrepareWorktreeFromWorktreeResponse, WorktreeCleanArtifactsReq, WorktreeDbPathReq,
+    WorktreeDbPathResponse, WorktreeDbRebuildReq, WorktreeDbStatsReq, WorktreeDetachReq,
+    WorktreeGcReq, WorktreeListReq, WorktreeSalvageReq, WorktreeShowReq,
 };
 pub use xai_grok_workspace_types::rpc::{RpcActivityClass, WorkspaceRpc};
 /// Implements [`WorkspaceRpc`] for request types whose responses
@@ -99,6 +104,12 @@ pub trait WorkspaceOp: WorkspaceRpc + DeserializeOwned + Send + Sync {
         ws: &WorkspaceHandle,
         session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response>;
+}
+fn hub_transfer_client() -> WorkspaceResult<reqwest::Client> {
+    xai_grok_extra_ca::build_reqwest_client(|builder| {
+        builder.timeout(std::time::Duration::from_secs(600))
+    })
+    .map_err(|e| WorkspaceError::HubError(format!("failed to create HTTP client: {e}")))
 }
 /// Prepare a worktree fork from an existing worktree (validation + path resolution).
 /// Returns a serialized result with `spawn_task` flag and the response.
@@ -260,7 +271,7 @@ fn session_tracker(
         .ok_or_else(|| WorkspaceError::SessionNotFound(sid.to_owned()))?;
     Ok(session.hunk_tracker().clone())
 }
-/// Ancestor hop budget when locating `.grok/repos.json`.
+/// Ancestor hop budget when locating `.opengrok/repos.json`.
 ///
 /// Grove rewrite is one hop (`/workspace/app` → `/workspace`). Desktop
 /// workspaces can sit deeper than that; this is a backstop only. Primary
@@ -269,14 +280,13 @@ const REPOS_MANIFEST_MAX_ANCESTOR_HOPS: usize = 16;
 /// Directories to probe for [`REPOS_MANIFEST_RELATIVE_PATH`], starting at
 /// `root_cwd` (post-grove-rewrite agent cwd) and walking up.
 ///
-/// Does not escape the sandbox workspace or load `~/.grok/repos.json` /
-/// `$GROK_HOME/repos.json` (user-global, not a provisioned workspace).
+/// Does not escape the sandbox workspace or load `~/.opengrok/repos.json` /
+/// `$OPENGROK_HOME/repos.json` (user-global, not a provisioned workspace).
 fn repos_manifest_search_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
     let rel = xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH;
-    #[allow(deprecated)]
-    let home = std::env::home_dir();
+    let home = dirs::home_dir();
     let mut global_manifests = Vec::with_capacity(2);
-    if let Some(v) = std::env::var_os("GROK_HOME")
+    if let Some(v) = std::env::var_os("OPENGROK_HOME")
         && !v.is_empty()
     {
         global_manifests.push(std::path::PathBuf::from(v).join("repos.json"));
@@ -1059,6 +1069,85 @@ impl WorkspaceOp for HookRegistryReq {
     }
 }
 #[async_trait]
+impl WorkspaceOp for StoreSessionImageReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let session_id = session_id.ok_or_else(|| {
+            WorkspaceError::HubError("store_session_image requires a bound session".to_owned())
+        })?;
+        let session = ws
+            .session(session_id)
+            .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.to_owned()))?;
+        if !matches!(self.extension.as_str(), "jpg" | "png" | "webp" | "gif") {
+            return Err(WorkspaceError::HubError(
+                "store_session_image extension must be jpg, png, webp, or gif".to_owned(),
+            ));
+        }
+        let folder = session
+            .toolset()
+            .resources
+            .lock()
+            .await
+            .require::<SessionFolder>()
+            .map_err(|e| WorkspaceError::HubError(format!("store_session_image: {e}")))?
+            .0
+            .clone();
+        if self.content_base64.len()
+            > xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BASE64_BYTES
+        {
+            return Err(WorkspaceError::HubError(format!(
+                "session image exceeds {} byte limit",
+                xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES
+            )));
+        }
+        let content_base64 = self.content_base64.clone();
+        let extension = self.extension.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(content_base64)
+                .map_err(|e| {
+                    WorkspaceError::HubError(format!("invalid session image base64: {e}"))
+                })?;
+            if content.len() > xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES {
+                return Err(WorkspaceError::HubError(format!(
+                    "session image exceeds {} byte limit",
+                    xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES
+                )));
+            }
+            let folder = dunce::canonicalize(&folder).map_err(|e| {
+                WorkspaceError::HubError(format!(
+                    "resolve session image folder {}: {e}",
+                    folder.display()
+                ))
+            })?;
+            let path = folder.join(format!("{}.{extension}", uuid::Uuid::new_v4()));
+            let file_path = path
+                .to_str()
+                .ok_or_else(|| {
+                    WorkspaceError::HubError("session image path is not UTF-8".to_owned())
+                })?
+                .to_owned();
+            let mut temp = tempfile::NamedTempFile::new_in(&folder).map_err(|e| {
+                WorkspaceError::HubError(format!("create session image temporary file: {e}"))
+            })?;
+            temp.write_all(&content)
+                .map_err(|e| WorkspaceError::HubError(format!("write session image: {e}")))?;
+            temp.as_file()
+                .sync_all()
+                .map_err(|e| WorkspaceError::HubError(format!("sync session image: {e}")))?;
+            temp.persist_noclobber(&path).map_err(|e| {
+                WorkspaceError::HubError(format!("persist session image {}: {e}", path.display()))
+            })?;
+            Ok(StoreSessionImageRes { file_path })
+        })
+        .await
+        .map_err(|e| WorkspaceError::JoinError(e.to_string()))?
+    }
+}
+#[async_trait]
 impl WorkspaceOp for PutFilesReq {
     async fn execute(
         &self,
@@ -1106,6 +1195,16 @@ impl WorkspaceOp for ClientFsReadFileReq {
         session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
         crate::file_system::client_fs::read_file(ws, session_id, self).await
+    }
+}
+#[async_trait]
+impl WorkspaceOp for ClientFsWriteFileReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        crate::file_system::client_fs::write_file(ws, session_id, self).await
     }
 }
 /// Resolve the index root for a code-nav op. Prefers the explicit per-session
@@ -1369,6 +1468,60 @@ impl WorkspaceOp for WorktreeGcReq {
     }
 }
 #[async_trait]
+impl WorkspaceOp for WorktreeDetachReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let allow_copy = self.allow_copy;
+        let report = tokio::task::spawn_blocking(move || {
+            crate::worktree::detach_worktree_mgmt(&id, allow_copy)
+        })
+        .await
+        .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+        .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkspaceOp for WorktreeSalvageReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let out = self.out.clone();
+        let report =
+            tokio::task::spawn_blocking(move || crate::worktree::salvage_worktree_mgmt(&id, &out))
+                .await
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkspaceOp for WorktreeCleanArtifactsReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let report =
+            tokio::task::spawn_blocking(move || crate::worktree::clean_artifacts_mgmt(&id))
+                .await
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
 impl WorkspaceOp for WorktreeDbStatsReq {
     async fn execute(
         &self,
@@ -1421,6 +1574,119 @@ impl WorkspaceOps {
             client: WorkspaceClient::with_connected_flag((*harness).clone(), connected),
         }
     }
+    /// The local workspace's shared sandbox. Proxy workspaces enforce on their server.
+    async fn command_sandbox(
+        &self,
+        remote: Option<&xai_grok_config_types::RemoteSettings>,
+    ) -> WorkspaceResult<Option<Arc<crate::sandbox::WorkspaceSandbox>>> {
+        let Self::Local { handle } = self else {
+            return Ok(None);
+        };
+        let shared = &handle.shared;
+        let root = shared.root_cwd.clone();
+        let control_dir = shared.workspace_home.clone();
+        let settings = remote.cloned();
+        let sandbox = shared
+            .sandbox
+            .get_or_init(|| async move {
+                let mut config =
+                    crate::sandbox::WorkspaceSandboxConfig::for_root(root, control_dir);
+                config.remote = settings;
+                crate::sandbox::WorkspaceSandbox::serve(config).await
+            })
+            .await;
+        sandbox.update_remote(remote);
+        if let Err(error) = sandbox.sync_network().await {
+            tracing::warn!(%error, "sandbox egress proxy unavailable; enforced commands have no network");
+        }
+        Ok(Some(Arc::clone(sandbox)))
+    }
+
+    /// Return the workspace-owned launch hook for local shell backends.
+    /// The hook resolves current settings at each spawn, including when currently off.
+    pub async fn sandbox_launch(
+        &self,
+        remote: Option<&xai_grok_config_types::RemoteSettings>,
+    ) -> WorkspaceResult<Option<Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>>> {
+        Ok(self
+            .command_sandbox(remote)
+            .await?
+            .map(|sandbox| sandbox as Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>))
+    }
+
+    /// Drive a local shell tool through per-call ownership, egress and at
+    /// most one approved replay. Call only after the shell's normal plan,
+    /// hook and permission checks. Dropping the stream releases its call.
+    pub fn run_sandbox_shell_call<F>(
+        &self,
+        session_id: &str,
+        call_id: String,
+        command: Option<String>,
+        owner_transport: Option<Arc<dyn crate::permission::PermissionHookTransport>>,
+        mut dispatch: F,
+    ) -> xai_tool_runtime::ToolStream<xai_grok_tools::types::output::ToolRunResult>
+    where
+        F: FnMut() -> xai_tool_runtime::ToolStream<xai_grok_tools::types::output::ToolRunResult>
+            + Send
+            + 'static,
+    {
+        let Self::Local { handle } = self else {
+            return dispatch();
+        };
+        let Some(session) = handle.session(session_id) else {
+            return xai_tool_runtime::terminal_only(Err(xai_tool_runtime::ToolError::new(
+                xai_tool_runtime::ToolErrorKind::PermissionDenied,
+                "sandbox session is unavailable",
+            )));
+        };
+        if handle.shared.sandbox().is_none() {
+            return xai_tool_runtime::terminal_only(Err(xai_tool_runtime::ToolError::new(
+                xai_tool_runtime::ToolErrorKind::PermissionDenied,
+                "workspace sandbox is unavailable",
+            )));
+        }
+        crate::sandbox::result_path::run_shell_call_with_owner(
+            handle.clone(),
+            session,
+            call_id,
+            command,
+            false,
+            owner_transport,
+            dispatch,
+        )
+    }
+
+    /// Check before every command sent to an external ACP terminal. Such a terminal cannot be
+    /// wrapped locally and must refuse when enforcement is required or cannot be established.
+    pub async fn sandbox_requires_local_enforcement(&self) -> WorkspaceResult<bool> {
+        let Some(sandbox) = self.command_sandbox(None).await? else {
+            // A proxy's sandbox mode is enforced by the remote workspace and is
+            // not observable here. Do not send an unwrapped command on an
+            // assumption that the remote workspace is unrestricted.
+            return Ok(true);
+        };
+        tokio::task::spawn_blocking(move || {
+            sandbox.mode() != xai_grok_sandbox::command::SandboxMode::Off
+        })
+        .await
+        .map_err(|error| WorkspaceError::JoinError(error.to_string()))
+    }
+
+    /// Enroll a local session's permission leases in sandbox-mode transitions.
+    /// Remote mode cannot be proven here, so proxy workspaces return `None`.
+    pub fn register_sandbox_mode_lease_fence(
+        &self,
+        permission: crate::permission::PermissionHandle,
+    ) -> Option<crate::sandbox_mode_fence::SandboxModeLeaseRegistration> {
+        match self {
+            Self::Local { handle } => Some(crate::sandbox_mode_fence::register_permission(
+                &handle.shared.root_cwd,
+                permission,
+            )),
+            Self::Proxy { .. } => None,
+        }
+    }
+
     /// Whether this handle routes through the server (proxy mode).
     pub fn is_proxy(&self) -> bool {
         matches!(self, Self::Proxy { .. })
@@ -1659,6 +1925,19 @@ impl WorkspaceOps {
         call_id: &str,
         session_id: Option<&str>,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        let mut ctx = xai_tool_runtime::ToolCallContext::default();
+        ctx.call_id = xai_tool_protocol::ToolCallId::new(call_id.to_owned()).unwrap_or(ctx.call_id);
+        self.call_tool_with_context(name, args, session_id, ctx)
+            .await
+    }
+    /// Local dispatch keeps the caller's context. The proxy hop cannot carry a slot, so it is not serialized.
+    pub async fn call_tool_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        session_id: Option<&str>,
+        ctx: xai_tool_runtime::ToolCallContext,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         match self {
             Self::Local { handle } => {
                 let session_id = session_id.ok_or_else(|| {
@@ -1676,7 +1955,7 @@ impl WorkspaceOps {
                         ),
                     )
                 })?;
-                session.toolset().call(name, args, call_id, None).await
+                session.toolset().call_with_context(name, args, ctx).await
             }
             Self::Proxy { client } => {
                 if !client.is_connected() {
@@ -1691,10 +1970,8 @@ impl WorkspaceOps {
                         format!("invalid tool name: {e}"),
                     )
                 })?;
-                let mut ctx = xai_tool_runtime::ToolCallContext::default();
-                ctx.call_id =
-                    xai_tool_protocol::ToolCallId::new(call_id.to_owned()).unwrap_or(ctx.call_id);
-                let mut stream = client.harness().call(tool_id, args, ctx).await;
+                let proxy_ctx = xai_tool_runtime::ToolCallContext::new(ctx.call_id.clone());
+                let mut stream = client.harness().call(tool_id, args, proxy_ctx).await;
                 let typed = crate::hub_channel::consume_stream_terminal(&mut stream)
                     .await
                     .inspect_err(|e| {
@@ -1761,6 +2038,18 @@ mod tests {
             CreateWorktreeFromWorktreeSyncReq::METHOD,
             "workspace.worktree_create_from_worktree_sync"
         );
+        assert_eq!(WorktreeDetachReq::METHOD, "workspace.worktree_detach");
+        assert_eq!(WorktreeSalvageReq::METHOD, "workspace.worktree_salvage");
+        assert_eq!(
+            WorktreeCleanArtifactsReq::METHOD,
+            "workspace.worktree_clean_artifacts"
+        );
+        assert_eq!(WorktreeDetachReq::ACTIVITY, RpcActivityClass::Mutation);
+        assert_eq!(WorktreeSalvageReq::ACTIVITY, RpcActivityClass::Mutation);
+        assert_eq!(
+            WorktreeCleanArtifactsReq::ACTIVITY,
+            RpcActivityClass::Mutation
+        );
     }
     /// The reported bug: every window's git queries ran against the workspace
     /// launch directory. `git_op_cwd` must return the per-session repo the
@@ -1801,7 +2090,7 @@ mod tests {
             base_branch: "main".into(),
             session_branch: "conv/1".into(),
         }]);
-        std::fs::create_dir_all(tmp.path().join(".grok")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".opengrok")).unwrap();
         std::fs::write(
             tmp.path()
                 .join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
@@ -1850,7 +2139,7 @@ mod tests {
             base_branch: "".into(),
             session_branch: "conv/1".into(),
         }]);
-        std::fs::create_dir_all(sandbox_ws.join(".grok")).unwrap();
+        std::fs::create_dir_all(sandbox_ws.join(".opengrok")).unwrap();
         std::fs::write(
             sandbox_ws.join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
             one.to_json_bytes().unwrap(),
@@ -1867,7 +2156,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
         assert_eq!(
             dirs,
@@ -1883,7 +2172,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _home = crate::TestEnvGuard::unset("HOME");
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
         assert!(
             dirs.contains(&std::path::PathBuf::from("/workspace/app")),
@@ -1895,13 +2184,27 @@ mod tests {
         );
     }
     #[test]
+    fn repos_manifest_search_dirs_ignores_upstream_grok_home() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let open_grok_home = tempfile::tempdir().unwrap();
+        let _home = crate::TestEnvGuard::set("HOME", home.path());
+        let _open_grok = crate::TestEnvGuard::set("OPENGROK_HOME", open_grok_home.path());
+        let _upstream = crate::TestEnvGuard::set("GROK_HOME", &workspace.path().join(".opengrok"));
+        let dirs = repos_manifest_search_dirs(workspace.path());
+        assert!(dirs.contains(&workspace.path().to_path_buf()));
+    }
+    #[test]
     fn repos_manifest_search_dirs_skips_user_global_grok_home() {
         let _lock = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let start = home.path().join("src").join("org").join("app");
         let dirs = repos_manifest_search_dirs(&start);
         assert!(dirs.contains(&start));
@@ -1909,7 +2212,7 @@ mod tests {
         assert!(dirs.contains(&home.path().join("src")));
         assert!(
             !dirs.iter().any(|d| d == home.path()),
-            "must not probe $HOME/.grok/repos.json: {dirs:?}"
+            "must not probe $HOME/.opengrok/repos.json: {dirs:?}"
         );
     }
     /// Sync + `block_on` so `ENV_TEST_LOCK` is not held across `.await`
@@ -1921,7 +2224,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = crate::TestEnvGuard::set("HOME", home.path());
-        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("OPENGROK_HOME");
         let global = RepoManifest::new(vec![ProvisionedRepo {
             name: "global".into(),
             repository: "acme/global".into(),
@@ -1929,9 +2232,9 @@ mod tests {
             base_branch: "main".into(),
             session_branch: "x".into(),
         }]);
-        std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+        std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
         std::fs::write(
-            home.path().join(".grok").join("repos.json"),
+            home.path().join(".opengrok").join("repos.json"),
             global.to_json_bytes().unwrap(),
         )
         .unwrap();
@@ -1945,7 +2248,7 @@ mod tests {
         let listed = rt.block_on(ops.repos_list()).expect("list");
         assert!(
             listed.repos.is_empty(),
-            "missing workspace manifest must not fall back to ~/.grok/repos.json: {:?}",
+            "missing workspace manifest must not fall back to ~/.opengrok/repos.json: {:?}",
             listed.repos
         );
     }
@@ -2125,7 +2428,7 @@ mod tests {
             url: None,
             url_raw: None,
             timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
+            source_dir: std::path::PathBuf::from("/home/u/.opengrok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::File,
         };
@@ -2255,7 +2558,7 @@ mod tests {
             url: None,
             url_raw: None,
             timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
+            source_dir: std::path::PathBuf::from("/home/u/.opengrok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::Managed,
         };
@@ -2265,8 +2568,7 @@ mod tests {
             "HookSpecWire serde shape drifted from upstream HookSpec"
         );
     }
-    /// The worktree-fork request projects onto / rebuilds from its wire mirror;
-    /// the two `#[serde(skip)]` runtime fields never ride the wire.
+    /// The worktree-fork request projects onto / rebuilds from its wire mirror; `#[serde(skip)]` runtime fields are never serialized.
     #[test]
     fn create_worktree_from_worktree_request_wire_round_trip() {
         let req = crate::worktree::CreateWorktreeFromWorktreeRequest {
@@ -2276,8 +2578,11 @@ mod tests {
             git_ref: Some("main".to_string()),
             worktree_type: Some(crate::worktree::WorktreeType::Linked),
             label: None,
+            grove_worktree: None,
             cancellation_token: None,
             resolved_dest_path: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -2287,6 +2592,34 @@ mod tests {
         assert_eq!(back.source_worktree_path, "/src");
         assert!(back.cancellation_token.is_none());
         assert!(back.resolved_dest_path.is_none());
+        assert!(back.resolved_source_git_root.is_none());
+    }
+
+    #[test]
+    fn worktree_fork_rpc_preserves_explicit_grove_flags() {
+        for grove_worktree in [None, Some(false), Some(true)] {
+            let request = crate::worktree::CreateWorktreeFromWorktreeRequest {
+                source_worktree_path: "/src".to_owned(),
+                new_session_id: "s2".to_owned(),
+                copy_mode: crate::worktree::WorktreeCopyMode::Dirty,
+                git_ref: None,
+                worktree_type: Some(crate::worktree::WorktreeType::Linked),
+                label: None,
+                grove_worktree,
+                cancellation_token: None,
+                resolved_dest_path: None,
+                resolved_source_git_root: None,
+                grove_gate_source: None,
+            };
+            let operation = CreateWorktreeFromWorktreeSyncReq {
+                inner: request.into_wire(),
+            };
+            let encoded = serde_json::to_value(&operation).unwrap();
+            let decoded: CreateWorktreeFromWorktreeSyncReq =
+                serde_json::from_value(encoded).unwrap();
+            let restored = crate::worktree::CreateWorktreeFromWorktreeRequest::from(decoded.inner);
+            assert_eq!(restored.grove_worktree, grove_worktree);
+        }
     }
     use crate::handle::tests::make_handle;
     #[tokio::test]

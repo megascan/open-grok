@@ -11,7 +11,7 @@ use crate::types::output::{
 use crate::types::requirements::Expr;
 #[allow(unused_imports)]
 use crate::types::resources::{
-    Cwd, DisplayCwd, FileSystem, NotificationHandle, SharedResources, resolve_model_path,
+    Cwd, DisplayCwd, FileSystem, NotificationHandle, PlanFile, SharedResources, resolve_model_path,
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 
@@ -49,6 +49,10 @@ impl crate::types::tool_metadata::ToolMetadata for WriteTool {
 
     fn tool_namespace(&self) -> ToolNamespace {
         ToolNamespace::OpenCode
+    }
+
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("file_path")
     }
 
     fn description_template(&self) -> &str {
@@ -111,15 +115,34 @@ impl xai_tool_runtime::Tool for WriteTool {
 
         // Resolve the model-provided path.
         let path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+        let plan = ctx.extensions.get::<PlanFile>();
+        let (path, fs) = if let Some(plan) = &plan {
+            plan.check_path(&path).map_err(|e| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("write").expect("valid"),
+                    e.to_string(),
+                )
+            })?;
+            (plan.path().to_path_buf(), plan.filesystem())
+        } else {
+            (path, fs)
+        };
 
         // ── Check if file exists and read old content ────────────
         let (existed, old_content) = match fs.read_file(&path).await {
             Ok(bytes) => (true, Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(e) if plan.is_some() && e.io_error_kind() != Some(std::io::ErrorKind::NotFound) => {
+                return Err(xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("write").expect("valid"),
+                    e.to_string(),
+                ));
+            }
             Err(_) => (false, None),
         };
 
         // ── Create parent directories if needed ──────────────────
-        if let Some(parent) = path.parent()
+        if plan.is_none()
+            && let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -215,6 +238,95 @@ mod tests {
         resources.insert(FileSystem(Arc::new(LocalFs)));
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
         resources
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_limits_write_and_rejects_a_swapped_link() {
+        use crate::computer::types::AsyncFileSystem;
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = root.join("plan.md");
+        let outside = root.join("outside");
+        std::fs::write(&outside, "protected").unwrap();
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let mut ctx = test_ctx(test_resources(&root).into_shared());
+        ctx.extensions.insert(plan.clone());
+        let input = WriteInput {
+            file_path: plan_path.to_string_lossy().into_owned(),
+            content: "plan".into(),
+        };
+        xai_tool_runtime::Tool::run(&WriteTool, ctx, input)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&plan_path).unwrap(), "plan");
+
+        let mut ctx = test_ctx(test_resources(&root).into_shared());
+        ctx.extensions.insert(plan.clone());
+        let input = WriteInput {
+            file_path: outside.to_string_lossy().into_owned(),
+            content: "bad".into(),
+        };
+        assert!(
+            xai_tool_runtime::Tool::run(&WriteTool, ctx, input)
+                .await
+                .is_err()
+        );
+
+        std::fs::remove_file(&plan_path).unwrap();
+        symlink(&outside, &plan_path).unwrap();
+        let mut ctx = test_ctx(test_resources(&root).into_shared());
+        ctx.extensions.insert(plan);
+        let input = WriteInput {
+            file_path: plan_path.to_string_lossy().into_owned(),
+            content: "bad".into(),
+        };
+        assert!(
+            xai_tool_runtime::Tool::run(&WriteTool, ctx, input)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "protected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_is_scoped_to_one_parallel_call() {
+        use crate::computer::types::AsyncFileSystem;
+
+        let tmp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = root.join("plan.md");
+        let ordinary_path = root.join("ordinary.txt");
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let shared = test_resources(&root).into_shared();
+        let mut plan_ctx = test_ctx(shared.clone());
+        plan_ctx.extensions.insert(plan);
+        let ordinary_ctx = test_ctx(shared);
+        let (plan_result, ordinary_result) = tokio::join!(
+            xai_tool_runtime::Tool::run(
+                &WriteTool,
+                plan_ctx,
+                WriteInput {
+                    file_path: plan_path.to_string_lossy().into_owned(),
+                    content: "plan".into()
+                }
+            ),
+            xai_tool_runtime::Tool::run(
+                &WriteTool,
+                ordinary_ctx,
+                WriteInput {
+                    file_path: ordinary_path.to_string_lossy().into_owned(),
+                    content: "ordinary".into()
+                }
+            ),
+        );
+        plan_result.unwrap();
+        ordinary_result.unwrap();
+        assert_eq!(std::fs::read_to_string(plan_path).unwrap(), "plan");
+        assert_eq!(std::fs::read_to_string(ordinary_path).unwrap(), "ordinary");
     }
 
     // ── Write new file ──────────────────────────────────────────

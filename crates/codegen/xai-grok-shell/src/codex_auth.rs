@@ -813,6 +813,24 @@ fn report_browser_launch_failure(
     }
 }
 
+fn write_codex_browser_prompt(writer: &mut impl Write, url: &str) -> io::Result<()> {
+    crate::auth::device_code::write_required_login_prompt(
+        writer,
+        format_args!(
+            "\nSigning in to OpenAI Codex with ChatGPT...\nOpen this URL if your browser does not open automatically:\n  {url}\n"
+        ),
+    )
+}
+
+fn write_codex_device_prompt(writer: &mut impl Write, url: &str, code: &str) -> io::Result<()> {
+    crate::auth::device_code::write_required_login_prompt(
+        writer,
+        format_args!(
+            "\nOpen this URL and sign in to ChatGPT:\n  {url}\nThen enter this one-time code (expires in 15 minutes):\n  {code}\nContinue only if you started this login in Open Grok.\n"
+        ),
+    )
+}
+
 async fn run_browser_login_at(
     path: &Path,
     endpoints: &CodexEndpoints,
@@ -827,6 +845,10 @@ async fn run_browser_login_at(
     let pkce = generate_pkce();
     let expected_state = generate_state();
     let auth_url = build_authorize_url(endpoints, &redirect_uri, &pkce, &expected_state)?;
+    if announce {
+        write_codex_browser_prompt(&mut std::io::stderr().lock(), &auth_url)
+            .context("could not write sign-in instructions")?;
+    }
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let state = Arc::new(CallbackState {
         expected_state,
@@ -841,12 +863,6 @@ async fn run_browser_login_at(
         }
     });
 
-    if announce {
-        eprintln!();
-        eprintln!("Signing in to OpenAI Codex with ChatGPT...");
-        eprintln!("Open this URL if your browser does not open automatically:");
-        eprintln!("  {auth_url}");
-    }
     let open_url = auth_url.clone();
     let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url))
         .await
@@ -887,12 +903,12 @@ async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<
         .await
         .context("Codex device-code response was invalid")?;
     let verification_url = format!("{issuer}/codex/device");
-    eprintln!();
-    eprintln!("Open this URL and sign in to ChatGPT:");
-    eprintln!("  {verification_url}");
-    eprintln!("Then enter this one-time code (expires in 15 minutes):");
-    eprintln!("  {}", device.user_code);
-    eprintln!("Continue only if you started this login in Open Grok.");
+    write_codex_device_prompt(
+        &mut std::io::stderr().lock(),
+        &verification_url,
+        &device.user_code,
+    )
+    .context("could not write sign-in instructions")?;
     let open_url = verification_url.clone();
     tokio::task::spawn_blocking(move || webbrowser::open(&open_url));
 
@@ -1420,6 +1436,37 @@ pub(crate) fn image_api_key_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_required_prompts_fail_on_closed_output() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let url = "https://example.invalid/login";
+        assert_eq!(
+            write_codex_browser_prompt(&mut Closed, url)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            write_codex_device_prompt(&mut Closed, url, "test-code")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut displayed = Vec::new();
+        write_codex_device_prompt(&mut displayed, url, "test-code").unwrap();
+        let text = String::from_utf8(displayed).unwrap();
+        assert!(text.contains(url));
+        assert!(text.contains("test-code"));
+    }
     use std::sync::atomic::AtomicUsize;
 
     fn jwt(payload: serde_json::Value) -> String {

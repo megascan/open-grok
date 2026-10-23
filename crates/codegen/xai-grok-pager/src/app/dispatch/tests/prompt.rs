@@ -398,8 +398,6 @@ fn show_undo_tip_no_op_when_flag_off() {
     assert!(!app.agents[&id].ephemeral_tip.is_active());
 }
 
-// ── Small-screen tip (`show_small_screen_tip` + its one-shot trigger) ──
-
 /// `show_small_screen_tip` on a drawable agent shows the tip and increments
 /// the per-session seen count in memory (nothing persisted — the fn returns
 /// nothing, so it cannot raise effects).
@@ -673,8 +671,6 @@ fn small_screen_trigger_suppressed_when_user_compact_on() {
     assert!(!app.agents[&id].ephemeral_tip.is_active());
     assert!(app.tip_seen_counts.is_empty(), "no count burned");
 }
-
-// ── SSH wrap tip (`show_ssh_wrap_tip` + its one-shot trigger) ──
 
 /// `show_ssh_wrap_tip` on a drawable agent shows the tip and increments the
 /// per-session seen count in memory (nothing persisted — the fn returns
@@ -2751,8 +2747,6 @@ fn bash_before_the_session_binds_is_queued_and_recorded() {
     );
 }
 
-// ── Reconnect-pending dispatch guards ─────────────────────────────
-
 #[test]
 fn send_prompt_blocked_during_reconnect() {
     let mut app = test_app_with_agent();
@@ -3335,9 +3329,7 @@ fn interject_before_paste_probe_keeps_image() {
     assert!(app.agents[&id].prompt.images.is_empty());
 }
 
-/// Guard: a stashed send must NOT be re-issued to the wrong session when the
-/// user switched agents during the probe window. The image still attaches to
-/// the original target; the stale send is dropped, not sent to the new agent.
+/// A paste-dependent send stays bound to the original session across a switch.
 #[test]
 fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3404,8 +3396,8 @@ fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     assert_eq!(app.agents[&a].prompt.images.len(), 1);
     assert!(app.agents[&a].prompt.text().contains("[Image #1]"));
     let preview_identity = app.agents[&a].prompt.images[0].preview.identity();
-    // (2) A's stash is cleared so it can't leak.
-    assert!(app.agents[&a].deferred_send.is_none());
+    // (2) A's submission stays pending, rather than being sent to B.
+    assert!(app.agents[&a].deferred_send.is_some());
     assert_eq!(app.agents[&a].paste_probe_in_flight, 0);
     // (3) No send is re-issued to the now-active B. The only returned effect
     // prepares the image that was attached to A.
@@ -3422,6 +3414,344 @@ fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
         b_queue_before,
         "agent B's queue must be untouched"
     );
+    app.active_view = ActiveView::Agent(a);
+    app.reconnect_pending = true;
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+    assert!(app.agents[&a].deferred_send.is_some());
+    app.reconnect_pending = false;
+    app.agents.get_mut(&a).unwrap().active_modal =
+        Some(crate::views::modal::ActiveModal::CommandPalette {
+            entries: vec![],
+            state: crate::views::picker::PickerState::input_active(),
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+    assert!(app.agents[&a].deferred_send.is_some());
+    app.agents.get_mut(&a).unwrap().active_modal = None;
+    let effects = super::super::task_result::resume_focused_deferred_paste(&mut app);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SendPromptBlocks { agent_id, blocks, .. }
+            if *agent_id == a && blocks.iter().any(|block| matches!(block, acp::ContentBlock::Image(_))))));
+    assert!(app.agents[&a].deferred_send.is_none());
+    assert!(super::super::task_result::resume_focused_deferred_paste(&mut app).is_empty());
+}
+
+#[test]
+fn deferred_paste_send_cancels_when_draft_or_binding_changes() {
+    use crate::app::actions::{
+        ClipboardPasteContext, ClipboardPasteSource, ClipboardPasteTarget, ClipboardTextRead,
+        ProbedAttachment,
+    };
+    use crate::app::agent_view::AgentDeferredSend;
+    for rebind in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("original");
+        agent.paste_probe_in_flight = 1;
+        agent.defer_prompt_send(AgentDeferredSend::SendPrompt);
+        let binding_epoch = agent.session_binding_epoch;
+        if rebind {
+            agent.bind_session_id(acp::SessionId::new("new-session"));
+        } else {
+            agent.prompt.set_text("changed");
+        }
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx: ClipboardPasteContext {
+                    target: ClipboardPasteTarget::AgentPrompt {
+                        agent_id: id,
+                        binding_epoch,
+                        images_dir: None,
+                        feedback_tool_call_id: None,
+                    },
+                    source: ClipboardPasteSource::ClipboardKey {
+                        text: ClipboardTextRead::Success(None),
+                        tip_showing: false,
+                    },
+                },
+                image: ProbedAttachment::NoRaster,
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )));
+        assert!(app.agents[&id].deferred_send.is_none());
+        assert_eq!(
+            app.agents[&id].prompt.text(),
+            if rebind { "original" } else { "changed" }
+        );
+    }
+}
+
+#[test]
+fn editing_a_deferred_paste_send_cancels_it_even_if_text_is_restored() {
+    use crate::app::agent_view::AgentDeferredSend;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.prompt.set_text("original");
+    agent.paste_probe_in_flight = 1;
+    agent.defer_prompt_send(AgentDeferredSend::SendPrompt);
+    agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(agent.deferred_send.is_none());
+    agent.prompt.set_text("original");
+    assert!(agent.deferred_send.is_none());
+}
+
+#[test]
+fn second_image_paste_cancels_earlier_submission_in_either_completion_order() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for reverse in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("original");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .handle_prompt_key_for_test(&key);
+        let first_ctx = app.agents[&id]
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("first probe");
+        app.agents.get_mut(&id).unwrap().pending_effects.clear();
+        dispatch(Action::SendPrompt("original".into()), &mut app);
+        assert!(app.agents[&id].deferred_send.is_some());
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .handle_prompt_key_for_test(&key);
+        let second_ctx = app.agents[&id]
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("second probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        app.agents.get_mut(&id).unwrap().pending_effects.clear();
+        assert!(app.agents[&id].deferred_send.is_none());
+        let mut contexts = vec![first_ctx, second_ctx];
+        if reverse {
+            contexts.reverse();
+        }
+        for ctx in contexts {
+            let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+                data: vec![1, 2, 3],
+                mime_type: "image/png".into(),
+            });
+            let effects = dispatch(
+                Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                    ctx,
+                    image: crate::app::actions::ProbedAttachment::Image(pasted),
+                    file_urls: None,
+                }),
+                &mut app,
+            );
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+            )));
+        }
+        assert_eq!(app.agents[&id].prompt.images.len(), 2);
+        assert!(app.agents[&id].prompt.text().contains("original"));
+    }
+}
+
+#[test]
+fn bracketed_paste_cancels_submission_but_keeps_the_earlier_image() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.set_active_pane(ActivePane::Prompt, true);
+    agent.prompt.set_text("original");
+    crate::clipboard::set_clipboard_probe_hook(crate::clipboard::ClipboardProbeHook::with_raster(
+        None,
+    ));
+    agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    let ctx = agent
+        .pending_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+            _ => None,
+        })
+        .expect("probe");
+    crate::clipboard::clear_clipboard_probe_hook();
+    agent.pending_effects.clear();
+    dispatch(Action::SendPrompt("original".into()), &mut app);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.handle_input(
+        &Event::Paste("more\ntext".into()),
+        &crate::actions::ActionRegistry::defaults(),
+    );
+    assert!(agent.deferred_send.is_none());
+    let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: vec![1, 2, 3],
+        mime_type: "image/png".into(),
+    });
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+            ctx,
+            image: crate::app::actions::ProbedAttachment::Image(pasted),
+            file_urls: None,
+        }),
+        &mut app,
+    );
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+    )));
+    assert_eq!(app.agents[&id].prompt.images.len(), 1);
+    assert!(app.agents[&id].prompt.text().contains("more"));
+}
+
+#[test]
+fn canceled_paste_probe_cannot_attach_after_session_rebind() {
+    use crate::app::actions::{ClipboardPasteSource, ClipboardTextRead, ProbedAttachment};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for is_image in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("original");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let mut ctx = agent
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        agent.pending_effects.clear();
+        dispatch(Action::SendPrompt("original".into()), &mut app);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(agent.deferred_send.is_none());
+        agent.bind_session_id(acp::SessionId::new("new-session"));
+        let new_draft = agent.prompt.text().to_owned();
+        ctx.source = ClipboardPasteSource::ClipboardKey {
+            text: ClipboardTextRead::Success(Some("stale caption".into())),
+            tip_showing: false,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let staged_path = directory.path().join("stale.png");
+        let image = if is_image {
+            std::fs::write(&staged_path, [1, 2, 3]).unwrap();
+            let mut pasted =
+                crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+                    data: vec![1, 2, 3],
+                    mime_type: "image/png".into(),
+                });
+            pasted.staged_temp_path = Some(staged_path.clone());
+            ProbedAttachment::Image(pasted)
+        } else {
+            ProbedAttachment::NoRaster
+        };
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx,
+                image,
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )));
+        let agent = &app.agents[&id];
+        assert_eq!(agent.prompt.text(), new_draft);
+        assert!(agent.prompt.images.is_empty());
+        assert_eq!(agent.paste_probe_in_flight, 0);
+        assert!(!staged_path.exists());
+    }
+}
+
+#[test]
+fn new_session_adopts_paste_probe_started_before_creation() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for submit in [false, true] {
+        let mut app = test_app();
+        dispatch(Action::NewSession, &mut app);
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        assert!(agent.session.session_id.is_none());
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent.prompt.set_text("new draft");
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::with_raster(None),
+        );
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let ctx = agent
+            .pending_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ProbeClipboardAttachment { ctx, .. } => Some(ctx.clone()),
+                _ => None,
+            })
+            .expect("probe");
+        crate::clipboard::clear_clipboard_probe_hook();
+        agent.pending_effects.clear();
+        if submit {
+            dispatch(Action::SendPrompt("new draft".into()), &mut app);
+            assert!(app.agents[&id].deferred_send.is_some());
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: id,
+                session_id: acp::SessionId::new("created-session"),
+                models: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        let pasted = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: "image/png".into(),
+        });
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ClipboardAttachmentProbed {
+                ctx,
+                image: crate::app::actions::ProbedAttachment::Image(pasted),
+                file_urls: None,
+            }),
+            &mut app,
+        );
+        if submit {
+            assert!(effects.iter().any(|effect| matches!(effect,
+                Effect::SendPromptBlocks { agent_id, blocks, .. }
+                    if *agent_id == id && blocks.iter().any(|block| matches!(block, acp::ContentBlock::Image(_))))));
+            assert!(app.agents[&id].deferred_send.is_none());
+        } else {
+            assert_eq!(app.agents[&id].prompt.images.len(), 1);
+            assert!(app.agents[&id].prompt.text().contains("new draft"));
+        }
+    }
 }
 
 /// A prompt submitted before the session binds is held in the agent's queue rather than dropped.
@@ -3450,8 +3780,6 @@ fn prompt_before_the_session_binds_is_queued() {
         "nothing may go to the wire before the session binds, got {effects:?}"
     );
 }
-
-// ── Minimal-mode slash gate tests ───────────────────────────────────
 
 /// Returns true if any system block in agent 0's scrollback contains
 /// `needle`. Avoids `last_system_text`'s "last block must be System" panic
@@ -3514,8 +3842,6 @@ fn minimal_mode_allows_mode_agnostic_slash_command() {
     );
 }
 
-// ── /queue (ShowQueue) dispatch tests ───────────────────────────────
-
 #[test]
 fn show_queue_empty_commits_empty_message() {
     let mut app = test_app_with_agent();
@@ -3551,8 +3877,6 @@ fn show_queue_no_active_agent_is_noop() {
     let effects = dispatch(Action::ShowQueue, &mut app);
     assert!(effects.is_empty(), "ShowQueue without an agent is a no-op");
 }
-
-// ── Send-now cancel marker suppression (PromptResponse rail) ────────
 
 /// Count of "Turn cancelled by user …" marker blocks in the agent's scrollback.
 fn count_cancelled_markers(app: &AppView, id: AgentId) -> usize {
@@ -3678,6 +4002,7 @@ fn send_prompt_now_dispatch_arms_expectation_and_suppresses_marker() {
         Action::SendPromptNow {
             text: "run this instead".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4005,6 +4330,7 @@ fn send_now_during_active_goal_does_not_arm_expectation() {
         Action::SendPromptNow {
             text: "goal steer".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4055,6 +4381,7 @@ fn goal_send_now_painted_block_survives_removed_from_queue_response() {
         Action::SendPromptNow {
             text: "goal steer".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4120,6 +4447,7 @@ fn goal_send_now_painted_block_survives_queue_changed_removal() {
         Action::SendPromptNow {
             text: "goal steer".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4181,6 +4509,7 @@ fn send_prompt_now_during_reconnect_requeues_locally() {
         Action::SendPromptNow {
             text: "typed mid-outage".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4219,6 +4548,7 @@ fn failed_send_now_requeues_payload_and_retires_echo() {
         Action::SendPromptNow {
             text: "gets lost on the wire".into(),
             images: vec![],
+            image_notice: None,
         },
         &mut app,
     );
@@ -4338,7 +4668,7 @@ fn local_drain_holds_while_server_row_queued() {
 
     let agent = app.agents.get_mut(&id).unwrap();
     assert!(agent.session.state.is_idle());
-    let effects = maybe_drain_queue(agent).effects;
+    let effects = maybe_drain_queue(agent, &mut app.pending_image_notices).effects;
     assert!(
         effects.is_empty(),
         "local drain must hold while the server owns the next turn, got {effects:?}"
@@ -4353,7 +4683,7 @@ fn local_drain_holds_while_server_row_queued() {
     // turn, not a queued one) — once it's marked running and the turn ends,
     // the local row drains normally.
     agent.session.current_prompt_id = Some("srv-1".into());
-    let effects = maybe_drain_queue(agent).effects;
+    let effects = maybe_drain_queue(agent, &mut app.pending_image_notices).effects;
     assert!(
         matches!(effects.as_slice(), [Effect::SendPrompt { .. }]),
         "a running-only shared queue must not hold the local drain, got {effects:?}"
@@ -4797,4 +5127,758 @@ fn suggestion_debounce_routes_by_agent_id_not_active_view() {
         )),
         "expiry must fetch for the arming agent even off-screen: {effects:?}"
     );
+}
+
+fn toast_text(app: &AppView, id: AgentId) -> Option<&str> {
+    app.agents[&id].toast.as_ref().map(|(msg, _)| msg.as_str())
+}
+
+/// Home, Ctrl+K, Ctrl+Y turns the chip into plain `[Image #1]` text and back; the send still carries the image block.
+#[test]
+fn yanked_image_chip_is_sent_as_image_block() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+        agent.prompt.append_text("what is this");
+        let _ = agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(
+            agent.prompt.text().is_empty(),
+            "Ctrl+K kills the whole line"
+        );
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(agent.prompt.text(), "[Image #1] what is this");
+        assert_eq!(
+            agent.prompt.images.len(),
+            1,
+            "the yanked placeholder must re-bind its image"
+        );
+    }
+
+    let text = app.agents[&id].prompt.text().to_string();
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+
+    match effects.as_slice() {
+        [Effect::SendPromptBlocks { blocks, .. }] => {
+            let Some(acp::ContentBlock::Text(tb)) = blocks.first() else {
+                panic!("first block must be text");
+            };
+            assert_eq!(tb.text, "[Image #1] what is this");
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|b| matches!(b, acp::ContentBlock::Image(_)))
+                    .count(),
+                1,
+                "the yanked chip must ride as one image block"
+            );
+        }
+        other => panic!("expected SendPromptBlocks with the image, got {other:?}"),
+    }
+    assert!(
+        !toast_text(&app, id).is_some_and(|msg| msg.contains("not attached")),
+        "a bound chip must not raise the unbound toast"
+    );
+}
+
+/// A recalled `[Image #1]` with no record behind it still sends as text, with a toast saying so.
+#[test]
+fn unbound_image_placeholder_send_toasts_and_keeps_text() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .prompt
+        .set_text("see [Image #1]");
+
+    let effects = dispatch(Action::SendPrompt("see [Image #1]".into()), &mut app);
+
+    match effects.as_slice() {
+        [Effect::SendPrompt { text, .. }] => assert_eq!(text, "see [Image #1]"),
+        other => panic!("expected a plain SendPrompt, got {other:?}"),
+    }
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Image #1 not attached — placeholder sent as text")
+    );
+    assert!(&app.agents[&id].prompt.text().is_empty());
+}
+
+/// Mid-turn Send now (Ctrl+Enter) runs the same unbound check before it drains the composer; the
+/// notice rides the send action and surfaces when it is dispatched.
+#[test]
+fn send_now_with_unbound_placeholder_toasts() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.state = AgentState::TurnRunning;
+    agent.set_active_pane(ActivePane::Prompt, true);
+    agent.prompt.set_text("compare [Image #1] and [Image #3]");
+
+    let outcome =
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let crate::app::app_view::InputOutcome::Action(action) = outcome else {
+        panic!("expected SendPromptNow, got {outcome:?}");
+    };
+    let Action::SendPromptNow {
+        text,
+        images,
+        image_notice,
+    } = &action
+    else {
+        panic!("expected SendPromptNow, got {action:?}");
+    };
+    assert_eq!(text, "compare [Image #1] and [Image #3]");
+    assert!(images.is_empty(), "no record backs the placeholders");
+    assert!(image_notice.is_some(), "the notice must ride the send");
+    dispatch(action, &mut app);
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images #1, #3 not attached — placeholders sent as text")
+    );
+}
+
+/// Send now with both failure kinds: the placeholder notice rides the action and the read failure
+/// is found while the same dispatch builds the blocks, so one toast carries both.
+#[test]
+fn send_now_with_unbound_and_unreadable_shares_one_toast() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.state = AgentState::TurnRunning;
+    agent.set_active_pane(ActivePane::Prompt, true);
+    agent.prompt.set_text("compare [Image #7] with ");
+    agent.prompt.set_cursor(agent.prompt.text().len());
+    let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+    image.encoded_bytes = None;
+    image.session_image_path = Some(dir.path().join("gone.png"));
+    agent.prompt.insert_image(image).unwrap();
+
+    let outcome =
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let crate::app::app_view::InputOutcome::Action(action) = outcome else {
+        panic!("expected SendPromptNow, got {outcome:?}");
+    };
+    let effects = dispatch(action, &mut app);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPromptNow { .. })),
+        "the send still goes out, got {effects:?}"
+    );
+    assert_eq!(
+        toast_text(&app, id),
+        Some(
+            "Image #7 not attached — placeholder sent as text; Image #1 couldn't be read — not sent"
+        )
+    );
+}
+
+/// Ctrl+C releases the image records; undo brings the chip back without one. Sending it is text-only
+/// and says so instead of passing silently as a bound chip.
+#[test]
+fn recordless_chip_after_clear_and_undo_toasts_on_send() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(agent.prompt.text(), "[Image #1] ");
+        assert!(agent.prompt.images.is_empty());
+    }
+
+    let effects = dispatch(Action::SendPrompt("[Image #1] ".into()), &mut app);
+
+    match effects.as_slice() {
+        [Effect::SendPrompt { text, .. }] => assert_eq!(text, "[Image #1] "),
+        other => panic!("expected a plain SendPrompt, got {other:?}"),
+    }
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Image #1 not attached — placeholder sent as text")
+    );
+}
+
+/// Recalling a history line over a draft that holds `[Image #1]`: the line's own `[Image #1]` names
+/// an image from an earlier send, so it must not attach the current draft's record. The send is
+/// text-only with the unbound toast, not a silent image send.
+#[test]
+fn history_recall_over_image_draft_sends_placeholder_as_text() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+        assert_eq!(agent.prompt.text(), "[Image #1] ");
+        assert_eq!(agent.prompt.images.len(), 1);
+
+        agent.accept_history_entry("[Image #1] older prompt");
+
+        assert_eq!(agent.prompt.text(), "[Image #1] older prompt");
+        assert!(
+            agent.prompt.images.is_empty(),
+            "the draft's record is released"
+        );
+        assert_eq!(agent.prompt.image_undo_stash_len(), 0);
+        assert_eq!(agent.prompt.unbound_image_placeholders(), vec![1]);
+    }
+
+    let effects = dispatch(
+        Action::SendPrompt("[Image #1] older prompt".into()),
+        &mut app,
+    );
+
+    match effects.as_slice() {
+        [Effect::SendPrompt { text, .. }] => assert_eq!(text, "[Image #1] older prompt"),
+        other => panic!("expected a text-only SendPrompt, got {other:?}"),
+    }
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Image #1 not attached — placeholder sent as text")
+    );
+    assert!(&app.agents[&id].prompt.text().is_empty());
+}
+
+/// `/compact` with a chip still compacts; the image is dropped with a toast instead of silently.
+#[test]
+fn compact_with_images_toasts_and_drops() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/compact ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+
+    assert!(
+        matches!(effects.as_slice(), [Effect::Compact { .. }]),
+        "the command must still run, got {effects:?}"
+    );
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images not sent with /compact — paste them again")
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.prompt.images.is_empty());
+    assert!(agent.prompt.text().is_empty());
+    assert!(
+        agent
+            .session
+            .in_flight_prompt
+            .as_ref()
+            .is_none_or(|p| p.images.is_empty()),
+        "a command row never carries images"
+    );
+}
+
+/// A skill prompt sends its wire blocks only; composer images are dropped with a toast.
+#[test]
+fn skill_prompt_with_images_toasts() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    register_pr_workflow_skill(&mut app, id);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/pr-workflow ship it ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+
+    match effects.as_slice() {
+        [Effect::SendPromptBlocks { blocks, .. }] => assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, acp::ContentBlock::Image(_))),
+            "skill wire blocks must not carry composer images"
+        ),
+        other => panic!("expected the skill SendPromptBlocks, got {other:?}"),
+    }
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images not sent with a skill prompt — paste them again")
+    );
+    assert!(&app.agents[&id].prompt.images.is_empty());
+}
+
+/// A slash command whose action cannot carry images names itself in the toast.
+#[test]
+fn action_slash_command_with_images_toasts() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/announcements hide ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images not sent with /announcements — paste them again")
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.prompt.images.is_empty());
+    assert!(agent.prompt.text().is_empty());
+}
+
+/// A queued image whose file vanished sends without its block and tells the user which one.
+#[test]
+fn unloadable_image_toasts_on_drain() {
+    use crate::app::dispatch::tests::enqueue_local;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    enqueue_local(&mut app, id, "look at [Image #2]");
+    {
+        let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+        image.display_number = 2;
+        image.encoded_bytes = None;
+        image.session_image_path = Some(dir.path().join("gone.png"));
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .pending_prompts
+            .back_mut()
+            .unwrap()
+            .images = vec![image];
+    }
+
+    let effects = dispatch(Action::DrainQueue, &mut app);
+
+    match effects.as_slice() {
+        [Effect::SendPromptBlocks { blocks, .. }] => {
+            assert_eq!(
+                blocks.len(),
+                1,
+                "only the text block survives, got {blocks:?}"
+            );
+            let Some(acp::ContentBlock::Text(tb)) = blocks.first() else {
+                panic!("first block must be text");
+            };
+            assert_eq!(tb.text, "look at [Image #2]");
+        }
+        other => panic!("expected SendPromptBlocks, got {other:?}"),
+    }
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Image #2 couldn't be read — not sent")
+    );
+}
+
+/// `/remember` clears the composer through its own path; attached images are still reported.
+#[test]
+fn remember_note_with_images_toasts() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/remember keep this ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images not sent with /remember — paste them again")
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.prompt.images.is_empty());
+    assert!(agent.prompt.text().is_empty());
+}
+
+/// A command that toasts on its own (`/multiline`) must not bury the image notice.
+#[test]
+fn action_with_own_toast_still_shows_image_notice() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/multiline ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    assert!(
+        &app.agents[&id].multiline_mode,
+        "the command itself still ran"
+    );
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Images not sent with /multiline — paste them again")
+    );
+}
+
+/// One send with an unbound placeholder and an unreadable attachment yields one combined toast.
+#[test]
+fn unbound_and_unreadable_in_one_send_share_one_toast() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("see [Image #7] and ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+        image.encoded_bytes = None;
+        image.session_image_path = Some(dir.path().join("gone.png"));
+        agent.prompt.insert_image(image).unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+
+    assert!(
+        matches!(effects.as_slice(), [Effect::SendPromptBlocks { .. }]),
+        "the prompt still sends, got {effects:?}"
+    );
+    assert_eq!(
+        toast_text(&app, id),
+        Some(
+            "Image #7 not attached — placeholder sent as text; Image #1 couldn't be read — not sent"
+        )
+    );
+}
+
+/// Minimal mode renders no toasts: the notice lands in the transcript instead.
+#[test]
+fn minimal_mode_image_notice_goes_to_scrollback() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .prompt
+        .set_text("see [Image #1]");
+
+    dispatch(Action::SendPrompt("see [Image #1]".into()), &mut app);
+
+    assert!(
+        &app.agents[&id].toast.is_none(),
+        "minimal mode must not rely on a toast"
+    );
+    assert_eq!(
+        last_system_text(&app, id),
+        "Image #1 not attached — placeholder sent as text"
+    );
+}
+
+/// An edited queued `/multiline` row carrying an image, followed by a queued prompt whose image cannot
+/// be read: the nested command dispatch and the queue drain both queue a notice, and only the outermost
+/// dispatch shows them, as one toast.
+#[test]
+fn nested_dispatch_and_queue_drain_share_one_toast() {
+    use crate::app::dispatch::tests::enqueue_local;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    enqueue_local(&mut app, id, "edit me");
+    enqueue_local(&mut app, id, "look at [Image #2]");
+    let edited_id = {
+        let agent = app.agents.get_mut(&id).unwrap();
+        let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+        image.display_number = 2;
+        image.encoded_bytes = None;
+        image.session_image_path = Some(dir.path().join("gone.png"));
+        agent.session.pending_prompts.back_mut().unwrap().images = vec![image];
+        agent.session.pending_prompts.front().unwrap().id
+    };
+
+    let effects = dispatch(
+        Action::RunEditedQueuedCommand {
+            local_id: edited_id,
+            server: None,
+            // Fork note: the fork's queue-edit flow is text-only (upstream's
+            // `StashedPrompt` submission predates this replay and was never
+            // adopted), so only the drain notice below can fire here.
+            text: "/multiline".into(),
+        },
+        &mut app,
+    );
+
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPromptBlocks { .. })),
+        "the next queued prompt must drain, got {effects:?}"
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.multiline_mode, "the edited command still ran");
+    assert_eq!(
+        toast_text(&app, id),
+        Some("Image #2 couldn't be read — not sent")
+    );
+}
+
+/// `/home` leaves the session view before the notice shows; it must land on the welcome screen.
+#[test]
+fn home_with_images_toasts_on_the_welcome_screen() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/home ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert_eq!(
+        app.welcome_toast
+            .as_ref()
+            .map(|(message, _)| message.as_str()),
+        Some("Images not sent with /home — paste them again")
+    );
+    assert!(
+        toast_text(&app, id).is_none(),
+        "the hidden agent must not hold the notice"
+    );
+}
+
+/// A rewound draft with a stale stash record and a duplicate placeholder, submitted as an unknown
+/// slash command that passes through as a prompt: the composer is snapshotted once, so the queued row
+/// carries exactly one image.
+#[test]
+fn passthrough_slash_submission_sends_rewound_image_once() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.set_active_pane(ActivePane::Prompt, true);
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+        // Backspace twice parks the record in the undo stash.
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let _ = agent
+            .handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(agent.prompt.text().is_empty());
+
+        let mut restored = crate::app::agent_view::test_fixtures::test_pasted_image();
+        restored.display_number = 1;
+        agent.prompt.set_text("/xyz look [Image #1] ");
+        agent
+            .prompt
+            .restore_chip_elements(&[crate::app::agent::ChipElement {
+                range: 10..20,
+                kind: crate::views::prompt_widget::KIND_IMAGE,
+                display: None,
+            }]);
+        agent.prompt.set_images(vec![restored]);
+        agent.prompt.append_text("[Image #1]");
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+
+    let Some(blocks) = effects.iter().find_map(|e| match e {
+        Effect::SendPromptBlocks { blocks, .. } => Some(blocks),
+        _ => None,
+    }) else {
+        panic!("expected SendPromptBlocks, got {effects:?}");
+    };
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|b| matches!(b, acp::ContentBlock::Image(_)))
+            .count(),
+        1,
+        "exactly one image may ride the pass-through prompt, got {blocks:?}"
+    );
+    assert!(&app.agents[&id].prompt.images.is_empty());
+}
+
+/// Minimal `/new` replaces the visible session and drops the originating agent inside the same
+/// submission; the notice must still reach the new session's transcript.
+#[test]
+fn minimal_new_with_images_notes_on_the_new_session() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/new ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    let ActiveView::Agent(new_id) = app.active_view else {
+        panic!(
+            "minimal /new must land on an agent, got {:?}",
+            app.active_view
+        );
+    };
+    assert_ne!(new_id, id);
+    assert!(
+        app.agents.get(&id).is_none(),
+        "minimal /new drops the originating agent"
+    );
+    assert_eq!(
+        last_system_text(&app, new_id),
+        "Images not sent with /new — paste them again"
+    );
+}
+
+/// Minimal `/home` has no welcome chrome: it opens a fresh session, and the notice follows it there.
+#[test]
+fn minimal_home_with_images_notes_on_the_new_session() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.prompt.set_text("/home ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+            .prompt
+            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
+            .unwrap();
+    }
+    let text = app.agents[&id].prompt.text().to_string();
+
+    dispatch(Action::SendPrompt(text), &mut app);
+
+    let ActiveView::Agent(new_id) = app.active_view else {
+        panic!(
+            "minimal /home must land on an agent, got {:?}",
+            app.active_view
+        );
+    };
+    assert_ne!(new_id, id);
+    assert!(app.agents.get(&id).is_none());
+    assert_eq!(
+        last_system_text(&app, new_id),
+        "Images not sent with /home — paste them again"
+    );
+}
+
+/// Minimal mode with no agent has no transcript to write to. A flush there must leave the notices
+/// queued for the session that opens next, not drop them.
+#[test]
+fn minimal_flush_without_agent_keeps_notices_for_the_next_flush() {
+    let mut app = test_app();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    let notice = "Images not sent with /home — paste them again";
+    app.pending_image_notices.push(notice.to_owned());
+
+    assert!(
+        !crate::app::dispatch::flush_image_notices(&mut app),
+        "no surface changed"
+    );
+    assert_eq!(app.pending_image_notices, vec![notice.to_owned()]);
+
+    let id = AgentId(0);
+    let session = make_test_agent_session(&app, id, "test-session");
+    app.agents
+        .insert(id, AgentView::new(session, ScrollbackState::new()));
+    app.next_agent_id = 1;
+    switch_to_agent(&mut app, id, SwitchCause::New);
+
+    assert!(crate::app::dispatch::flush_image_notices(&mut app));
+    assert!(app.pending_image_notices.is_empty());
+    assert_eq!(last_system_text(&app, id), notice);
+}
+
+/// The dashboard popup can raise a send-now while the dashboard, not a session, is on screen. The send
+/// bails; the carried notice still reaches the visible surface.
+#[test]
+fn send_now_from_dashboard_view_still_flushes_image_notice() {
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::AgentDashboard;
+    ensure_dashboard_state(&mut app);
+
+    let effects = dispatch(
+        Action::SendPromptNow {
+            text: "see [Image #1]".into(),
+            images: vec![],
+            image_notice: Some("Image #1 not attached — placeholder sent as text".into()),
+        },
+        &mut app,
+    );
+
+    assert!(
+        effects.is_empty(),
+        "no session view: the send bails, got {effects:?}"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().error_toast.as_deref(),
+        Some("Image #1 not attached — placeholder sent as text")
+    );
+    assert!(toast_text(&app, AgentId(0)).is_none());
 }

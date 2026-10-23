@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod registry;
 pub mod trust;
+pub use xai_grok_permission_rules::source_identity;
 
 pub use discovery::{
     DiscoveredPlugin, PluginOrigin, PluginScope, discover_plugins, project_plugin_dirs,

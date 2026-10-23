@@ -4,6 +4,7 @@ use crate::hub::HubConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+pub use xai_grok_hooks::discovery::HookSourceConfig;
 use xai_grok_tools::registry::types::{SessionContext, ToolRegistryBuilder, ToolServerConfig};
 /// Default capacity for the workspace event broadcast channel.
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 64;
@@ -116,6 +117,8 @@ pub struct WorkspaceBindConfig {
     /// Initial auto-approve (YOLO) state. `None` on legacy payloads →
     /// fail-closed (false).
     pub yolo_mode: Option<bool>,
+    /// Owner's ceiling on remembered grants and unattended calls.
+    pub tool_approval_policy: xai_tool_runtime::ToolApprovalPolicy,
     /// Plane-configured toolset in the gRPC wire shape. An empty list is
     /// treated as unset (proto3 repeated default).
     pub tools: Option<Vec<xai_grok_tools_api::ToolConfigEntry>>,
@@ -124,6 +127,7 @@ pub struct WorkspaceBindConfig {
     /// Opt-in: forward `BackgroundTaskCompleted` system notifications for this session.
     pub system_notifications: bool,
     pub rpc_only: bool,
+    pub session_root: Option<PathBuf>,
 }
 /// Outcome of resolving a [`WorkspaceBindConfig`]; lets callers fail closed
 /// instead of widening to the default toolset. Deliberately has **no preset
@@ -177,11 +181,17 @@ impl WorkspaceBindConfig {
                 .and_then(|v| parse_field("tool_config", v)),
             viewer_ctx: wire.viewer_ctx,
             yolo_mode: wire.yolo_mode,
+            tool_approval_policy: match wire.tool_approval_policy {
+                Some(Ok(policy)) => policy,
+                Some(Err(_)) => xai_tool_runtime::ToolApprovalPolicy::AlwaysPrompt,
+                None => xai_tool_runtime::ToolApprovalPolicy::GrantsAllowed,
+            },
             tools: Some(wire.tools).filter(|tools| !tools.is_empty()),
             manifest_version: wire.manifest_version,
             manifest_hash: wire.manifest_hash,
             system_notifications: wire.system_notifications.unwrap_or(false),
             rpc_only: wire.rpc_only,
+            session_root: wire.session_root.map(PathBuf::from),
         }
     }
     /// Resolve the selected toolset.
@@ -372,6 +382,24 @@ mod bind_config_tests {
         let cfg = WorkspaceBindConfig::from_metadata(&v);
         assert_eq!(cfg.yolo_mode, Some(true));
     }
+
+    #[test]
+    fn workspace_bind_approval_policy_fails_closed_on_invalid_values() {
+        use xai_tool_runtime::ToolApprovalPolicy;
+        let parse = |value| WorkspaceBindConfig::from_metadata(&value).tool_approval_policy;
+        assert_eq!(
+            parse(serde_json::json!({})),
+            ToolApprovalPolicy::GrantsAllowed
+        );
+        assert_eq!(
+            parse(serde_json::json!({"tool_approval_policy": "unattended_allowed"})),
+            ToolApprovalPolicy::UnattendedAllowed
+        );
+        assert_eq!(
+            parse(serde_json::json!({"tool_approval_policy": "unattended"})),
+            ToolApprovalPolicy::AlwaysPrompt
+        );
+    }
     #[test]
     fn workspace_bind_config_yolo_mode_omitted_or_malformed_fails_closed() {
         let omitted = WorkspaceBindConfig::from_metadata(&serde_json::json!({"preset": "explore"}));
@@ -402,6 +430,24 @@ mod bind_config_tests {
         let explicit_off =
             WorkspaceBindConfig::from_metadata(&serde_json::json!({"rpc_only": false}));
         assert!(!explicit_off.rpc_only);
+    }
+    #[test]
+    fn workspace_bind_config_extracts_session_root() {
+        let on = WorkspaceBindConfig::from_metadata(&serde_json::json!({
+            "session_root": "/workspace/conv-abc",
+        }));
+        assert_eq!(
+            on.session_root.as_deref(),
+            Some(std::path::Path::new("/workspace/conv-abc"))
+        );
+        let off = WorkspaceBindConfig::from_metadata(&serde_json::json!({"preset": "explore"}));
+        assert!(off.session_root.is_none());
+        let malformed = WorkspaceBindConfig::from_metadata(&serde_json::json!({
+            "session_root": 123,
+            "preset": "explore",
+        }));
+        assert!(malformed.session_root.is_none());
+        assert_eq!(malformed.preset.as_deref(), Some("explore"));
     }
     #[test]
     fn workspace_bind_config_from_metadata_extracts_manifest_fields() {
@@ -730,7 +776,7 @@ pub struct WorkspaceConfig {
     pub event_buffer_capacity: usize,
     /// Pluggable [`SessionContext`] / [`ToolRegistryBuilder`] producer.
     pub session_factory: Arc<dyn SessionContextFactory>,
-    /// Global hook sources (e.g. `~/.claude/settings.json`, `~/.grok/hooks/`).
+    /// Global hook sources (e.g. `~/.claude/settings.json`, `~/.opengrok/hooks/`).
     pub hook_global_sources: Vec<HookSourceConfig>,
     /// Project-scoped hook sources (e.g. `<project>/.grok/hooks/`).
     pub hook_project_sources: Vec<HookSourceConfig>,
@@ -775,61 +821,16 @@ pub struct WorkspaceConfig {
 /// Metadata a tool server announces so hub consumers can identify and route
 /// to it. Every field is optional and independently sourced; a local process
 /// announces none.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct WorkspaceServerMetadata {
-    /// Sandbox that provisioned this server. Absent for local servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_id: Option<String>,
-    /// Logical sandbox-service session UUID, from the `GROK_SESSION_ID` env
-    /// var. Present whenever that var is set (every sandbox container, start
-    /// and restore), absent otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    /// Provider that provisioned this server. Populated on the start path
-    /// only (no container-side source on restore); absent for local servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    /// Per-spawn launch nonce minted by the sandbox orchestrator and echoed
-    /// verbatim on the diagnostics `/ready` endpoint. Absent for local/legacy
-    /// launches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_id: Option<String>,
-}
-impl WorkspaceServerMetadata {
-    /// Merge an env-sourced logical session id into caller-supplied
-    /// tool-server metadata (`None` on the restore/local path).
-    ///
-    /// `env_session_id` is the raw `GROK_SESSION_ID`; empty is normalized to
-    /// absent. An explicit `session_id` already in `metadata` is never
-    /// clobbered. A non-object `metadata` value is returned unchanged (a
-    /// defensive no-op — the sole caller always sends an object).
-    pub fn merge_session_metadata(
-        metadata: Option<serde_json::Value>,
-        env_session_id: Option<String>,
-    ) -> Option<serde_json::Value> {
-        let env_session_id = env_session_id.filter(|s| !s.is_empty());
-        match metadata {
-            Some(mut value) => {
-                if let Some(session_id) = env_session_id
-                    && let Some(obj) = value.as_object_mut()
-                    && !obj.contains_key("session_id")
-                {
-                    obj.insert(
-                        "session_id".to_owned(),
-                        serde_json::Value::String(session_id),
-                    );
-                }
-                Some(value)
-            }
-            None => serde_json::to_value(WorkspaceServerMetadata {
-                sandbox_id: None,
-                session_id: env_session_id,
-                provider_id: None,
-                launch_id: None,
-            })
-            .ok(),
-        }
+pub use xai_tool_protocol::ServerIdentityMetadata as WorkspaceServerMetadata;
+pub fn merge_session_metadata(
+    metadata: Option<serde_json::Value>,
+    env_session_id: Option<String>,
+) -> Option<serde_json::Value> {
+    WorkspaceServerMetadata {
+        session_id: env_session_id.filter(|s| !s.is_empty()),
+        ..Default::default()
     }
+    .merge_into(metadata)
 }
 impl WorkspaceConfig {
     /// Construct a minimal config suitable for proxy-mode workspaces
@@ -924,16 +925,6 @@ impl std::fmt::Debug for AgentSessionConfig {
             .finish()
     }
 }
-/// A single hook source: either a JSON settings file or a directory of
-/// `*.json` hook files. Maps 1:1 to [`xai_grok_hooks::discovery::HookSource`]
-/// but uses owned `PathBuf` so the config struct is `'static`.
-#[derive(Debug, Clone)]
-pub enum HookSourceConfig {
-    /// A single JSON settings file (e.g. `~/.claude/settings.json`).
-    SettingsFile(PathBuf),
-    /// A directory of `*.json` hook files (e.g. `~/.grok/hooks/`).
-    Directory(PathBuf),
-}
 /// Filesystem isolation strategy for a forked session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationMode {
@@ -947,7 +938,7 @@ pub enum IsolationMode {
 }
 #[cfg(test)]
 mod tests {
-    use super::WorkspaceServerMetadata;
+    use super::{WorkspaceServerMetadata, merge_session_metadata};
     #[test]
     fn workspace_server_metadata_serializes_all_present_fields() {
         let meta = WorkspaceServerMetadata {
@@ -955,6 +946,7 @@ mod tests {
             session_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
             provider_id: Some("test-provider".to_owned()),
             launch_id: Some("33333333-3333-3333-3333-333333333333".to_owned()),
+            ..Default::default()
         };
         let value = serde_json::to_value(&meta).unwrap();
         assert_eq!(
@@ -971,9 +963,7 @@ mod tests {
     fn workspace_server_metadata_omits_none_fields() {
         let meta = WorkspaceServerMetadata {
             sandbox_id: Some("sb-123".to_owned()),
-            session_id: None,
-            provider_id: None,
-            launch_id: None,
+            ..Default::default()
         };
         let value = serde_json::to_value(&meta).unwrap();
         assert_eq!(value, serde_json::json!({ "sandbox_id": "sb-123" }));
@@ -989,6 +979,7 @@ mod tests {
         });
         let meta: WorkspaceServerMetadata = serde_json::from_value(legacy).unwrap();
         assert_eq!(meta.sandbox_id.as_deref(), Some("sb-legacy"));
+        assert_eq!(meta.cwd.as_deref(), Some("/workspace"));
         assert_eq!(meta.session_id, None);
         assert_eq!(meta.provider_id, None);
     }
@@ -998,7 +989,7 @@ mod tests {
             sandbox_id: Some("sb-123".to_owned()),
             session_id: Some("22222222-2222-2222-2222-222222222222".to_owned()),
             provider_id: Some("test-provider".to_owned()),
-            launch_id: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: WorkspaceServerMetadata = serde_json::from_str(&json).unwrap();
@@ -1045,19 +1036,15 @@ mod tests {
     }
     #[test]
     fn merge_session_metadata_builds_struct_from_env_on_none_branch() {
-        let merged =
-            WorkspaceServerMetadata::merge_session_metadata(None, Some("sess-1".to_owned()))
-                .unwrap();
+        let merged = merge_session_metadata(None, Some("sess-1".to_owned())).unwrap();
         assert_eq!(merged, serde_json::json!({ "session_id": "sess-1" }));
-        let empty = WorkspaceServerMetadata::merge_session_metadata(None, None).unwrap();
+        let empty = merge_session_metadata(None, None).unwrap();
         assert_eq!(empty, serde_json::json!({}));
     }
     #[test]
     fn merge_session_metadata_overlays_into_object_without_clobbering() {
         let base = serde_json::json!({ "sandbox_id": "sb-9", "mode": "remote" });
-        let merged =
-            WorkspaceServerMetadata::merge_session_metadata(Some(base), Some("env-id".to_owned()))
-                .unwrap();
+        let merged = merge_session_metadata(Some(base), Some("env-id".to_owned())).unwrap();
         assert_eq!(
             merged,
             serde_json::json!({
@@ -1067,41 +1054,28 @@ mod tests {
             })
         );
         let explicit = serde_json::json!({ "session_id": "explicit" });
-        let merged = WorkspaceServerMetadata::merge_session_metadata(
-            Some(explicit),
-            Some("env-id".to_owned()),
-        )
-        .unwrap();
+        let merged = merge_session_metadata(Some(explicit), Some("env-id".to_owned())).unwrap();
         assert_eq!(merged, serde_json::json!({ "session_id": "explicit" }));
     }
     #[test]
     fn merge_session_metadata_leaves_object_untouched_when_no_env_id() {
         let base = serde_json::json!({ "sandbox_id": "sb-9" });
-        let merged =
-            WorkspaceServerMetadata::merge_session_metadata(Some(base.clone()), None).unwrap();
+        let merged = merge_session_metadata(Some(base.clone()), None).unwrap();
         assert_eq!(merged, base);
     }
     #[test]
     fn merge_session_metadata_non_object_is_returned_unchanged() {
         let scalar = serde_json::json!("just-a-string");
-        let merged = WorkspaceServerMetadata::merge_session_metadata(
-            Some(scalar.clone()),
-            Some("env-id".to_owned()),
-        )
-        .unwrap();
+        let merged =
+            merge_session_metadata(Some(scalar.clone()), Some("env-id".to_owned())).unwrap();
         assert_eq!(merged, scalar);
     }
     #[test]
     fn merge_session_metadata_treats_empty_env_id_as_absent() {
-        let none_branch =
-            WorkspaceServerMetadata::merge_session_metadata(None, Some(String::new())).unwrap();
+        let none_branch = merge_session_metadata(None, Some(String::new())).unwrap();
         assert_eq!(none_branch, serde_json::json!({}));
         let base = serde_json::json!({ "sandbox_id": "sb-9" });
-        let overlay = WorkspaceServerMetadata::merge_session_metadata(
-            Some(base.clone()),
-            Some(String::new()),
-        )
-        .unwrap();
+        let overlay = merge_session_metadata(Some(base.clone()), Some(String::new())).unwrap();
         assert_eq!(overlay, base);
     }
     #[test]
@@ -1109,5 +1083,16 @@ mod tests {
         let bad = serde_json::json!({ "sandbox_id": "sb-1", "session_id": 42 });
         let result: Result<WorkspaceServerMetadata, _> = serde_json::from_value(bad);
         assert!(result.is_err());
+    }
+    #[test]
+    fn workspace_server_metadata_from_metadata_salvages_wrong_typed_sibling() {
+        let bad = serde_json::json!({ "sandbox_id": "sb-1", "session_id": 42 });
+        let meta = WorkspaceServerMetadata::from_metadata(&bad);
+        assert_eq!(meta.sandbox_id.as_deref(), Some("sb-1"));
+        assert_eq!(meta.session_id, None);
+        assert_eq!(
+            WorkspaceServerMetadata::from_metadata(&serde_json::json!("opaque")),
+            WorkspaceServerMetadata::default()
+        );
     }
 }

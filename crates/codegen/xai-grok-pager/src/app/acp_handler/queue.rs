@@ -43,6 +43,12 @@ pub(super) struct PromptCompletePayload {
     /// "Turn cancelled" marker); stamped top-level, absent on older shells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cancel_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation_context: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) error_kind: Option<String>,
     /// `_meta` extension point — parsed defensively as a trigger fallback.
     #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub(super) meta: Option<serde_json::Value>,
@@ -54,9 +60,33 @@ impl PromptCompletePayload {
     /// `_meta.cancelTrigger` (the envelope shape of the durable rail).
     /// `None` (older shells) means a normal cancel.
     pub(super) fn cancel_trigger(&self) -> Option<&str> {
-        self.cancel_trigger
-            .as_deref()
-            .or_else(|| self.meta.as_ref()?.get("cancelTrigger")?.as_str())
+        self.cancel_trigger.as_deref().or_else(|| {
+            self.meta
+                .as_ref()?
+                .get(super::super::turn_completion::CANCEL_TRIGGER_KEY)?
+                .as_str()
+        })
+    }
+
+    pub(super) fn cancellation_category(&self) -> Option<&str> {
+        self.cancellation_category.as_deref().or_else(|| {
+            self.meta
+                .as_ref()?
+                .get(super::super::turn_completion::CANCELLATION_CATEGORY_KEY)?
+                .as_str()
+        })
+    }
+
+    pub(super) fn cancellation_context(&self) -> Option<&serde_json::Value> {
+        self.cancellation_context.as_ref().or_else(|| {
+            self.meta
+                .as_ref()?
+                .get(super::super::turn_completion::CANCELLATION_CONTEXT_KEY)
+        })
+    }
+
+    pub(super) fn error_kind(&self) -> Option<crate::app::error_display::WireErrorType> {
+        crate::app::error_display::wire_error_kind(self.error_kind.as_deref())
     }
 }
 
@@ -70,6 +100,30 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
 
     let running_prompt_id = changed.running_prompt_id.clone();
     let session_id = changed.session_id.clone();
+
+    let sid = acp::SessionId::new(session_id.clone());
+    let session_match = find_session_match(app, &sid);
+    if let Some(SessionMatch::Child(parent_id)) = session_match {
+        let snapshot = changed.entries;
+        if snapshot.is_empty() {
+            app.shared_prompt_queues.remove(&session_id);
+        } else {
+            app.shared_prompt_queues
+                .insert(session_id.clone(), snapshot.clone());
+        }
+
+        let is_active_parent = is_matched_agent_active(app, parent_id);
+        let Some(parent) = app.agents.get_mut(&parent_id) else {
+            return false;
+        };
+        let is_active = is_active_parent && parent.active_subagent.as_deref() == Some(&session_id);
+        let Some(child) = parent.subagent_views.get_mut(&session_id) else {
+            return false;
+        };
+        child.shared_queue = snapshot;
+        child.sync_queue_pane();
+        return is_active;
+    }
 
     // Prefer running_* fields on the payload (authoritative; present when a
     // turn is promoting). Fall back to the local mirror for older shells.
@@ -98,8 +152,7 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
         .unwrap_or_else(|| "prompt".to_string());
 
     // Resolve the owning agent before the queue is replaced.
-    let sid = acp::SessionId::new(session_id.clone());
-    let agent_id = match find_session_match(app, &sid) {
+    let agent_id = match session_match {
         Some(SessionMatch::Root(id)) => Some(id),
         _ => None,
     };
@@ -378,30 +431,25 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         prompt_id = %pid,
                         "stashing running-prompt adoption (FIFO handoff race)",
                     );
-                    // A rebroadcast for the SAME running prompt (every queue
-                    // edit/no-op rebroadcasts) must not clobber the stash: the
-                    // first broadcast consumed the drained row from the mirror,
-                    // so this pass re-derives `text: None` and the deferred
-                    // shim would render no user block (and the echo-skip armed
-                    // above already swallowed the shell's echo).
-                    if app
+                    // Same-prompt rebroadcast must not clobber the stash (`text` is already None).
+                    // Still fall through to local flush: promote may have just cleared the server front.
+                    let same_stashed_prompt = app
                         .pending_running_adoptions
                         .get(&aid)
-                        .is_some_and(|p| p.prompt_id == pid)
-                    {
-                        return true;
-                    }
+                        .is_some_and(|p| p.prompt_id == pid);
                     // A newer running prompt supersedes any earlier stash.
-                    if let Some(prev) = app.pending_running_adoptions.insert(
-                        aid,
-                        PendingRunningAdoption {
-                            prompt_id: pid.clone(),
-                            text: running_text,
-                            combined_texts: running_combined,
-                            kind: running_kind,
-                            turn_ended: false,
-                        },
-                    ) && let Some(agent) = app.agents.get_mut(&aid)
+                    if !same_stashed_prompt
+                        && let Some(prev) = app.pending_running_adoptions.insert(
+                            aid,
+                            PendingRunningAdoption {
+                                prompt_id: pid.clone(),
+                                text: running_text,
+                                combined_texts: running_combined,
+                                kind: running_kind,
+                                turn_ended: false,
+                            },
+                        )
+                        && let Some(agent) = app.agents.get_mut(&aid)
                     {
                         agent.discard_pending_adoption_updates(&prev.prompt_id);
                     }
@@ -409,6 +457,16 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
             }
         }
         _ => {}
+    }
+    // Retry local flush after server-queue rows clear (wait-start can arrive before promote).
+    if let Some(aid) = agent_id
+        && app
+            .agents
+            .get(&aid)
+            .is_some_and(|agent| !agent.session.loading_replay)
+    {
+        let flush = crate::app::dispatch::flush_held_local_queue_into_wait(app, Some(aid));
+        app.pending_effects.extend(flush);
     }
     true
 }
@@ -433,10 +491,38 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     let session_id = payload.session_id.as_str();
 
     let sid = acp::SessionId::new(session_id.to_string());
-    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+    let Some(matched) = find_session_match(app, &sid) else {
         return false;
     };
+    let id = matched.agent_id();
     let is_active = is_matched_agent_active(app, id);
+    let signal = super::super::turn_completion::TerminalSignal {
+        prompt_id: payload.prompt_id.as_deref(),
+        stop_reason: payload.stop_reason.as_deref(),
+        agent_result: payload.agent_result.as_deref(),
+        cancel_trigger: payload.cancel_trigger(),
+        cancellation_category: payload.cancellation_category(),
+        cancellation_context: payload.cancellation_context(),
+        error_kind: payload.error_kind(),
+    };
+    if let SessionMatch::Child(_) = matched {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return false;
+        };
+        let (finished, label) = {
+            let Some(child) = agent.child_view_for_live_update_mut(session_id) else {
+                return false;
+            };
+            let finished =
+                super::super::turn_completion::finalize_child_view_turn(child, signal, None);
+            let label = finished.then(|| subagent_activity_label(child));
+            (finished, label)
+        };
+        if let Some(label) = label {
+            sync_subagent_activity(agent, session_id, label);
+        }
+        return finished && is_active;
+    }
     let Some(agent) = app.agents.get_mut(&id) else {
         return false;
     };
@@ -444,13 +530,82 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     // Finalize on the agent, then map the outcome to the return bool in the one
     // shared place both terminal rails use (returns it directly — arming reports
     // a change unconditionally so a background tab still wakes the reconcile tick).
-    let outcome = super::super::turn_completion::finalize_turn_from_terminal(
-        agent,
-        session_id,
-        payload.prompt_id.as_deref(),
-        payload.stop_reason.as_deref(),
-        payload.agent_result.as_deref(),
-        payload.cancel_trigger(),
-    );
+    let outcome =
+        super::super::turn_completion::finalize_turn_from_terminal(agent, session_id, signal);
     super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PromptCompletePayload;
+
+    #[test]
+    fn prompt_complete_payload_error_kind_parses_at_ingress() {
+        use crate::app::error_display::WireErrorType;
+
+        for (kind, expected) in [
+            (
+                Some("max_tokens_truncation"),
+                Some(WireErrorType::MaxTokensTruncation),
+            ),
+            (Some("a_newer_shells_kind"), Some(WireErrorType::Other)),
+            (None, None),
+        ] {
+            let payload: PromptCompletePayload = serde_json::from_value(serde_json::json!({
+                "sessionId": "session-1",
+                "stopReason": "error",
+                "errorKind": kind,
+            }))
+            .expect("payload parses");
+            assert_eq!(payload.error_kind(), expected);
+        }
+    }
+
+    #[test]
+    fn prompt_complete_payload_cancel_metadata_prefers_top_level_fields() {
+        let context = serde_json::json!({"hook_name": "prompt-guard", "reason": "blocked"});
+        let payload: PromptCompletePayload = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "cancelTrigger": "hook_denied",
+            "cancellationCategory": "HookDenied",
+            "cancellationContext": context,
+            "_meta": {
+                "cancelTrigger": "send_now",
+                "cancellationCategory": "UserCancel",
+                "cancellationContext": {"reason": "older context"},
+            },
+        }))
+        .expect("payload parses");
+        assert_eq!(payload.cancel_trigger(), Some("hook_denied"));
+        assert_eq!(payload.cancellation_category(), Some("HookDenied"));
+        assert_eq!(payload.cancellation_context(), Some(&context));
+    }
+
+    #[test]
+    fn prompt_complete_payload_cancel_metadata_falls_back_to_meta() {
+        let context = serde_json::json!({"hook_name": "prompt-guard", "reason": "blocked"});
+        let payload: PromptCompletePayload = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "_meta": {
+                "cancelTrigger": "hook_denied",
+                "cancellationCategory": "HookDenied",
+                "cancellationContext": context,
+            },
+        }))
+        .expect("payload parses");
+        assert_eq!(payload.cancel_trigger(), Some("hook_denied"));
+        assert_eq!(payload.cancellation_category(), Some("HookDenied"));
+        assert_eq!(payload.cancellation_context(), Some(&context));
+
+        for meta in [serde_json::Value::Null, serde_json::json!("malformed")] {
+            let payload: PromptCompletePayload = serde_json::from_value(serde_json::json!({
+                "sessionId": "session-1",
+                "_meta": meta,
+            }))
+            .expect("legacy payload parses");
+            assert_eq!(payload.cancel_trigger(), None);
+            assert_eq!(payload.cancellation_category(), None);
+            assert_eq!(payload.cancellation_context(), None);
+        }
+    }
 }

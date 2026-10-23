@@ -6,6 +6,8 @@
 //! avoids transitive dependencies on shell-specific types
 //! (`xai-grok-tools`, etc.).
 
+use std::num::NonZeroU64;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
@@ -22,6 +24,8 @@ pub enum AuthScheme {
     #[default]
     Bearer,
     XApiKey,
+    #[serde(alias = "x_goog_api_key", alias = "goog_api_key", alias = "google")]
+    XGoogApiKey,
 }
 
 /// Truthful, session-scoped execution policy exposed to the Codex provider.
@@ -97,6 +101,9 @@ pub struct SamplerConfig {
     /// it; it is informational metadata used by the session for compaction
     /// decisions.
     pub context_window: u64,
+    /// Provider request-body cap, already defaulted from `api_backend` by model resolution; `None` budgets to 50 MiB.
+    #[serde(default)]
+    pub max_request_bytes: Option<NonZeroU64>,
     pub force_http1: bool,
     pub max_retries: Option<u32>,
     pub stream_tool_calls: bool,
@@ -159,6 +166,8 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
     #[serde(default)]
+    pub codex_model: xai_grok_sampling_types::CodexModelMetadata,
+    #[serde(default)]
     pub use_responses_lite: bool,
     #[serde(default)]
     pub experimental_supported_tools: Vec<String>,
@@ -196,6 +205,9 @@ impl SamplerConfig {
             && self.use_responses_lite
     }
 
+    /// Advertise the host's immediate-return user-message tool when the exact
+    /// model route enables it. This is independent of OAuth vs. API-key auth
+    /// and Responses Lite; it does not enable Responses `async: true` calls.
     pub fn supports_async_user_messages(&self) -> bool {
         self.provider == ModelProvider::Codex
             && self.api_backend == ApiBackend::Responses
@@ -224,6 +236,7 @@ impl Default for SamplerConfig {
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 0,
+            max_request_bytes: None,
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
@@ -241,6 +254,7 @@ impl Default for SamplerConfig {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,
@@ -362,6 +376,7 @@ mod tests {
             ModelProvider::Xai,
             ModelProvider::DeepSeek,
             ModelProvider::Meta,
+            ModelProvider::Custom,
         ] {
             for lite in [false, true] {
                 for async_messages in [false, true] {
@@ -391,6 +406,36 @@ mod tests {
                     assert!(!incompatible.uses_responses_lite());
                     assert!(!incompatible.supports_async_user_messages());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn async_user_messages_are_independent_of_api_key_or_oauth_auth() {
+        #[derive(Debug)]
+        struct TestBearerResolver;
+
+        impl BearerResolver for TestBearerResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("test-oauth-bearer".into())
+            }
+        }
+
+        for api_key in [None, Some("test-api-key".to_owned())] {
+            for live_auth in [false, true] {
+                let mut config = SamplerConfig {
+                    provider: ModelProvider::Codex,
+                    api_backend: ApiBackend::Responses,
+                    api_key: api_key.clone(),
+                    bearer_resolver: live_auth
+                        .then(|| std::sync::Arc::new(TestBearerResolver) as SharedBearerResolver),
+                    experimental_supported_tools: vec!["send_user_message_async".into()],
+                    ..Default::default()
+                };
+                assert!(config.supports_async_user_messages());
+                assert!(!config.uses_responses_lite());
+                config.experimental_supported_tools.clear();
+                assert!(!config.supports_async_user_messages());
             }
         }
     }

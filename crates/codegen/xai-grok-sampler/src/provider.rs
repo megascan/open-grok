@@ -19,6 +19,9 @@ use crate::config::{CodexApprovalPolicy, CodexPermissions, SamplerConfig};
 
 /// Process-level fallback for the `x-grok-client-identifier` header.
 const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
+/// Current stable Anthropic Messages wire version. A custom endpoint on the
+/// Messages backend gets this when its model entry does not pin a version.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 /// Codex session-affinity headers (codex-rs `build_session_headers`).
 ///
@@ -45,6 +48,9 @@ pub struct ResponsesRequestPolicy {
     pub multi_agent_v2: bool,
     pub use_responses_lite: bool,
     pub local_effort: Option<ReasoningEffort>,
+    pub ultra_effort: Option<ReasoningEffort>,
+    pub verbosity: Option<String>,
+    pub persistent_instructions: Option<String>,
     pub reasoning_summary: Option<ReasoningSummary>,
     pub codex_permissions: Option<CodexPermissions>,
     pub session_id: Option<String>,
@@ -59,6 +65,7 @@ pub struct ProviderRequestHeaders<'a> {
     pub model_id: &'a str,
     pub session_id: &'a str,
     pub turn_idx: Option<&'a str>,
+    pub transient_retry: Option<&'a str>,
     pub agent_id: &'a str,
     pub deployment_id: Option<&'a str>,
     pub user_id: Option<&'a str>,
@@ -78,6 +85,9 @@ impl ProviderRequestHeaders<'_> {
             .header("x-grok-agent-id", self.agent_id);
         if let Some(turn_idx) = self.turn_idx {
             builder = builder.header("x-grok-turn-idx", turn_idx);
+        }
+        if let Some(attempt) = self.transient_retry {
+            builder = builder.header("x-grok-transient-retry", attempt);
         }
         if let Some(deployment_id) = self.deployment_id.filter(|value| !value.is_empty()) {
             builder = builder.header("x-grok-deployment-id", deployment_id);
@@ -211,6 +221,7 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
                 patch_deepseek_responses_request(request_body, policy)
             }
             Some(ResponsesDialect::Meta) => patch_meta_responses_request(request_body),
+            Some(ResponsesDialect::OpenAi) => patch_openai_responses_request(request_body, policy),
         }
     }
 
@@ -218,9 +229,12 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
     fn prompt_cache_key(&self, session_id: Option<&str>) -> Option<String> {
         match self.profile().responses_dialect() {
             None
-            | Some(ResponsesDialect::Xai | ResponsesDialect::DeepSeek | ResponsesDialect::Meta) => {
-                None
-            }
+            | Some(
+                ResponsesDialect::Xai
+                | ResponsesDialect::DeepSeek
+                | ResponsesDialect::Meta
+                | ResponsesDialect::OpenAi,
+            ) => None,
             Some(ResponsesDialect::Codex) => session_id
                 .filter(|session_id| !session_id.is_empty())
                 .map(str::to_owned),
@@ -298,8 +312,12 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
 
         match self.profile().responses_dialect() {
             None
-            | Some(ResponsesDialect::Xai | ResponsesDialect::DeepSeek | ResponsesDialect::Meta) => {
-            }
+            | Some(
+                ResponsesDialect::Xai
+                | ResponsesDialect::DeepSeek
+                | ResponsesDialect::Meta
+                | ResponsesDialect::OpenAi,
+            ) => {}
             Some(ResponsesDialect::Codex) => {
                 let value = parsed
                     .as_ref()
@@ -333,7 +351,8 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
                 ResponsesDialect::Xai
                 | ResponsesDialect::Codex
                 | ResponsesDialect::DeepSeek
-                | ResponsesDialect::Meta,
+                | ResponsesDialect::Meta
+                | ResponsesDialect::OpenAi,
             ) => true,
         }
     }
@@ -562,6 +581,20 @@ fn normalize_runinfra_deepseek_v4_flash_effort(effort: ReasoningEffort) -> Reaso
 #[derive(Debug)]
 pub struct GeminiProvider;
 
+/// A user-supplied server address (custom-provider wizard, `[model.*]` with
+/// `provider = "custom"`). The endpoint is untrusted third-party infrastructure
+/// and its wire support is unknown, so this adapter sends only the plain
+/// protocol it was configured for: OpenAI Chat Completions, vanilla OpenAI
+/// Responses, or Anthropic Messages.
+///
+/// Nothing provider-private leaves the process on this route: no `x-grok-*`
+/// headers (standard metadata policy), no session-id cache keys, no hosted
+/// tools, no Code Mode transport, and no built-in credentials. Chat-only
+/// extensions that OpenAI-compatible servers commonly reject (`thinking`,
+/// per-message `model_id`) and Grok-internal `service_tier` are dropped.
+#[derive(Debug)]
+pub struct CustomProvider;
+
 /// OpenRouter is an OpenAI-compatible Chat Completions gateway. It maps
 /// `reasoning_effort` onto the nested `reasoning` object OpenRouter
 /// documents, copies replayed thinking onto `messages[].reasoning`, and
@@ -594,7 +627,13 @@ impl ProviderAdapter for OpenRouterProvider {
     fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
         request.service_tier = None;
         request.thinking = None;
-        if let Some(effort) = request.reasoning_effort.take() {
+        let effort = request.reasoning_effort.take().or_else(|| {
+            request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort)
+        });
+        if let Some(effort) = effort {
             request.reasoning = Some(ChatReasoningConfig::effort(
                 normalize_openrouter_reasoning_effort(effort),
             ));
@@ -607,6 +646,43 @@ impl ProviderAdapter for OpenRouterProvider {
                 message.reasoning_content = None;
             }
         }
+    }
+}
+
+impl ProviderAdapter for CustomProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Custom
+    }
+
+    /// Keep the Chat Completions body to the portable OpenAI surface. The
+    /// endpoint's actual grammar is unknown, so a strict server must never see
+    /// Grok-internal routing (`service_tier`), a per-message model override, or
+    /// provider-specific `thinking` / nested `reasoning` extensions.
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.service_tier = None;
+        request.thinking = None;
+        request.reasoning = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+            message.reasoning = None;
+        }
+    }
+
+    /// Anthropic-compatible servers require `anthropic-version`; it is a wire
+    /// requirement, not a preference. Supply the current stable version on the
+    /// Messages backend only, and only when the model entry did not already
+    /// pin one through `extra_headers` — the user's value must keep winning.
+    ///
+    /// This runs after `extra_headers` are applied, so it must never
+    /// overwrite: `entry().or_insert()` is load-bearing here.
+    fn apply_default_headers(&self, headers: &mut HeaderMap, config: &SamplerConfig) {
+        self.sanitize_headers(headers);
+        if config.api_backend != ApiBackend::Messages {
+            return;
+        }
+        headers
+            .entry("anthropic-version")
+            .or_insert_with(|| HeaderValue::from_static(ANTHROPIC_VERSION));
     }
 }
 
@@ -745,9 +821,10 @@ static ZAI_PROVIDER: ZaiProvider = ZaiProvider;
 static RUNINFRA_PROVIDER: RuninfraProvider = RuninfraProvider;
 static GEMINI_PROVIDER: GeminiProvider = GeminiProvider;
 static OPENROUTER_PROVIDER: OpenRouterProvider = OpenRouterProvider;
+static CUSTOM_PROVIDER: CustomProvider = CustomProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 12] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 13] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -796,6 +873,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 12] = [
         provider: ModelProvider::OpenRouter,
         adapter: &OPENROUTER_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::Custom,
+        adapter: &CUSTOM_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -815,6 +896,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Runinfra => PROVIDER_REGISTRY[9].adapter,
         ModelProvider::Gemini => PROVIDER_REGISTRY[10].adapter,
         ModelProvider::OpenRouter => PROVIDER_REGISTRY[11].adapter,
+        ModelProvider::Custom => PROVIDER_REGISTRY[12].adapter,
     }
 }
 
@@ -868,13 +950,31 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
     ) {
         ensure_reasoning_object(request_body);
-        request_body["reasoning"]["effort"] = Value::String("max".to_owned());
+        let effort = if policy.local_effort == Some(ReasoningEffort::Ultra) {
+            policy.ultra_effort.unwrap_or(ReasoningEffort::Max)
+        } else {
+            ReasoningEffort::Max
+        };
+        request_body["reasoning"]["effort"] = Value::String(effort.as_str().to_owned());
+    }
+
+    if let Some(verbosity @ ("low" | "medium" | "high")) = policy.verbosity.as_deref() {
+        if request_body.get("text").is_none_or(Value::is_null) {
+            request_body["text"] = serde_json::json!({});
+        }
+        if let Some(text) = request_body.get_mut("text").and_then(Value::as_object_mut) {
+            text.entry("verbosity")
+                .or_insert_with(|| Value::String(verbosity.to_owned()));
+        }
     }
 
     if !policy.multi_agent_v2 {
+        patch_codex_persistent_mode(request_body, policy.persistent_instructions.as_deref());
         return;
     }
-    let mode_text = if policy.local_effort == Some(ReasoningEffort::Ultra) {
+    let mode_text = if policy.local_effort == Some(ReasoningEffort::Ultra)
+        && policy.persistent_instructions.is_none()
+    {
         PROACTIVE_MULTI_AGENT_MODE_TEXT
     } else {
         EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
@@ -895,6 +995,118 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+    patch_codex_persistent_mode(request_body, policy.persistent_instructions.as_deref());
+}
+
+fn patch_codex_persistent_mode(body: &mut Value, instructions: Option<&str>) {
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| {
+            if item.get("role").and_then(Value::as_str) != Some("developer") {
+                return true;
+            }
+            let owned = |text: &str| {
+                text.starts_with("<persistent_mode>\n") && text.ends_with("\n</persistent_mode>")
+            };
+            match item.get("content") {
+                Some(Value::String(text)) => !owned(text),
+                Some(Value::Array(parts)) if parts.len() == 1 => !parts[0]
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(owned),
+                _ => true,
+            }
+        });
+    }
+    let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) else {
+        return;
+    };
+    // codex-rs 0.153.1 maps the local persistent effort to `disabled`.
+    ensure_reasoning_object(body);
+    body["reasoning"]["effort"] = "disabled".into();
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let insert_at = input
+            .last()
+            .filter(|item| item["role"] == "user")
+            .map_or(input.len(), |_| input.len() - 1);
+        input.insert(insert_at, serde_json::json!({
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": format!("<persistent_mode>\n{instructions}\n</persistent_mode>")}]
+        }));
+    }
+}
+
+#[cfg(test)]
+mod codex_catalog_1531_tests {
+    use super::*;
+
+    #[test]
+    fn ultra_uses_catalog_effort_but_max_does_not() {
+        for (local, expected) in [
+            (ReasoningEffort::Ultra, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let mut body = serde_json::json!({"input":[{"role":"user","content":"work"}],"text":{"format":{"type":"text"}}});
+            patch_codex_responses_request(
+                &mut body,
+                ResponsesRequestPolicy {
+                    local_effort: Some(local),
+                    ultra_effort: Some(ReasoningEffort::Xhigh),
+                    multi_agent_v2: true,
+                    verbosity: Some("low".into()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["reasoning"]["effort"], expected);
+            assert_eq!(body["text"]["verbosity"], "low");
+            assert_eq!(body["text"]["format"]["type"], "text");
+            assert_eq!(
+                body["input"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(PROACTIVE_MULTI_AGENT_MODE_TEXT),
+                local == ReasoningEffort::Ultra
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_mode_is_request_local_and_provider_scoped() {
+        let original = serde_json::json!({"input":[{"role":"user","content":"work"}],"reasoning":{"effort":"medium"}});
+        let mut codex = original.clone();
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut codex,
+            ResponsesRequestPolicy {
+                persistent_instructions: Some("Continue the authorized task.".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(codex["reasoning"]["effort"], "disabled");
+        assert_eq!(codex["input"].as_array().unwrap().len(), 2);
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut codex,
+            ResponsesRequestPolicy {
+                persistent_instructions: Some("Updated instructions.".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(codex["input"].as_array().unwrap().len(), 2);
+        assert!(!codex.to_string().contains("Continue the authorized task."));
+        for provider in [ModelProvider::Xai, ModelProvider::Custom] {
+            let mut body = original.clone();
+            provider_adapter(provider).patch_responses_request(
+                &mut body,
+                ResponsesRequestPolicy {
+                    persistent_instructions: Some("must not leak".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(!body.to_string().contains("must not leak"));
+        }
+        let mut disabled = original.clone();
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut disabled, Default::default());
+        assert!(!disabled.to_string().contains("persistent_mode"));
+    }
 }
 
 fn patch_codex_agent_message_ids(request_body: &mut Value) {
@@ -1186,6 +1398,88 @@ fn patch_deepseek_responses_request(request_body: &mut Value, policy: ResponsesR
         .is_some_and(serde_json::Map::is_empty)
     {
         body.remove("reasoning");
+    }
+}
+
+/// Clamp one reasoning-effort level to the set OpenAI documents for
+/// `reasoning.effort` (`minimal` / `low` / `medium` / `high`). `None` means the
+/// request should not carry an effort at all, and Open Grok's broader menu
+/// (`xhigh` / `max` / `ultra`) collapses onto `high` so a strict gateway cannot
+/// 400 on a level it has never heard of.
+fn openai_responses_effort(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal => Some("minimal"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High
+        | ReasoningEffort::Xhigh
+        | ReasoningEffort::Max
+        | ReasoningEffort::Ultra => Some("high"),
+    }
+}
+
+/// Shape a Responses request for a user-supplied endpoint that speaks the
+/// vanilla OpenAI Responses protocol.
+///
+/// The endpoint is third-party infrastructure whose exact support is unknown,
+/// so the body keeps only the portable stateless surface: Open Grok replays the
+/// full input every turn, `store: false` stays (the fork's zero-data-retention
+/// default), and encrypted reasoning round-trips through the `include` the
+/// shared builder already sets. Everything that would imply provider-side
+/// continuity, account routing, hosted prompt templates, background execution,
+/// or a session-derived cache key is removed rather than silently ignored — a
+/// BYO address must never receive first-party routing metadata or a session id.
+fn patch_openai_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
+    let Some(body) = request_body.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "background",
+        "client_metadata",
+        "conversation",
+        "metadata",
+        "previous_response_id",
+        "prompt",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "service_tier",
+        "stream_options",
+        "truncation",
+    ] {
+        body.remove(field);
+    }
+    // `store: false` deliberately survives: it is the fork's
+    // zero-data-retention default, and dropping it would let a vanilla OpenAI
+    // endpoint persist the conversation server-side.
+
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        // `summary` is a Codex-side preference, and `service_tier`-style
+        // routing has no meaning on a BYO endpoint.
+        reasoning.remove("summary");
+        match policy.local_effort.and_then(openai_responses_effort) {
+            Some(effort) => {
+                reasoning.insert("effort".to_owned(), Value::String(effort.to_owned()));
+            }
+            None => {
+                reasoning.remove("effort");
+            }
+        }
+    }
+    if body
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        body.remove("reasoning");
+    }
+    if body
+        .get("include")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        body.remove("include");
     }
 }
 
@@ -1725,6 +2019,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Custom,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -1755,6 +2050,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Custom,
         ] {
             let mut request = base_request();
             let original = request.clone();
@@ -1783,6 +2079,13 @@ mod tests {
                 ModelProvider::Meta => {
                     assert_eq!(request["input"], original["input"]);
                     assert_eq!(request["reasoning"]["effort"], "xhigh");
+                    assert!(request["reasoning"].get("summary").is_none());
+                }
+                // The BYO Responses route clamps to OpenAI's documented effort
+                // set and drops the Codex-only summary preference.
+                ModelProvider::Custom => {
+                    assert_eq!(request["input"], original["input"]);
+                    assert_eq!(request["reasoning"]["effort"], "high");
                     assert!(request["reasoning"].get("summary").is_none());
                 }
                 _ => assert_eq!(request, original),
@@ -1961,6 +2264,242 @@ mod tests {
             assert_eq!(input[3]["type"], "function_call_output");
             assert_eq!(input[4]["role"], "user");
         }
+    }
+
+    #[test]
+    fn custom_provider_policy_is_fail_closed_for_untrusted_endpoints() {
+        let custom = provider_adapter(ModelProvider::Custom);
+        // Every wizard format is reachable, and none of them carries Codex
+        // turn state into a third-party session.
+        for backend in [
+            ApiBackend::ChatCompletions,
+            ApiBackend::Responses,
+            ApiBackend::Messages,
+        ] {
+            assert!(
+                custom.validate_backend(&backend).is_ok(),
+                "a custom endpoint must accept {backend:?}"
+            );
+            assert!(
+                !custom.supports_turn_state(&backend),
+                "a custom endpoint cannot carry Codex turn state on {backend:?}"
+            );
+        }
+        // A user-operated address gets no first-party identity or capabilities:
+        // no session-derived cache key, no xAI request metadata, no hosted
+        // tools, no Code Mode transport, and no xAI service access.
+        assert_eq!(custom.prompt_cache_key(Some("session")), None);
+        assert!(!custom.sends_doom_loop_opt_in());
+        assert!(custom.normalizes_response_events());
+        let profile = custom.profile();
+        assert_eq!(
+            profile.code_mode_transport,
+            xai_grok_sampling_types::CodeModeTransport::Unsupported
+        );
+        assert_eq!(profile.hosted_tool_dialect, None);
+        assert!(!profile.has_native_web_search());
+        assert!(!profile.allows_xai_services());
+        assert!(profile.session_auth.is_api_key_only());
+        assert_eq!(profile.responses_dialect(), Some(ResponsesDialect::OpenAi));
+    }
+
+    #[test]
+    fn custom_chat_request_keeps_only_the_portable_openai_surface() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
+
+        let mut assistant = ChatRequestMessage::assistant("previous turn", "byo-model", None);
+        assistant.reasoning = Some("gateway thoughts".to_owned());
+        let mut request = ChatCompletionRequest::new("byo-model", vec![assistant]);
+        request.temperature = Some(0.7);
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        request.service_tier = Some("priority".to_owned());
+        request.thinking = Some(ChatThinkingMode::enabled());
+        request.reasoning = Some(ChatReasoningConfig::effort(ReasoningEffort::High));
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({"type": "object", "properties": {"key": {"type": "string"}}}),
+        )]);
+
+        provider_adapter(ModelProvider::Custom).sanitize_chat_request(&mut request);
+
+        assert_eq!(request.service_tier, None);
+        assert!(
+            request.thinking.is_none(),
+            "a provider-specific thinking extension must not reach an unknown server"
+        );
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(request.temperature, Some(0.7));
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert!(wire.get("reasoning").is_none());
+        assert!(wire["messages"][0].get("reasoning").is_none());
+        assert_eq!(wire["tools"][0]["type"], "function");
+    }
+
+    #[test]
+    fn custom_messages_pins_anthropic_version_without_overriding_an_explicit_one() {
+        fn headers_for(backend: ApiBackend, pinned: Option<&str>) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            // Stand-ins for whatever `extra_headers` or a header injector put
+            // on the request before provider defaults are applied.
+            headers.insert("x-grok-session-id", HeaderValue::from_static("private"));
+            if let Some(pinned) = pinned {
+                headers.insert(
+                    "anthropic-version",
+                    HeaderValue::from_str(pinned).expect("valid header"),
+                );
+            }
+            provider_adapter(ModelProvider::Custom).apply_default_headers(
+                &mut headers,
+                &SamplerConfig {
+                    max_request_bytes: None,
+                    api_key: Some("test-key".to_owned()),
+                    base_url: "https://byo.example/v1".to_owned(),
+                    model: "byo-model".to_owned(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: backend,
+                    provider: ModelProvider::Custom,
+                    auth_scheme: crate::config::AuthScheme::Bearer,
+                    extra_headers: indexmap::IndexMap::new(),
+                    query_params: indexmap::IndexMap::new(),
+                    env_http_headers: indexmap::IndexMap::new(),
+                    context_window: 8192,
+                    force_http1: false,
+                    max_retries: None,
+                    stream_tool_calls: false,
+                    idle_timeout_secs: None,
+                    reasoning_effort: None,
+                    service_tier: None,
+                    reasoning_summary: None,
+                    origin_client: None,
+                    client_identifier: None,
+                    deployment_id: None,
+                    user_id: None,
+                    client_version: None,
+                    attribution_callback: None,
+                    bearer_resolver: None,
+                    supports_backend_search: false,
+                    supports_standalone_web_search: false,
+                    codex_multi_agent_v2: false,
+                    codex_model: Default::default(),
+                    use_responses_lite: false,
+                    experimental_supported_tools: Vec::new(),
+                    codex_permissions: None,
+                    compactions_remaining: None,
+                    compaction_at_tokens: None,
+                    doom_loop_recovery: None,
+                    header_injector: None,
+                },
+            );
+            headers
+        }
+
+        let version = |headers: &HeaderMap| {
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        let messages = headers_for(ApiBackend::Messages, None);
+        assert_eq!(version(&messages).as_deref(), Some(ANTHROPIC_VERSION));
+        assert!(
+            messages.get("x-grok-session-id").is_none(),
+            "private x-grok headers must never reach a user-operated address"
+        );
+        assert_eq!(
+            version(&headers_for(ApiBackend::Messages, Some("2024-10-22"))).as_deref(),
+            Some("2024-10-22"),
+            "an explicitly pinned version on the model entry must win"
+        );
+        for backend in [ApiBackend::ChatCompletions, ApiBackend::Responses] {
+            assert!(
+                version(&headers_for(backend, None)).is_none(),
+                "{backend:?} must not carry an Anthropic header"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_responses_sends_only_the_vanilla_openai_surface() {
+        let mut request = serde_json::json!({
+            "model": "byo-model",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hello"}
+                ]},
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "reasoning": {"effort": "ultra", "summary": "concise"},
+            "service_tier": "priority",
+            "prompt_cache_key": "session-identity",
+            "prompt_cache_retention": "24h",
+            "previous_response_id": "resp_1",
+            "conversation": "conv_1",
+            "background": true,
+            "truncation": "auto",
+            "safety_identifier": "user-1",
+            "client_metadata": {"x-codex-turn-metadata": "opaque"},
+        });
+        provider_adapter(ModelProvider::Custom).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                local_effort: Some(ReasoningEffort::Ultra),
+                ..Default::default()
+            },
+        );
+
+        // Stateless full-input replay: the endpoint's own encrypted reasoning
+        // round-trips, and `store: false` survives so a vanilla OpenAI host
+        // does not start persisting the conversation.
+        assert_eq!(request["input"].as_array().expect("input").len(), 2);
+        assert_eq!(request["store"], false);
+        assert_eq!(request["include"][0], "reasoning.encrypted_content");
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert!(request["reasoning"].get("summary").is_none());
+        for field in [
+            "background",
+            "client_metadata",
+            "conversation",
+            "previous_response_id",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "service_tier",
+            "truncation",
+        ] {
+            assert!(
+                request.get(field).is_none(),
+                "{field} must not reach a user-operated endpoint"
+            );
+        }
+
+        // No effort selected means no `reasoning` block at all, and an empty
+        // `include` array is dropped rather than sent as `[]`.
+        let mut bare = serde_json::json!({
+            "input": [],
+            "include": [],
+            "reasoning": {"summary": "concise"},
+        });
+        provider_adapter(ModelProvider::Custom).patch_responses_request(
+            &mut bare,
+            ResponsesRequestPolicy {
+                local_effort: Some(ReasoningEffort::None),
+                ..Default::default()
+            },
+        );
+        assert!(bare.get("reasoning").is_none());
+        assert!(bare.get("include").is_none());
     }
 
     #[test]
@@ -2283,14 +2822,40 @@ mod tests {
         assert!(unset.reasoning.is_none());
         assert!(unset.reasoning_effort.is_none());
 
-        assert_eq!(
-            normalize_openrouter_reasoning_effort(ReasoningEffort::Ultra),
-            ReasoningEffort::Max
-        );
-        assert_eq!(
-            normalize_openrouter_reasoning_effort(ReasoningEffort::Xhigh),
-            ReasoningEffort::Xhigh
-        );
+        // Both the shared shorthand and explicitly supplied nested controls
+        // must use the gateway's effort vocabulary. The shorthand is
+        // authoritative when both forms are supplied.
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ] {
+            let expected = if effort == ReasoningEffort::Ultra {
+                ReasoningEffort::Max
+            } else {
+                effort
+            };
+            for nested in [false, true] {
+                let mut request = ChatCompletionRequest::new("model", Vec::new());
+                request.reasoning = Some(ChatReasoningConfig::effort(if nested {
+                    effort
+                } else {
+                    ReasoningEffort::Medium
+                }));
+                if !nested {
+                    request.reasoning_effort = Some(effort);
+                }
+                provider_adapter(ModelProvider::OpenRouter).sanitize_chat_request(&mut request);
+                let wire = serde_json::to_value(request).expect("serializes");
+                assert!(wire.get("reasoning_effort").is_none());
+                assert_eq!(wire["reasoning"]["effort"], expected.as_str());
+            }
+        }
     }
 
     #[test]
@@ -2332,6 +2897,7 @@ mod tests {
     fn xai_client_version_header_always_present_and_base_semver() {
         fn config_with_version(client_version: Option<&str>) -> SamplerConfig {
             SamplerConfig {
+                max_request_bytes: None,
                 api_key: Some("test-key".to_string()),
                 base_url: "https://api.x.ai".to_string(),
                 model: "grok-4.5".to_string(),
@@ -2362,6 +2928,7 @@ mod tests {
                 supports_backend_search: false,
                 supports_standalone_web_search: false,
                 codex_multi_agent_v2: false,
+                codex_model: Default::default(),
                 use_responses_lite: false,
                 experimental_supported_tools: Vec::new(),
                 codex_permissions: None,

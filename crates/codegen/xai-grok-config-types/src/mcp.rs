@@ -5,6 +5,7 @@ use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use xai_grok_mcp::oauth_config::McpOAuthConfig;
 
@@ -54,6 +55,9 @@ pub enum McpServerTransportConfig {
         /// Name of the environment variable to read and set for `Authorization: Bearer <token>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bearer_token_env_var: Option<String>,
+        /// Path to a token re-read for each HTTP request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token_file: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         headers: Option<HashMap<String, String>>,
         /// OAuth client ID for providers that don't support Dynamic Client Registration.
@@ -93,6 +97,7 @@ pub struct McpServerConfigProblem {
 pub const KNOWN_MCP_SERVER_FIELDS: &[&str] = &[
     "args",
     "bearer_token_env_var",
+    "bearer_token_file",
     "command",
     "cwd",
     "enabled",
@@ -280,37 +285,10 @@ fn render_setup_templates(
     config: &mut McpServerConfig,
     variables: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let sub = |s: &str| render_setup_template(s, variables);
-    match &mut config.transport {
-        McpServerTransportConfig::Stdio {
-            command,
-            args,
-            env,
-            cwd,
-        } => {
-            *command = sub(command)?;
-            for arg in args.iter_mut() {
-                *arg = sub(arg)?;
-            }
-            if let Some(env) = env.as_mut() {
-                for value in env.values_mut() {
-                    *value = sub(value)?;
-                }
-            }
-            if let Some(cwd) = cwd.as_mut() {
-                *cwd = sub(cwd)?;
-            }
-        }
-        McpServerTransportConfig::StreamableHttp { url, headers, .. } => {
-            *url = sub(url)?;
-            if let Some(headers) = headers.as_mut() {
-                for value in headers.values_mut() {
-                    *value = sub(value)?;
-                }
-            }
-        }
-    }
-    Ok(())
+    config.try_for_each_substitutable_field(|value| {
+        *value = render_setup_template(value, variables)?;
+        Ok(())
+    })
 }
 
 impl McpServerConfig {
@@ -369,6 +347,17 @@ impl McpServerConfig {
     }
 
     pub fn expand_strings(&mut self, sub: &dyn Fn(&str) -> String) {
+        let Ok(()) = self.try_for_each_substitutable_field::<Infallible>(|value| {
+            *value = sub(value);
+            Ok(())
+        });
+    }
+
+    // Setup and environment expansion must visit the same transport fields.
+    fn try_for_each_substitutable_field<E>(
+        &mut self,
+        mut visit: impl FnMut(&mut String) -> Result<(), E>,
+    ) -> Result<(), E> {
         match &mut self.transport {
             McpServerTransportConfig::Stdio {
                 command,
@@ -376,28 +365,33 @@ impl McpServerConfig {
                 env,
                 cwd,
             } => {
-                *command = sub(command);
+                visit(command)?;
                 for arg in args.iter_mut() {
-                    *arg = sub(arg);
+                    visit(arg)?;
                 }
-                if let Some(env) = env.as_mut() {
-                    for value in env.values_mut() {
-                        *value = sub(value);
-                    }
+                for value in env.iter_mut().flat_map(HashMap::values_mut) {
+                    visit(value)?;
                 }
                 if let Some(cwd) = cwd.as_mut() {
-                    *cwd = sub(cwd);
+                    visit(cwd)?;
                 }
             }
-            McpServerTransportConfig::StreamableHttp { url, headers, .. } => {
-                *url = sub(url);
-                if let Some(headers) = headers.as_mut() {
-                    for value in headers.values_mut() {
-                        *value = sub(value);
-                    }
+            McpServerTransportConfig::StreamableHttp {
+                url,
+                headers,
+                bearer_token_file,
+                ..
+            } => {
+                visit(url)?;
+                for value in headers.iter_mut().flat_map(HashMap::values_mut) {
+                    visit(value)?;
+                }
+                if let Some(path) = bearer_token_file.as_mut() {
+                    visit(path)?;
                 }
             }
         }
+        Ok(())
     }
 
     pub fn to_acp_mcp_server(&self, name: impl Into<String>) -> Option<acp::McpServer> {
@@ -431,6 +425,7 @@ impl McpServerConfig {
                 url,
                 transport_type,
                 bearer_token_env_var,
+                bearer_token_file,
                 headers,
                 ..
             } => {
@@ -446,13 +441,12 @@ impl McpServerConfig {
                     })
                     .unwrap_or_default();
 
-                // Add bearer token from environment variable if specified
                 if let Some(env_var) = bearer_token_env_var {
                     match std::env::var(env_var) {
                         Ok(token) => {
                             http_headers.push(acp::HttpHeader::new(
                                 "Authorization",
-                                format!("Bearer {}", token),
+                                format!("Bearer {token}"),
                             ));
                         }
                         Err(_) => {
@@ -472,11 +466,23 @@ impl McpServerConfig {
 
                 Some(if is_sse {
                     acp::McpServer::Sse(
-                        acp::McpServerSse::new(name, url.clone()).headers(http_headers),
+                        acp::McpServerSse::new(name, url.clone())
+                            .headers(http_headers)
+                            .meta(
+                                bearer_token_file
+                                    .as_deref()
+                                    .map(xai_grok_config::bearer_token_file_meta),
+                            ),
                     )
                 } else {
                     acp::McpServer::Http(
-                        acp::McpServerHttp::new(name, url.clone()).headers(http_headers),
+                        acp::McpServerHttp::new(name, url.clone())
+                            .headers(http_headers)
+                            .meta(
+                                bearer_token_file
+                                    .as_deref()
+                                    .map(xai_grok_config::bearer_token_file_meta),
+                            ),
                     )
                 })
             }
@@ -583,6 +589,28 @@ mod tests {
     }
 
     #[test]
+    fn token_file_is_carried_in_http_and_sse_metadata() {
+        for (url, kind) in [
+            ("https://example.test/mcp", "http"),
+            ("https://example.test/sse", "sse"),
+        ] {
+            let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+                "url": url, "type": kind, "bearer_token_file": "/tmp/token"
+            }))
+            .unwrap();
+            let meta = match config.to_acp_mcp_server("service").unwrap() {
+                acp::McpServer::Http(server) => server.meta,
+                acp::McpServer::Sse(server) => server.meta,
+                _ => panic!("expected HTTP or SSE"),
+            };
+            assert_eq!(
+                xai_grok_config::BearerTokenPath::try_from(PathBuf::from("/tmp/token")).map(Some),
+                xai_grok_config::BearerTokenPath::from_meta(meta.as_ref())
+            );
+        }
+    }
+
+    #[test]
     fn transport_less_entry_fails_to_deserialize() {
         for value in [
             serde_json::json!({ "enabled": false }),
@@ -634,6 +662,7 @@ mod tests {
                 url: "https://x/mcp".into(),
                 transport_type: Some("http".into()),
                 bearer_token_env_var: Some("TOK".into()),
+                bearer_token_file: None,
                 headers: Some(HashMap::from([("H".into(), "v".into())])),
                 oauth_client_id: Some("id".into()),
                 oauth_client_secret_env_var: Some("SEC".into()),
@@ -721,6 +750,35 @@ mod tests {
     }
 
     #[test]
+    fn token_file_path_expands_setup_and_environment_values() {
+        let config: McpConfig = serde_json::from_str(site_select_setup_json()).unwrap();
+        let mut server = config.mcp_servers["acme"].clone();
+        let McpServerTransportConfig::StreamableHttp {
+            bearer_token_file, ..
+        } = &mut server.transport
+        else {
+            panic!("expected HTTP server");
+        };
+        *bearer_token_file = Some("${TOKEN_DIR}/{{url}}".into());
+        server.expand_strings(&|value| value.replace("${TOKEN_DIR}", "/secrets"));
+        let prefs = McpServerPreferences {
+            values: HashMap::from([("site".into(), "us5".into())]),
+            source: None,
+            updated_at: None,
+        };
+        let McpSetupResolution::Resolved(resolved) = server.resolve_setup(Some(&prefs)) else {
+            panic!("expected resolved server");
+        };
+        let acp::McpServer::Http(http) = resolved.to_acp_mcp_server("acme").unwrap() else {
+            panic!("expected HTTP transport");
+        };
+        assert_eq!(
+            xai_grok_config::configured_bearer_token_file(http.meta.as_ref()).as_deref(),
+            Some("/secrets/https://mcp.us5.example.com/v1/mcp")
+        );
+    }
+
+    #[test]
     fn mcp_setup_invalid_preference_value_requires_setup() {
         let setup = McpSetupConfig {
             fields: vec![McpSetupField {
@@ -741,6 +799,7 @@ mod tests {
                 url: "{{url}}".into(),
                 transport_type: None,
                 bearer_token_env_var: None,
+                bearer_token_file: None,
                 headers: None,
                 oauth_client_id: None,
                 oauth_client_secret_env_var: None,
@@ -799,6 +858,7 @@ mod tests {
                 url: "https://example.com".into(),
                 transport_type: None,
                 bearer_token_env_var: None,
+                bearer_token_file: None,
                 headers: None,
                 oauth_client_id: None,
                 oauth_client_secret_env_var: None,

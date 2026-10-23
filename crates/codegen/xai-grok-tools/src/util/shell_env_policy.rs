@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::LazyLock;
 use wildmatch::WildMatchPattern;
 
@@ -217,7 +218,15 @@ pub(crate) fn install_policy_base_env(
     active: Option<&ShellEnvironmentPolicy>,
 ) {
     if let Some(policy) = active {
-        cmd.env_clear();
+        // Keep explicit removals visible to sandbox wrappers that reconstruct
+        // the effective child environment before replacing the command.
+        let names: Vec<OsString> = std::env::vars_os()
+            .map(|(name, _)| name)
+            .chain(cmd.as_std().get_envs().map(|(name, _)| name.to_os_string()))
+            .collect();
+        for name in names {
+            cmd.env_remove(name);
+        }
         cmd.envs(create_env(policy));
     }
 }

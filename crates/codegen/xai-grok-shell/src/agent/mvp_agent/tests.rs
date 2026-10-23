@@ -239,6 +239,7 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
         team_blocked_reasons: vec![],
         coding_data_retention_opt_out: false,
         has_grok_code_access: None,
+        can_administer_team: None,
         refresh_token: None,
         expires_at: None,
         oidc_issuer: None,
@@ -1120,10 +1121,10 @@ fn startup_hints_from_meta_prefers_session_request_over_init() {
 }
 #[test]
 fn startup_hints_from_meta_session_object_wins_whole_not_merged() {
-    let session = serde_json::json!({ "startupHints": { "skipGitStatus": true } });
+    let session = serde_json::json!({ "startupHints": { "isSubagent": true } });
     let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
     let hints = startup_hints_from_meta(session.as_object(), init.as_object());
-    assert!(hints.skip_git_status);
+    assert!(hints.is_subagent);
     assert!(!hints.non_interactive);
 }
 #[test]
@@ -1375,10 +1376,12 @@ fn make_test_handle(
     crate::session::SessionHandle {
         cmd_tx,
         persistence_tx,
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),
             cwd: test_cwd_str,
@@ -1389,8 +1392,8 @@ fn make_test_handle(
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        mcp_servers: vec![],
-        initial_client_mcp_servers: vec![],
+        mcp_servers: Default::default(),
+        initial_client_mcp_servers: Default::default(),
         display_cwd: None,
         feedback_manager: std::sync::Arc::new(
             crate::session::feedback_manager::FeedbackManager::local_only("test"),
@@ -1405,6 +1408,7 @@ fn make_test_handle(
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
+        context_window_selection: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: yolo,
@@ -1420,6 +1424,7 @@ fn make_test_handle(
         )),
         force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         permission_handle: xai_grok_workspace::permission::PermissionHandle::allow_all(),
+        sandbox_mode_lease_registration: None,
         attribution_callback: None,
         agent_name: "grok-build".to_string(),
         managed_mcp_proxy_base_url: String::new(),
@@ -2190,6 +2195,54 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
+async fn new_root_session(agent: &MvpAgent, cwd: &std::path::Path) -> acp::SessionId {
+    agent.set_auth_method(acp::AuthMethodId::new("cached_token"));
+    let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+        acp::ClientCapabilities::new()
+            .fs(acp::FileSystemCapabilities::new())
+            .terminal(false),
+    );
+    agent.initialize_request.set(init).unwrap();
+    let sid = uuid::Uuid::now_v7().to_string();
+    let meta = serde_json::json!({ "sessionId": sid, "modelId": "test-model" })
+        .as_object()
+        .cloned();
+    agent
+        .new_session_inner(acp::NewSessionRequest::new(cwd.to_path_buf()).meta(meta))
+        .await
+        .expect("session/new succeeds")
+        .session_id
+}
+#[test]
+fn new_session_records_setup_phases_for_bisection() {
+    xai_grok_telemetry::unified_log::redirect_to_temp_for_tests();
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let cwd = tempfile::tempdir().unwrap();
+        let mark = xai_grok_telemetry::unified_log::snapshot_log()
+            .unwrap_or_default()
+            .len();
+        let sid = new_root_session(&agent, cwd.path()).await;
+        agent.remove_session(&sid);
+        let log = xai_grok_telemetry::unified_log::snapshot_log().unwrap_or_default();
+        let appended = String::from_utf8_lossy(log.get(mark.min(log.len())..).unwrap_or(&[]));
+        for phase in [
+            "resolve_workspace",
+            "plugin_registry",
+            "mcp_merge",
+            "persistence_init",
+            "spawn_session_actor",
+            "git_discovery",
+        ] {
+            let needle = format!("\"phase\":\"{phase}\"");
+            assert!(
+                appended.contains(needle.as_str()),
+                "session/new must record {phase} in unified.jsonl; got:\n{appended}"
+            );
+        }
+        assert!(appended.contains("\"msg\":\"session created\""));
+    });
+}
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(
         "x.ai/session/usage",
@@ -2318,6 +2371,28 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
         agent.plugin_registry_handle.snapshot().is_none(),
         "snapshot must start empty (boot discovery deferred past initialize)"
     );
+    let list_req = acp::ExtRequest::new(
+        "x.ai/plugins/list",
+        serde_json::value::to_raw_value(&serde_json::json!({ "sessionId": "no-such-session" }))
+            .unwrap()
+            .into(),
+    );
+    let resp = crate::extensions::plugins::handle(&agent, &list_req)
+        .await
+        .expect("plugins/list");
+    let listed: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
+    let names: Vec<&str> = listed
+        .get("result")
+        .and_then(|r| r.get("plugins"))
+        .and_then(|p| p.as_array())
+        .expect("plugins array")
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"regr-lazy-mcp-plugin"),
+        "session-less plugins/list must populate the snapshot first, got {names:?}"
+    );
     agent.ensure_plugin_registry();
     let snapshot = agent
         .plugin_registry_handle
@@ -2334,6 +2409,63 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
             .snapshot()
             .is_some_and(|s| s.get("regr-lazy-mcp-plugin").is_some()),
         "repeat call must keep the populated snapshot"
+    );
+}
+/// Regression: the shared snapshot was built from the boot-time in-memory
+/// `[plugins]` config, which `config.toml` edits never refresh. A plugin
+/// toggled after the agent started (marketplace install, plugin enable/disable,
+/// a client editing the file) kept its boot-time `enabled` for session-less
+/// `x.ai/plugins/list` / `x.ai/skills/list` callers until restart, while
+/// per-session registries, which read disk, were right. The shared rebuild
+/// must read disk too.
+///
+/// Exercised through a project `.opengrok/config.toml` (merged by
+/// `resolve_effective_plugins_config` for the given cwd): `grok_home()` is a
+/// process-wide `OnceLock`, so the user layer cannot be isolated per test.
+#[tokio::test]
+async fn shared_plugin_registry_snapshot_reads_plugins_config_from_disk() {
+    use crate::agent::config::Config as AgentConfig;
+    use crate::auth::{AuthManager, GrokComConfig};
+    let plugin_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        plugin_dir.path().join("plugin.json"),
+        r#"{"name": "regr-disk-disabled"}"#,
+    )
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    let project_config_dir = repo.path().join(".opengrok");
+    std::fs::create_dir_all(&project_config_dir).unwrap();
+    let auth_home = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(auth_home.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let mut cfg = AgentConfig::default();
+    cfg.plugins.cli_plugin_dirs = vec![plugin_dir.path().to_path_buf()];
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    let rebuild = |label: &str| {
+        let (trusted, disk_cfg) = MvpAgent::registry_build_inputs(repo.path(), None);
+        agent
+            .plugin_registry_handle
+            .reload(Some(repo.path()), &disk_cfg, trusted, true);
+        agent
+            .plugin_registry_handle
+            .snapshot()
+            .unwrap_or_else(|| panic!("{label}: snapshot must be populated"))
+            .get("regr-disk-disabled")
+            .unwrap_or_else(|| panic!("{label}: plugin must be discovered"))
+            .enabled
+    };
+    assert!(rebuild("baseline"), "nothing disables the plugin yet");
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        "[plugins]\ndisabled = [\"regr-disk-disabled\"]\n",
+    )
+    .unwrap();
+    assert!(
+        !rebuild("after disk edit"),
+        "rebuild must take `disabled` from config on disk, not the boot-time config"
     );
 }
 #[cfg(unix)]
@@ -2738,6 +2870,11 @@ mod eligibility_gates {
 fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
     let entry = |model: &str| ModelEntry {
         info: config::ModelInfo {
+            notice: None,
+            context_windows: Vec::new(),
+            max_request_bytes: None,
+            reasoning_effort_server_default: false,
+            variants: Vec::new(),
             user_selectable: true,
             id: None,
             model: model.to_string(),
@@ -2752,6 +2889,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             apply_patch_tool_type: None,
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
@@ -2766,6 +2904,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             agent_type: config::default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -3147,7 +3286,10 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     assert!(matches!(
         agent.prepare_video_gen_config(),
-        VideoGenConfig::Disabled
+        VideoGenConfig::Enabled {
+            zdr_restricted: true,
+            ..
+        }
     ));
     agent.cfg.borrow_mut().zdr_video_output_s3 = Some(zdr_s3());
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = false;
@@ -3268,7 +3410,7 @@ async fn openai_image_gen_config_uses_isolated_codex_identity() {
     };
     assert_eq!(provider, ImageGenerationProvider::OpenAi);
     assert!(
-        api_key.is_empty(),
+        api_key.is_none(),
         "the OAuth-only OpenAI route must not copy the token into the unused static field"
     );
     assert_eq!(base_url, crate::codex_auth::inference_base_url());
@@ -4864,11 +5006,17 @@ fn explicit_close_finalizes_the_replica() {
             (
                 options.cancel_subagents,
                 options.kill_background_tasks,
-                options.rewind_if_no_output,
+                options.history,
                 options.trigger.as_ref().map(|t| t.as_str()),
                 options.user_initiated
             ),
-            (true, true, false, Some("session_close"), false),
+            (
+                true,
+                true,
+                crate::session::commands::CancelHistoryDisposition::Keep,
+                Some("session_close"),
+                false
+            ),
         );
         assert!(
             matches!(

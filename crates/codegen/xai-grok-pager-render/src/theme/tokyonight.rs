@@ -273,9 +273,44 @@ impl Theme {
         }
     }
 
+    /// One step fainter than [`Self::dim`]: `gray_dim` blended 0.66 toward
+    /// `bg_base`, for text that must stay present but read after every label.
+    /// Falls back to [`Self::dim`] on palettes that cannot blend.
+    pub fn faint(&self) -> Style {
+        const BLEND: f32 = 0.66;
+        crate::render::color::blend_color(self.bg_base, self.gray_dim, BLEND)
+            .map_or(self.dim(), |c| Style::new().fg(c))
+    }
+
     /// Get a style for primary text.
     pub const fn primary(&self) -> Style {
         Style::new().fg(self.text_primary)
+    }
+
+    /// Whether this is the bandless terminal-native palette: every band slot is `Reset` so the terminal's own canvas shows through.
+    /// The canonical predicate for "reverse video / decoration fallback instead of a color band" — key every such branch off this, not off individual slots.
+    pub const fn is_bandless(&self) -> bool {
+        matches!(self.bg_visual, Color::Reset)
+    }
+
+    /// Patch over the already-rendered row. Bandless uses reverse video: a bright-black band can sit too close to default fg.
+    pub const fn selection_overlay(&self) -> Style {
+        if self.is_bandless() {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.bg_visual)
+        }
+    }
+
+    /// Hover analog of [`Self::selection_overlay`], keyed off `bg_hover`.
+    /// On the bandless palette hover and selection share reverse video (they shared the same band before); the cursor row stays distinguishable by its marker/bold.
+    /// Dropdowns and chips use this. Inline terminal rows use a row-hover bg instead.
+    pub const fn hover_overlay(&self) -> Style {
+        if self.is_bandless() {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.bg_hover)
+        }
     }
 }
 

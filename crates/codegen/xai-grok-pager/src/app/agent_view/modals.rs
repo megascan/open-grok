@@ -1,4 +1,4 @@
-//! Modal input handlers: agents/persona modals and the extensions modal
+//! Modal input handlers: the feedback modal, agents/persona modals, and the extensions modal
 //! (hooks, plugins, marketplace, skills, MCP servers) with its actions.
 
 use super::AgentView;
@@ -6,10 +6,178 @@ use super::AgentView;
 use super::test_fixtures;
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
+use crate::views::feedback_modal::{FeedbackModalDisplacement, FeedbackModalOutcome};
 use crate::views::file_search::line_viewer::LineViewerState;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+
+#[allow(dead_code)]
+const MAX_CONCURRENT_FEEDBACK_TRACE_UPLOADS: usize = 8;
 
 impl AgentView {
+    /// The sole feedback-open guard for already-present blocking surfaces.
+    pub(crate) fn feedback_modal_open_blocker(&self) -> Option<&'static str> {
+        if self.feedback_modal.is_some() {
+            Some("The feedback form is already open")
+        } else if self.active_subagent.is_some() {
+            Some("Close the subagent view before sending feedback")
+        } else if self.question_view.is_some() {
+            Some("Finish answering the current question first")
+        } else if !self.no_input_overlay_pending()
+            || self.modal_owns_input()
+            || self.key_owner() != super::KeyOwner::Pane
+        {
+            Some("Close or answer what's open before sending feedback")
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_feedback_trace_capacity(&self) -> bool {
+        self.pending_feedback_trace_uploads.len() + self.parked_feedback_trace_consents.len()
+            < MAX_CONCURRENT_FEEDBACK_TRACE_UPLOADS
+    }
+
+    pub(crate) fn register_pending_trace_upload(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) {
+        self.pending_feedback_trace_uploads.push_back(submission_id);
+    }
+
+    pub(crate) fn park_feedback_trace_consent(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+        consent: crate::views::feedback_modal::ParkedFeedbackTraceConsent,
+    ) {
+        self.parked_feedback_trace_consents
+            .push_back((submission_id, consent));
+    }
+
+    pub(crate) fn take_parked_feedback_trace_consent(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) -> Option<crate::views::feedback_modal::ParkedFeedbackTraceConsent> {
+        let position = self
+            .parked_feedback_trace_consents
+            .iter()
+            .position(|(parked, _)| *parked == submission_id)?;
+        self.parked_feedback_trace_consents
+            .remove(position)
+            .map(|(_, consent)| consent)
+    }
+
+    pub(crate) fn take_pending_trace_upload(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) -> bool {
+        if let Some(position) = self
+            .pending_feedback_trace_uploads
+            .iter()
+            .position(|pending| *pending == submission_id)
+        {
+            let _ = self.pending_feedback_trace_uploads.remove(position);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn displace_feedback_modal(&mut self, reason: FeedbackModalDisplacement) -> bool {
+        let Some(modal) = self.feedback_modal.take() else {
+            return false;
+        };
+        let draft_disposition = if modal.is_draft_submit_pending() {
+            "The feedback send is still in progress; its outcome will appear here."
+        } else {
+            "Your draft was discarded."
+        };
+        let notice = format!("{} {draft_disposition}", reason.notice());
+        self.scrollback
+            .push_block(crate::scrollback::block::RenderBlock::system(notice));
+        true
+    }
+
+    pub(super) fn handle_feedback_modal_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        if self.feedback_modal.is_none() {
+            return InputOutcome::Unchanged;
+        }
+        let Some(modal) = self.feedback_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = modal.handle_key(key);
+        if let Some(request) = modal.take_pending_request() {
+            return InputOutcome::Action(Action::RequestFeedbackDraft { request });
+        }
+        match outcome {
+            FeedbackModalOutcome::Cancel => {
+                self.feedback_modal = None;
+                self.promote_pending_elicitation();
+                InputOutcome::Changed
+            }
+            FeedbackModalOutcome::Submit => InputOutcome::Action(Action::SubmitFeedbackModal {
+                modal_id: modal.id(),
+            }),
+            FeedbackModalOutcome::Changed => InputOutcome::Changed,
+        }
+    }
+
+    pub(super) fn handle_feedback_modal_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
+        let Some(modal) = self.feedback_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = modal.handle_mouse(mouse);
+        if let Some(request) = modal.take_pending_request() {
+            return InputOutcome::Action(Action::RequestFeedbackDraft { request });
+        }
+        if outcome == FeedbackModalOutcome::Cancel {
+            self.feedback_modal = None;
+            self.promote_pending_elicitation();
+        }
+        InputOutcome::Changed
+    }
+
+    pub(super) fn handle_feedback_modal_paste(&mut self, text: &str) -> InputOutcome {
+        if self
+            .feedback_modal
+            .as_ref()
+            .is_some_and(|modal| modal.blocks_composer_input())
+            && self.feedback_modal.as_ref().is_some_and(|modal| {
+                modal.active_tab() != crate::views::feedback_modal::FeedbackTab::Drafts
+            })
+        {
+            return InputOutcome::Unchanged;
+        }
+        if let Some(wrap) = crate::wrap_clipboard_image::try_decode_wrap_host_image_paste(text) {
+            return match wrap {
+                crate::wrap_clipboard_image::WrapImagePaste::Image(data) => {
+                    let pasted = crate::prompt_images::from_clipboard_data(&data);
+                    let outcome = self
+                        .feedback_modal
+                        .as_mut()
+                        .map(|modal| modal.insert_image(pasted));
+                    match outcome {
+                        Some(Ok(())) => InputOutcome::Changed,
+                        Some(Err(message)) => {
+                            if let Some(modal) = self.feedback_modal.as_mut() {
+                                modal.set_error(message);
+                            }
+                            InputOutcome::Changed
+                        }
+                        None => InputOutcome::Unchanged,
+                    }
+                }
+                crate::wrap_clipboard_image::WrapImagePaste::NoImage => InputOutcome::Unchanged,
+            };
+        }
+        if let Some(modal) = self.feedback_modal.as_mut() {
+            modal.handle_paste(text);
+            InputOutcome::Changed
+        } else {
+            InputOutcome::Unchanged
+        }
+    }
+
     // -- Agents modal input handling --
 
     pub(super) fn handle_agents_modal_key(
@@ -251,8 +419,10 @@ impl AgentView {
                 }
             }
             ButtonAction::ToggleSelectedHook | ButtonAction::RemoveSelectedHook => {
-                if let TabDataState::Loaded(ref data) = state.hooks_data
-                    && let Some(idx) = state.selected_data_index()
+                let TabDataState::Loaded(ref data) = state.hooks_data else {
+                    return (None, None);
+                };
+                if let Some(idx) = state.selected_data_index()
                     && let Some(hook) = data.hooks.get(idx)
                 {
                     let label = if matches!(action, ButtonAction::ToggleSelectedHook)
@@ -264,6 +434,15 @@ impl AgentView {
                     } else {
                         hook.name.clone()
                     };
+                    (Some(label), next_enabled)
+                } else if matches!(action, ButtonAction::RemoveSelectedHook)
+                    && let Some(source_dir) = state
+                        .entry_group_keys
+                        .get(state.picker_state.selected)
+                        .and_then(|k| k.as_ref())
+                {
+                    let (label, _) =
+                        crate::views::extensions_modal::derive_source_label(source_dir);
                     (Some(label), next_enabled)
                 } else {
                     (None, None)
@@ -922,7 +1101,7 @@ impl AgentView {
                         None
                     }
                 }
-                _ => None, // Unhandled — fall through to picker
+                _ => None, // Unhandled; fall through to picker
             }
         };
         // Dispatch shortcut click (if any) now that the &mut borrow is released.
@@ -1337,6 +1516,7 @@ impl AgentView {
                     state.skills_collapsed_groups.remove(group_key)
                 }
             }
+            crate::views::extensions_modal::ExtensionsTab::Workflows => false,
             crate::views::extensions_modal::ExtensionsTab::Marketplace => {
                 let source_has_error = group_key
                     .parse::<usize>()
@@ -1493,12 +1673,7 @@ impl AgentView {
                 }
                 InputOutcome::Changed
             }
-            ButtonAction::ReloadSkills => {
-                if let Some(ref mut state) = self.extensions_modal {
-                    state.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-                }
-                InputOutcome::Action(Action::ReloadSkills)
-            }
+            ButtonAction::ReloadSkills => InputOutcome::Action(Action::ReloadSkills),
             ButtonAction::RefreshMcpList => InputOutcome::Action(Action::RefreshMcpList),
             ButtonAction::OpenManagedConnectors => {
                 InputOutcome::Action(Action::OpenManagedConnectors)
@@ -1621,23 +1796,57 @@ impl AgentView {
                 InputOutcome::Action(Action::ExecuteMarketplaceAction(marketplace_action))
             }
             ButtonAction::RemoveSelectedHook => {
-                if let Some(ref state) = self.extensions_modal {
-                    use crate::views::extensions_modal::TabDataState;
-                    if let TabDataState::Loaded(ref data) = state.hooks_data
-                        && let Some(idx) = state.selected_data_index()
-                        && let Some(hook) = data.hooks.get(idx)
-                    {
-                        let path = hook.source_dir.clone();
-                        let (label, _) = crate::views::extensions_modal::derive_source_label(&path);
-                        return self.prompt_extensions_confirm(
-                            format!("Remove hook source \"{label}\"?"),
-                            crate::views::extensions_modal::ConfirmationAction::Hooks(
-                                xai_hooks_plugins_types::HooksAction::Remove { path },
+                use crate::views::extensions_modal::TabDataState;
+                let selected = if let Some(ref state) = self.extensions_modal
+                    && let TabDataState::Loaded(ref data) = state.hooks_data
+                {
+                    let source_dir = if let Some(idx) = state.selected_data_index() {
+                        data.hooks.get(idx).map(|h| h.source_dir.clone())
+                    } else {
+                        state
+                            .entry_group_keys
+                            .get(state.picker_state.selected)
+                            .and_then(|k| k.clone())
+                    };
+                    source_dir.map(|source_dir| {
+                        (
+                            crate::views::extensions_modal::hook_source_pinned(
+                                &data.hooks,
+                                &source_dir,
                             ),
+                            data.hooks
+                                .iter()
+                                .any(|h| h.source_dir == source_dir && h.removable),
+                            source_dir,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let Some((source_pinned, removable, path)) = selected else {
+                    return InputOutcome::Changed;
+                };
+                if source_pinned || !removable {
+                    let message = if source_pinned {
+                        "This hook source is enforced by managed policy and cannot be removed."
+                    } else {
+                        "Only user-added hook directories can be removed here."
+                    };
+                    if let Some(ref mut state) = self.extensions_modal {
+                        state.modal_message = Some(
+                            crate::views::extensions_modal::ModalMessage::Info(message.to_owned()),
                         );
                     }
+                    InputOutcome::Changed
+                } else {
+                    let (label, _) = crate::views::extensions_modal::derive_source_label(&path);
+                    self.prompt_extensions_confirm(
+                        format!("Remove hook source \"{label}\"?"),
+                        crate::views::extensions_modal::ConfirmationAction::Hooks(
+                            xai_hooks_plugins_types::HooksAction::Remove { path },
+                        ),
+                    )
                 }
-                InputOutcome::Changed
             }
             ButtonAction::ToggleSelectedHook => {
                 if let Some(ref state) = self.extensions_modal
@@ -1656,7 +1865,9 @@ impl AgentView {
                             .iter()
                             .filter(|h| h.source_dir == *source)
                             .collect();
-                        let any_enabled = group_hooks.iter().any(|h| !h.disabled);
+                        let any_enabled = crate::views::extensions_modal::hook_group_any_enabled(
+                            group_hooks.iter().copied(),
+                        );
                         let hook_names: Vec<String> =
                             group_hooks.iter().map(|h| h.name.clone()).collect();
                         let action = xai_hooks_plugins_types::HooksAction::ToggleSource {
@@ -1849,7 +2060,7 @@ impl AgentView {
                                 }
                             }
                         }
-                        ExtensionsTab::Skills => {
+                        ExtensionsTab::Skills | ExtensionsTab::Workflows => {
                             let sel = state.picker_state.selected;
                             if let Some(gk) = state
                                 .entry_group_keys
@@ -2228,6 +2439,7 @@ mod extensions_action_target_tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled,
+            blocked_reason: None,
             source: "local".into(),
             wire_source: crate::views::mcps_modal::McpWireSource::Local,
             plugin_name: None,
@@ -2453,6 +2665,8 @@ mod extensions_action_target_tests {
             timeout_ms: 0,
             source_dir: source_dir.into(),
             disabled,
+            pinned: false,
+            removable: false,
         }
     }
 
@@ -2484,6 +2698,87 @@ mod extensions_action_target_tests {
         let (target, enabled) =
             AgentView::extensions_action_target(&modal, &ButtonAction::RemoveSelectedHook);
         assert_eq!(target.as_deref(), Some("src/hook-a"));
+        assert_eq!(enabled, None);
+    }
+
+    #[test]
+    fn remove_refuses_policy_source_without_confirm() {
+        let mut agent = super::test_fixtures::make_agent();
+        let mut pinned = hook_info("policy/hook-a", "/etc/grok", false);
+        pinned.pinned = true;
+        let sibling = hook_info("policy/hook-b", "/etc/grok", false);
+        let mut modal = hooks_modal(vec![pinned, sibling]);
+        modal.entry_data_indices = vec![Some(0), Some(1)];
+        modal.entry_group_keys = vec![None, None];
+        modal.picker_state.selected = 1;
+        agent.extensions_modal = Some(modal);
+
+        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
+        use crate::views::extensions_modal::ModalMessage;
+        match &agent.extensions_modal.as_ref().unwrap().modal_message {
+            Some(ModalMessage::Info(msg)) => {
+                assert!(msg.contains("managed policy"), "unexpected copy: {msg}");
+            }
+            other => panic!("expected Info refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_on_group_header_resolves_source_via_group_key() {
+        use crate::views::extensions_modal::ModalMessage;
+
+        let mut agent = super::test_fixtures::make_agent();
+        let mut removable = hook_info("user/hook-a", "/reg/user", false);
+        removable.removable = true;
+        let mut modal = hooks_modal(vec![removable]);
+        modal.entry_data_indices = vec![None, Some(0)];
+        modal.entry_group_keys = vec![Some("/reg/user".to_string()), None];
+        modal.picker_state.selected = 0;
+        agent.extensions_modal = Some(modal);
+
+        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
+        match &agent.extensions_modal.as_ref().unwrap().modal_message {
+            Some(ModalMessage::Confirmation { message, .. }) => {
+                assert!(
+                    message.contains("Remove hook source"),
+                    "unexpected copy: {message}"
+                );
+            }
+            other => panic!("expected remove confirm from header selection, got {other:?}"),
+        }
+
+        let mut agent = super::test_fixtures::make_agent();
+        let mut pinned = hook_info("policy/hook-a", "/etc/grok", false);
+        pinned.pinned = true;
+        pinned.removable = true;
+        let mut modal = hooks_modal(vec![pinned]);
+        modal.entry_data_indices = vec![None, Some(0)];
+        modal.entry_group_keys = vec![Some("/etc/grok".to_string()), None];
+        modal.picker_state.selected = 0;
+        agent.extensions_modal = Some(modal);
+
+        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
+        match &agent.extensions_modal.as_ref().unwrap().modal_message {
+            Some(ModalMessage::Info(msg)) => {
+                assert!(msg.contains("managed policy"), "unexpected copy: {msg}");
+            }
+            other => panic!("expected Info refusal from header selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_target_resolves_source_label_on_group_header() {
+        let mut removable = hook_info("user/hook-a", "/reg/user", false);
+        removable.removable = true;
+        let mut modal = hooks_modal(vec![removable]);
+        modal.entry_data_indices = vec![None, Some(0)];
+        modal.entry_group_keys = vec![Some("/reg/user".to_string()), None];
+        modal.picker_state.selected = 0;
+
+        let (target, enabled) =
+            AgentView::extensions_action_target(&modal, &ButtonAction::RemoveSelectedHook);
+        let expected_label = crate::views::extensions_modal::derive_source_label("/reg/user").0;
+        assert_eq!(target.as_deref(), Some(expected_label.as_str()));
         assert_eq!(enabled, None);
     }
 
@@ -2741,6 +3036,7 @@ mod connectors_url_click_tests {
             setup_values: std::collections::HashMap::new(),
             tools: vec![],
             enabled: true,
+            blocked_reason: None,
             source: "managed".into(),
             wire_source: McpWireSource::Managed,
             plugin_name: None,
@@ -2989,6 +3285,7 @@ mod extensions_modal_confirmation_tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".into(),
             wire_source,
             plugin_name: None,
@@ -3007,6 +3304,8 @@ mod extensions_modal_confirmation_tests {
             timeout_ms: 0,
             source_dir: source_dir.into(),
             disabled: false,
+            pinned: false,
+            removable: false,
         }
     }
 
@@ -3107,7 +3406,11 @@ mod extensions_modal_confirmation_tests {
         let source = "/tmp/my-hooks-dir";
         let mut hooks = ExtensionsModalState::new(ExtensionsTab::Hooks);
         hooks.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![hook_info("hook-a", source)],
+            hooks: vec![{
+                let mut h = hook_info("hook-a", source);
+                h.removable = true;
+                h
+            }],
             project_trusted: true,
             load_errors: Vec::new(),
         });

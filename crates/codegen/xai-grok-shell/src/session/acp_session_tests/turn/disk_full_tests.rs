@@ -29,6 +29,46 @@ where
     tokio::task::LocalSet::new().block_on(&rt, f);
 }
 
+#[test]
+fn host_turn_stamps_a_fresh_turn_start() {
+    block_on_session(|| {
+        current_thread_local(async {
+            let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            drain_gateway(gateway_rx);
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            super::rate_limit_backoff_tests::drain_persistence(persistence_rx);
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            actor.chat_state_handle.record_turn_start(1);
+            let before = chrono::Utc::now().timestamp_millis();
+            Box::pin(actor.handle_prompt(
+                "p-session-info",
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "/session-info",
+                ))],
+                PromptMode::Agent,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("host-side session info");
+            let meta = actor
+                .chat_state_handle
+                .get_notification_meta()
+                .await
+                .unwrap();
+            assert!(meta.turn_start_ms.unwrap() >= before);
+        });
+    });
+}
+
 const TODO_ARGS: &str = r#"{"todos":[{"id":"t1","content":"poll","status":"completed"}]}"#;
 
 fn drain_gateway(mut rx: tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>) {

@@ -64,18 +64,23 @@ pub fn abbreviate_path(path: &str) -> Cow<'_, str> {
         }
         return Cow::Owned(format!("{prefix}/{}", rest.display()));
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = path.strip_prefix(&home)
+    if let Some(home) = dirs::home_dir()
+        && !home.as_os_str().is_empty()
+        && let Ok(rest) = path_buf.strip_prefix(&home)
     {
-        if rest.is_empty() {
+        if rest.as_os_str().is_empty() {
             return Cow::Borrowed("~");
         }
-        if rest.starts_with('/') {
-            return Cow::Owned(format!("~{rest}"));
-        }
+        return Cow::Owned(format!("~/{}", rest.display()));
     }
     Cow::Borrowed(path)
+}
+
+/// Location-chrome path: [`abbreviate_path`] then last-two-component shortening.
+/// Clipboard and other callers keep [`abbreviate_path`].
+pub fn display_location_path(path: impl AsRef<Path>) -> String {
+    let lossy = path.as_ref().to_string_lossy();
+    crate::location_path::shorten_location_path(&abbreviate_path(&lossy)).into_owned()
 }
 
 /// True when `path` is under user [`grok_home()`] (not project `{cwd}/.opengrok`).
@@ -467,6 +472,33 @@ mod tests {
                 "got {abbreviated}"
             );
         }
+    }
+
+    #[test]
+    fn abbreviate_path_collapses_home_with_native_separator() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        if home.as_os_str().is_empty() {
+            return;
+        }
+        let full = home.join("not-opengrok-home").join("file.txt");
+        let full_str = full.to_string_lossy();
+        let abbreviated = abbreviate_path(&full_str);
+        let expected = format!(
+            "~/{}",
+            Path::new("not-opengrok-home").join("file.txt").display()
+        );
+        assert_eq!(abbreviated.as_ref(), expected);
+    }
+
+    #[test]
+    fn display_location_path_shortens_middle_components() {
+        assert_eq!(
+            display_location_path(Path::new("/work/xai/frontend/apps")),
+            "/w/x/frontend/apps"
+        );
+        assert!(!display_location_path(Path::new("/work/wt/session-1")).contains("(worktree of"));
     }
 
     #[test]

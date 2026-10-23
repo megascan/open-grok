@@ -70,7 +70,7 @@ Hooks are discovered from several places (all are merged):
 | Project | `<project>/.cursor/hooks.json` | Requires trust | Cursor compatibility (configurable) |
 | Config | `~/.opengrok/config.toml` | Always | Your hooks alongside the rest of your config |
 | Config | `managed_config.toml` (`$OPENGROK_HOME` and `/etc/opengrok`) | Always | Organization-distributed hooks (server-synced and on-device) |
-| Config | `requirements.toml` (user and system) | Always | Organization-distributed hooks in the requirements layer |
+| Config | `requirements.toml` (signed cache, and `/etc/opengrok`) | Always | Organization-enforced hooks; see [Enforced hooks](#enforced-hooks) |
 | Plugin | Bundled inside installed plugins | Per-plugin | Shared team hooks |
 
 Config-file hooks live in the same TOML your organization already controls; see [Hooks in Config Files](#hooks-in-config-files) for the format. The compatible vendor hook sources are scanned by default. To disable scanning for a specific vendor, set `[compat.<vendor>] hooks = false` in `~/.opengrok/config.toml` or the corresponding environment variable. See [Configuration](05-configuration.md#harness-compatibility) for details.
@@ -193,7 +193,7 @@ Hooks can also live directly in your Open Grok config, so a team can distribute 
 |------|------|-------------|
 | `~/.opengrok/config.toml` | User | You |
 | `managed_config.toml` (`$OPENGROK_HOME`, `/etc/opengrok`) | Managed / system | Your organization |
-| `requirements.toml` (user and system) | Requirements | Your organization |
+| `requirements.toml` (`$OPENGROK_HOME` signed cache, `/etc/opengrok`) | Requirements | Your organization |
 
 The TOML is structurally identical to the JSON hook object, so an existing hook transliterates directly:
 
@@ -221,8 +221,35 @@ timeout = 10
 Prefer the inline form to avoid repeating the `[[hooks.<Event>.hooks]]` header for each handler.
 
 - **Additive across layers.** Every layer's hooks run; a lower-priority layer adds hooks but never replaces another layer's block. A hook defined identically in more than one layer is deduplicated, keeping the highest-authority copy.
-- **Provenance labels.** Config hooks appear in `/hooks` tagged by origin (`managed:`, `requirements/user:`, `user:`, and so on) so you can see which layer contributed each one.
+- **Provenance labels.** Config hooks appear in `/hooks` tagged by origin (`managed:`, `requirements/signed:`, `requirements/user:`, `user:`, and so on) so you can see which layer contributed each one.
 - **No read-time expansion.** A literal `${VAR}` in a `command` or `url` reaches the hook runner unchanged, matching JSON hook-file semantics; the runner performs the single expansion.
+
+### Enforced hooks
+
+Hooks from the config layers your organization controls are enforced: they carry a `[policy]` badge in `/hooks`, `Space` refuses to disable them, an entry in `~/.opengrok/disabled-hooks` does not skip them, and their source cannot be removed. Two layers qualify:
+
+- The root-owned system files `/etc/opengrok/requirements.toml` and `/etc/opengrok/managed_config.toml` (`requirements/system:` and `system_managed:` names).
+- The `~/.opengrok/requirements.toml` that the deployment sync writes, while its bytes match the signed policy the server sent (`requirements/signed:` names). If the file is edited or its signature file is missing or unreadable, its hooks load as your own (`requirements/user:` names) and can be disabled again; an unreadable `requirements.toml` contributes no hooks. Organizations that need the file to stay intact set `fail_closed = true` in the same requirements, which refuses to start on an edited copy or a missing signature (an unreadable file is a read error and still starts). See [Configuration](05-configuration.md) for the config layers.
+
+Hooks in `~/.opengrok/managed_config.toml` and `~/.opengrok/config.toml` are distribution, not enforcement: you can disable them.
+
+### Allow only managed hooks
+
+An organization can restrict a machine to the hooks it enforces:
+
+```toml
+# /etc/opengrok/requirements.toml
+allow_managed_hooks_only = true
+```
+
+With this set:
+
+- **What runs.** Only [enforced hooks](#enforced-hooks): the ones from the root-owned `/etc/opengrok/requirements.toml` and `/etc/opengrok/managed_config.toml`, and the ones in the synced `~/.opengrok/requirements.toml` while it matches its signature. An edited synced file loads as your own hooks, which the pin skips.
+- **What is skipped.** Every other hook, at dispatch: `~/.opengrok/hooks`, every `~/.opengrok/*.toml` file, project hooks, plugin hooks, agent frontmatter hooks, and the Claude and Cursor compatibility files. In `/hooks` they show `[disabled]`, and enabling them is refused ("Hooks outside managed policy are disabled by your organization."); `open-grok inspect` names the file that set the pin.
+- **What still runs.** Hooks the embedding client registers over ACP (an IDE or the desktop app), as under Claude Code's `allowManagedHooksOnly`. The pager's `[[ui.notifications.hooks]]` commands are a separate mechanism.
+- **Windows.** There is no root-owned layer (no `/etc/opengrok`), so only the signed synced `requirements.toml` hooks and ACP client hooks still run.
+
+The key is a tighten-only policy pin: any native policy layer (`requirements.toml` or `managed_config.toml` in `$OPENGROK_HOME` or `/etc/opengrok`, or macOS MDM) or Claude's `managed-settings.json` can set it, the camelCase `allowManagedHooksOnly` is accepted everywhere, no layer can release it, and a non-boolean value engages it. Like the other policy pins it is read once at startup, so a pin added mid-session applies at the next start, not on `/hooks` Reload. `open-grok inspect` lists it under **Enforced by policy** as "Hooks outside managed policy disabled" with the file that set it.
 
 ---
 
@@ -253,9 +280,33 @@ For `PreToolUse` hooks, write JSON to **stdout**:
 
 - **Allow**: `{"decision": "allow"}`
 - **Deny**: `{"decision": "deny", "reason": "Unsafe command detected"}`
+- **Ask for approval**: `{"hookSpecificOutput": {"permissionDecision": "ask", "permissionDecisionReason": "Please review this command"}}`
+- **Defer to normal permissions**: `{"hookSpecificOutput": {"permissionDecision": "defer"}}`
 - **Rewrite the tool input**: `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"command": "npm test"}}}`
 
-`updatedInput` replaces the tool's input before it runs. The value must be a JSON object; a non-object is ignored. The rewritten input is what the plan-mode gate, the permission prompt, and the tool itself all see, so a hook can normalize or harden a call rather than only allow or deny it. Because hooks run before the plan-mode gate, a hook with side effects fires even when plan mode later rejects the call. If the rewritten input fails the tool's schema, the call is blocked and reported as an invalid-input error rather than falling back to the original. A `deny` decision discards any `updatedInput`; when several hooks return one, the last wins. Omitting `decision` while returning `updatedInput` allows the call and applies the rewrite.
+`updatedInput` replaces the tool's input before it runs. The value must be a
+JSON object; a non-object is ignored. Open Grok applies its plan-mode edit
+gate **before hooks**, then checks rewritten input again before permissions
+and dispatch. A hook cannot retarget the call to another tool or bypass plan
+mode, deny rules, or the sandbox. If the rewritten input fails the tool's
+schema, the call is blocked rather than falling back to the original. A
+`deny` decision discards the rewrite; when several hooks return a valid
+rewrite, the last wins. Omitting `decision` permits the rewrite but still
+requires normal authorization.
+
+`ask` requests the normal interactive approval flow; it does not grant
+permission itself. `defer` continues normal permission evaluation. These
+decisions are supported for file/plugin command and HTTP hooks; ACP client
+hook callbacks retain their own supported decision contract.
+
+### Post-tool context and output
+
+`PostToolUse` can return `hookSpecificOutput.additionalContext` to add a note
+for the model after the result. `updatedToolOutput` replaces a built-in tool
+result, while `updatedMCPToolOutput` replaces an MCP result. The replacement
+must match that tool's result format; invalid or wrong-kind replacements are
+ignored. This is result processing, not a way to undo an executed operation.
+The same delivery path applies to ordinary calls and nested Code Mode calls.
 
 ### Exit Codes
 
@@ -280,7 +331,7 @@ The hook input includes `stopHookActive` and `lastAssistantMessage`. `stopHookAc
 
 `Stop` and `SubagentStop` hooks default to a 600-second timeout (matching Claude Code) because gates commonly run builds or test suites, and a timed-out hook fails open, so the agent stops anyway. Other events keep the 5-second default. Set `timeout` explicitly when a gate needs more: `{ "type": "command", "command": "bin/verify.sh", "timeout": 1200 }`.
 
-The gate runs only for genuine completions. A turn that was interrupted (Esc / Ctrl+C), refused, or cut off at the turn limit skips the Stop gate, though a Ctrl+C that lands while a Stop hook is already running kills it mid-flight (see below); API-error turns fire `StopFailure`, and cancelled turns fire `StopCancelled`. A separate Stop also fires at session end (`reason: "channel_closed"` or `"shutdown"`); its decision output is parsed but ignored, since there is no turn left to continue. A script that counts or gates on Stop fires should check `reason == "end_turn"` so the session-end fire doesn't skew it.
+The gate runs only for genuine completions. A turn that was interrupted (Ctrl+C, a client stop button, or a client `session/cancel`), refused, or cut off at the turn limit skips the Stop gate, though a Ctrl+C that lands while a Stop hook is already running kills it mid-flight (see below); API-error turns fire `StopFailure`, and cancelled turns fire `StopCancelled`. A separate Stop also fires at session end (`reason: "channel_closed"` or `"shutdown"`); its decision output is parsed but ignored, since there is no turn left to continue. A script that counts or gates on Stop fires should check `reason == "end_turn"` so the session-end fire doesn't skew it.
 
 `StopFailure` is observation-only (use it to log failures or send alerts; output and exit code are ignored). Its input carries `error` (the classified type the matcher tests: `rate_limit`, `authentication_failed`, `invalid_request`, `server_error`, `max_output_tokens`, or `unknown` for anything the runtime cannot distinguish; capacity errors classify as `rate_limit`), `errorDetails` (the raw error detail, when available, clipped at 1000 characters; absent for a refusal, whose explanation rides `lastAssistantMessage` alone), `lastAssistantMessage` (the rendered error text shown in the conversation; for this event it is the error string, not assistant output), and `subagentType` (the subagent's type when the turn ran inside one).
 
@@ -313,7 +364,7 @@ Some turns report none of the three:
 
 `StopCancelled`'s input carries:
 
-- `reason`: the classified cause, and the value the matcher tests. `user_interrupt` (Ctrl+C, Esc, a client stop button, or a client `session/cancel`), `permission_rejected` (you declined a tool call), `permission_cancelled` (you dismissed the prompt), `max_turns`, `no_progress` (the agent bailed out after repeated no-op rounds), or `unknown` (a cancel the runtime could not classify, and the forward-compatible fallback). The matcher tests this field only, so a hook that wants every user-initiated stop matches the reasons it cares about and reads `cancelledBy` from the payload. New reasons may be added over time, so treat an unrecognized value the way you treat `unknown`.
+- `reason`: the classified cause, and the value the matcher tests. `user_interrupt` (Ctrl+C, a client stop button, or a client `session/cancel`), `permission_rejected` (you declined a tool call), `permission_cancelled` (you dismissed the prompt), `max_turns`, `no_progress` (the agent bailed out after repeated no-op rounds), or `unknown` (a cancel the runtime could not classify, and the forward-compatible fallback). The matcher tests this field only, so a hook that wants every user-initiated stop matches the reasons it cares about and reads `cancelledBy` from the payload. New reasons may be added over time, so treat an unrecognized value the way you treat `unknown`.
 - `cancelledBy`: `user` for an interrupt, a declined tool call, or a dismissed prompt; `runtime` for everything the agent decided itself, such as `max_turns` and `no_progress`; `unknown` when `reason` is `unknown`, because a cancel the runtime could not classify cannot claim the user was uninvolved. Derived from `reason`, so a new reason classifies automatically. Values may be added here too: treat one you do not recognize the way you treat `unknown`, rather than assuming anything that is not `user` was the runtime.
 - `cancelTrigger`: the gesture, when the client named one, clipped at 64 characters, since a gesture name is a token. The bundled pager sends one of four: `ctrl_c`, `esc`, `mouse` (the on-screen stop button), or `dashboard_stop`. Another client may send any string, and it is passed through verbatim. Every value here classifies as `user_interrupt`, including one that happens to spell an internal name such as `shutdown`, because a client asking to cancel is the user asking; read `cancelledBy` from the payload rather than parsing this string. Omitted for a bare `session/cancel` and for every runtime-initiated reason.
 - `reasonDetails`: the same kind of detail `StopFailure` puts in `errorDetails`, when the runtime has one. For a declined tool call it is `<tool>: <why>`. Clipped at 1000 characters, like `StopFailure`'s `errorDetails`.

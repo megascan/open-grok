@@ -7,7 +7,8 @@
 use crate::util::config::WorktreeType as ShellWorktreeType;
 use anyhow::{Context, Result};
 use std::path::Path;
-use xai_grok_workspace::session::git::find_git_root_from_path;
+use xai_grok_telemetry::region;
+use xai_grok_telemetry::region::Parent;
 pub use xai_grok_workspace::worktree::*;
 const WORKTREE_LOG: &str = "xai_worktree";
 impl From<ShellWorktreeType> for WorktreeType {
@@ -37,6 +38,7 @@ async fn create_worktree_for_resume(
     copy_mode: WorktreeCopyMode,
     worktree_type: ShellWorktreeType,
     git_ref: Option<String>,
+    grove_worktree: bool,
 ) -> Result<CreateWorktreeFromWorktreeResponse> {
     let copy_mode = if git_ref.is_some() {
         WorktreeCopyMode::Clean
@@ -50,56 +52,32 @@ async fn create_worktree_for_resume(
         git_ref,
         worktree_type: Some(WorktreeType::from(worktree_type)),
         label: None,
+        grove_worktree: Some(grove_worktree),
         cancellation_token: None,
         resolved_dest_path: None,
+        resolved_source_git_root: None,
+        grove_gate_source: None,
     };
     let source = std::path::Path::new(source_cwd);
-    if find_git_root_from_path(source)
-        .ok()
-        .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj())
-    {
+    if git_or_grove_is_jj_async(source, grove_worktree).await {
         create_jj_workspace(&wt_req).await
     } else {
         create_worktree_from_worktree_sync(&wt_req).await
     }
 }
 /// Best-effort cleanup of a worktree created during a failed resume flow.
-async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
-    let wt = std::path::Path::new(worktree_path);
-    if !wt.exists() {
-        return;
-    }
-    let is_jj = find_git_root_from_path(std::path::Path::new(source_cwd))
-        .ok()
-        .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj());
-    if is_jj {
-        if let Err(e) = remove_jj_workspace(worktree_path).await {
-            tracing::warn!(error = %e, "failed to clean up jj workspace after failure");
-        }
-    } else {
-        let wt_path = wt.to_path_buf();
-        match tokio::task::spawn_blocking(move || xai_fast_worktree::remove_worktree(&wt_path))
-            .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "fast remove_worktree failed during cleanup, trying rm");
-                let _ = tokio::fs::remove_dir_all(wt).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "remove_worktree task panicked during cleanup, trying rm");
-                let _ = tokio::fs::remove_dir_all(wt).await;
-            }
-        }
-        if let Ok(root) = find_git_root_from_path(std::path::Path::new(source_cwd)) {
-            let wt_path = wt.to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                xai_fast_worktree::remove_stale_worktree_registration(&root, &wt_path)
-            })
-            .await;
-        }
+async fn cleanup_worktree_on_failure(worktree_path: &str) {
+    let request = RemoveWorktreeRequest {
+        worktree_path: Some(worktree_path.to_owned()),
+        id_or_path: None,
+        force: false,
+        dry_run: false,
+    };
+    if let Err(error) = remove_worktree(&request, &BackgroundCopyContext::new()).await {
+        tracing::warn!(error = %error, "worktree cleanup failed; retaining remaining data");
     }
 }
+
 /// Check out a persisted HEAD commit in a worktree, with fetch fallback.
 ///
 /// Always stashes any dirty state (the worktree may carry copies of the
@@ -174,8 +152,8 @@ pub(crate) async fn resume_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: bool,
 ) -> Result<ResumeSessionInWorktreeResponse> {
-    use xai_grok_workspace::session::git::effective_worktree_path;
     tracing::info!(
         target: WORKTREE_LOG,
         session_id = %req.session_id,
@@ -204,6 +182,7 @@ pub(crate) async fn resume_session_in_worktree(
             registry_client,
             auth_manager,
             agent_id,
+            grove_worktree,
         )
         .await;
     }
@@ -214,9 +193,14 @@ pub(crate) async fn resume_session_in_worktree(
             req.session_id,
         )
     })?;
+    let record = client
+        .get_session(&req.session_id)
+        .await
+        .context("fetching session record for remote restore")?;
+    let turn = crate::session::restore::resolve_restore_turn(&record, None);
     tracing::info!(
         session_id = %req.session_id,
-        "Restoring remote session: creating worktree first to keep source clean"
+        "Restoring remote session: creating worktree after registry lookup"
     );
     let worktree_type = req
         .worktree_type
@@ -227,13 +211,39 @@ pub(crate) async fn resume_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
-    let record = client
-        .get_session(&req.session_id)
-        .await
-        .context("fetching session record for remote restore")?;
-    let turn = crate::session::restore::resolve_restore_turn(&record, None);
+    let dest = wt_resp.worktree_path.clone();
+    let created = wt_resp.status == "created";
+    match restore_remote_session_into_worktree(
+        req,
+        ops,
+        client,
+        restore_code_default,
+        turn,
+        wt_resp,
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            if created {
+                cleanup_worktree_on_failure(&dest).await;
+            }
+            Err(e)
+        }
+    }
+}
+async fn restore_remote_session_into_worktree(
+    req: &ResumeSessionInWorktreeRequest,
+    #[allow(unused_variables)] ops: &xai_grok_workspace::WorkspaceOps,
+    client: &crate::agent::session_registry_client::SessionRegistryClient,
+    restore_code_default: bool,
+    turn: i32,
+    wt_resp: CreateWorktreeFromWorktreeResponse,
+) -> Result<ResumeSessionInWorktreeResponse> {
+    use xai_grok_workspace::session::git::effective_worktree_path;
     let restore_code = remote_worktree_restores_codebase(req.restore_code, restore_code_default);
     let memory_dl_future = crate::session::restore::download_to_tempfile(
         client,
@@ -261,7 +271,6 @@ pub(crate) async fn resume_session_in_worktree(
         )
         .await;
     if session_state_result.is_skipped() {
-        cleanup_worktree_on_failure(&req.source_cwd, &wt_resp.worktree_path).await;
         anyhow::bail!(
             "Session {} session-state archive was unavailable -- \
              conversation history cannot be recovered. Retry in a few moments.",
@@ -308,6 +317,7 @@ async fn resume_local_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: bool,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use crate::session::fork::{ForkSessionRequest, fork_session};
     use xai_grok_workspace::session::git::effective_worktree_path;
@@ -320,6 +330,7 @@ async fn resume_local_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
     tracing::info!(
@@ -338,9 +349,9 @@ async fn resume_local_session_in_worktree(
         restore_degree: None,
     };
     if req.restore_code.unwrap_or(restore_code_default) {
-        let is_jj = find_git_root_from_path(std::path::Path::new(resolved_source_cwd))
-            .ok()
-            .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj());
+        let is_jj =
+            git_or_grove_is_jj_async(std::path::Path::new(resolved_source_cwd), grove_worktree)
+                .await;
         if !is_jj {
             if xai_grok_workspace::session::git::should_warn_registry_disabled(
                 is_jj,
@@ -410,7 +421,9 @@ async fn resume_local_session_in_worktree(
     let fork_resp = match fork_session(fork_req, agent_id, auth_manager).await {
         Ok(r) => r,
         Err(e) => {
-            cleanup_worktree_on_failure(resolved_source_cwd, &wt_resp.worktree_path).await;
+            if wt_resp.status == "created" {
+                cleanup_worktree_on_failure(&wt_resp.worktree_path).await;
+            }
             return Err(anyhow::anyhow!("Failed to fork session into worktree: {e}"));
         }
     };
@@ -434,6 +447,8 @@ pub(crate) async fn rehydrate_session_in_worktree(
     req: &RehydrateSessionRequest,
     #[allow(unused_variables)] ops: &xai_grok_workspace::WorkspaceOps,
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
+    grove_worktree: bool,
+    grove_gate_source: &'static str,
 ) -> Result<RehydrateSessionResponse> {
     let worktree_path_str = req.worktree_path.as_deref().unwrap_or(&req.source_cwd);
     let repo_root = Path::new(&req.repo_root);
@@ -474,7 +489,8 @@ pub(crate) async fn rehydrate_session_in_worktree(
         let dest = worktree_path_str.to_string();
         let session_id = req.session_id.clone();
         let btrfs_delegate = btrfs_delegate_from_env();
-        tokio::task::spawn_blocking(move || {
+        let _recreate = region!("worktree.cwd_recreate", Parent::Inherit);
+        let created = tokio::task::spawn_blocking(move || {
             use xai_fast_worktree::{
                 CreationMode, IgnoredFilesMode, WorkingTreeMode, WorktreeBuilder,
             };
@@ -484,13 +500,27 @@ pub(crate) async fn rehydrate_session_in_worktree(
                 .creation_mode(CreationMode::Linked)
                 .worktree_kind(xai_fast_worktree::WorktreeKind::Fork)
                 .session_id(session_id);
+            if let Some(opts) = crate::util::config::grove_worktree_opts_if_enabled(grove_worktree)
+            {
+                builder = builder.grove_worktree(opts);
+            }
             if let Some(delegate) = btrfs_delegate {
                 builder = builder.btrfs_delegate(delegate);
             }
             builder.create()
         })
         .await
-        .map_err(|e| anyhow::anyhow!("worktree creation task failed: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("worktree creation task failed: {e}"))?;
+        let report = created?;
+        tracing::info!(
+            session_id = %req.session_id,
+            worktree_path = %report.worktree_path.display(),
+            resolved_strategy = report.resolved_strategy,
+            skipped = %xai_fast_worktree::render_arm_skips(&report.skipped),
+            grove_worktree,
+            grove_gate_source,
+            "rehydrate: created worktree"
+        );
     }
     let client = registry_client.ok_or_else(|| {
         anyhow::anyhow!(
@@ -933,6 +963,7 @@ mod tests {
             None,
             None,
             "test-agent",
+            false,
         )
         .await;
         let err = result.expect_err("should fail when session not found and no registry");
@@ -988,6 +1019,7 @@ mod tests {
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
+            false,
         )
         .await
         .expect("worktree creation should succeed");
@@ -1028,6 +1060,7 @@ mod tests {
             WorktreeCopyMode::Dirty,
             ShellWorktreeType::Linked,
             Some("main".into()),
+            false,
         )
         .await
         .expect("worktree creation with git_ref should succeed");
@@ -1043,7 +1076,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn cleanup_worktree_on_failure_removes_created_worktree() {
+    async fn cleanup_worktree_on_failure_preserves_active_creator_and_source() {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo_path = tmp.path().join("repo");
         std::fs::create_dir(&repo_path).unwrap();
@@ -1056,17 +1089,34 @@ mod tests {
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
+            false,
         )
         .await
         .expect("worktree creation should succeed");
         let wt_path = std::path::Path::new(&wt_resp.worktree_path);
         assert!(wt_path.exists(), "worktree should exist before cleanup");
-        cleanup_worktree_on_failure(&source_cwd, &wt_resp.worktree_path).await;
+        cleanup_worktree_on_failure(&wt_resp.worktree_path).await;
         assert!(
-            !wt_path.exists(),
-            "worktree directory should be removed after cleanup",
+            wt_path.exists(),
+            "a live creator keeps the worktree protected during cleanup",
         );
         assert!(repo_path.join("file.txt").exists());
+        xai_fast_worktree::remove_worktree(wt_path).unwrap();
+    }
+    #[tokio::test]
+    async fn cleanup_worktree_on_failure_rejects_unmanaged_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        git_commit_all(&repo, "initial");
+        cleanup_worktree_on_failure(repo.to_str().unwrap()).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "original"
+        );
+        assert!(repo.join(".git").is_dir());
     }
     #[test]
     fn worktree_base_dir_extracts_repo_name() {

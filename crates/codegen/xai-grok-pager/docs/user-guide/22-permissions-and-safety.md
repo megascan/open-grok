@@ -130,20 +130,22 @@ Open Grok can still load Claude-style permission **rules** from managed settings
 
 When the model requests a tool, the following checks happen in order:
 
-1. **`PreToolUse` hooks**. A hook can deny a tool call before any other check. A hook that allows a call does not skip the checks below; it only declines to deny. See [10-hooks.md](10-hooks.md).
+1. **Plan mode and `PreToolUse` hooks**. Plan mode restricts edits to the session plan file, including after a hook rewrites a call. A hook can deny a tool call, and a hook that allows a call does not skip the checks below. See [19-plan-mode.md](19-plan-mode.md) and [10-hooks.md](10-hooks.md).
 
 2. **Permission rules** (from configuration files or `--allow`/`--deny` flags)
    - A matching `deny` rule rejects the call. `deny` wins over every other rule.
    - A matching `ask` rule prompts you, including for file reads, searches, and shell commands that would otherwise be auto-approved.
    - A matching `allow` rule approves the call.
 
-3. **Remembered grants**. Per-command approvals you saved from earlier prompts apply here, scoped to the current project. An existing grant can satisfy an `ask` rule instead of re-prompting. Commands on the [dangerous list](#dangerous-commands) prompt again rather than using a remembered prefix. See [Interactive Approvals](#interactive-approvals-and-where-they-persist).
+3. **Remembered grants**. Per-command approvals you saved from earlier prompts apply here, scoped to the current project. An existing command grant can satisfy a shell `ask` rule; an edit `ask` rule still prompts despite a remembered edit grant. Commands on the [dangerous list](#dangerous-commands) prompt again rather than using a remembered prefix. See [Interactive Approvals](#interactive-approvals-and-where-they-persist).
 
 4. **Built-in auto-approvals**. Read-only tools and a fixed set of read-only shell commands run without prompting (see below).
 
 5. **Prompt policy** (set by the [permission mode](#permission-modes)): prompt you, auto-approve, or auto-deny the call.
 
 [Always-approve](#always-approve) short-circuits this pipeline after step 2: `deny` rules, hooks, and `ask` rules that match a shell command's segments still apply, but remembered grants (including remembered "never allow" entries) are not consulted, and `ask` rules on non-shell tools do not prompt.
+
+For `apply_patch`, Edit rules are checked against every file the patch adds, updates, deletes, or moves, including both sides of a move. A deny or ask on any target applies to the whole patch; a configured allow covers it only if it covers every target. A permitted plan-file edit is auto-approved unless a hook asks for approval. Safe plan writes require support from the active filesystem; if unavailable, the edit is rejected.
 
 ---
 
@@ -341,7 +343,15 @@ A trailing `:*` suffix on a Bash rule is stripped to a plain prefix: `Bash(git c
 
 Commands that cannot be split into simple segments (subshells, command substitution `$(...)`, backticks, background `&`, control flow) prompt as a single unit when Bash restrictions are configured.
 
-Segment-level checks (`deny` and `ask` rules, remembered grants, and the read-only command list) strip environment-variable prefixes such as `RUST_LOG=debug`, and peel a fixed set of process wrappers (`timeout`, `nice`, `ionice`, `chrt`, `stdbuf`, `env`) so that `deny` and `ask` rules match either the wrapped or the inner command. `deny` and `ask` rules are also checked inside inline scripts passed to `bash -c`. Other wrappers, including `sudo`, `xargs`, and `nohup`, are not peeled; write rules that include them explicitly. `allow` rules do not get this treatment: they match the command string as written, so a leading environment assignment or wrapper keeps an `allow` rule from matching and the command prompts instead.
+Each segment is normalized before rules are matched. Leading environment assignments such as `RUST_LOG=debug` are stripped, and a fixed set of wrappers (`timeout`, `nice`, `ionice`, `chrt`, `stdbuf`, `env`) is peeled away, so rules match the inner command: `Bash(npm test *)` approves `RUST_LOG=debug timeout 30 npm test --workers=4`. This applies to `deny`, `ask`, and `allow` rules, remembered grants, and the read-only command list.
+
+A few more matching details:
+
+- Rules also apply inside a literal script passed to `bash -c`. For `allow`, every command inside that script must itself be allowed.
+- Wrappers not on the list (`sudo`, `xargs`, `nohup`, …) are not peeled. Write rules that name them explicitly.
+- When the parser cannot safely peel a form (for example `env -S`), the command prompts instead of matching an `allow` rule.
+- Matching sees parsed literal words joined by single spaces, without shell quotes. Recovered filename variables retain their written spelling; values are never expanded for rule matching.
+- An `allow` rule can cover a quoted filename variable when it is an `ls` or `rg` file operand that follows `--`, carries a literal `/` or `./` prefix, or was assigned a literal path earlier in the same script; `echo`, `head`, and `tail` may appear alongside with literal arguments only, and dynamic options, writes, other programs, and Read/Edit restrictions still prompt. The variable keeps its written spelling, quotes included (`rg -n ERROR "$LOG"`), so match it with `*`. Ask and Auto both honor such a covering `allow` (and an exact remembered grant for the whole script) without the classifier; other scripts with variable arguments go to the classifier in Auto.
 
 ### Dangerous Commands
 

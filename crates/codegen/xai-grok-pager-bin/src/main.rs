@@ -31,7 +31,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use xai_grok_pager::app::{
-    AgentCmd, Command, HeadlessArgs, LeaderMode, LeaderTargetArgs, PagerArgs, join_early_prefetch,
+    AgentCmd, Command, EARLY_PREFETCH_WAIT, HeadlessArgs, LeaderMode, LeaderTargetArgs, PagerArgs,
     resolve_leader_mode, resolve_use_leader, warn_leader_disabled_by_sandbox,
 };
 use xai_grok_pager::app::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
@@ -45,7 +45,129 @@ use xai_grok_shell::leader::{
 use xai_grok_shell::leader::{
     ControlPayload, LeaderClient, LeaderEnvUrls, connect_or_spawn, socket_path_for_ws_url,
 };
+use xai_grok_telemetry::process_info::{
+    Entrypoint, Interactivity, ProcessIdentity, ReleaseChannel, set_identity, set_release_channel,
+};
 use xai_grok_update::{UpdateConfig, auto_update, enforce_version_policy_or_exit};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
+#[cfg(all(feature = "test-seams", debug_assertions))]
+mod test_seam {
+    use xai_tty_utils::cli_eprintln as eprintln;
+    const TEST_TRUSTED_PUBKEY_FILE_ENV: &str = "GROK_TEST_TRUSTED_PUBKEY_FILE";
+    pub(super) fn install() {
+        let Ok(path) = std::env::var(TEST_TRUSTED_PUBKEY_FILE_ENV) else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("open-grok test-seams: cannot read {path}: {e}");
+                return;
+            }
+        };
+        let Some(separator) = bytes.iter().position(|byte| *byte == b'\n') else {
+            eprintln!("open-grok test-seams: pubkey file lacks a key_id separator");
+            return;
+        };
+        let (key_id, rest) = bytes.split_at(separator);
+        let Some(public_key) = rest.get(1..) else {
+            return;
+        };
+        let Ok(key_id) = std::str::from_utf8(key_id) else {
+            eprintln!("open-grok test-seams: key_id is not utf8");
+            return;
+        };
+        let key_id = key_id.trim();
+        if public_key.len() != 32 {
+            eprintln!(
+                "open-grok test-seams: pubkey must be 32 bytes, found {}",
+                public_key.len()
+            );
+            return;
+        }
+        xai_grok_config::signed_policy::test_seam::set_embedded_keys(&[(key_id, public_key)]);
+    }
+}
+
+fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<ProcessIdentity> {
+    let (entrypoint, interactivity) = match command {
+        Some(Command::Agent(_) | Command::Dashboard) => return None,
+        Some(Command::Login { .. }) => (Entrypoint::Cli, Interactivity::Interactive),
+        Some(
+            Command::Inspect { .. }
+            | Command::Doctor(_)
+            | Command::Logout { .. }
+            | Command::Mcp(_)
+            | Command::Plugin(_)
+            | Command::Memory(_)
+            | Command::Models
+            | Command::Sessions(_)
+            | Command::Usage(_)
+            | Command::Setup { .. }
+            | Command::Share(_)
+            | Command::Wrap(_)
+            | Command::Export(_)
+            | Command::Trace(_)
+            | Command::Update { .. }
+            | Command::Version { .. }
+            | Command::Completions { .. }
+            | Command::Worktree(_)
+            | Command::Clone(_)
+            | Command::DiskUsage(_)
+            | Command::Workspace(_),
+        ) => (Entrypoint::Cli, Interactivity::Unattended),
+        None if is_interactive => return None,
+        None => (Entrypoint::Headless, Interactivity::Unattended),
+    };
+    Some(ProcessIdentity {
+        entrypoint,
+        leader: xai_grok_telemetry::process_info::LeaderMode::Standalone,
+        interactivity,
+    })
+}
+
+fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        None | Some(
+            Command::Agent(_) | Command::Dashboard | Command::Models | Command::Worktree(_)
+        )
+    )
+}
+
+async fn maybe_run_pre_tui_login(args: &mut PagerArgs) -> Result<()> {
+    use std::io::IsTerminal;
+    use xai_grok_shell::auth::pre_tui::{PreTuiLoginOutcome, maybe_run_pre_tui_external_login};
+
+    let config = xai_grok_shell::config::load_agent_config_disk_only()
+        .map_err(|error| anyhow::anyhow!("Failed to load startup config: {error}"))?;
+    if args.startup_uses_xai_session(&config)
+        && matches!(
+            maybe_run_pre_tui_external_login(
+                &config.grok_com_config,
+                args.force_login,
+                std::io::stdin().is_terminal(),
+            )
+            .await?,
+            PreTuiLoginOutcome::SignedIn(_)
+        )
+    {
+        args.force_login = false;
+    }
+    Ok(())
+}
+
+fn validate_memory_flush_target(args: &PagerArgs, has_prompt: bool) -> Result<()> {
+    if args.memory_flush
+        && !has_prompt
+        && args.resume_session.is_none()
+        && args.load_session.is_none()
+        && !args.continue_last_session
+    {
+        anyhow::bail!("--memory-flush without a prompt requires --resume/-r or --continue/-c");
+    }
+    Ok(())
+}
 /// Apply headless args to an existing config, only overriding values that are
 /// explicitly set. This allows environment defaults to be preserved when
 /// specific args are not provided.
@@ -126,6 +248,7 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
     let registry = tracing_subscriber::registry()
         .with(fmt_layer.with_filter(env_filter))
         .with(xai_grok_telemetry::sampling_log::layer())
+        .with(xai_grok_telemetry::span_profile::layer(app_entrypoint))
         .with(xai_grok_telemetry::instrumentation::layer())
         .with(xai_grok_telemetry::hooks_log::layer())
         .with(xai_grok_telemetry::otel_layer::build_otel_layer(
@@ -150,6 +273,7 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
 }
 /// `open-grok setup`: rendering + exit codes only; fetch logic lives in `xai_grok_shell::managed_config`.
 /// `json` prints the served configuration instead of installing it.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn run_setup_command(json: bool) {
     use xai_grok_shell::managed_config::{self, SetupOutcome};
     if !managed_config::has_principal() {
@@ -196,6 +320,9 @@ async fn run_setup_command(json: bool) {
     }
     match managed_config::run_setup().await {
         SetupOutcome::Installed => eprintln!("Applied managed configuration."),
+        SetupOutcome::Staged => {
+            eprintln!("Verified managed configuration staged; restart Open Grok to apply.");
+        }
         SetupOutcome::NothingConfigured => {
             eprintln!(
                 "Your team doesn't have a managed configuration yet. A team admin can set one up at console.x.ai."
@@ -218,6 +345,7 @@ fn resolve_target(args: &LeaderTargetArgs) -> LeaderTarget {
         None => LeaderTarget::Environment(xai_grok_shell::env::GrokBuildEnvironment::Production),
     }
 }
+#[tracing::instrument(skip_all)]
 async fn connect_to_leader(
     args: &LeaderTargetArgs,
 ) -> Result<(LeaderDescriptor, xai_grok_shell::leader::LeaderClient)> {
@@ -290,8 +418,10 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 /// Blocking fetch of remote settings via the startup prefetch path.
 fn fetch_remote_settings() -> Option<xai_grok_shell::util::config::RemoteSettings> {
-    join_early_prefetch(xai_grok_shell::agent::models::start_early_prefetch(None))
+    xai_grok_shell::agent::models::startup_prefetch::begin(None);
+    xai_grok_shell::agent::models::startup_prefetch::wait_settings(EARLY_PREFETCH_WAIT)
 }
+#[tracing::instrument(level = "debug", skip_all)]
 async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
     if matches!(
         &args.command,
@@ -360,6 +490,7 @@ fn ensure_workspace_caps(reg: &LeaderRegistration) -> Result<()> {
     }
     Ok(())
 }
+#[tracing::instrument(level = "debug", skip_all)]
 async fn connect_workspace_control(
     agent_config: &AgentConfig,
     target: &LeaderTargetArgs,
@@ -384,6 +515,7 @@ async fn connect_workspace_control(
         )
     })
 }
+#[tracing::instrument(level = "debug", skip_all)]
 async fn workspace_control(
     target: &LeaderTargetArgs,
     json: bool,
@@ -398,6 +530,7 @@ async fn workspace_control(
     client.cancel();
     Ok(())
 }
+#[tracing::instrument(level = "debug", skip_all)]
 async fn workspace_start(
     args: WorkspaceStartArgs,
     restart: bool,
@@ -737,6 +870,7 @@ fn parse_replay_response(msg: &str, expected_id: &serde_json::Value) -> Option<R
 /// "unknown session id" failures after a leader crash: the bridge declared
 /// the reconnect complete while the new leader was still loading the session,
 /// and the client's next `session/prompt` raced (and lost against) the load.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn replay_request_until_response(
     tx: &tokio::sync::mpsc::UnboundedSender<String>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -829,6 +963,7 @@ fn replay_load_json(sid: &str, cached: &CachedSession) -> Option<String> {
 /// nothing to replay or every restore failed — callers emit
 /// `x.ai/leader_reconnected` with empty params in that case, signalling the
 /// external client to re-establish state itself.
+#[tracing::instrument(skip_all)]
 async fn replay_acp_state_after_reconnect(
     tx: &tokio::sync::mpsc::UnboundedSender<String>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -894,8 +1029,15 @@ fn shutdown_and_flush_telemetry(exit_code: i32) -> ! {
     xai_grok_telemetry::sentry::flush_on_shutdown();
     xai_grok_telemetry::otel_layer::shutdown_otel();
     xai_grok_telemetry::debug_log::flush();
+    finalize_span_profile();
     std::process::exit(exit_code);
 }
+fn finalize_span_profile() {
+    if let Some(path) = xai_grok_telemetry::span_profile::finalize() {
+        eprintln!("open-grok: span profile written to {}", path.display());
+    }
+}
+#[tracing::instrument(level = "debug", skip_all)]
 async fn forward_stdio_line_to_leader(
     line: Vec<u8>,
     leader_tx: &tokio::sync::Mutex<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -931,6 +1073,7 @@ async fn forward_stdio_line_to_leader(
 const PLUGIN_DIR_LEADER_WARNING: &str = "open-grok: --plugin-dir is ignored in leader mode; run with --no-leader to \
      load per-process plugins";
 /// Run the `agent` subcommand, dispatching to the appropriate mode.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn run_agent_command(
     agent_args: Box<xai_grok_pager::app::AgentArgs>,
     permission_mode_flag: Option<String>,
@@ -973,7 +1116,17 @@ async fn run_agent_command(
             }
         }
     }
-    let early_prefetch = xai_grok_shell::agent::models::start_early_prefetch(None);
+    let had_prefetch = match xai_grok_shell::config::load_agent_config_disk_only() {
+        Ok(mut config) => {
+            config.default_model_override = agent_args.model.clone();
+            apply_agent_endpoint_args(&agent_args, &mut config);
+            xai_grok_shell::agent::models::startup_prefetch::begin_before_policy_gate(&config)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "startup prefetch skipped (disk config load failed)");
+            false
+        }
+    };
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     let is_stdio = matches!(agent_args.mode, Some(AgentCmd::Stdio));
     let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
@@ -995,7 +1148,11 @@ async fn run_agent_command(
             .ok();
         }
     }
-    let remote_settings = join_early_prefetch(early_prefetch);
+    let remote_settings = if had_prefetch {
+        xai_grok_shell::agent::models::startup_prefetch::wait_settings(EARLY_PREFETCH_WAIT)
+    } else {
+        None
+    };
     xai_grok_shell::util::config::set_remote_campaigns_from_settings(remote_settings.as_ref());
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
@@ -1074,6 +1231,20 @@ async fn run_agent_command(
     if let Some(profile) = disabled_by_confinement {
         warn_leader_disabled_by_sandbox(profile);
     }
+    set_identity(ProcessIdentity {
+        entrypoint: match &agent_args.mode {
+            Some(AgentCmd::Stdio) => Entrypoint::Embedded,
+            Some(AgentCmd::Leader(_)) => Entrypoint::Leader,
+            Some(AgentCmd::Serve(_)) => Entrypoint::Workspace,
+            Some(AgentCmd::Headless(_)) | None => Entrypoint::Headless,
+        },
+        leader: if use_leader || is_leader {
+            xai_grok_telemetry::process_info::LeaderMode::Attached
+        } else {
+            xai_grok_telemetry::process_info::LeaderMode::Standalone
+        },
+        interactivity: Interactivity::Unattended,
+    });
     let managed_application = xai_grok_config::grok_application();
     let managed_install = is_managed_install(std::env::current_exe().ok(), &managed_application);
     if stdio_auto_update_enabled(
@@ -1669,15 +1840,43 @@ fn version_text(channel_label: &str) -> String {
 fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::io::Result<()> {
     writer.write_all(version_text(channel_label).as_bytes())
 }
-fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
-    if !args.version {
-        return false;
+
+fn write_antigravity_login_url(writer: &mut impl std::io::Write, url: &str) -> std::io::Result<()> {
+    writeln!(writer, "Open this link to sign in to Antigravity:\n{url}")?;
+    writer.flush()
+}
+/// The leader gets its own crash directory: `install()` opens `last-crash.bin` with `O_TRUNC`, so a pager and a
+/// leader sharing one directory would each wipe the other's pending crash blob on start.
+fn crash_dir_for(args: &PagerArgs) -> std::path::PathBuf {
+    let base = xai_grok_shell::util::grok_home::grok_home().join("crash");
+    let is_leader = matches!(
+        &args.command,
+        Some(Command::Agent(agent)) if matches!(agent.mode, Some(AgentCmd::Leader(_)))
+    );
+    if is_leader { base.join("leader") } else { base }
+}
+fn dispatch_version_if_requested(args: &PagerArgs) -> std::io::Result<bool> {
+    let json = match &args.command {
+        _ if args.version => false,
+        Some(Command::Version { json }) => *json,
+        _ => return Ok(false),
+    };
+    if json {
+        let payload = serde_json::json!({
+            "currentVersion": xai_grok_version::version_with_commit(),
+            "releaseSource": xai_grok_update::RELEASE_SOURCE,
+        });
+        xai_tty_utils::cli_output::write_checked(
+            std::io::stdout().lock(),
+            format_args!("{payload}\n"),
+        )?;
+    } else {
+        xai_tty_utils::cli_output::ignore_broken_pipe(write_version(
+            &mut std::io::stdout().lock(),
+            "",
+        ))?;
     }
-    if let Err(error) = write_version(&mut std::io::stdout().lock(), "") {
-        eprintln!("Error: {error}");
-        std::process::exit(1);
-    }
-    true
+    Ok(true)
 }
 fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     let Some(Command::Doctor(doctor_args)) = &args.command else {
@@ -1703,10 +1902,23 @@ fn main() {
         std::process::exit(code);
     }
     let args = PagerArgs::parse_cli();
-    if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
+    match dispatch_version_if_requested(&args) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
+    if dispatch_doctor_if_requested(&args) {
         return;
     }
+    set_release_channel(ReleaseChannel::from_label(
+        xai_grok_update::channel_name().unwrap_or_default(),
+    ));
     xai_grok_pager_minimal::install();
+    #[cfg(all(feature = "test-seams", debug_assertions))]
+    test_seam::install();
     #[cfg(all(feature = "jemalloc", unix))]
     xai_grok_pager::memory_release::install_release_hook(purge_jemalloc_retained_pages);
     #[cfg(all(feature = "jemalloc", unix))]
@@ -1736,7 +1948,7 @@ fn main() {
     xai_grok_pager::docs::extract_user_guide_docs(&xai_grok_shell::util::grok_home::grok_home());
     xai_crash_handler::install_terminal_restore_only();
     if xai_grok_shell::util::config::load_crash_handler_enabled_sync() {
-        let crash_dir = xai_grok_shell::util::grok_home::grok_home().join("crash");
+        let crash_dir = crash_dir_for(&args);
         if let Some(report) = xai_crash_handler::check_previous_crash(&crash_dir) {
             eprintln!("Open Grok crashed during your last session.");
             eprintln!("  Signal:  {}", report.signal_name);
@@ -1754,13 +1966,6 @@ fn main() {
             );
         }
     }
-    let crashed = xai_grok_shell::active_sessions::collect_crashed().unwrap_or_default();
-    if !crashed.is_empty() {
-        tracing::info!(
-            count = crashed.len(),
-            "Found crashed sessions from a previous run"
-        );
-    }
     let workers = cli_worker_threads();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(workers.get()).enable_all();
@@ -1773,6 +1978,7 @@ fn main() {
     xai_grok_telemetry::debug_log::flush();
     if let Err(e) = result {
         xai_tty_utils::restore_native_stderr();
+        finalize_span_profile();
         match e.downcast_ref::<xai_grok_pager::app::StartupFailure>() {
             Some(startup) => eprintln!("{}", startup.user_report()),
             None => eprintln!("Error: {e:#}"),
@@ -1780,9 +1986,11 @@ fn main() {
         drop(_sentry_guard);
         std::process::exit(1);
     }
+    finalize_span_profile();
 }
+#[tracing::instrument(level = "debug", skip_all)]
 async fn async_main(args: PagerArgs) -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xai_grok_extra_ca::ensure_default_crypto_provider();
     let mut args = args.apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {
         unsafe { std::env::set_var("GROK_COMPACTION_MODE", mode) };
@@ -1814,11 +2022,18 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         set_if_unset("GROK_HOOKS_LOG", "1");
     }
     if let Some(Command::Completions { shell }) = &args.command {
-        xai_grok_pager::completions_cmd::run(*shell);
+        xai_grok_pager::completions_cmd::run(*shell)?;
         return Ok(());
     }
     if let Some(Command::Wrap(ref wrap_args)) = args.command {
         return xai_grok_pager::wrap_cmd::run(wrap_args);
+    }
+    if let Some(Command::Clone(clone_args)) = &args.command {
+        let clone_args = clone_args.clone();
+        return tokio::task::spawn_blocking(move || {
+            xai_grok_pager::clone_cmd::run_clone(clone_args)
+        })
+        .await?;
     }
     args.pin_local_resume_target()?;
     let saved_profile = args.saved_resume_profile();
@@ -1833,6 +2048,45 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             std::process::exit(1);
         }
     };
+    if args.trust {
+        match std::env::current_dir() {
+            Ok(cwd) => xai_grok_workspace::folder_trust::grant_folder_trust(&cwd),
+            Err(error) => {
+                eprintln!("warning: --trust: failed to resolve cwd; folder not trusted: {error}");
+            }
+        }
+    }
+    if command_needs_pre_sandbox_policy_heal(args.command.as_ref()) {
+        match xai_grok_shell::config::load_agent_config_disk_only() {
+            Ok(mut config) => {
+                if let Some(Command::Agent(agent_args)) = args.command.as_ref() {
+                    apply_agent_endpoint_args(agent_args, &mut config);
+                }
+                if args.startup_uses_xai_session(&config) {
+                    config.default_model_override = match args.command.as_ref() {
+                        Some(Command::Agent(agent_args)) => agent_args.model.clone(),
+                        _ => args.model.clone(),
+                    };
+                    xai_grok_shell::agent::models::startup_prefetch::begin_before_policy_gate(
+                        &config,
+                    );
+                    let auth_manager = std::sync::Arc::new(config.create_auth_manager());
+                    auth_manager.configure_refresher(
+                        config.grok_com_config.auth_provider_command.clone(),
+                        None,
+                    );
+                    xai_grok_shell::managed_config::ensure_managed_policy_present(&auth_manager)
+                        .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "managed policy: skipped session-start heal (disk config load failed)"
+                );
+            }
+        }
+    }
     xai_grok_shell::config::apply_sandbox(
         None,
         sandbox_profile_arg.as_deref(),
@@ -1842,27 +2096,20 @@ async fn async_main(args: PagerArgs) -> Result<()> {
     let is_interactive = args.command.is_none()
         && args.single.is_none()
         && args.prompt_json.is_none()
-        && args.prompt_file.is_none();
+        && args.prompt_file.is_none()
+        && !args.memory_flush;
     xai_grok_shell::http::set_client_name(if is_interactive {
         xai_grok_workspace::permission::ClientType::GrokPager
     } else {
         xai_grok_workspace::permission::ClientType::Generic
     });
+    if let Some(identity) = process_identity(args.command.as_ref(), is_interactive) {
+        set_identity(identity);
+    }
     let update_config = build_update_config();
     if let Some(command) = args.command.take() {
         match command {
-            Command::Version { json } => {
-                if json {
-                    let payload = serde_json::json!({
-                        "currentVersion": xai_grok_version::version_with_commit(),
-                        "releaseSource": xai_grok_update::RELEASE_SOURCE,
-                    });
-                    println!("{}", serde_json::to_string(&payload)?);
-                } else {
-                    write_version(&mut std::io::stdout().lock(), "")?;
-                }
-                return Ok(());
-            }
+            Command::Version { .. } => unreachable!("version was consumed before startup"),
             Command::Agent(agent_args) => {
                 if args.leader || args.no_leader {
                     let flag = if args.leader {
@@ -1921,7 +2168,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
                 let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                return xai_grok_pager::worktree_cmd::run(worktree_args, &agent_config).await;
+                let result = xai_grok_pager::worktree_cmd::run(worktree_args, &agent_config).await;
+                return result;
             }
             Command::DiskUsage(disk_usage_args) => {
                 init_tracing_simple("cli");
@@ -1940,6 +2188,11 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::sessions_cmd::run(sessions_args, &agent_config).await;
             }
+            Command::Usage(usage_args) => {
+                init_tracing_simple("cli");
+                let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                return xai_grok_pager::usage_cmd::run(usage_args);
+            }
             Command::Share(ref share_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
@@ -1954,8 +2207,11 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Trace(trace_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
+                let mut agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                if !trace_args.local {
+                    agent_config.remote_settings = fetch_remote_settings();
+                }
                 return xai_grok_pager::trace_cmd::run(trace_args, &agent_config).await;
             }
             Command::Memory(memory_args) => {
@@ -1987,11 +2243,41 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 legacy: _,
                 oauth,
                 codex,
+                antigravity,
                 device_auth,
                 devbox,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                if antigravity {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        anyhow::bail!("Antigravity sign-in requires an interactive terminal");
+                    }
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(),
+                        std::env::current_dir()?,
+                    )?;
+                    let cancel = CancellationToken::new();
+                    let login = xai_grok_shell::agent::antigravity_acp::login_user(
+                        &launch,
+                        |url| write_antigravity_login_url(&mut std::io::stderr().lock(), url),
+                        &cancel,
+                    );
+                    tokio::pin!(login);
+                    let result = tokio::select! {
+                        result = &mut login => result,
+                        _ = tokio::signal::ctrl_c() => {
+                            cancel.cancel();
+                            login.await
+                        }
+                    };
+                    result.map_err(|error| anyhow::anyhow!(
+                        "Antigravity sign-in failed: {error}. Install the ACP runtime with scripts/install-antigravity-acp.sh or set OPENGROK_ANTIGRAVITY_ACP."
+                    ))?;
+                    println!("Connected Antigravity.");
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 if codex {
                     let account = xai_grok_shell::codex_auth::run_cli_login(device_auth).await?;
                     let label = account
@@ -2009,8 +2295,25 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout { codex, all } => {
+            Command::Logout {
+                codex,
+                all,
+                antigravity,
+            } => {
                 init_tracing_simple("cli");
+                if antigravity {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(),
+                        std::env::current_dir()?,
+                    )?;
+                    xai_grok_shell::agent::antigravity_acp::logout_user(
+                        &launch,
+                        &CancellationToken::new(),
+                    )
+                    .await?;
+                    println!("Signed out of Antigravity.");
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 if codex || all {
                     let removed = xai_grok_shell::codex_auth::run_cli_logout().await?;
                     println!(
@@ -2030,12 +2333,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 xai_grok_shell::auth::run_cli_logout(&config)?;
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Wrap(ref wrap_args) => {
-                return xai_grok_pager::wrap_cmd::run(wrap_args);
-            }
-            Command::Completions { shell } => {
-                xai_grok_pager::completions_cmd::run(shell);
-                return Ok(());
+            Command::Wrap(_) | Command::Completions { .. } | Command::Clone(_) => {
+                unreachable!("command was handled before sandbox initialization")
             }
             Command::Dashboard => {
                 args.command = Some(Command::Dashboard);
@@ -2048,7 +2347,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         args.prompt_json.as_deref(),
         args.prompt_file.as_deref(),
     )?;
-    if let Some(prompt) = headless_prompt {
+    if headless_prompt.is_some() || args.memory_flush {
+        validate_memory_flush_target(&args, headless_prompt.is_some())?;
         init_tracing_simple(HEADLESS_ENTRYPOINT);
         let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
         enforce_version_policy_or_exit();
@@ -2070,8 +2370,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         {
             args.output_format = xai_grok_pager::headless::OutputFormat::Json;
         }
+        let memory_enabled_override = args.memory_enabled_override();
+        let memory_flush = args.memory_flush;
         return xai_grok_pager::headless::run_single_turn(
-            prompt,
+            headless_prompt,
             args.verbatim,
             xai_grok_pager::headless::HeadlessOptions {
                 session_id: args.session_id.clone(),
@@ -2104,6 +2406,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 background_wait_timeout: std::time::Duration::from_secs(
                     args.background_wait_timeout_secs,
                 ),
+                memory_flush,
+                memory_enabled_override,
             },
         )
         .await;
@@ -2132,6 +2436,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         } else {
             None
         };
+    maybe_run_pre_tui_login(&mut args).await?;
     let result = xai_grok_pager::app::run(args, bg_update_rx).await;
     xai_grok_sandbox::flush();
     match result {
@@ -2157,6 +2462,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
 /// because the target was already on disk) or the child failed does this
 /// fall back to a fresh blocking `open-grok update`, which itself resolves to
 /// "Already up to date" without downloading when the disk is current.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn finish_update_on_exit(
     adopted: Option<tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>>,
     update_config: &UpdateConfig,
@@ -2286,6 +2592,7 @@ fn get_channel_switch(alpha: bool, stable: bool, enterprise: bool) -> Option<&'s
     }
 }
 /// Handle `grok-pager update [--check] [--json] [--force-reinstall] [--version X] [--alpha|--stable|--enterprise]`.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn run_update_command(
     check: bool,
     json: bool,
@@ -2322,16 +2629,19 @@ async fn run_update_command(
     }
 
     let mut update_config = base_update_config.clone();
-    let installed = auto_update::run_update(
+    let result = auto_update::run_update(
         force_reinstall,
         version.as_deref(),
         None,
         &mut update_config,
     )
-    .await?;
-    if let Some(installed_version) = installed {
-        signal_leaders_to_relaunch(&installed_version).await;
+    .await;
+    if let Ok(Some(installed_version)) = &result {
+        signal_leaders_to_relaunch(installed_version).await;
     }
+    xai_grok_telemetry::session_ctx::drain_pending(xai_grok_telemetry::session_ctx::CLI_DRAIN)
+        .await;
+    result?;
     Ok(())
 }
 /// After a successful `open-grok update`, ask any running leader on this machine that
@@ -2341,6 +2651,7 @@ async fn run_update_command(
 /// Best-effort and non-fatal: discovery/connect/control failures are logged and
 /// skipped. The leader re-checks the directional version guard authoritatively;
 /// the pager-side `live_info` check just avoids connecting to newer leaders.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn signal_leaders_to_relaunch(installed_version: &str) {
     for d in xai_grok_shell::leader::discover_leaders().await {
         if d.classification != xai_grok_shell::leader::LeaderDiscoveryState::Reachable {
@@ -2402,6 +2713,82 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_process_identity_distinguishes_cli_and_headless() {
+        for (argv, interactivity) in [
+            (vec!["open-grok", "version"], Interactivity::Unattended),
+            (
+                vec!["open-grok", "clone", "https://example.com/repo.git"],
+                Interactivity::Unattended,
+            ),
+            (
+                vec!["open-grok", "login", "--codex"],
+                Interactivity::Interactive,
+            ),
+        ] {
+            let args = PagerArgs::try_parse_from(argv).unwrap();
+            assert_eq!(
+                process_identity(args.command.as_ref(), false),
+                Some(ProcessIdentity {
+                    entrypoint: Entrypoint::Cli,
+                    leader: xai_grok_telemetry::process_info::LeaderMode::Standalone,
+                    interactivity,
+                })
+            );
+        }
+        assert!(process_identity(None, true).is_none());
+        assert_eq!(
+            process_identity(None, false).unwrap().entrypoint,
+            Entrypoint::Headless
+        );
+        let args = PagerArgs::try_parse_from(["open-grok", "agent", "stdio"]).unwrap();
+        assert!(process_identity(args.command.as_ref(), false).is_none());
+    }
+
+    #[test]
+    fn startup_policy_heal_only_runs_for_agent_commands() {
+        for argv in [
+            vec!["open-grok"],
+            vec!["open-grok", "agent", "stdio"],
+            vec!["open-grok", "models"],
+            vec!["open-grok", "dashboard"],
+        ] {
+            let args = PagerArgs::try_parse_from(argv).unwrap();
+            assert!(command_needs_pre_sandbox_policy_heal(args.command.as_ref()));
+        }
+        for argv in [
+            vec!["open-grok", "inspect"],
+            vec!["open-grok", "mcp", "list"],
+            vec!["open-grok", "version"],
+            vec!["open-grok", "clone", "https://example.com/repo.git"],
+        ] {
+            let args = PagerArgs::try_parse_from(argv).unwrap();
+            assert!(!command_needs_pre_sandbox_policy_heal(
+                args.command.as_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_memory_flush_without_prompt_requires_existing_session() {
+        let mut args = PagerArgs::try_parse_from(["open-grok"]).unwrap();
+        assert!(validate_memory_flush_target(&args, false).is_ok());
+        args.memory_flush = true;
+        assert!(validate_memory_flush_target(&args, false).is_err());
+        assert!(validate_memory_flush_target(&args, true).is_ok());
+        args.session_id = Some("new-session-id".into());
+        assert!(validate_memory_flush_target(&args, false).is_err());
+        args.resume_session = Some("existing-session".into());
+        assert!(validate_memory_flush_target(&args, false).is_ok());
+        args.resume_session = None;
+        args.load_session = Some("existing-session".into());
+        assert!(validate_memory_flush_target(&args, false).is_ok());
+        args.load_session = None;
+        args.continue_last_session = true;
+        assert!(validate_memory_flush_target(&args, false).is_ok());
+    }
+
     #[test]
     fn default_caps_the_core_count() {
         let nz = |n| NonZeroUsize::new(n).unwrap();
@@ -2497,6 +2884,53 @@ mod tests {
             assert!(output.ends_with(expected_suffix), "{output:?}");
         }
     }
+
+    #[test]
+    fn antigravity_login_url_requires_successful_write_and_flush() {
+        struct Failing {
+            kind: std::io::ErrorKind,
+            fail_on_flush: bool,
+        }
+        impl std::io::Write for Failing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(self.kind.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_on_flush {
+                    Err(self.kind.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            for fail_on_flush in [false, true] {
+                let error = write_antigravity_login_url(
+                    &mut Failing {
+                        kind,
+                        fail_on_flush,
+                    },
+                    "https://example.test/authorization",
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+        }
+        let mut output = Vec::new();
+        write_antigravity_login_url(&mut output, "https://example.test/authorization").unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("https://example.test/authorization")
+        );
+    }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {
         let version = PagerArgs::try_parse_from(["grok", "--version"]).unwrap();
@@ -2546,7 +2980,7 @@ mod tests {
         if jemalloc_prof_available() {
             return true;
         }
-        eprintln!(
+        std::eprintln!(
             "skip jemalloc prof checks: opt.prof false \
              (release-dist static conf, or MALLOC_CONF=prof:true,prof_active:false,lg_prof_sample={})",
             xai_grok_shell::heap_profile::LG_PROF_SAMPLE

@@ -1390,3 +1390,219 @@ async fn goal_resume_reminder_is_plan_aware_when_planner_enabled() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn goal_no_tool_continuations_pause_and_resume_with_fresh_streak() {
+    use crate::session::goal_tracker::GoalStatus;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, _tmp, mut persisted) = make_planner_actor_capturing(None, false).await;
+            create_test_goal(&actor);
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("old-goal", false)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", true)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            let snapshot = actor.goal_tracker.lock().snapshot().cloned().unwrap();
+            assert_eq!(snapshot.status, GoalStatus::NoProgressPaused);
+            assert!(snapshot.pause_message.unwrap().contains("/goal resume"));
+            let mut persisted_pause = false;
+            while let Ok(msg) = persisted.try_recv() {
+                if let PersistenceMsg::GoalModeState(state) = msg {
+                    persisted_pause |= state.status == GoalStatus::NoProgressPaused;
+                }
+            }
+            assert!(persisted_pause, "the no-progress pause must be durable");
+            let _ = actor.resume_goal().await;
+            assert_eq!(actor.goal_tracker.lock().status(), Some(GoalStatus::Active));
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                !actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+            assert!(
+                actor
+                    .pause_goal_after_no_tool_continuation("g-test", false)
+                    .await
+            );
+        })
+        .await;
+}
+
+/// The initial user round is not a continuation; three subsequent no-tool
+/// rounds must stop the real prompt loop without submitting a fifth request.
+#[test]
+#[serial]
+fn real_goal_turn_pauses_after_three_no_tool_continuations() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            use super::rate_limit_backoff_tests::{drain_gateway, drain_persistence};
+            use xai_grok_test_support::{MockInferenceServer, MockModelEntry};
+
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .unwrap();
+            let tmp = TempDir::new().unwrap();
+            let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _retries = drain_gateway(gateway_rx);
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            drain_persistence(persistence_rx);
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.events = crate::session::events::EventTracker::new(tmp.path());
+            actor.goal_enabled = true;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+            set_goal_harness_for_tests(&actor);
+            actor.goal_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::session::goal_tracker::GoalTracker::new(tmp.path().to_path_buf()),
+            ));
+            actor.goal_tracker.lock().create_goal(
+                "turn-goal".into(),
+                "Complete the requested work".into(),
+                None,
+                0,
+                "2026-01-01T00:00:00Z".into(),
+                None,
+            );
+            let retry_policy = xai_grok_sampler::RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            };
+            let sampler_config = xai_grok_sampler::SamplerConfig {
+                base_url: server.url(),
+                model: "test".into(),
+                api_backend: xai_grok_sampler::ApiBackend::Responses,
+                context_window: 256_000,
+                max_retries: Some(0),
+                idle_timeout_secs: Some(30),
+                ..Default::default()
+            };
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.sampler_handle =
+                xai_grok_sampler::SamplerActor::spawn(sampler_config, retry_policy, event_tx);
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.model = "test".into();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            let actor = StdArc::new(actor);
+            let drainer = actor.clone();
+            tokio::task::spawn_local(async move {
+                while let Some(event) = event_rx.recv().await {
+                    drainer.handle_sampling_event(event).await;
+                }
+            });
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                actor.handle_prompt(
+                    "goal-real-user",
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "continue the work",
+                    ))],
+                    PromptMode::Agent,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("goal turn must terminate")
+            .expect("no-progress pause completes the prompt");
+            assert_eq!(outcome.stop_reason, acp::StopReason::EndTurn);
+            assert_eq!(
+                server.request_count_for("/v1/responses"),
+                4,
+                "one user round plus three goal continuations; goal={:?}, harness={}",
+                actor.goal_tracker.lock().snapshot(),
+                actor.goal_harness_enabled()
+            );
+            assert_eq!(
+                actor.goal_tracker.lock().status(),
+                Some(crate::session::goal_tracker::GoalStatus::NoProgressPaused)
+            );
+
+            // An exhausted budget wins over a third no-tool strike. Drive a
+            // new synthetic continuation with two prior strikes through the
+            // same real prompt entry point.
+            {
+                let mut tracker = actor.goal_tracker.lock();
+                tracker.create_goal(
+                    "budget-goal".into(),
+                    "Respect the budget".into(),
+                    Some(1),
+                    0,
+                    "2026-01-01T00:00:00Z".into(),
+                    None,
+                );
+                assert!(!tracker.record_goal_continuation(false));
+                assert!(!tracker.record_goal_continuation(false));
+            }
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                actor.handle_prompt(
+                    "goal-summary-budget",
+                    vec![acp::ContentBlock::Text(acp::TextContent::new("continue"))],
+                    PromptMode::Agent,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("budgeted goal turn must terminate")
+            .expect("budget exhaustion completes the prompt");
+            assert_eq!(outcome.stop_reason, acp::StopReason::EndTurn);
+            assert_eq!(
+                actor.goal_tracker.lock().status(),
+                Some(crate::session::goal_tracker::GoalStatus::BudgetLimited)
+            );
+        })
+    });
+}

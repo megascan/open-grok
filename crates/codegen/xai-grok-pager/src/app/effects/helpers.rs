@@ -7,8 +7,8 @@ use super::actions::{PermissionModePersist, SubagentKillOutcome, TaskResult};
 use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
-    RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
-    http_status_from_error,
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, error_kind_str_from_error,
+    format_rate_limited_user_message, http_status_from_error,
 };
 use xai_grok_shell::session::ExtMethodResult;
 use xai_grok_shell::session::unified_list::ListScope;
@@ -22,33 +22,102 @@ const SESSION_RPC_SLACK: std::time::Duration = std::time::Duration::from_secs(50
 pub(super) fn session_rpc_timeout() -> std::time::Duration {
     SESSION_RPC_FLOOR.max(xai_grok_workspace::envrc::loader_budget() + SESSION_RPC_SLACK)
 }
-/// `acp_send` bounded by [`session_rpc_timeout`]; on expiry, an error naming
-/// `action` instead of an eternal spinner.
+
+pub(super) fn encode_feedback_images(
+    images: crate::views::prompt_widget::FeedbackImages,
+) -> Result<Vec<xai_grok_shell::session::FeedbackImage>, String> {
+    use base64::Engine as _;
+    use xai_grok_shell::session::{
+        MAX_FEEDBACK_IMAGE_BYTES, MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES,
+        feedback_image_extension,
+    };
+    if images.len() > MAX_FEEDBACK_IMAGES {
+        return Err(format!("Feedback supports at most {MAX_FEEDBACK_IMAGES} images."));
+    }
+    let mut encoded = Vec::new();
+    let mut total_bytes = 0usize;
+    for image in images.as_slice() {
+        let (bytes, mime_type) = crate::prompt_images::load_for_send(image)
+            .ok_or_else(|| "Could not read a feedback attachment.".to_owned())?;
+        if feedback_image_extension(&mime_type).is_none() {
+            return Err("Unsupported feedback image format.".to_owned());
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if bytes.len() > MAX_FEEDBACK_IMAGE_BYTES || total_bytes > MAX_FEEDBACK_IMAGE_TOTAL_BYTES {
+            return Err("Feedback images exceed the attachment size limit.".to_owned());
+        }
+        encoded.push(xai_grok_shell::session::FeedbackImage {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type,
+            file_name: image.source_path.as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned()),
+        });
+    }
+    Ok(encoded)
+}
+/// Why a bounded session RPC failed; `TimedOut` is observed at the deadline, not inferred later.
+#[derive(Debug)]
+pub(crate) enum SessionRpcError {
+    TimedOut { action: String, timeout: std::time::Duration },
+    Rpc(acp::Error),
+}
+impl SessionRpcError {
+    pub(crate) fn timed_out(&self) -> bool {
+        matches!(self, Self::TimedOut { .. })
+    }
+}
+impl std::fmt::Display for SessionRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut { action, timeout } => {
+                write!(
+                f,
+                "{action} timed out after {}s. It may still finish in the background; \
+                 retrying right away can run into the same delay.",
+                timeout.as_secs()
+            )
+            }
+            Self::Rpc(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for SessionRpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rpc(e) => Some(e),
+            Self::TimedOut { .. } => None,
+        }
+    }
+}
+/// `acp_send` bounded by [`session_rpc_timeout`], returning a typed [`SessionRpcError`] on expiry.
 pub(super) async fn acp_send_bounded<R, T>(
     request: T,
     tx: &tokio::sync::mpsc::UnboundedSender<R>,
     action: &str,
-) -> Result<T::Response, acp::Error>
+) -> Result<T::Response, SessionRpcError>
 where
     T: xai_acp_lib::AcpRequest,
     R: From<xai_acp_lib::AcpArgs<T>> + std::fmt::Debug,
 {
     let timeout = session_rpc_timeout();
     match tokio::time::timeout(timeout, acp_send(request, tx)).await {
-        Ok(result) => result,
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(SessionRpcError::Rpc(e)),
         Err(_elapsed) => {
-            Err(
-                acp::Error::new(
-                    acp::ErrorCode::InternalError.into(),
-                    format!(
-                "{action} timed out after {}s. It may still finish in the background; \
-                 retrying right away can run into the same delay.",
-                timeout.as_secs()
-            ),
-                ),
-            )
+            Err(SessionRpcError::TimedOut {
+                action: action.to_owned(),
+                timeout,
+            })
         }
     }
+}
+/// Timeout message naming the step a create stalled on.
+pub(crate) fn timed_out_while(step: &str) -> String {
+    format!(
+        "Couldn't start the session: it timed out while {step}. It may still finish in the \
+         background, so give it a moment before trying again."
+    )
 }
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
@@ -149,10 +218,33 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
         .unwrap_or_else(|| err.to_string());
     crate::app::error_display::format_request_failure(
             http_status_from_error(err),
-            None,
+            crate::app::error_display::wire_error_kind(error_kind_str_from_error(err)),
             &raw,
         )
         .message()
+}
+/// Send an `x.ai/memory/{flush,dream}` request and decode its typed response.
+pub(super) async fn memory_command_request<T: serde::de::DeserializeOwned>(
+    method: &'static str,
+    session_id: &acp::SessionId,
+    tx: &AcpAgentTx,
+) -> Result<T, String> {
+    let body = xai_grok_shell::extensions::memory::MemoryFlushRequest {
+        session_id: session_id.0.to_string(),
+    };
+    let req = acp::ExtRequest::new(
+        method,
+        serde_json::value::to_raw_value(&body)
+            .expect("serialize memory command params")
+            .into(),
+    );
+    match acp_send(req, tx).await {
+        Ok(resp) => {
+            serde_json::from_str::<T>(resp.0.get())
+                .map_err(|_| "Couldn't read the shell's reply.".to_string())
+        }
+        Err(e) => Err(sanitize_user_error(&e.to_string())),
+    }
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -313,6 +405,7 @@ pub(crate) struct SessionFlags {
     /// as `restoreCode` in the `resume_session` ACP payload for worktrees.
     pub restore_code: Option<bool>,
     pub agent_override: Option<serde_json::Value>,
+    pub defer_builtin_agent_profile: bool,
     /// Always-approve for this session (`_meta.yoloMode`).
     pub yolo_mode: bool,
     /// Auto (classifier) permission mode (`_meta.autoMode`). Mutually exclusive
@@ -347,7 +440,7 @@ impl SessionFlags {
     /// needed; it already includes TaskTool). Chat mode never injects a
     /// Build profile (remote owns agent behavior).
     pub(super) fn agent_profile(&self) -> Option<&'static str> {
-        if self.chat_mode {
+        if self.chat_mode || self.defer_builtin_agent_profile {
             return None;
         }
         match (self.plan_mode, self.subagents, self.ask_user) {
@@ -597,10 +690,13 @@ pub(crate) struct EffectMeta {
 pub(super) fn extract_first_user_prompt(
     info: &xai_grok_shell::session::info::Info,
 ) -> Option<String> {
-    use std::io::BufRead;
     let history_path = xai_grok_shell::session::persistence::session_dir(info)
         .join("chat_history.jsonl");
-    let file = std::fs::File::open(history_path).ok()?;
+    extract_first_user_prompt_from_path(&history_path)
+}
+fn extract_first_user_prompt_from_path(history_path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = xai_file_utils::session_file::open(history_path).ok()?;
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.ok()?;
@@ -641,7 +737,7 @@ pub(super) fn count_chat_history_stats(history_path: &Path) -> (usize, usize) {
     use xai_grok_shell::sampling::{AssistantItem, ConversationItem, UserItem};
     let mut turn_count = 0usize;
     let mut tool_call_count = 0usize;
-    let Ok(file) = std::fs::File::open(history_path) else {
+    let Ok(file) = xai_file_utils::session_file::open(history_path) else {
         return (0, 0);
     };
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
@@ -664,6 +760,8 @@ pub enum ConversationsPartial {
     NoOauth,
     Timeout,
     Error,
+    /// Exact resume lookup could not prove the native list was complete.
+    BuildIncomplete,
 }
 impl ConversationsPartial {
     /// Actionable picker notice for a degraded conversations lane.
@@ -671,6 +769,7 @@ impl ConversationsPartial {
         match self {
             Self::NoOauth => "Couldn't load your chats \u{2014} log in with /login",
             Self::Timeout | Self::Error => "Couldn't load conversations \u{2014} retry",
+            Self::BuildIncomplete => "Session list may be incomplete; choose a session from the picker",
         }
     }
 }
@@ -715,6 +814,20 @@ pub(super) fn parse_session_list_scope(payload: &serde_json::Value) -> ListScope
 pub(super) fn parse_session_picker_entries(
     payload: &serde_json::Value,
 ) -> Vec<crate::app::app_view::SessionPickerEntry> {
+    parse_session_picker_entries_inner(payload, false)
+}
+
+/// Include older and untitled rows when checking an exact resume argument.
+pub(super) fn parse_session_picker_entries_for_resume(
+    payload: &serde_json::Value,
+) -> Vec<crate::app::app_view::SessionPickerEntry> {
+    parse_session_picker_entries_inner(payload, true)
+}
+
+fn parse_session_picker_entries_inner(
+    payload: &serde_json::Value,
+    include_all: bool,
+) -> Vec<crate::app::app_view::SessionPickerEntry> {
     use crate::app::app_view::SessionPickerEntry;
     let entries: Vec<serde_json::Value> = payload
         .get("sessions")
@@ -758,13 +871,13 @@ pub(super) fn parse_session_picker_entries(
                 .and_then(|s| s.parse().ok());
             let updated_at: chrono::DateTime<chrono::Utc> = match parsed_updated {
                 Some(ts) => {
-                    if !is_conversation && ts < cutoff {
+                    if !include_all && !is_conversation && ts < cutoff {
                         return None;
                     }
                     ts
                 }
                 None => {
-                    if !is_conversation {
+                    if !include_all && !is_conversation {
                         return None;
                     }
                     parsed_created.unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
@@ -832,6 +945,16 @@ pub(super) fn parse_session_picker_entries(
                 .or_else(|| v.get("last_turn_summary"))
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            let last_recap = v
+                .get("lastRecap")
+                .or_else(|| v.get("last_recap"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
+            let session_kind = v
+                .get("sessionKind")
+                .or_else(|| v.get("session_kind"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let repo_name = crate::views::session_picker::repo_name_from_cwd(&cwd_str);
             Some(SessionPickerEntry {
                 id,
@@ -848,11 +971,13 @@ pub(super) fn parse_session_picker_entries(
                 repo_name,
                 worktree_label,
                 last_turn_summary,
+                last_recap,
+                session_kind,
                 card_detail: None,
             })
         })
         .filter_map(|mut e| {
-            if e.summary.is_empty() {
+            if e.summary.is_empty() && !include_all {
                 if e.source == "conversation" {
                     e.summary = "Untitled".to_string();
                 } else {
@@ -1104,6 +1229,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "dashboard_preview" => {
+            let SettingValue::Bool(enabled) = value else {
+                return Err(kind_mismatch("dashboard_preview", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_dashboard_preview(enabled)
+                .await
+                .map_err(|error| error.to_string())
+        }
         "page_flip_on_send" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
@@ -1165,22 +1298,6 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("swarm_mode", "Bool", &value));
             };
             xai_grok_shell::util::config::set_swarm_mode(b)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        "antigravity_subagents" => {
-            let SettingValue::Bool(b) = value else {
-                return Err(kind_mismatch("antigravity_subagents", "Bool", &value));
-            };
-            xai_grok_shell::util::config::set_antigravity_subagents(b)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        "antigravity_skip_permissions" => {
-            let SettingValue::Bool(b) = value else {
-                return Err(kind_mismatch("antigravity_skip_permissions", "Bool", &value));
-            };
-            xai_grok_shell::util::config::set_antigravity_skip_permissions(b)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1371,6 +1488,16 @@ pub(crate) async fn persist_setting(
             xai_grok_shell::util::config::set_remember_tool_approvals(b)
                 .await
                 .map_err(|e| e.to_string())
+        }
+        "codex_persistent_mode" | "codex_guardian_review" => {
+            let SettingValue::Bool(enabled) = value else {
+                return Err(kind_mismatch(key, "Bool", &value));
+            };
+            if key == "codex_persistent_mode" {
+                xai_grok_shell::util::config::set_codex_persistent_mode(enabled).await
+            } else {
+                xai_grok_shell::util::config::set_codex_guardian_review(enabled).await
+            }.map_err(|error| error.to_string())
         }
         "code_mode" => {
             let SettingValue::Enum(value) = value else {
@@ -1868,9 +1995,36 @@ pub(super) fn unregister_active_session_best_effort_in(
             tracing::debug!(
             session_id = %session_id.0,
             "Skipped active-session unregister under lock contention; \
-             reaped by collect_crashed on next launch"
+             pruned by the next register"
         )
         }
         Err(e) => tracing::warn!(?e, "Failed to unregister active session"),
+    }
+}
+
+#[cfg(test)]
+mod gzip_history_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn gzip_history_preserves_card_preview_and_stats() {
+        use xai_grok_shell::sampling::ConversationItem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_history.jsonl");
+        let item: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": "<user_query>Implement compression</user_query>"}],
+        })).unwrap();
+        let history = format!("{}\n", serde_json::to_string(&item).unwrap());
+        std::fs::write(&path, history.as_bytes()).unwrap();
+        assert_eq!(extract_first_user_prompt_from_path(&path).as_deref(), Some("Implement compression"));
+        assert_eq!(count_chat_history_stats(&path), (1, 0));
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(history.as_bytes()).unwrap();
+        std::fs::write(&path, gzip.finish().unwrap()).unwrap();
+        assert_eq!(extract_first_user_prompt_from_path(&path).as_deref(), Some("Implement compression"));
+        assert_eq!(count_chat_history_stats(&path), (1, 0));
     }
 }

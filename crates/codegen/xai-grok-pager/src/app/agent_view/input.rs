@@ -114,14 +114,9 @@ impl AgentView {
 
     /// Minimal's composer stays logically focused when Vim startup leaves the
     /// legacy pane field on Scrollback; overlays and dropdowns still own input.
-    pub(crate) fn external_prompt_editor_access(
-        &self,
-        minimal_logical_prompt: bool,
-    ) -> ExternalPromptEditorAccess {
-        let pane_owns_prompt = minimal_logical_prompt || self.active_pane == AgentPane::Prompt;
+    pub(crate) fn external_prompt_editor_access(&self) -> ExternalPromptEditorAccess {
         let owned_elsewhere = !matches!(self.prompt_mode, super::PromptMode::Normal)
             || self.active_subagent.is_some()
-            || !pane_owns_prompt
             || self.active_modal.is_some()
             || self.extensions_modal.is_some()
             || self.agents_modal.is_some()
@@ -136,11 +131,12 @@ impl AgentView {
             || self.btw_focused
             || !self.permission_queue.is_empty()
             || self.question_view.is_some()
+            || self.feedback_modal.is_some()
+            || self.elicitation_view.is_some()
             || self.plan_approval_view.is_some()
             || self.casual_commenting_range.is_some()
             || self.cancel_turn_view.is_some()
             || self.rewind_state.is_some()
-            || self.inline_edit.is_some()
             || self.jump_state.is_some()
             || self.prompt.any_dropdown_open();
         if owned_elsewhere {
@@ -203,6 +199,7 @@ impl AgentView {
             || self.gboom.is_some()
             || self.video_viewer.is_some()
             || self.image_viewer.is_some()
+            || self.feedback_modal.is_some()
     }
     /// Prompt pane focused with an empty draft and no overlay or prompt-local
     /// sub-state owning keys — the state where a bare Left backs out of the
@@ -255,61 +252,25 @@ impl AgentView {
     pub(crate) fn is_minimal_mode(&self) -> bool {
         self.prompt.slash_controller.screen_mode().is_minimal()
     }
-    /// Whether a bare Esc pressed right now would reach
-    /// [`Self::try_handle_esc_policy`]'s mid-turn cancel (assuming a turn is
-    /// running — callers gate on that): the hint-bar predicate deciding when
-    /// to advertise `Esc` instead of `Ctrl+C` for CancelTurn. Composed from
-    /// the same predicates input routing uses, so the hint cannot claim Esc
-    /// while a higher-priority consumer (dropdown, search, viewer/modal,
-    /// agents/persona modal, needs-input overlay, queued-prompt or inline
-    /// edit, subagent-view close, selection/link/goal/rewind/btw/jump,
-    /// latent composer mode) would steal the press. Conservative on purpose:
-    /// when false, the registry `Ctrl+C` is shown, which always cancels.
-    /// `esc_owned_before_agent` is the app-level ownership snapshot
-    /// (`AppView::esc_owned_before_agent`: voice dictation listening or
-    /// pending cold-start, a focused dev tracing pane, the top-level cloud /
-    /// import-Claude modals, and the dashboard's attached-agent popup — all
-    /// consume Esc before any agent routing), passed down by the draw path.
-    pub(crate) fn esc_would_cancel_turn(&self, esc_owned_before_agent: bool) -> bool {
-        if esc_owned_before_agent
-            || !crate::app::esc_cancels_turn(self.is_minimal_mode(), self.vim_mode)
-        {
-            return false;
-        }
-        let pane_clear = match self.active_pane {
-            AgentPane::Prompt => {
-                !self.modal_owns_input()
-                    && self.block_viewer.is_none()
-                    && self.line_viewer.is_none()
-                    && !self.prompt.any_dropdown_open()
-                    && !self.prompt.prompt_suggestion_visible()
-                    && self.prompt_input_mode == PromptInputMode::Normal
-            }
-            AgentPane::Scrollback => self.is_bare_scrollback(),
-            _ => false,
-        };
-        pane_clear
-            && matches!(self.prompt_mode, crate::app::queue_edit::PromptMode::Normal)
-            && self.inline_edit.is_none()
-            && !self.is_subagent_view
-            && self.agents_modal.is_none()
-            && self.persona_detail.is_none()
-            && self.no_esc_consumer_pending()
-            && self.no_input_overlay_pending()
+    /// Whether a bare Esc pressed right now would cancel a running turn.
+    /// Always false: Esc never cancels; the hint bar keeps the registry
+    /// `Ctrl+C` CancelTurn binding. `esc_owned_before_agent` is unused and
+    /// kept so the draw path can keep passing its ownership snapshot.
+    pub(crate) fn esc_would_cancel_turn(&self, _esc_owned_before_agent: bool) -> bool {
+        false
     }
     /// Esc on the prompt pane in a dashboard overlay backs out to the dashboard list (the prompt-focus mirror of the Left-arrow back-out), but only
     /// for an empty, Normal-mode composer with no per-pane Esc consumer pending. Beyond [`Self::is_empty_focused_prompt`] it also requires
     /// `PromptInputMode::Normal` (so a Bash/Remember empty prompt keeps Esc as its mode-exit, matching the full-screen view) and
     /// [`Self::no_esc_consumer_pending`] (so Esc still clears or dismisses a pending text selection / link highlight / goal detail / rewind first;
     /// Esc, unlike Left, is their consumer). A non-empty draft fails the guard so Esc still arms "press again to clear".
-    /// Used only in the overlay cascade; the full-screen Esc policy (clear / rewind while idle; mid-turn cancel or swallow) is untouched.
+    /// Used only in the overlay cascade; the full-screen Esc policy (clear / rewind while idle; mid-turn hint or swallow) is untouched.
     ///
     /// Also gated to an idle agent (no running, cancelling, or wake turn):
     /// while one is in flight, Esc must fall through to
-    /// [`Self::try_handle_esc_policy`] (running → cancel in minimal / non-vim
-    /// mode, swallow in vim mode; cancelling → retry CancelTurn), not detach
-    /// to the dashboard. Detach mid-turn stays on
-    /// Ctrl+\ / Left.
+    /// [`Self::try_handle_esc_policy`] (running → hint at Ctrl+C; cancelling
+    /// → swallow without a hint), not detach to the dashboard. Detach
+    /// mid-turn stays on Ctrl+\ / Left.
     pub(crate) fn overlay_esc_backs_out_from_prompt(&self) -> bool {
         self.is_empty_focused_prompt()
             && self.prompt_input_mode == PromptInputMode::Normal
@@ -582,6 +543,12 @@ impl AgentView {
         {
             return InputOutcome::Changed;
         }
+        if self.feedback_modal.is_some()
+            && let Event::Paste(text) = ev
+            && crate::wrap_clipboard_image::try_decode_wrap_host_image_paste(text).is_some()
+        {
+            return self.handle_feedback_modal_paste(text);
+        }
         if let Event::Paste(text) = ev
             && let Some(outcome) = self.try_handle_wrap_host_image_paste(text)
         {
@@ -692,6 +659,19 @@ impl AgentView {
                 return InputOutcome::Changed;
             }
         }
+        if self.active_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_modal_key_with_registry(key, registry)
+                }
+                Event::Mouse(mouse) => self.handle_modal_mouse_with_registry(mouse, registry),
+                Event::Paste(text) => self.handle_modal_paste(text, registry),
+                _ => InputOutcome::Changed,
+            };
+        }
         if self.btw_state.is_some()
             && let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
@@ -756,19 +736,6 @@ impl AgentView {
                 _ => {}
             }
         }
-        if self.active_modal.is_some() {
-            return match ev {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_modal_key_with_registry(key, registry)
-                }
-                Event::Mouse(mouse) => self.handle_modal_mouse_with_registry(mouse, registry),
-                Event::Paste(text) => self.handle_modal_paste(text, registry),
-                _ => InputOutcome::Changed,
-            };
-        }
         if self.line_viewer.is_some() && self.focused_card() != Some(BlockingCard::Permission) {
             if let Event::Mouse(mouse) = ev
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -830,6 +797,19 @@ impl AgentView {
                         self.handle_line_viewer_mouse(mouse)
                     }
                 }
+                _ => InputOutcome::Changed,
+            };
+        }
+        if self.feedback_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always).is_some() {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_feedback_modal_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_feedback_modal_mouse(mouse),
+                Event::Paste(text) => self.handle_feedback_modal_paste(text),
                 _ => InputOutcome::Changed,
             };
         }
@@ -1056,53 +1036,17 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
-        if self.rewind_state.is_some() {
+        if self.focused_card() == Some(BlockingCard::McpElicitation) {
             return match ev {
-                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if key!('q', CONTROL).matches(key) {
                         return InputOutcome::Unchanged;
                     }
-                    self.handle_rewind_key(key)
+                    self.handle_elicitation_key(key)
                 }
-                Event::Mouse(mouse) => self.handle_rewind_mouse(mouse),
-                _ => InputOutcome::Unchanged,
-            };
-        }
-        if self.inline_edit.is_some() {
-            return match ev {
-                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_inline_edit_key(key)
-                }
-                Event::Mouse(mouse) => self.handle_inline_edit_mouse(mouse),
-                Event::Paste(text) => {
-                    if let Some(ref mut edit) = self.inline_edit {
-                        edit.textarea.insert_str(text);
-                    }
-                    InputOutcome::Changed
-                }
-                _ => InputOutcome::Unchanged,
-            };
-        }
-        if self.jump_state.is_some() {
-            return match ev {
-                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
-                    }
-                    if registry.matches_id(ActionId::CancelTurn, key)
-                        && (self.stoppable_activity_running() || self.any_cancel_pending())
-                    {
-                        self.dismiss_jump_picker();
-                        return self
-                            .handle_agent_action_with_registry(ActionId::CancelTurn, registry);
-                    }
-                    self.handle_jump_key(key)
-                }
-                Event::Mouse(mouse) => self.handle_jump_mouse(mouse),
-                _ => InputOutcome::Unchanged,
+                Event::Paste(text) => self.handle_elicitation_paste(text),
+                Event::Mouse(mouse) => self.handle_elicitation_mouse(mouse),
+                _ => InputOutcome::Changed,
             };
         }
         if self.focused_card() == Some(BlockingCard::CancelTurn) {
@@ -1141,6 +1085,37 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
+        if self.rewind_state.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                    if key!('q', CONTROL).matches(key) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_rewind_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_rewind_mouse(mouse),
+                _ => InputOutcome::Unchanged,
+            };
+        }
+        if self.jump_state.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                    if key!('q', CONTROL).matches(key) {
+                        return InputOutcome::Unchanged;
+                    }
+                    if registry.matches_id(ActionId::CancelTurn, key)
+                        && (self.stoppable_activity_running() || self.any_cancel_pending())
+                    {
+                        self.dismiss_jump_picker();
+                        return self
+                            .handle_agent_action_with_registry(ActionId::CancelTurn, registry);
+                    }
+                    self.handle_jump_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_jump_mouse(mouse),
+                _ => InputOutcome::Unchanged,
+            };
+        }
         if let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
             && registry.matches_id(ActionId::SendToBackground, key)
@@ -1165,6 +1140,7 @@ impl AgentView {
                 AgentPane::Queue => self.handle_queue_key(key, registry),
                 AgentPane::Tasks => self.handle_bg_tasks_key(key, registry),
                 AgentPane::Catalog => self.handle_catalog_key(key, registry),
+                AgentPane::Dock => self.handle_dock_key(key),
             },
             Event::Paste(text) => {
                 if self.active_pane == AgentPane::Scrollback
@@ -1179,6 +1155,9 @@ impl AgentView {
                     return InputOutcome::ActionThenForward(Action::FocusPrompt);
                 }
                 if self.active_pane == AgentPane::Prompt {
+                    // Invalidate before applying the new paste, so the earlier
+                    // probe still attaches to this same session's edited draft.
+                    self.cancel_pending_paste_submission();
                     self.ephemeral_tip
                         .clear(crate::tips::clipboard_focus::CLIPBOARD_IMAGE_TIP_KEY);
                     self.btw_focused = false;
@@ -1212,7 +1191,7 @@ impl AgentView {
                         AgentPane::Tasks => self.tasks.handle_paste(text),
                         AgentPane::Catalog => self.catalog.handle_paste(text),
                         AgentPane::Queue => self.queue.handle_paste(text),
-                        AgentPane::Prompt | AgentPane::Scrollback => false,
+                        AgentPane::Prompt | AgentPane::Scrollback | AgentPane::Dock => false,
                     };
                     if consumed {
                         InputOutcome::Changed
@@ -1244,6 +1223,20 @@ impl AgentView {
             && key.kind != KeyEventKind::Release
             && registry.matches_id(ActionId::ToggleTasks, key)
         {
+            if self.dock_on {
+                if self.dock_hidden {
+                    self.dock_hidden = false;
+                    return InputOutcome::Changed;
+                }
+                if self.dock_shown {
+                    self.dock_hidden = true;
+                    if self.active_pane == AgentPane::Dock {
+                        self.set_active_pane(AgentPane::Scrollback, false);
+                    }
+                    return InputOutcome::Changed;
+                }
+                return InputOutcome::Unchanged;
+            }
             self.tasks.overlay.toggle();
             self.tasks.on_state_change();
             if self.tasks.overlay.focused {
@@ -1255,9 +1248,11 @@ impl AgentView {
         }
         if let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
-            && key!('s', CONTROL).matches(key)
+            && registry.matches_id(ActionId::OpenSessions, key)
         {
             self.active_modal = Some(ActiveModal::SessionPicker {
+                generation: 0,
+                detail_seq: 0,
                 state: crate::views::picker::PickerState::default(),
                 entries: None,
                 loading: true,
@@ -1278,7 +1273,13 @@ impl AgentView {
             && registry.matches_id(ActionId::ToggleQueue, key)
             && (self.queue.is_visible() || !self.visible_queue_is_empty())
         {
-            self.toggle_queue_pane();
+            if self.dock_shown {
+                self.dock_queued_expanded = !self.dock_queued_expanded;
+            } else if self.dock_on {
+                return InputOutcome::Unchanged;
+            } else {
+                self.toggle_queue_pane();
+            }
             return InputOutcome::Changed;
         }
         if let Event::Key(key) = ev
@@ -1367,7 +1368,7 @@ impl AgentView {
         if let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
             && matches!(self.active_pane, AgentPane::Prompt | AgentPane::Scrollback)
-            && let Some(outcome) = self.try_handle_esc_policy(key)
+            && let Some(outcome) = self.try_handle_esc_policy(key, registry)
         {
             return outcome;
         }
@@ -1452,7 +1453,7 @@ impl AgentView {
                 }
             }
             ActionId::EditPromptExternal => {
-                if self.external_prompt_editor_access(true)
+                if self.external_prompt_editor_access()
                     == ExternalPromptEditorAccess::OwnedElsewhere
                 {
                     InputOutcome::Changed
@@ -1932,6 +1933,20 @@ mod btw_focus_tests {
             "{surface} Esc must restore the complete minimal /btw lifecycle"
         );
     }
+    fn session_info_modal() -> crate::views::modal::ActiveModal {
+        crate::views::modal::ActiveModal::UsageInfo {
+            state: Box::new(crate::views::usage_modal::UsageInfoModalState::new(
+                crate::views::usage_modal::UsageInfoTab::SessionInfo,
+                crate::views::usage_modal::UsageInfoContext {
+                    session_id: Some("s".into()),
+                    usage_visible: true,
+                    chat_kind: false,
+                    billing_redirect_url: None,
+                    subscription_tier: None,
+                },
+            )),
+        }
+    }
     #[test]
     fn focused_panel_scrolls_with_arrows() {
         let mut agent = prompt_focused_agent();
@@ -2108,6 +2123,14 @@ mod btw_focus_tests {
         goal.handle_minimal_input(&key(KeyCode::Esc), &reg);
         assert!(!goal.show_goal_detail, "goal detail handled Esc");
         assert_minimal_btw_active(&goal, "goal detail");
+        let mut session_info = minimal_btw_agent();
+        session_info.active_modal = Some(session_info_modal());
+        session_info.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            session_info.active_modal.is_none(),
+            "session-info handled Esc"
+        );
+        assert_minimal_btw_active(&session_info, "session-info");
     }
     #[test]
     fn minimal_btw_surface_owner_covers_shared_modal_cascade() {
@@ -2139,6 +2162,46 @@ mod btw_focus_tests {
         agent.handle_input(&key(KeyCode::Esc), &reg);
         assert!(agent.btw_state.is_none());
         assert!(!agent.permission_queue.is_empty());
+    }
+    #[test]
+    fn fullscreen_session_info_owns_esc_over_btw() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.active_modal = Some(session_info_modal());
+        agent.handle_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            agent.active_modal.is_none(),
+            "first Esc closes the painted /session-info modal"
+        );
+        assert!(
+            agent.btw_state.is_some(),
+            "the /btw panel survives under the modal"
+        );
+        agent.handle_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            agent.btw_state.is_none(),
+            "a second Esc dismisses the /btw panel"
+        );
+    }
+    #[test]
+    fn fullscreen_session_info_owns_arrows_over_btw_scroll() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.btw_focused = true;
+        agent.active_modal = Some(session_info_modal());
+        agent.handle_input(&key(KeyCode::Down), &reg);
+        assert_eq!(
+            done_scroll_offset(&agent),
+            0,
+            "arrows must not scroll /btw while the modal is painted on top"
+        );
+        assert!(
+            agent.active_modal.is_some(),
+            "Down must leave the painted modal open"
+        );
+        assert!(agent.btw_state.is_some());
     }
     #[test]
     fn minimal_does_not_scroll_unpainted_btw_geometry() {
@@ -2321,11 +2384,15 @@ mod focus_gained_restore_tests {
     }
 }
 #[cfg(test)]
-mod esc_would_cancel_turn_tests {
+mod mid_turn_esc_hint_tests {
     use super::test_fixtures::make_agent;
     use super::{AgentPane, AgentView};
+    use crate::actions::ActionRegistry;
+    use crate::app::actions::Action;
     use crate::app::agent::AgentState;
-    /// Running-turn agent on the prompt pane with no Esc consumers layered.
+    use crate::app::app_view::InputOutcome;
+    use crate::scrollback::block::RenderBlock;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     fn running_agent(vim_mode: bool) -> AgentView {
         let mut agent = make_agent();
         agent.session.state = AgentState::TurnRunning;
@@ -2333,119 +2400,113 @@ mod esc_would_cancel_turn_tests {
         agent.vim_mode = vim_mode;
         agent
     }
+    fn press_esc(agent: &mut AgentView) -> InputOutcome {
+        agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &ActionRegistry::defaults(),
+        )
+    }
+    fn count_hint_lines(agent: &AgentView) -> usize {
+        (0..agent.scrollback.len())
+            .filter(|&i| {
+                matches!(
+                    agent.scrollback.entry(i).map(|e| &e.block),
+                    Some(RenderBlock::System(system))
+                        if system.text == "Press Ctrl+c to cancel the turn"
+                )
+            })
+            .count()
+    }
+    /// Esc never cancels a running turn; it names the registry cancel key instead, in every mode and from either pane.
     #[test]
-    fn gate_non_vim_true_vim_false_minimal_overrides_vim() {
-        assert!(running_agent(false).esc_would_cancel_turn(false));
-        assert!(!running_agent(true).esc_would_cancel_turn(false));
-        let mut agent = running_agent(true);
+    fn mid_turn_esc_shows_ctrl_c_hint_instead_of_cancelling() {
+        for (vim_mode, minimal, pane) in [
+            (false, false, AgentPane::Prompt),
+            (true, false, AgentPane::Prompt),
+            (true, true, AgentPane::Prompt),
+            (false, false, AgentPane::Scrollback),
+        ] {
+            let mut agent = running_agent(vim_mode);
+            agent.active_pane = pane;
+            if minimal {
+                agent
+                    .prompt
+                    .set_screen_mode(crate::app::ScreenMode::Minimal);
+            }
+            agent.prompt.set_text("draft");
+            let outcome = press_esc(&mut agent);
+            assert!(
+                matches!(outcome, InputOutcome::Changed),
+                "vim={vim_mode} minimal={minimal} pane={pane:?}: expected Changed, got {outcome:?}"
+            );
+            if minimal {
+                assert_eq!(None, agent.active_toast_message());
+                let _ = press_esc(&mut agent);
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::system("streamed block between presses"));
+                let _ = press_esc(&mut agent);
+                assert_eq!(1, count_hint_lines(&agent), "one hint line per user turn");
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::user_prompt("next prompt"));
+                let _ = press_esc(&mut agent);
+                assert_eq!(
+                    2,
+                    count_hint_lines(&agent),
+                    "a new user turn allows one more"
+                );
+            } else {
+                assert_eq!(
+                    Some("Press Ctrl+c to cancel the turn"),
+                    agent.active_toast_message(),
+                    "vim={vim_mode} pane={pane:?}"
+                );
+            }
+            assert_eq!(None, agent.cancel_trigger_hint);
+            assert!(agent.session.state.is_turn_running());
+            assert_eq!("draft", agent.prompt.text(), "the draft is preserved");
+        }
+    }
+    /// While a cancel is already in flight, Esc is swallowed without a hint (Ctrl+C escalates to quit there, so the hint would mislead) and never re-sends the cancel.
+    #[test]
+    fn esc_while_cancelling_is_swallowed_without_hint() {
+        let mut agent = running_agent(false);
+        agent.session.state = AgentState::TurnCancelling;
+        let outcome = press_esc(&mut agent);
+        assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
+        assert_eq!(None, agent.active_toast_message());
+        assert_eq!(None, agent.cancel_trigger_hint);
+    }
+    /// Ctrl+C on an empty prompt is still the cancel gesture.
+    #[test]
+    fn ctrl_c_still_cancels() {
+        let mut agent = running_agent(false);
+        let outcome = agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &ActionRegistry::defaults(),
+        );
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            Some(crate::app::actions::CancelTrigger::CtrlC),
+            agent.cancel_trigger_hint
+        );
+    }
+    /// The hint-bar predicate is always false: Esc never cancels.
+    #[test]
+    fn esc_would_cancel_turn_is_always_false() {
+        let mut agent = running_agent(false);
+        assert!(!agent.esc_would_cancel_turn(false));
+        assert!(!agent.esc_would_cancel_turn(true));
+        agent.vim_mode = true;
+        assert!(!agent.esc_would_cancel_turn(false));
         agent
             .prompt
             .set_screen_mode(crate::app::ScreenMode::Minimal);
-        assert!(agent.esc_would_cancel_turn(false));
-    }
-    #[test]
-    fn app_level_esc_owner_suppresses_esc_hint() {
-        assert!(!running_agent(false).esc_would_cancel_turn(true));
-    }
-    #[test]
-    fn queued_edit_and_inline_edit_steal_esc() {
-        let mut agent = running_agent(false);
-        agent.prompt_mode = crate::app::queue_edit::PromptMode::EditingQueued {
-            id: 1,
-            original: "queued row".into(),
-            server_id: None,
-            kind: crate::app::agent::QueueEntryKind::Prompt,
-        };
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "queued-prompt editing owns Esc (discard edit), not cancel"
-        );
-        let mut agent = running_agent(false);
-        agent.inline_edit = Some(crate::app::inline_edit::InlineEditState {
-            entry_id: crate::scrollback::entry::EntryId::new(1),
-            prompt_index: 0,
-            original: "sent".into(),
-            textarea: xai_ratatui_textarea::TextArea::new(),
-            textarea_state: xai_ratatui_textarea::TextAreaState::default(),
-            last_text_area: None,
-            last_rect: None,
-        });
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "an open inline prompt edit owns Esc (dismiss), not cancel"
-        );
-    }
-    #[test]
-    fn subagent_fullscreen_view_owns_esc() {
-        let mut agent = running_agent(false);
-        agent.is_subagent_view = true;
-        agent.active_pane = AgentPane::Scrollback;
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "Esc in a fullscreen subagent view closes the child, not cancel"
-        );
-    }
-    #[test]
-    fn agents_and_persona_modals_steal_esc() {
-        let mut agent = running_agent(false);
-        agent.agents_modal = Some(crate::views::agents_modal::AgentsModalState::new(
-            std::path::Path::new("/nonexistent"),
-            &std::collections::HashMap::new(),
-            &crate::app::bundle::BundleState::default(),
-            None,
-            None,
-        ));
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "an open agents modal owns Esc (close), not cancel"
-        );
-        let mut agent = running_agent(false);
-        agent.persona_detail =
-            Some(crate::views::persona_detail::PersonaDetailState::from_name_only("researcher"));
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "an open persona detail owns Esc (back/close), not cancel"
-        );
-    }
-    #[test]
-    fn bare_scrollback_true_but_open_search_steals_esc() {
-        let mut agent = running_agent(false);
-        agent.active_pane = AgentPane::Scrollback;
-        assert!(agent.esc_would_cancel_turn(false), "bare scrollback");
-        agent.scrollback_search = Some(crate::scrollback::search::ScrollbackSearchState::open());
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "an open scrollback search dismisses Esc, so the hint must not claim it cancels"
-        );
-    }
-    #[test]
-    fn open_slash_dropdown_steals_esc() {
-        let mut agent = running_agent(false);
-        agent.prompt.set_text("/he");
-        agent.prompt.refresh_slash(&agent.session.models);
-        assert!(
-            agent.prompt.slash_open(),
-            "precondition: slash dropdown open"
-        );
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "an open slash dropdown dismisses Esc, so the hint must not claim it cancels"
-        );
-    }
-    #[test]
-    fn latent_composer_mode_and_other_panes_keep_ctrl_c() {
-        let mut agent = running_agent(false);
-        agent.prompt_input_mode = super::PromptInputMode::Bash;
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "a latent bash composer owns the empty-prompt Esc as its mode-exit"
-        );
-        let mut agent = running_agent(false);
-        agent.active_pane = AgentPane::Queue;
-        assert!(
-            !agent.esc_would_cancel_turn(false),
-            "panes that never reach the Esc policy must not advertise Esc"
-        );
+        assert!(!agent.esc_would_cancel_turn(false));
     }
 }
 #[cfg(test)]
@@ -2623,41 +2684,6 @@ mod voice_stop_click_during_plan_review_tests {
             matches!(outcome, InputOutcome::Action(Action::VoiceToggle)),
             "[stop] click during plan feedback must dispatch VoiceToggle, got {outcome:?}"
         );
-    }
-}
-#[cfg(test)]
-mod rich_textarea_paste_routing_tests {
-    use super::test_fixtures::make_agent;
-    use crate::actions::ActionRegistry;
-    use crate::app::inline_edit::InlineEditState;
-    use crate::scrollback::entry::EntryId;
-    use crossterm::event::Event;
-    use xai_ratatui_textarea::{TextArea, TextAreaState};
-    #[test]
-    fn inline_edit_receives_raw_multiline_paste_without_touching_prompt() {
-        let mut agent = make_agent();
-        agent.prompt.set_text("hidden prompt");
-        let mut textarea = TextArea::new();
-        textarea.set_text("ab");
-        textarea.set_cursor(1);
-        agent.inline_edit = Some(InlineEditState {
-            entry_id: EntryId::new(1),
-            prompt_index: 0,
-            original: "ab".to_owned(),
-            textarea,
-            textarea_state: TextAreaState::default(),
-            last_text_area: None,
-            last_rect: None,
-        });
-        let _ = agent.handle_input(
-            &Event::Paste("中\nline".to_owned()),
-            &ActionRegistry::defaults(),
-        );
-        assert_eq!(
-            agent.inline_edit.as_ref().map(|edit| edit.textarea.text()),
-            Some("a中\nlineb")
-        );
-        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }
 /// Pasting while the scrollback pane holds the keyboard (prompt unfocused) must land in

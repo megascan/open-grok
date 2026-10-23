@@ -31,12 +31,19 @@ Grok stores each session in its own directory, grouped by working directory. It 
   plan.json               # TODO/task list state
   rewind_points.jsonl     # rewind points for /rewind undo
   signals.json            # session signals (token usage, tool/turn counters)
+  usage.json              # session/turn model usage and reported cost summaries
   feedback.jsonl          # user feedback and ratings
   compaction_checkpoints/ # saved state from compaction (manual or auto)
   subagents/              # per-subagent metadata (meta.json); the child sessions live in the normal sessions tree
 ```
 
 `summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
+
+Completed turns retain elapsed time and structured failure/cancellation
+metadata so resumed conversations can show the original turn footer. Older
+sessions without those optional fields remain readable. New headless sessions
+are classified separately for browsing, rather than being mixed into the
+default interactive-session list.
 
 ---
 
@@ -187,7 +194,7 @@ This shows:
 - API backend and sandbox profile (when set)
 - Context window usage (used and total tokens, with the percentage used)
 
-On the Session info tab, click a value to copy it, or drag to select a range (same highlight as the tool viewer). `c` copies the session ID and `y` copies the whole block. Copy uses the same clipboard route as the rest of Grok, including `grok wrap`.
+On the Session info tab, click a value to copy it, or drag to select a range (same highlight as the tool viewer). `c` copies the session ID and `y` copies the whole block. Copy uses the same clipboard route as the rest of Grok, including `open-grok wrap`.
 
 ---
 
@@ -207,6 +214,19 @@ open-grok -p "What were we doing?" -c
 ```
 
 In headless mode, resume an existing session with `-r`/`--resume`, which errors if the session does not exist, or continue the most recent session in the current directory with `-c`/`--continue`. A non-ID value is matched against session titles for the current directory, ignoring letter case (a sole manually renamed match wins among duplicates; remaining duplicates error with their IDs; UUID-shaped values always take the ID path) — scripts should pass the session ID from JSON output (see below) to `-r`.
+
+`--memory-flush` requests a memory flush after a headless prompt. It can also
+run without a new prompt when resuming an existing session:
+
+```sh
+open-grok --memory-flush -r <session-id>
+open-grok --memory-flush -p "Finish the task" -r <session-id>
+```
+
+Flush-only mode requires `--resume` or `--continue`; it does not silently
+create an empty conversation. Memory configuration and the selected provider's
+normal routing rules still apply. Read persisted usage with
+`open-grok usage <session-id> [turn]`.
 
 Use `-s`/`--session-id` only to **create** a new session with a **UUID** (errors if the value is not a UUID, or if that ID already has a session under the target session directory). It does **not** resume an existing session — that was the old hidden upsert behavior; use `-r`/`-c` instead. Combine `-s` with `-r`/`-c` only when also passing `--fork-session` (forks history into a new ID; optional `-s` names the child UUID). This matches Claude Code’s anti-overwrite model (client preflight under the write cwd; sequential use is reliable, concurrent same-ID is best-effort).
 
@@ -272,6 +292,31 @@ Worktree sessions are managed internally through the `x.ai/git/worktree/*` exten
 
 Resume a session in a fresh worktree with `open-grok -w -r <session-id>`.
 
+### Manage Grove redirections
+
+A Grove worktree can redirect ignored artifact directories such as `target` and `node_modules` to storage outside the projected tree. The redirect commands take the mount path as their first argument.
+
+```bash
+grok worktree redirect list /path/to/worktree
+grok worktree redirect list /path/to/worktree --json
+grok worktree redirect add /path/to/worktree target bind
+grok worktree redirect del /path/to/worktree target
+grok worktree redirect fixup /path/to/worktree
+grok worktree redirect unmount /path/to/worktree target
+```
+
+`list` prints `repo_path`, `type`, `mechanism`, `target`, `source`, and `state`. Run `unmount` without a repo-relative path to take down every redirect on the mount. Use `fixup --force` to replace Grove-owned residue. Use `fixup --strict` to refuse a populated plain directory.
+
+
+```bash
+grok clone https://example.com/org/repo.git --redirect-ignored
+grok clone https://example.com/org/repo.git \
+  --redirect-ignored --redirect-dir build --redirect-dir '**/node_modules'
+grok clone https://example.com/org/repo.git --no-redirects
+```
+
+`GROVE_REDIRECTS=0` remains a runtime kill switch. Grok does not save the kill switch as the clone's redirect choice.
+
 ### Checking Disk Usage
 
 `open-grok du` (alias: `open-grok disk-usage`) reports what the Open Grok home (`~/.opengrok`) uses on disk. It lists each top-level directory, largest first, then each worktree with its size, type, age, label, and path. Worktrees the registry does not track appear as `untracked`. Pass `--json` for the same report as machine-readable output.
@@ -293,6 +338,8 @@ To reclaim space, run `open-grok worktree gc --max-age 7d --dry-run`, then the s
 Untracked rows are not in the registry, so gc never visits them. Remove one with `open-grok worktree rm --dry-run <path>`, then without `--dry-run`.
 ```
 
+After the Open Grok home table, `open-grok du` may print **Redirections**, **Orphaned redirections**, and **Unattributed redirect directories**. Those bytes live in Grove escape jails, not in the home total. An empty scan prints nothing. Reclaim a live jail with `open-grok worktree clean-artifacts`. Purge live jails plus proven orphans with `open-grok du --clean --yes`. Delete only proven orphans with `open-grok du --clean-orphaned --yes`.
+
 `AGE` is the value `open-grok worktree gc` measures: time since the worktree was last accessed, or since it was created when that is more recent. Session and agent activity update it; a shell or editor left open in the directory does not. An untracked worktree has no registry entry, so its age comes from the newest file underneath it.
 
 Sizes are physical block counts on Unix and logical file sizes elsewhere, matching what `open-grok worktree show` reports. A worktree clone shares storage with its source and each copy counts in full, so the total can exceed both `du -sh` and the space actually in use. When the total exceeds the used space on the volume, the report says so. `--json` carries the same figures as `volume_capacity_bytes` and `volume_available_bytes`.
@@ -311,11 +358,17 @@ To reclaim space, run `open-grok worktree gc --max-age 7d`, which removes tracke
 
 ### Persistence Format
 
-Grok stores the conversation as newline-delimited JSON (JSONL). Each line in `updates.jsonl` is a self-contained ACP session update event. This format supports:
+Open Grok stores the conversation as newline-delimited JSON (JSONL), with automatic gzip compression for large histories. Each decoded line in `updates.jsonl` is a self-contained ACP session update event. This format supports:
 
 - Incremental writes (append-only during a session)
 - Efficient streaming reads (for session restore)
-- Easy debugging (each line is valid JSON)
+- Easy debugging after decompression (each line is valid JSON)
+
+The `updates.jsonl` and `chat_history.jsonl` filenames stay the same whether their contents are plain or gzip-compressed. Open Grok detects the format automatically for resume, search, fork, rewind, previews, and exports. Existing plain sessions remain readable. Older Open Grok versions without gzip support cannot read compressed histories.
+
+Histories of at least 64 KiB are compressed only when it saves space. Full history saves can compress immediately; append histories compress after 30 seconds without a persistence update or when the persistence writer closes. Writing again automatically restores plain JSONL before appending. An abrupt exit can leave a valid plain history. Existing sessions are compressed as they are written, without a bulk conversion at startup.
+
+To inspect a history manually, run `file /path/to/session/updates.jsonl`. For a gzip file, use `gzip -dc /path/to/session/updates.jsonl | jq .`; for a plain file, use `jq . /path/to/session/updates.jsonl`.
 
 The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- are plain JSON rather than JSONL. JSONL is the source of truth for session content; `open-grok sessions search` additionally maintains a local SQLite FTS5 index over session titles and prompts for fast keyword search.
 
@@ -330,10 +383,12 @@ The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- ar
 - `current_model_id` -- the model in use
 - `parent_session_id` -- the source session for a fork or restore
 - `agent_name` -- the agent definition active when the session was last saved
+- `last_turn_summary` -- an ultra-short summary of the most recent turn
+- `last_recap` -- a bounded preview of the latest session recap
 
 ### Disk Usage
 
-Session history (`updates.jsonl`, `chat_history.jsonl`) dominates disk usage in long sessions. Use `/compact` to reduce history size.
+Session history (`updates.jsonl`, `chat_history.jsonl`) dominates disk usage in long sessions. Automatic gzip compression reduces its disk footprint while preserving the full stored content. `/compact` separately summarizes model context; it does not remove the authoritative update timeline.
 
 ---
 

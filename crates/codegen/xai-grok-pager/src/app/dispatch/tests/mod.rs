@@ -2,8 +2,10 @@
 mod auth;
 mod billing;
 mod cta_e2e;
+mod custom_provider;
 mod dashboard;
 mod jump;
+mod mid_text_goal;
 mod modes;
 mod notes;
 mod permissions;
@@ -13,6 +15,7 @@ mod router;
 mod session;
 mod settings;
 mod status;
+mod status_line;
 mod swarm;
 mod task_result;
 mod transcript;
@@ -50,6 +53,7 @@ use super::session::fork::build_child_fork_marker;
 use super::session::lifecycle::{dispatch_new_session_inner, drain_startup_actions, finish_trust};
 use super::session::load::{dispatch_load_session_with_restore, reanchor_grouped_selection};
 use super::session::modal::{dispatch_rename_session, dispatch_sessions_confirm_close};
+use super::settings::handle_feature_override_persisted;
 use super::settings::setters::set_default_model_inner;
 use super::settings::ui::{action_for_reset, apply_setting_rollback};
 use super::status::scrub_error_for_toast;
@@ -59,16 +63,18 @@ use crate::acp::model_state::ModelState;
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{
     Action, CodexLoginPurpose, Effect, SubagentKillOutcome, SwitchModelError, TaskResult,
+    WorkspaceMemberUpsertFailure,
 };
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
 use crate::app::app_view::{
-    ActiveView, AppView, AuthMode, AuthState, PrimaryProvider, TrustState, VoiceState, VoiceTarget,
-    WelcomeAnnouncementState,
+    ActiveView, AppView, AuthMode, AuthState, PendingCodingDataWrite, PrimaryProvider, TrustState,
+    VoiceState, VoiceTarget, WelcomeAnnouncementState,
 };
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
 use crate::scrollback::state::ScrollbackState;
+use crate::views::session_picker_surface::SessionPickerHost;
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use std::path::PathBuf;
@@ -134,6 +140,7 @@ fn test_app() -> AppView {
         cwd_has_git_ancestor: false,
         acp_tx: tx,
         scratch: crate::scrollback::render::ScratchBuffer::new(),
+        status_line: Default::default(),
         cursor: crate::render::draw::CursorState::new(),
         pending_action: None,
         exit_session_pending: None,
@@ -222,11 +229,14 @@ fn test_app() -> AppView {
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
         privacy_banner_acked: None,
-        privacy_banner_opt_in_inflight: false,
+        coding_data_pending_write: None,
         coding_data_write_seq: 0,
         show_tips: None,
         auto_update: None,
         ask_user_question_timeout_enabled: None,
+        subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+            xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+        ),
         zdr_access_enabled: false,
         usage_billing_redirect_url: None,
         access_gate_shown_logged: false,
@@ -274,6 +284,8 @@ fn test_app() -> AppView {
         #[cfg(feature = "local-workspace")]
         welcome_on_workspace_mode: false,
         welcome_toast: None,
+        dispatch_depth: 0,
+        pending_image_notices: Vec::new(),
         welcome_on_privacy_banner: false,
         welcome_on_upgrade_cta: false,
         auth_show_raw_url: false,
@@ -293,7 +305,10 @@ fn test_app() -> AppView {
         foreign_session_scan_seq: 0,
         foreign_scan_coordinator: Default::default(),
         session_picker_lanes: Default::default(),
-        session_picker_detail_generation: 0,
+        session_picker_detail_seq: 0,
+        picker_generation_counter: 0,
+        session_picker_generation: 0,
+        dashboard_session_picker: None,
         session_picker_entries_query: None,
         session_picker_pending_delete: None,
         welcome_tick: 0,
@@ -306,8 +321,10 @@ fn test_app() -> AppView {
         quit_for_update: false,
         relaunch: None,
         import_claude_modal: None,
+        custom_provider_modal: None,
         welcome_doc_viewer: None,
         screen_mode: crate::app::ScreenMode::Inline,
+        pending_screen_mode_switch: None,
         pending_effects: Vec::new(),
         pending_editor: None,
         pending_pager_path: None,
@@ -317,6 +334,7 @@ fn test_app() -> AppView {
         show_resolved_model: true,
         sharing_enabled: false,
         plugin_cta_enabled: false,
+        workspace_dashboard_enabled: false,
         usage_visible: true,
         has_external_auth_provider: false,
         tier_restricted_commands: Vec::new(),
@@ -327,6 +345,14 @@ fn test_app() -> AppView {
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
+        workspace_store: None,
+        workspace_snapshot: None,
+        workspace_store_loading: false,
+        workspace_sync_requested: false,
+        workspace_write_in_flight: false,
+        workspace_writes_disabled: false,
+        workspace_retry_metadata: Default::default(),
+        workspace_failed_metadata: Default::default(),
         shared_prompt_queues: std::collections::HashMap::new(),
         optimistic_prompt_echoes: std::collections::HashMap::new(),
         pending_running_adoptions: std::collections::HashMap::new(),
@@ -346,6 +372,9 @@ fn test_app() -> AppView {
         voice_auth: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
+        voice_session: xai_grok_voice::VoiceSessionId::default(),
+        voice_trailing_final: None,
+        voice_clip_deadline: None,
     }
 }
 /// Build a default `AgentSession` for
@@ -381,6 +410,9 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
+        hook_block_hold: false,
+        blocked_prompt: None,
         provider_rebind_pending: false,
         user_model_preference: None,
         deferred_model_switch: app.deferred_model_switch_from_cli(),
@@ -393,6 +425,12 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         created_via_new: false,
     }
 }
+pub(super) fn test_agent_mut(app: &mut AppView, id: AgentId) -> &mut AgentView {
+    let Some(agent) = app.agents.get_mut(&id) else {
+        panic!("agent {id:?} is not registered");
+    };
+    agent
+}
 pub(super) fn test_app_with_agent() -> AppView {
     let mut app = test_app();
     let id = AgentId(0);
@@ -403,6 +441,12 @@ pub(super) fn test_app_with_agent() -> AppView {
     app.next_agent_id = 1;
     switch_to_agent(&mut app, id, SwitchCause::New);
     app
+}
+pub(super) fn test_agent(app: &AppView, id: AgentId) -> &AgentView {
+    match app.agents.get(&id) {
+        Some(agent) => agent,
+        None => panic!("missing agent {id:?}"),
+    }
 }
 /// Give a test agent a generated title so the dashboard renders it.
 ///
@@ -465,7 +509,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         prompt: None,
         child_cwd: None,
         worktree_path: None,
-        child_updates_replayed: false,
+        transcript: Default::default(),
     }
 }
 fn cta_entry(name: &str, status: &str) -> xai_hooks_plugins_types::MarketplacePluginEntry {
@@ -521,6 +565,7 @@ fn cta_mcp_server(
         setup_values: std::collections::HashMap::new(),
         tools: vec![],
         enabled: true,
+        blocked_reason: None,
         source: plugin
             .map(|p| format!("plugin: {p}"))
             .unwrap_or_else(|| "local".into()),
@@ -552,6 +597,9 @@ fn arm_reconcile_with_trigger(
             prompt_id: prompt_id.into(),
             stop_reason: Some(stop_reason.into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: cancel_trigger.map(str::to_string),
             received_at: std::time::Instant::now() - age,
         });
@@ -656,6 +704,9 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -802,6 +853,9 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -842,6 +896,8 @@ fn setup_reset_confirm_open(app: &mut AppView, key: crate::settings::SettingKey)
 }
 fn make_picker_entry(id: &str, cwd: &str) -> crate::app::app_view::SessionPickerEntry {
     crate::app::app_view::SessionPickerEntry {
+        last_recap: None,
+        session_kind: None,
         id: id.into(),
         summary: id.into(),
         updated_at: chrono::Utc::now(),
@@ -872,6 +928,8 @@ fn open_session_picker_with(
     use crate::views::modal::ActiveModal;
     let agent = get_active_agent_mut(app).expect("active agent");
     agent.active_modal = Some(ActiveModal::SessionPicker {
+        generation: 0,
+        detail_seq: 0,
         state: crate::views::picker::PickerState::default(),
         entries: Some(entries),
         loading: false,
@@ -886,6 +944,30 @@ fn open_session_picker_with(
         pending_delete: None,
     });
 }
+fn modal_picker_generation(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { generation, .. }) => *generation,
+        _ => panic!("expected SessionPicker modal"),
+    }
+}
+
+fn modal_picker_detail_seq(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { detail_seq, .. }) => *detail_seq,
+        _ => panic!("expected SessionPicker modal"),
+    }
+}
+
 /// Toast strings match the expected format and contain on/off
 /// status.
 fn read_toast(app: &AppView) -> String {
@@ -956,6 +1038,7 @@ fn enqueue_permission_with_enable_always_approve(
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });
@@ -1003,16 +1086,24 @@ fn dashboard_row_order(app: &AppView) -> Vec<crate::views::dashboard::DashboardR
     } else {
         &app.dashboard_local_sessions
     };
-    let rows = crate::views::dashboard::build_rows_with_roster(
-        &app.agents,
-        &d.pinned,
-        &d.reorder,
-        None,
-        d.grouping,
-        &d.filter,
-        home,
-        roster,
-    );
+    let rows = if app.workspace_dashboard_enabled {
+        app.workspace_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::views::dashboard::build_rows_with_workspace(&app.agents, snapshot, home)
+            })
+            .unwrap_or_default()
+    } else {
+        crate::views::dashboard::build_rows_with_roster(
+            &app.agents,
+            &d.pinned,
+            &d.reorder,
+            d.grouping,
+            &d.filter,
+            home,
+            roster,
+        )
+    };
     crate::views::dashboard::render::focusables(
         &rows,
         d.grouping,
@@ -1087,6 +1178,7 @@ fn push_synthetic_permission(
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     };

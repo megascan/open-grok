@@ -85,10 +85,18 @@ pub struct CreateWorktreeRequest {
     /// If not specified, the agent's config default will be used.
     #[serde(default)]
     pub worktree_type: Option<WorktreeType>,
+    #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
     /// Human-readable label for the worktree directory name.
     /// When absent, an automatic `YYYY-MM-DD-<uuid>` label is generated.
     #[serde(default)]
     pub label: Option<String>,
+    /// Gate source from `gate_grove_worktree_layers` (`request` / `env` / `local` / `enable_all` / `remote` / `remote_kill` / `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
+    /// Pinned by prepare so streaming `Created.source_git_root` matches `Creating`.
+    #[serde(default, skip)]
+    pub resolved_source_git_root: Option<String>,
 }
 impl WorkspaceRpc for CreateWorktreeRequest {
     const METHOD: &'static str = "workspace.create_worktree";
@@ -190,6 +198,11 @@ pub struct CreateWorktreeFromWorktreeResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktreeFromWorktreeRequestWire {
+    #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
+    /// Gate source from `gate_grove_worktree_layers` (`request` / `env` / `local` / `enable_all` / `remote` / `remote_kill` / `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
     pub source_worktree_path: String,
     pub new_session_id: String,
     #[serde(default = "default_copy_mode")]
@@ -327,8 +340,56 @@ impl WorkspaceRpc for WorktreeDbStatsReq {
     const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Value;
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeDetachReq {
+    pub id_or_path: String,
+    #[serde(default)]
+    pub allow_copy: bool,
+}
+impl WorkspaceRpc for WorktreeDetachReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_detach";
+    type Response = Value;
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSalvageReq {
+    pub id_or_path: String,
+    pub out: String,
+}
+impl WorkspaceRpc for WorktreeSalvageReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_salvage";
+    type Response = Value;
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanArtifactsReq {
+    pub id_or_path: String,
+}
+impl WorkspaceRpc for WorktreeCleanArtifactsReq {
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    const METHOD: &'static str = "workspace.worktree_clean_artifacts";
+    type Response = Value;
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grove_worktree_aliases_and_absence_remain_wire_compatible() {
+        for key in ["groveWorktree", "nfsWorktree", "nfs_worktree"] {
+            let mut value = serde_json::json!({"sessionId":"session", "sourcePath":"/source"});
+            value[key] = serde_json::Value::Bool(true);
+            let request: CreateWorktreeRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(request.grove_worktree, Some(true));
+        }
+        let request: CreateWorktreeRequest = serde_json::from_value(serde_json::json!({
+            "sessionId":"session", "sourcePath":"/source"
+        }))
+        .unwrap();
+        assert_eq!(request.grove_worktree, None);
+    }
     use super::*;
     #[test]
     fn method_constants() {
@@ -363,6 +424,8 @@ mod tests {
                 git_ref: None,
                 worktree_type: None,
                 label: None,
+                grove_worktree: None,
+                grove_gate_source: None,
             },
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -384,6 +447,9 @@ mod tests {
             ignored_skip_patterns: vec![],
             worktree_type: None,
             label: None,
+            grove_worktree: None,
+            grove_gate_source: None,
+            resolved_source_git_root: None,
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["sessionId"], "s1");

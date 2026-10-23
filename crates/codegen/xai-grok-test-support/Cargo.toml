@@ -7,15 +7,16 @@ description = "Shared test-support for grok-build crates: mock inference server,
 publish = false
 
 [dependencies]
-agent-client-protocol = { workspace = true }
+agent-client-protocol = { workspace = true, features = ["unstable"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 portable-pty = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -27,7 +28,10 @@ xai-acp-lib = { workspace = true }
 xai-tty-utils = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 reqwest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 default-bazel = []

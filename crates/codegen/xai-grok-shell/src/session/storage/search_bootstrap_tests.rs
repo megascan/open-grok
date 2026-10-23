@@ -34,6 +34,186 @@ fn read_marker(db_path: &Path) -> Option<String> {
     with_search_index(db_path, |index| index.get_meta(META_KEY_LAST_BOOTSTRAP)).unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_task_backlog_is_bounded_for_ten_thousand_sessions() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::{Notify, Semaphore};
+
+    const JOBS: usize = 10_000;
+    let limit = BOOTSTRAP_MAX_CONCURRENT.max(1);
+    let gate = Arc::new(Semaphore::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let all_started = Arc::new(Notify::new());
+
+    let producer = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        let started = Arc::clone(&started);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        let submitted = Arc::clone(&submitted);
+        let completed = Arc::clone(&completed);
+        let all_started = Arc::clone(&all_started);
+        async move {
+            let mut tasks = BoundedIndexTasks::new();
+            let mut max_spawned = 0;
+            for _ in 0..JOBS {
+                let gate = Arc::clone(&gate);
+                let started = Arc::clone(&started);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let completed = Arc::clone(&completed);
+                let all_started = Arc::clone(&all_started);
+                tasks
+                    .spawn(async move {
+                        let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(running, Ordering::SeqCst);
+                        if started.fetch_add(1, Ordering::SeqCst) + 1 == limit {
+                            all_started.notify_one();
+                        }
+                        gate.acquire().await.unwrap().forget();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await;
+                max_spawned = max_spawned.max(tasks.tasks.len());
+                submitted.fetch_add(1, Ordering::SeqCst);
+            }
+            tasks.drain().await;
+            max_spawned
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), all_started.notified())
+        .await
+        .expect("initial tasks did not start");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while submitted.load(Ordering::SeqCst) < limit {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial tasks were not submitted");
+    assert_eq!(submitted.load(Ordering::SeqCst), limit);
+    assert_eq!(started.load(Ordering::SeqCst), limit);
+    gate.add_permits(JOBS);
+
+    let max_spawned = producer.await.unwrap();
+    assert_eq!(submitted.load(Ordering::SeqCst), JOBS);
+    assert_eq!(completed.load(Ordering::SeqCst), JOBS);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(max_spawned <= limit);
+    assert!(max_active.load(Ordering::SeqCst) <= limit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_bootstrap_indexes_and_prunes_multiple_batches() {
+    use crate::session::storage::search_fts::SessionDoc;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let storage = JsonlStorageAdapter::with_root(root.clone());
+    const SMALL: usize = 10;
+    for i in 0..SMALL + 2 {
+        let info = Info {
+            id: acp::SessionId::new(format!("session-{i}")),
+            cwd: "/ws".to_string(),
+        };
+        storage
+            .init_session(&info, acp::ModelId::new("test"))
+            .await
+            .unwrap();
+        let path = storage.updates_file_path(&info).unwrap();
+        if i < SMALL {
+            let update = serde_json::json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": format!("session-{i}"),
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": format!("prompt {i}") },
+                    },
+                },
+            });
+            std::fs::write(path, format!("{update}\n")).unwrap();
+        } else {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(BOOTSTRAP_MAX_FILE_SIZE + 1)
+                .unwrap();
+        }
+    }
+    let db_path = search_db_path(&root);
+    let retained = SessionDoc {
+        session_id: format!("session-{}", SMALL + 1),
+        cwd: "/ws".into(),
+        updated_at_unix: 0,
+        title: "retained".into(),
+        content: "previous full content".into(),
+        content_hash: "retained-hash".into(),
+    };
+    let stale = SessionDoc {
+        session_id: "stale".into(),
+        ..retained.clone()
+    };
+    with_search_index(&db_path, |index| {
+        index.upsert_doc(&retained)?;
+        index.upsert_doc(&stale)
+    })
+    .unwrap();
+
+    let summaries = storage.list_sessions(None).await.unwrap();
+    let progress = Arc::new(BootstrapProgress::default());
+    bootstrap_with_lease_inner(
+        &root,
+        &storage,
+        &progress,
+        &TEST_TIMING,
+        BootstrapRole::Launch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(progress.total.load(Ordering::Relaxed), (SMALL + 2) as u64);
+    assert_eq!(progress.indexed.load(Ordering::Relaxed), SMALL as u64);
+    assert_eq!(progress.skipped.load(Ordering::Relaxed), 2);
+    assert!(read_marker(&db_path).is_some());
+
+    with_search_index(&db_path, |index| {
+        assert_eq!(index.get_content_hash("stale")?, None);
+        for summary in &summaries {
+            let id = summary.info.id.to_string();
+            let expected = if id == retained.session_id {
+                retained.content_hash.clone()
+            } else if id == format!("session-{SMALL}") {
+                build_session_doc(summary, String::new()).content_hash
+            } else {
+                let i: usize = id.strip_prefix("session-").unwrap().parse().unwrap();
+                build_session_doc(summary, format!("prompt {i}\n\n\n\n")).content_hash
+            };
+            assert_eq!(index.get_content_hash(&id)?, Some(expected), "{id}");
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let second = Arc::new(BootstrapProgress::default());
+    bootstrap_with_lease_inner(
+        &root,
+        &storage,
+        &second,
+        &TEST_TIMING,
+        BootstrapRole::Launch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.indexed.load(Ordering::Relaxed), SMALL as u64);
+    assert_eq!(second.unchanged.load(Ordering::Relaxed), SMALL as u64);
+    assert_eq!(second.skipped.load(Ordering::Relaxed), 2);
+}
+
 #[tokio::test]
 async fn test_claimant_reindexes_even_when_marker_exists() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -353,24 +533,22 @@ async fn test_launch_adopts_marker_written_before_first_claim() {
         .await
     });
 
-    // Wait until the late gate has snapped the empty marker and parked.
-    for _ in 0..100 {
-        if super::TEST_PAUSE_AFTER_MARKER_SNAPSHOT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none()
-        {
-            break;
-        }
+    // Wait until the late gate has snapped the empty marker and parked. The
+    // gate reaches the pause after disk I/O, so budget for a busy machine
+    // (a tight poll window flakes under full-suite parallel load) — but the
+    // loop exits as soon as the pause is observed.
+    let pause_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while super::TEST_PAUSE_AFTER_MARKER_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < pause_deadline,
+            "late gate never reached the post-snapshot pause"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(
-        super::TEST_PAUSE_AFTER_MARKER_SNAPSHOT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
-        "late gate never reached the post-snapshot pause"
-    );
 
     bootstrap_with_lease_inner(
         &root,

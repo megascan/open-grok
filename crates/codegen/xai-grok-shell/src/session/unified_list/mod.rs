@@ -4,6 +4,7 @@ mod facets;
 mod row;
 use crate::agent::session_registry_client::SessionRegistryClient;
 use crate::remote::{ConvError, ConvQuery, ConversationsClient};
+pub use crate::session::visibility::HeadlessPolicy;
 use cursor::{CompositeCursor, ConvLane, Paginated, merge_and_paginate};
 pub use envelope::{FacetMap, FacetValue, SessionKind, SessionMetaEnvelope};
 pub use facets::{
@@ -111,6 +112,8 @@ pub struct ListReq {
     /// Re-evaluated per page.
     #[serde(default)]
     pub allow_relax: bool,
+    #[serde(default)]
+    pub headless: Option<String>,
     #[serde(default, rename = "_meta")]
     pub meta: Option<serde_json::Value>,
 }
@@ -144,6 +147,7 @@ pub struct UnifiedListResult {
     pub next_cursor: Option<String>,
     pub facets: FacetSummary,
     pub conversations_partial: Option<PartialReason>,
+    pub build_list_complete: bool,
     /// Directory scope `rows` were drawn from; see [`ListReq::allow_relax`].
     pub scope: ListScope,
 }
@@ -226,11 +230,19 @@ pub async fn build_unified_list(
         limit: meta_limit,
     } = ParsedMeta::parse(req.meta.as_ref());
     let limit = req.limit.or(meta_limit).unwrap_or(DEFAULT_LIMIT);
+    let exhaustive = req
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("x.ai/exhaustiveBuild"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let query = req.query.or(meta_query);
     let cursor = CompositeCursor::decode(req.cursor.as_deref());
     let mut source_query = SourceQuery::default();
     reg.apply_pushdown(&facet_filters, &mut source_query);
-    let exclude_conversations = excludes_conversations(&facet_filters);
+    let headless = HeadlessPolicy::from_wire(req.headless.as_deref());
+    let exclude_conversations =
+        headless == HeadlessPolicy::Only || excludes_conversations(&facet_filters);
     let exclude_build = excludes_build(&facet_filters);
     let over = crate::session::merge::over_fetch(limit);
     let cwd_scope = if req.allow_relax {
@@ -246,42 +258,60 @@ pub async fn build_unified_list(
     });
     let local_fut = async {
         if exclude_build {
-            return LocalLane::default();
+            return LocalLane {
+                rows: Vec::new(),
+                relax: None,
+                complete: true,
+            };
         }
         let cwd = req.cwd.as_deref();
         if can_relax {
-            let lanes =
-                crate::session::merge::fetch_lanes(registry_client, cwd, cwd_scope, None, over)
-                    .await;
-            let rows = to_rows(
-                crate::session::merge::merge(
-                    lanes.remote.clone(),
-                    lanes.local,
-                    None,
-                    &lanes.repo_urls,
-                    over,
-                ),
-                reg,
+            let lanes = crate::session::merge::fetch_lanes_with_policy(
+                registry_client,
+                cwd,
+                cwd_scope,
+                None,
+                over,
+                headless,
+            )
+            .await;
+            let (merged, merge_complete) = crate::session::merge::merge_for_listing(
+                lanes.remote.clone(),
+                lanes.local,
+                None,
+                &lanes.repo_urls,
+                exhaustive,
             );
             LocalLane {
-                rows,
+                rows: to_rows(merged, reg),
+                complete: lanes.complete && merge_complete,
                 relax: Some(RelaxInputs {
                     remote: lanes.remote,
                     repo_urls: lanes.repo_urls,
+                    cwd_rows_dropped_by_policy: lanes.rows_dropped_by_policy,
                 }),
             }
         } else {
-            let merged = crate::session::merge::fetch_merged(
+            let lanes = crate::session::merge::fetch_lanes_with_policy(
                 registry_client,
                 cwd,
                 cwd_scope,
                 query.as_deref(),
                 over,
+                headless,
             )
             .await;
+            let (merged, merge_complete) = crate::session::merge::merge_for_listing(
+                lanes.remote,
+                lanes.local,
+                query.as_deref(),
+                &lanes.repo_urls,
+                exhaustive,
+            );
             LocalLane {
                 rows: to_rows(merged, reg),
                 relax: None,
+                complete: lanes.complete && merge_complete,
             }
         }
     };
@@ -333,10 +363,12 @@ pub async fn build_unified_list(
         LocalLane {
             rows: local_rows,
             relax,
+            complete: local_complete,
         },
         conv_lane,
     ) = tokio::join!(local_fut, conv_fut);
-    let (local_rows, scope) = maybe_relax(local_rows, relax, over, reg).await;
+    let (local_rows, scope, relax_complete) =
+        maybe_relax(local_rows, relax, over, reg, headless, exhaustive).await;
     {
         let (conv_lane_status, conv_rows) = match &conv_lane {
             ConvLane::Skipped => ("skipped", 0),
@@ -378,17 +410,19 @@ pub async fn build_unified_list(
         next_cursor: next_cursor.map(|c| c.encode()),
         facets,
         conversations_partial: partial,
+        build_list_complete: local_complete && relax_complete && partial.is_none(),
         scope,
     }
 }
-#[derive(Default)]
 struct LocalLane {
     rows: Vec<UnifiedRow>,
     relax: Option<RelaxInputs>,
+    complete: bool,
 }
 struct RelaxInputs {
     remote: Vec<crate::agent::session_registry_client::SessionRecord>,
     repo_urls: Vec<String>,
+    cwd_rows_dropped_by_policy: bool,
 }
 fn to_rows(
     merged: Vec<crate::session::merge::MergedSession>,
@@ -416,49 +450,90 @@ fn lane_has_no_messages(rows: &[UnifiedRow]) -> bool {
 async fn maybe_relax(
     local_rows: Vec<UnifiedRow>,
     relax: Option<RelaxInputs>,
-    over: usize,
+    _over: usize,
     reg: &FacetRegistry,
-) -> (Vec<UnifiedRow>, ListScope) {
-    let Some(relax) = relax.filter(|_| lane_has_no_messages(&local_rows)) else {
-        return (local_rows, ListScope::Cwd);
+    headless: HeadlessPolicy,
+    exhaustive: bool,
+) -> (Vec<UnifiedRow>, ListScope, bool) {
+    let Some(relax) = relax.filter(|relax| {
+        !(relax.cwd_rows_dropped_by_policy && local_rows.is_empty())
+            && lane_has_no_messages(&local_rows)
+    }) else {
+        return (local_rows, ListScope::Cwd, true);
     };
     let scope = if relax.repo_urls.is_empty() {
         ListScope::All
     } else {
         ListScope::Repo
     };
-    let all_local = crate::session::persistence::list_summaries(None)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::debug!("cwd scan failed: {e}");
-            Vec::new()
-        });
-    match relax_rows(relax, all_local, over, reg) {
+    let (all_local, complete) =
+        match crate::session::persistence::list_summaries_with_completeness(None).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::debug!("cwd scan failed: {error}");
+                (Vec::new(), false)
+            }
+        };
+    let (relaxed, merge_complete) =
+        relax_rows_for_listing(relax, all_local, reg, headless, exhaustive);
+    match relaxed {
         Some(relaxed) => {
             tracing::debug!(
                 rows = relaxed.len(),
                 scope = scope.as_str(),
                 "cwd empty; relaxing scope"
             );
-            (relaxed, scope)
+            (relaxed, scope, complete && merge_complete)
         }
-        None => (local_rows, ListScope::Cwd),
+        None => (local_rows, ListScope::Cwd, complete && merge_complete),
     }
 }
 /// Re-merge the registry page with a repo-scoped local scan (all directories
 /// when the cwd is not a repo); relax only when it reveals a messaged session.
+#[cfg(test)]
 fn relax_rows(
     relax: RelaxInputs,
     all_local: Vec<crate::session::persistence::Summary>,
     over: usize,
     reg: &FacetRegistry,
 ) -> Option<Vec<UnifiedRow>> {
+    relax_rows_with_policy(relax, all_local, over, reg, HeadlessPolicy::Include)
+}
+
+#[cfg(test)]
+fn relax_rows_with_policy(
+    mut relax: RelaxInputs,
+    mut all_local: Vec<crate::session::persistence::Summary>,
+    over: usize,
+    reg: &FacetRegistry,
+    headless: HeadlessPolicy,
+) -> Option<Vec<UnifiedRow>> {
+    crate::session::visibility::retain_session_lanes(&mut all_local, &mut relax.remote, headless);
     let scoped = crate::session::merge::filter_summaries_by_repo(all_local, &relax.repo_urls);
     let rows = to_rows(
         crate::session::merge::merge(relax.remote, scoped, None, &relax.repo_urls, over),
         reg,
     );
     (!lane_has_no_messages(&rows)).then_some(rows)
+}
+fn relax_rows_for_listing(
+    mut relax: RelaxInputs,
+    mut all_local: Vec<crate::session::persistence::Summary>,
+    reg: &FacetRegistry,
+    headless: HeadlessPolicy,
+    exhaustive: bool,
+) -> (Option<Vec<UnifiedRow>>, bool) {
+    crate::session::visibility::retain_session_lanes(&mut all_local, &mut relax.remote, headless);
+    let scoped = crate::session::merge::filter_summaries_by_repo(all_local, &relax.repo_urls);
+    let (merged, complete) = crate::session::merge::merge_for_listing(
+        relax.remote,
+        scoped,
+        None,
+        &relax.repo_urls,
+        exhaustive,
+    );
+    let rows = to_rows(merged, reg);
+    ((!lane_has_no_messages(&rows)).then_some(rows), complete)
 }
 fn excludes_conversations(filters: &BTreeMap<String, Vec<serde_json::Value>>) -> bool {
     match filters.get(KIND_FACET_KEY) {
@@ -492,6 +567,8 @@ pub(crate) struct ExtListResponseMeta {
     pub facets: FacetSummary,
     #[serde(rename = "x.ai/partial")]
     pub partial: PartialInfo,
+    #[serde(rename = "x.ai/buildListComplete")]
+    pub build_list_complete: bool,
     /// Present only when the listing relaxed beyond the cwd.
     #[serde(rename = "x.ai/listScope", skip_serializing_if = "Option::is_none")]
     pub list_scope: Option<&'static str>,
@@ -508,6 +585,7 @@ pub(crate) fn ext_list_response(result: UnifiedListResult) -> ExtListResponse {
         next_cursor,
         facets,
         conversations_partial,
+        build_list_complete,
         scope,
     } = result;
     ExtListResponse {
@@ -522,6 +600,7 @@ pub(crate) fn ext_list_response(result: UnifiedListResult) -> ExtListResponse {
                 conversations: conversations_partial.is_some(),
                 reason: conversations_partial.map(PartialReason::as_str),
             },
+            build_list_complete,
             list_scope: scope.is_relaxed().then_some(scope.as_str()),
         },
     }
@@ -550,6 +629,7 @@ mod tests {
             git_remotes: vec!["git@github.com:example/repo.git".into()],
             source_workspace_dir: Some("/Users/me/xai-src".into()),
             last_turn_summary: None,
+            last_recap: None,
             session_kind: Some("worktree".into()),
         }
     }
@@ -611,6 +691,31 @@ mod tests {
         assert!(value.get("summary").is_none());
         assert!(value.get("source").is_none());
     }
+    #[test]
+    fn native_rows_pagination_reaches_beyond_first_hundred() {
+        let rows: Vec<_> = (0..125)
+            .map(|i| row(&format!("s{i:03}"), "2026-06-01T00:00:00Z"))
+            .collect();
+        let mut cursor = CompositeCursor::default();
+        let mut seen = Vec::new();
+        loop {
+            let page = merge_and_paginate(rows.clone(), ConvLane::Skipped, &cursor, 30);
+            seen.extend(
+                page.candidates
+                    .iter()
+                    .take(page.emit_count)
+                    .map(|row| row.legacy.session_id.clone()),
+            );
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 125);
+        assert_eq!(seen.first().unwrap(), "s000");
+        assert_eq!(seen.last().unwrap(), "s124");
+    }
+
     #[test]
     fn total_order_is_updated_at_desc_then_session_id() {
         let mut rows = [
@@ -795,6 +900,23 @@ mod tests {
         });
         addr
     }
+    #[tokio::test]
+    async fn active_registry_without_exhaustion_proof_is_incomplete() {
+        let addr = spawn_conversations_stub(r#"{"sessions":[]}"#.into()).await;
+        let client = SessionRegistryClient::new(format!("http://{addr}"), "test-token");
+        let req = ListReq {
+            meta: Some(serde_json::json!({
+                "x.ai/facetFilters": { "kind": ["build"] },
+                "x.ai/exhaustiveBuild": true,
+            })),
+            ..Default::default()
+        };
+        let result = build_unified_list(Some(&client), None, req).await;
+        assert!(!result.build_list_complete);
+        let response = serde_json::to_value(ext_list_response(result)).unwrap();
+        assert_eq!(response["_meta"]["x.ai/buildListComplete"], false);
+    }
+
     /// A client-sent `kind: ["build"]` rewritten by [`force_kind_chat`]
     /// yields conversations only.
     #[tokio::test]
@@ -986,9 +1108,11 @@ mod tests {
                 next_cursor: None,
                 facets: facet_registry().summarize_window(&[]),
                 conversations_partial: Some(reason),
+                build_list_complete: false,
                 scope: ListScope::Cwd,
             }))
             .expect("serialize");
+            assert_eq!(value["_meta"]["x.ai/buildListComplete"], false);
             assert_eq!(
                 value["_meta"]["x.ai/partial"],
                 serde_json::json!({ "conversations": true, "reason": wire })
@@ -999,9 +1123,11 @@ mod tests {
             next_cursor: None,
             facets: facet_registry().summarize_window(&[]),
             conversations_partial: None,
+            build_list_complete: true,
             scope: ListScope::Cwd,
         }))
         .expect("serialize");
+        assert_eq!(healthy["_meta"]["x.ai/buildListComplete"], true);
         assert_eq!(
             healthy["_meta"]["x.ai/partial"],
             serde_json::json!({ "conversations": false })
@@ -1038,6 +1164,7 @@ mod tests {
         let relax = || RelaxInputs {
             remote: Vec::new(),
             repo_urls: vec![repo_url.clone()],
+            cwd_rows_dropped_by_policy: false,
         };
         let rows = relax_rows(
             relax(),
@@ -1070,6 +1197,7 @@ mod tests {
             next_cursor: None,
             facets: facet_registry().summarize_window(&[]),
             conversations_partial: None,
+            build_list_complete: true,
             scope,
         };
         let with =

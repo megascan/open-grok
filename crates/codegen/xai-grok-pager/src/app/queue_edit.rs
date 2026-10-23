@@ -66,9 +66,9 @@ impl AgentView {
             let (id, server_id) = (*id, server_id.clone());
             let ctrl_c_empty = key!('c', CONTROL).matches(key) && self.prompt.text().is_empty();
 
-            // Before bare-Enter save: Shift/Alt flags, or Apple Terminal bare
-            // Enter with Cmd/Shift/Opt held (CoreGraphics rescue in is_mod_enter).
-            if crate::input::is_mod_enter(key) {
+            // Before bare-Enter save: Shift/Alt (or Apple Terminal CoreGraphics rescue in
+            // is_mod_enter), plus delivered SUPER+Enter (Kitty) which is not send.
+            if crate::input::is_mod_enter(key) || crate::input::is_delivered_super_enter(key) {
                 self.prompt.textarea.insert_str("\n");
                 return Some(InputOutcome::Changed);
             }
@@ -77,6 +77,9 @@ impl AgentView {
             }
             if key.code == KeyCode::Esc || ctrl_c_empty {
                 self.exit_editing_mode();
+                if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                    return Some(InputOutcome::Changed);
+                }
                 return Some(InputOutcome::Action(Action::DrainQueue));
             }
         }
@@ -108,8 +111,17 @@ impl AgentView {
                 return Some(false); // blocked, no modal armed
             }
             // Clean edit — silently exit editing mode.
+            // The exit refocuses the composer and clears the caller's overlay-focus flip; restore it for the target
             self.exit_editing_mode();
-            self.active_pane = target;
+            self.set_active_pane(target, true);
+            match target {
+                AgentPane::Queue => self.queue.overlay.focused = true,
+                AgentPane::Todo => self.todo.overlay.focused = true,
+                AgentPane::Tasks => self.tasks.overlay.focused = true,
+                AgentPane::Catalog => self.catalog.overlay.focused = true,
+                _ => {}
+            }
+            crate::app::turn_completion::reopen_blocked_card_if_held(self);
             return Some(true);
         }
         None
@@ -136,6 +148,9 @@ impl AgentView {
                     if self.prompt.text().trim().is_empty() {
                         self.exit_editing_mode();
                         self.set_active_pane(pending_target, true);
+                        if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                            return InputOutcome::Changed;
+                        }
                         if was_drain_blocked {
                             return InputOutcome::Action(Action::DrainQueue);
                         }
@@ -161,6 +176,9 @@ impl AgentView {
                     // Discard changes (revert to original), exit editing.
                     self.exit_editing_mode();
                     self.set_active_pane(pending_target, true);
+                    if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                        return InputOutcome::Changed;
+                    }
                     if was_drain_blocked {
                         return InputOutcome::Action(Action::DrainQueue);
                     }
@@ -185,6 +203,7 @@ impl AgentView {
                             .unwrap_or(0);
                         self.exit_editing_mode();
                         self.set_active_pane(pending_target, true);
+                        crate::app::turn_completion::reopen_blocked_card_if_held(self);
                         return InputOutcome::Action(Action::QueueRemoveShared {
                             id: server_id,
                             expected_version,
@@ -195,8 +214,9 @@ impl AgentView {
                     }
                     self.exit_editing_mode();
                     self.set_active_pane(pending_target, true);
-                    // If drain was blocked and we deleted the front,
-                    // the next prompt (if any) should now drain.
+                    if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                        return InputOutcome::Changed;
+                    }
                     if was_drain_blocked {
                         return InputOutcome::Action(Action::DrainQueue);
                     }
@@ -381,41 +401,17 @@ impl AgentView {
                 })
             }
             None => {
-                let edited = self.prompt.stash();
-                let (new_text, mut images, chip_elements) = edited.into_submission();
-                // Local row: in-place mutation (existing behavior).
-                // Recompute token ranges for the edited text — the stale
-                // ranges would point at the pre-edit byte offsets.
-                let skill_token_ranges = self
-                    .prompt
-                    .slash_controller
-                    .recognized_token_ranges(&new_text, &self.session.models);
-                if let Some(entry) = self.session.pending_prompts.iter_mut().find(|p| p.id == id) {
-                    let retained: std::collections::HashSet<u64> = images
-                        .iter()
-                        .map(|image| image.preview.identity())
-                        .collect();
-                    for old in entry.images.drain(..) {
-                        if !retained.contains(&old.preview.identity()) {
-                            crate::prompt_images::cleanup_temp_file(&old);
-                        }
-                    }
-                    entry.text = new_text;
-                    entry.images = std::mem::take(&mut images);
-                    entry.chip_elements = chip_elements;
-                    entry.skill_token_ranges = skill_token_ranges;
-                    // Clear stale wire_blocks: edited text may no longer match the original skill
-                    // invocation. The prompt will be sent as plain text via the normal path.
-                    // Pager builtins never get here (`is_complete_builtin_invocation` routed them
-                    // to dispatch); ACP, skill, and unknown `/…` text is left for the agent's
-                    // resolve(), which does not know pager builtins.
-                    entry.wire_blocks = None;
-                    // display_as_skill rides wire_blocks (see its field doc) — clear both
-                    // together, or the drain keeps stale skill styling over the ranges.
-                    entry.display_as_skill = false;
+                self.save_local_queued_edit(id);
+                if self
+                    .session
+                    .blocked_prompt
+                    .as_ref()
+                    .is_none_or(|b| b.row_id == id)
+                {
+                    self.release_hook_block_hold();
+                } else if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                    return InputOutcome::Changed;
                 }
-                crate::prompt_images::drain_and_cleanup(&mut images);
-                self.exit_editing_mode();
                 if drain {
                     InputOutcome::Action(Action::DrainQueue)
                 } else {
@@ -423,6 +419,44 @@ impl AgentView {
                 }
             }
         }
+    }
+
+    /// Save a local queued edit as text, without dispatching a slash command.
+    pub(in crate::app) fn save_local_queued_edit(&mut self, id: u64) {
+        let edited = self.prompt.stash();
+        let (new_text, mut images, chip_elements) = edited.into_submission();
+        // Local row: in-place mutation (existing behavior).
+        // Recompute token ranges for the edited text — the stale
+        // ranges would point at the pre-edit byte offsets.
+        let skill_token_ranges = self
+            .prompt
+            .slash_controller
+            .recognized_token_ranges(&new_text, &self.session.models);
+        if let Some(entry) = self.session.pending_prompts.iter_mut().find(|p| p.id == id) {
+            let retained: std::collections::HashSet<u64> = images
+                .iter()
+                .map(|image| image.preview.identity())
+                .collect();
+            for old in entry.images.drain(..) {
+                if !retained.contains(&old.preview.identity()) {
+                    crate::prompt_images::cleanup_temp_file(&old);
+                }
+            }
+            entry.text = new_text;
+            entry.images = std::mem::take(&mut images);
+            entry.chip_elements = chip_elements;
+            entry.skill_token_ranges = skill_token_ranges;
+            // Clear stale wire_blocks: edited text may no longer match the original skill
+            // invocation. The prompt will be sent as plain text via the normal path.
+            // Normal saves route pager builtins to dispatch. A failed load saves
+            // the edit verbatim so it can be returned to the composer.
+            entry.wire_blocks = None;
+            // display_as_skill rides wire_blocks (see its field doc) — clear both
+            // together, or the drain keeps stale skill styling over the ranges.
+            entry.display_as_skill = false;
+        }
+        crate::prompt_images::drain_and_cleanup(&mut images);
+        self.exit_editing_mode();
     }
 
     /// Interject-key intercept while editing a queued row, delegated from
@@ -550,7 +584,7 @@ impl AgentView {
         self.show_toast("Queued prompt is no longer in the queue");
     }
 
-    /// Exit editing mode: restore stashed text, clear mode, focus queue pane.
+    /// Exit editing mode: restore stashed text, clear mode, focus the composer.
     /// No-op unless `EditingQueued`. The default exit; releases the
     /// server-side combine hold (cancel, lost-row, interject, modal paths).
     ///
@@ -602,13 +636,9 @@ impl AgentView {
         if matches!(self.active_modal, Some(ActiveModal::EditConfirm { .. })) {
             self.active_modal = None;
         }
-        // Return focus to queue pane (if still visible).
-        // Force=true: we just cleared editing mode, no lock to check.
-        if self.queue.is_visible() {
-            self.set_active_pane(AgentPane::Queue, true);
-        } else {
-            self.set_active_pane(AgentPane::Scrollback, true);
-        }
+        // Focus the composer: on the queue pane the next Enter re-opens the row edit instead of sending
+        // Pane-switch exits (modal confirm, clean-edit pane switch) re-target their own pane right after this
+        self.set_active_pane(AgentPane::Prompt, true);
     }
 }
 
@@ -656,12 +686,13 @@ mod tests {
         agent
     }
 
-    /// Shift/Alt+Enter → newline in edit mode (must not save).
-    /// Cmd/SUPER is not a product-wide newline chord (Apple Terminal only via CG).
+    /// Shift/Alt+Enter inserts a newline in edit mode (must not save).
+    /// Delivered SUPER+Enter (Kitty) is also a newline, not save — it is excluded
+    /// from is_mod_enter so multiline swap still uses only Shift/Alt.
     /// `/btw why` fences the ordering: mod-Enter beats the hijack in `save_edited_queued_row`.
     #[test]
     fn edit_mod_enter_inserts_newline_without_exiting() {
-        for mods in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        for mods in [KeyModifiers::SHIFT, KeyModifiers::ALT, KeyModifiers::SUPER] {
             for text in ["line1", "/btw why"] {
                 let mut agent = enter_edit_local_row();
                 agent.prompt.set_text(text);
@@ -700,6 +731,15 @@ mod tests {
         );
         assert!(matches!(agent.prompt_mode, PromptMode::Normal));
         assert_eq!(agent.session.pending_prompts[0].text, "line1 EDITED");
+    }
+
+    /// Saving an edit focuses the composer: the next Enter sends instead of re-opening the row edit.
+    #[test]
+    fn save_returns_focus_to_the_composer() {
+        let mut agent = enter_edit_local_row();
+        agent.prompt.set_text("local one EDITED");
+        let _ = agent.handle_prompt_key_for_test(&enter_key());
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
     }
 
     fn attach_image_to_local_row(agent: &mut AgentView) {
@@ -848,7 +888,9 @@ mod tests {
         let ctx = crate::app::actions::ClipboardPasteContext {
             target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                 agent_id: agent.session.id,
+                binding_epoch: agent.session_binding_epoch,
                 images_dir: None,
+                feedback_tool_call_id: None,
             },
             source: crate::app::actions::ClipboardPasteSource::ClipboardKey {
                 text: crate::app::actions::ClipboardTextRead::Success(None),
@@ -1297,6 +1339,19 @@ mod tests {
         );
     }
 
+    /// Ctrl+; with an unchanged edit lands focused on the queue pane.
+    /// Without the restored flip, the next structural key bounces focus to scrollback.
+    #[test]
+    fn toggle_queue_pane_with_clean_edit_lands_focused_on_the_queue() {
+        let mut agent = enter_edit_local_row();
+
+        agent.toggle_queue_pane();
+
+        assert!(matches!(agent.prompt_mode, PromptMode::Normal));
+        assert_eq!(agent.active_pane, AgentPane::Queue);
+        assert!(agent.queue.overlay.focused);
+    }
+
     /// Interject key while editing a LOCAL queued row mid-turn: the row
     /// leaves the queue, the EDITED text interjects, edit mode exits, and
     /// the stashed composer draft is restored (the pre-fix bug stranded
@@ -1550,9 +1605,19 @@ mod tests {
         }
     }
 
-    /// `exit_editing_mode` clears a stray `EditConfirm` (unreachable in-tree
-    /// after the reorder, so pin the backstop directly) and leaves every
-    /// other modal variant alone.
+    #[test]
+    fn exit_editing_mode_keeps_hook_block_hold() {
+        let mut agent = make_running_agent();
+        agent.session.hook_block_hold = true;
+        agent.prompt_mode = editing_lone_local();
+        agent.exit_editing_mode();
+        assert!(
+            agent.session.hook_block_hold,
+            "a plain edit exit resolves nothing: only saving or deleting the \
+             blocked row releases the hold"
+        );
+    }
+
     #[test]
     fn exit_editing_mode_clears_only_stray_edit_confirm() {
         let mut agent = make_running_agent();

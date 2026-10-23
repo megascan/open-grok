@@ -12,7 +12,7 @@ use crate::agent::MvpAgent;
 use crate::remote::client::BackendClient;
 use crate::session::export::{ExportedMessage, ExportedSession};
 use crate::session::info::Info as SessionInfo;
-use crate::session::persistence::list_summaries;
+use crate::session::persistence::list_summaries_for_mutation;
 use crate::session::share::{ShareSessionRequest, ShareSessionResponse};
 use crate::upload::trace::{SessionMetadataType, upload_session_metadata};
 use xai_grok_telemetry::id::agent_id;
@@ -57,7 +57,7 @@ async fn handle_share_session(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
     }
 
     // Find session info by searching through summaries
-    let summaries = list_summaries(None).await.map_err(|e| {
+    let summaries = list_summaries_for_mutation(None).await.map_err(|e| {
         acp::Error::internal_error().data(format!("Failed to list sessions: {}", e))
     })?;
 

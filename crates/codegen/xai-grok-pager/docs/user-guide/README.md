@@ -29,7 +29,8 @@ Customize and extend Grok Build.
 | 8 | [Skills](08-skills.md) | Reusable prompt packages in the SKILL.md format |
 | 9 | [Plugins](09-plugins.md) | Bundle and share skills, commands, agents, hooks, and MCP servers; install from, author, and govern marketplaces (organization controls) |
 | 10 | [Hooks](10-hooks.md) | Lifecycle scripts and HTTP callbacks for pre- and post-tool-use events |
-| 11 | [Custom Models](11-custom-models.md) | Bring-your-own-key, Ollama, and OpenAI-compatible endpoints |
+| 11 | [Custom Models](11-custom-models.md) | Guided `/provider` wizard, bring-your-own-key, Ollama, and OpenAI-compatible endpoints |
+| 26 | [Codex Model Controls](26-codex-model-controls.md) | GPT-6-astra, context overrides, persistent work, and browser review |
 | 12 | [Project Rules (AGENTS.md)](12-project-rules.md) | Per-directory AGENTS.md instructions and their precedence |
 | 13 | [Memory](13-memory.md) | Cross-session knowledge persistence with `/flush`, `/dream`, and hybrid search |
 
@@ -53,3 +54,5 @@ Automate, script, and integrate Grok Build with other systems.
 | 23 | [Agent Dashboard](23-dashboard.md) | Central overview of local sessions and forks |
 | 24 | [Monitoring Usage (External OpenTelemetry)](24-monitoring-usage.md) | Customer OTEL export |
 | 25 | [Session Collaboration Across Terminals](25-session-collaboration.md) | Session bus: list, read, and message other live Open Grok sessions |
+| 26 | [Status Line](25-status-line.md) | Built-in items and custom command-driven status output |
+| 27 | [Clone a Repository](27-clone.md) | Git-backed shallow clones, sparse checkout, and optional Grove integration |

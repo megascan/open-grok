@@ -5,12 +5,15 @@
 //! spawns them as async tasks on a [`JoinSet`].  When tasks complete,
 //! the event loop converts their output into [`TaskResult`] and feeds it
 //! back through dispatch.
+mod antigravity;
 mod helpers;
+mod rewind_order;
 use super::actions;
 use super::session_title_resolve::worktree_resume_failure_message;
 #[allow(unused_imports)]
 use super::{agent, dispatch};
 pub use helpers::ConversationsPartial;
+pub(crate) use helpers::timed_out_while;
 #[cfg(feature = "local-workspace")]
 pub(crate) use helpers::reject_non_fs_only_advertised_tools;
 pub(super) use helpers::{
@@ -31,7 +34,7 @@ use xai_acp_lib::{AcpAgentTx, acp_send};
 use xai_grok_telemetry::startup::{self, StartupPhase};
 use actions::{
     ClipboardPasteTarget, Effect, ProbedAttachment, SubagentKillOutcome,
-    SwitchModelError, TaskResult,
+    SwitchModelError, TaskResult, WorkspaceMemberUpsertFailure,
 };
 #[cfg(test)]
 use actions::PermissionModePersist;
@@ -41,6 +44,34 @@ use crate::unified_log as ulog;
 use xai_grok_shell::kimi_models::KimiApiEndpoint;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
+
+fn apply_permission_mode_override(
+    meta: &mut Option<acp::Meta>,
+    permission_mode_override: Option<actions::PermissionModeKind>,
+) {
+    let Some(mode) = permission_mode_override else {
+        return;
+    };
+    let meta = meta.get_or_insert_with(acp::Meta::new);
+    meta.insert("yoloMode".into(), serde_json::Value::Bool(mode.is_always_approve()));
+    meta.insert("autoMode".into(), serde_json::Value::Bool(mode.is_auto()));
+}
+
+fn active_session_registration_warning(
+    result: std::io::Result<Option<PathBuf>>,
+) -> Option<String> {
+    match result {
+        Ok(Some(backup)) => Some(format!(
+            "Active session registry was corrupted; readable sessions were recovered. Backup: {}",
+            backup.display()
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(?error, "Failed to register active session");
+            Some(format!("Couldn't register active session: {error}"))
+        }
+    }
+}
 
 /// Kimi endpoint, credential, and live-catalog mutations share one critical
 /// section. Latest-request tokens are tracked independently so an unrelated
@@ -214,6 +245,22 @@ impl Drop for KimiMutationTicket {
             let _ = start.send(());
         }
     }
+}
+
+/// Admit title RPCs synchronously in dispatch order, independently per session.
+/// Weak entries prevent closed sessions from accumulating process-wide state.
+fn title_mutation_ticket(session_id: &acp::SessionId) -> KimiMutationTicket {
+    static QUEUES: LazyLock<Mutex<std::collections::HashMap<String, std::sync::Weak<KimiMutationQueueInner>>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut queues = QUEUES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    let key = session_id.0.to_string();
+    let inner = queues.get(&key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+        let queue = KimiMutationQueue::new();
+        queues.insert(key, Arc::downgrade(&queue.inner));
+        queue.inner
+    });
+    KimiMutationQueue { inner }.enqueue()
 }
 
 fn latest_kimi_key_transport_token(endpoint: KimiApiEndpoint) -> &'static AtomicU64 {
@@ -782,6 +829,41 @@ fn custom_models_list_params_models(
         .transpose()
         .map_err(|error| format!("custom models list returned invalid records: {error}"))
         .map(|models| models.unwrap_or_default())
+}
+
+/// Ask the shell to enumerate models at a user-supplied address.
+///
+/// Kept next to `apply_custom_models` so the RPC envelope handling - including
+/// the same `sanitize_user_error` pass - stays in one place. The error string
+/// is meant for the wizard's inline notice, so it must never contain the key.
+async fn discover_custom_models(
+    tx: &AcpAgentTx,
+    params: serde_json::Value,
+) -> Result<crate::views::custom_provider_modal::DiscoverResponse, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/custom-providers/discover",
+        serde_json::value::to_raw_value(&params)
+            .expect("serialize custom provider discover params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("model discovery returned invalid JSON: {error}"))?;
+    if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
+        return Err(sanitize_user_error(
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("model discovery failed"),
+        ));
+    }
+    let result = envelope.get("result").unwrap_or(&envelope);
+    serde_json::from_value::<crate::views::custom_provider_modal::DiscoverResponse>(
+        result.clone(),
+    )
+    .map_err(|error| format!("model discovery returned an unexpected shape: {error}"))
 }
 
 async fn list_custom_models(tx: &AcpAgentTx) -> Result<CustomModelsApply, String> {
@@ -1644,6 +1726,85 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::DiscoverCustomProvider {
+            generation,
+            server_address,
+            format,
+            api_key,
+        } => {
+            // The address is untrusted third-party infrastructure. The pager
+            // forwards the raw string (the shell normalizes and validates it)
+            // and attaches only the key typed for it - never a first-party
+            // credential, never an env lookup, never a second hop.
+            let tx = acp_tx.clone();
+            let params = serde_json::json!({
+                "server_address": server_address,
+                "format": format,
+                "api_key": api_key.as_ref().map(|key| key.expose().to_owned()),
+            });
+            tasks.spawn(async move {
+                match discover_custom_models(&tx, params).await {
+                    Ok(response) => TaskResult::CustomProviderDiscovered {
+                        generation,
+                        error: None,
+                        response: Some(response),
+                    },
+                    Err(error) => TaskResult::CustomProviderDiscovered {
+                        generation,
+                        error: Some(error),
+                        response: None,
+                    },
+                }
+            });
+        }
+        Effect::UpsertCustomModelsMany {
+            generation,
+            api_backend,
+            auth_scheme,
+            base_url,
+            api_key,
+            rows,
+        } => {
+            // Zero selections never reach this arm (dispatch emits no effect),
+            // but an empty batch is a no-op request, so drop it here too.
+            if rows.is_empty() {
+                return (false, meta);
+            }
+            let tx = acp_tx.clone();
+            let params = crate::views::custom_provider_modal::upsert_many_params(
+                &api_backend,
+                &auth_scheme,
+                &base_url,
+                api_key.as_ref().map(|key| key.expose()),
+                &rows,
+            );
+            tasks.spawn(async move {
+                match apply_custom_models(
+                    &tx,
+                    "open-grok/custom-models/upsert-many",
+                    params,
+                )
+                .await
+                {
+                    Ok(applied) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                        custom_models: applied.custom_models,
+                    },
+                    Err(error) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: None,
+                        error: Some(error),
+                        models: None,
+                        custom_models: Vec::new(),
+                    },
+                }
+            });
+        }
         Effect::UpsertCustomModel {
             generation,
             key,
@@ -1652,6 +1813,7 @@ pub(crate) fn execute(
             provider,
             base_url,
             context_window,
+            max_context_window,
             api_backend,
             env_key,
         } => {
@@ -1670,6 +1832,7 @@ pub(crate) fn execute(
                 if let Some(base_url) = base_url {
                     params["base_url"] = serde_json::Value::String(base_url);
                 }
+                if let Some(max_context_window) = max_context_window { params["max_context_window"] = serde_json::json!(max_context_window); }
                 if let Some(context_window) = context_window {
                     params["context_window"] = serde_json::json!(context_window);
                 }
@@ -2431,13 +2594,16 @@ pub(crate) fn execute(
         }
         Effect::RegisterActiveSession { session_id, cwd } => {
             crate::app::signal_handler::set_current_session_id(Some(session_id.clone()));
-            if let Err(e) = xai_grok_shell::active_sessions::register(xai_grok_shell::active_sessions::ActiveSession {
-                session_id,
+            let result = xai_grok_shell::active_sessions::register_reporting(xai_grok_shell::active_sessions::ActiveSession {
+                session_id: session_id.clone(),
                 pid: std::process::id(),
                 cwd,
                 opened_at: chrono::Utc::now(),
-            }) {
-                tracing::warn!(?e, "Failed to register active session");
+            });
+            if let Some(message) = active_session_registration_warning(result) {
+                tasks.spawn(async move {
+                    TaskResult::ActiveSessionRegistrationWarning { session_id, message }
+                });
             }
         }
         Effect::UnregisterActiveSession { session_id } => {
@@ -2452,6 +2618,24 @@ pub(crate) fn execute(
             if let Err(e) = std::env::set_current_dir(&path) {
                 tracing::warn!(error = %e, "change location: failed to set_current_dir");
             }
+        }
+        Effect::LoadAgentsPluginRegistry { agent_id, cwd, request_id } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::views::agents_modal::load_agents_plugin_catalog(&cwd)
+                }).await.map_err(|_| "Could not load plugin agents.".to_owned());
+                TaskResult::AgentsPluginRegistryLoaded { agent_id, request_id, result }
+            });
+        }
+        Effect::RunStatusLineCommand(run) => {
+            tasks
+                .spawn(async move {
+                    let (id, outcome) = run.execute().await;
+                    TaskResult::StatusLineCommandFinished {
+                        id,
+                        outcome,
+                    }
+                });
         }
         Effect::ScheduleClearAuthCopyFeedback { generation } => {
             tasks
@@ -2488,6 +2672,71 @@ pub(crate) fn execute(
         Effect::CancelAuth { request_seq } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move { send_auth_cancel(&tx, request_seq).await });
+        }
+        Effect::LoginAntigravity { agent_id } => {
+            let cwd = cwd.to_path_buf();
+            let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
+            let (shown_tx, shown_rx) = tokio::sync::oneshot::channel();
+            tasks.spawn(async move {
+                let (url, opened, copied) = match url_rx.await {
+                    Ok(url) => {
+                        let opened = antigravity::open_authorization_url(&url).await;
+                        let copied = if !opened && agent_id.is_none() {
+                            let clipboard_url = url.clone();
+                            matches!(tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::task::spawn_blocking(move || {
+                                    crate::clipboard::SystemClipboard::try_set(&clipboard_url).reported_success()
+                                }),
+                            ).await, Ok(Ok(true)))
+                        } else { false };
+                        (Some(actions::SensitiveAuthUrl(url)), opened, copied)
+                    }
+                    Err(_) => (None, false, false),
+                };
+                TaskResult::AntigravityLoginUrlReady {
+                    agent_id,
+                    url, opened, copied, shown: Some(shown_tx),
+                }
+            });
+            tasks.spawn(async move {
+                let result = async {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(), cwd,
+                    ).map_err(|e| e.to_string())?;
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let mut url_tx = Some(url_tx);
+                    let login = xai_grok_shell::agent::antigravity_acp::login_user(
+                        &launch,
+                        move |url| {
+                            let tx = url_tx.take().ok_or_else(|| std::io::Error::other("Authorization URL already delivered"))?;
+                            tx.send(url.to_owned()).map_err(|_| std::io::Error::other("Could not deliver authorization URL"))
+                        },
+                        &cancel,
+                    );
+                    match tokio::time::timeout(std::time::Duration::from_secs(600), login).await {
+                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Err(_) => Err("Antigravity sign-in timed out".to_owned()),
+                    }
+                }.await;
+                // Process the URL event before completion can dismiss its modal.
+                let _ = shown_rx.await;
+                TaskResult::AntigravityAuthComplete { agent_id, logout: false, result }
+            });
+        }
+        Effect::LogoutAntigravity { agent_id } => {
+            let cwd = cwd.to_path_buf();
+            tasks.spawn(async move {
+                let result = async {
+                    let launch = xai_grok_shell::agent::antigravity_acp::Launch::discover(
+                        xai_grok_shell::util::grok_home::grok_home(), cwd,
+                    ).map_err(|e| e.to_string())?;
+                    xai_grok_shell::agent::antigravity_acp::logout_user(
+                        &launch, &tokio_util::sync::CancellationToken::new(),
+                    ).await.map_err(|e| e.to_string())
+                }.await;
+                TaskResult::AntigravityAuthComplete { agent_id, logout: true, result }
+            });
         }
         Effect::LoginCodex { agent_id, purpose } => {
             let tx = acp_tx.clone();
@@ -2606,6 +2855,7 @@ pub(crate) fn execute(
         Effect::CreateSession {
             agent_id,
             cwd: session_cwd,
+            permission_mode_override,
             model_id,
             preferred_session_id,
             chat_kind,
@@ -2621,6 +2871,7 @@ pub(crate) fn execute(
             let mut meta = session_flags.to_meta();
             let is_chat_path = chat_kind || session_flags.chat_mode;
             finalize_chat_session_meta(&mut meta, is_chat_path, session_flags);
+            apply_permission_mode_override(&mut meta, permission_mode_override);
             if let Some(ref mid) = model_id {
                 meta.get_or_insert_with(acp::Meta::new)
                     .insert("modelId".into(), serde_json::json!(mid.0));
@@ -2644,6 +2895,7 @@ pub(crate) fn execute(
                             return TaskResult::SessionFailed {
                                 agent_id,
                                 error: sanitize_user_error(&e.to_string()),
+                                timed_out: false,
                             };
                         }
                     }
@@ -2686,6 +2938,7 @@ pub(crate) fn execute(
                             }
                         }
                         Err(e) => {
+                            let timed_out = e.timed_out();
                             let error = e.to_string();
                             ulog::error(
                                 "session.create.failed",
@@ -2700,6 +2953,7 @@ pub(crate) fn execute(
                             TaskResult::SessionFailed {
                                 agent_id,
                                 error: sanitize_user_error(&error),
+                                timed_out,
                             }
                         }
                     }
@@ -2707,11 +2961,13 @@ pub(crate) fn execute(
         }
         Effect::CreateWorktreeSession {
             agent_id,
+            permission_mode_override,
             load_session_id,
             label,
             git_ref,
             model_id,
             preferred_session_id,
+            minted_session_id,
             chat_kind,
         } => {
             let tx = acp_tx.clone();
@@ -2722,11 +2978,16 @@ pub(crate) fn execute(
                 chat_kind || session_flags.chat_mode,
                 session_flags,
             );
+            apply_permission_mode_override(&mut meta, permission_mode_override);
             if let Some(ref mid) = model_id {
                 meta.get_or_insert_with(acp::Meta::new)
                     .insert("modelId".into(), serde_json::json!(mid.0));
             }
-            if load_session_id.is_none() && let Some(ref sid) = preferred_session_id {
+            let client_session_id = load_session_id
+                .is_none()
+                .then(|| preferred_session_id.clone().or(minted_session_id))
+                .flatten();
+            if let Some(ref sid) = client_session_id {
                 meta.get_or_insert_with(acp::Meta::new)
                     .insert("sessionId".into(), serde_json::json!(sid));
             }
@@ -2798,6 +3059,8 @@ pub(crate) fn execute(
                                         local_miss,
                                         &sanitize_user_error(&e.to_string()),
                                     ),
+                                    orphaned_worktree_root: None,
+                                    timed_out: e.timed_out(),
                                 };
                             }
                         };
@@ -2812,6 +3075,8 @@ pub(crate) fn execute(
                                         local_miss,
                                         &sanitize_user_error(&e.to_string()),
                                     ),
+                                    orphaned_worktree_root: None,
+                                    timed_out: false,
                                 };
                             }
                         };
@@ -2829,23 +3094,27 @@ pub(crate) fn execute(
                                     local_miss,
                                     &sanitize_user_error(&msg),
                                 ),
+                                orphaned_worktree_root: None,
+                                timed_out: false,
                             };
                         }
                         let result_obj = resp_value.get("result").unwrap_or(&resp_value);
-                        let new_session_id = result_obj
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&sid);
-                        let wt_path = result_obj
-                            .get("worktreePath")
-                            .and_then(|v| v.as_str())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| cwd.clone());
-                        let eff_cwd = result_obj
-                            .get("effectiveCwd")
-                            .and_then(|v| v.as_str())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| wt_path.clone());
+                        let (new_session_id, wt_path, eff_cwd) = match
+                            crate::app::session_startup::validate_worktree_resume_response(result_obj, &cwd)
+                        {
+                            Ok(paths) => paths,
+                            Err(e) => {
+                                return TaskResult::WorktreeSessionFailed {
+                                    agent_id,
+                                    error: worktree_resume_failure_message(
+                                        local_miss,
+                                        &sanitize_user_error(&e.to_string()),
+                                    ),
+                                    orphaned_worktree_root: None,
+                                    timed_out: false,
+                                };
+                            }
+                        };
                         let (code_restored, restore_summary, restore_degree) = parse_worktree_restore_payload(
                             result_obj,
                         );
@@ -2891,6 +3160,8 @@ pub(crate) fn execute(
                                 error: sanitize_user_error(
                                     &format!("couldn't create worktree: {e}"),
                                 ),
+                                orphaned_worktree_root: None,
+                                timed_out: false,
                             };
                         }
                     };
@@ -2904,6 +3175,8 @@ pub(crate) fn execute(
                                 error: sanitize_user_error(
                                     &format!("couldn't create worktree: {e}"),
                                 ),
+                                orphaned_worktree_root: None,
+                                timed_out: false,
                             };
                         }
                     };
@@ -2917,6 +3190,8 @@ pub(crate) fn execute(
                             error: sanitize_user_error(
                                 &format!("couldn't create worktree: {msg}"),
                             ),
+                            orphaned_worktree_root: None,
+                            timed_out: false,
                         };
                     }
                     let result_obj = resp_value.get("result").unwrap_or(&resp_value);
@@ -2931,6 +3206,8 @@ pub(crate) fn execute(
                                 error: sanitize_user_error(
                                     "couldn't create worktree: response missing worktreePath",
                                 ),
+                                orphaned_worktree_root: None,
+                                timed_out: false,
                             };
                         }
                     };
@@ -2952,7 +3229,7 @@ pub(crate) fn execute(
                     } else {
                         worktree_root.clone()
                     };
-                    if let Some(ref sid) = preferred_session_id {
+                    if let Some(ref sid) = client_session_id {
                         let session_cwd_str = session_cwd.to_string_lossy();
                         if let Err(e) = crate::app::session_startup::ensure_session_id_available(
                             sid,
@@ -2961,6 +3238,8 @@ pub(crate) fn execute(
                             return TaskResult::WorktreeSessionFailed {
                                 agent_id,
                                 error: sanitize_user_error(&e.to_string()),
+                                orphaned_worktree_root: Some(worktree_root),
+                                timed_out: false,
                             };
                         }
                     }
@@ -2999,6 +3278,8 @@ pub(crate) fn execute(
                             "couldn't create session in worktree: {e}"
                         ),
                                 ),
+                                orphaned_worktree_root: Some(worktree_root),
+                                timed_out: e.timed_out(),
                             }
                         }
                     }
@@ -3076,7 +3357,7 @@ pub(crate) fn execute(
                             }
                         }
                         Err(e) => {
-                            let codex_auth_required = is_codex_session_auth_required(&e);
+                            let codex_auth_required = matches!(&e, SessionRpcError::Rpc(e) if is_codex_session_auth_required(e));
                             let error = e.to_string();
                             ulog::error(
                                 "session.load.failed",
@@ -3210,14 +3491,23 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchSessionList { query, seq, kind_filter } => {
+        Effect::FetchSessionList {
+            host,
+            cwd_override,
+            generation,
+            query,
+            seq,
+            kind_filter,
+            headless_policy,
+        } => {
             let tx = acp_tx.clone();
-            let cwd = cwd.to_path_buf();
+            let cwd = cwd_override.unwrap_or_else(|| cwd.to_path_buf());
             tasks
                 .spawn(async move {
                     let mut params = serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
                     "limit": 30,
+                    "headless": headless_policy.as_wire_str(),
                 });
                     if let Some(q) = &query {
                         params["query"] = serde_json::Value::String(q.clone());
@@ -3233,6 +3523,8 @@ pub(crate) fn execute(
                         event = "session_list_fetch",
                         kind_filter = ?kinds,
                         query = ?query,
+                        ?host,
+                        generation,
                         seq,
                         "FetchSessionList with kind facet filter"
                     );
@@ -3252,6 +3544,8 @@ pub(crate) fn execute(
                                 .unwrap_or_default();
                             if let Some(err) = wrapper.get("error") {
                                 return TaskResult::SessionListFailed {
+                                    host,
+                                    generation,
                                     error: err.as_str().unwrap_or("unknown error").to_string(),
                                     seq,
                                     query,
@@ -3262,6 +3556,8 @@ pub(crate) fn execute(
                             let partial = parse_session_list_partial(payload);
                             let scope = parse_session_list_scope(payload);
                             TaskResult::SessionListLoaded {
+                                host,
+                                generation,
                                 sessions,
                                 partial,
                                 scope,
@@ -3271,6 +3567,8 @@ pub(crate) fn execute(
                         }
                         Err(e) => {
                             TaskResult::SessionListFailed {
+                                host,
+                                generation,
                                 error: sanitize_user_error(&format!("{e}")),
                                 seq,
                                 query,
@@ -3279,7 +3577,101 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::DebounceSessionSearch { query, seq } => {
+        Effect::FetchSessionListForResume {
+            argument, host, cwd_override, generation, seq, kind_filter, headless_policy,
+        } => {
+            let tx = acp_tx.clone();
+            let cwd = cwd_override.unwrap_or_else(|| cwd.to_path_buf());
+            tasks.spawn(async move {
+                let fail = |error: String| TaskResult::SessionListFailed {
+                    host, generation, error, seq, query: None,
+                };
+                let mut params = serde_json::json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "limit": 1000,
+                    "headless": headless_policy.as_wire_str(),
+                    "allowRelax": true,
+                    "_meta": { "x.ai/exhaustiveBuild": true },
+                });
+                if uuid::Uuid::try_parse(&argument).is_ok() {
+                    params["query"] = serde_json::Value::String(argument);
+                }
+                if let Some(kinds) = kind_filter {
+                    params["_meta"]["x.ai/facetFilters"] = serde_json::json!({ "kind": kinds });
+                }
+                let mut sessions = Vec::new();
+                let mut partial = None;
+                let mut scope = None;
+                let mut seen_cursors = std::collections::HashSet::new();
+                let mut build_complete = true;
+                // Bound defective servers and avoid trusting a repeating cursor.
+                for _ in 0..10 {
+                    let request = acp::ExtRequest::new(
+                        "x.ai/session/list",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize session list params").into(),
+                    );
+                    let response = match acp_send(request, &tx).await {
+                        Ok(response) => response,
+                        Err(error) => return fail(sanitize_user_error(&format!("{error}"))),
+                    };
+                    let wrapper: serde_json::Value = match serde_json::from_str(response.0.get()) {
+                        Ok(value) => value,
+                        Err(_) => return fail("Invalid session list response".into()),
+                    };
+                    if let Some(error) = wrapper.get("error") {
+                        return fail(error.as_str().unwrap_or("unknown error").to_string());
+                    }
+                    let payload = wrapper.get("result").unwrap_or(&wrapper);
+                    let Some(rows) = payload.get("sessions").and_then(|rows| rows.as_array()) else {
+                        return fail("Invalid session list response".into());
+                    };
+                    build_complete &= payload.get("_meta")
+                        .and_then(|meta| meta.get("x.ai/buildListComplete"))
+                        .and_then(|complete| complete.as_bool()) == Some(true);
+                    // Unparseable identities cannot be silently omitted from a uniqueness check.
+                    build_complete &= rows.iter().all(|row| {
+                        row.get("sessionId").or_else(|| row.get("session_id"))
+                            .and_then(|id| id.as_str()).is_some_and(|id| !id.is_empty())
+                            && row.get("summary").and_then(|summary| summary.as_str()).is_some()
+                    });
+                    let page_scope = parse_session_list_scope(payload);
+                    if scope.is_some_and(|s| s != page_scope) {
+                        return fail("Session list scope changed while loading".into());
+                    }
+                    scope = Some(page_scope);
+                    partial = partial.or_else(|| parse_session_list_partial(payload));
+                    sessions.extend(parse_session_picker_entries_for_resume(payload));
+                    let next = match payload.get("nextCursor") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(serde_json::Value::String(cursor)) if !cursor.is_empty() => Some(cursor),
+                        _ => return fail("Invalid session list cursor".into()),
+                    };
+                    let Some(next) = next else {
+                        if !build_complete {
+                            partial = partial.or(Some(ConversationsPartial::BuildIncomplete));
+                        }
+                        return TaskResult::SessionListLoaded {
+                            host, generation, sessions, partial,
+                            scope: scope.unwrap_or_default(), seq, query: None,
+                        };
+                    };
+                    // Each page is a new live snapshot. Never infer title uniqueness
+                    // when a row can move across the cursor between requests.
+                    build_complete = false;
+                    if !seen_cursors.insert(next.to_owned()) {
+                        return fail("Session list cursor repeated".into());
+                    }
+                    params["cursor"] = serde_json::Value::String(next.to_owned());
+                }
+                TaskResult::SessionListLoaded {
+                    host, generation, sessions,
+                    partial: partial.or(Some(ConversationsPartial::BuildIncomplete)),
+                    scope: scope.unwrap_or_default(), seq, query: None,
+                }
+            });
+        }
+        Effect::DebounceSessionSearch { host, generation, query, seq } => {
             tasks
                 .spawn(async move {
                     tokio::time::sleep(
@@ -3287,6 +3679,8 @@ pub(crate) fn execute(
                         )
                         .await;
                     TaskResult::SessionSearchDebounceExpired {
+                        host,
+                        generation,
                         query,
                         seq,
                     }
@@ -3337,6 +3731,8 @@ pub(crate) fn execute(
                     let params = serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
                     "limit": 30,
+                    "headless": xai_grok_shell::session::unified_list::HeadlessPolicy::Exclude
+                        .as_wire_str(),
                 });
                     let request = acp::ExtRequest::new(
                         "x.ai/session/list",
@@ -3367,6 +3763,86 @@ pub(crate) fn execute(
                         Err(_) => {
                             TaskResult::DashboardSessionsLoaded {
                                 sessions: vec![],
+                            }
+                        }
+                    }
+                });
+        }
+        Effect::LoadWorkspaceSnapshot { db_path } => {
+            tasks
+                .spawn(async move {
+                    match tokio::task::spawn_blocking(move || {
+                            let store = xai_grok_dashboard_store::WorkspaceStore::open(
+                                &db_path,
+                            )?;
+                            let snapshot = store.snapshot()?;
+                            Ok::<
+                                _,
+                                xai_grok_dashboard_store::StoreError,
+                            >((store, snapshot))
+                        })
+                        .await
+                    {
+                        Ok(Ok((store, snapshot))) => {
+                            TaskResult::WorkspaceSnapshotLoaded {
+                                store,
+                                snapshot,
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            TaskResult::WorkspaceSnapshotFailed {
+                                error: error.to_string(),
+                            }
+                        }
+                        Err(error) => {
+                            TaskResult::WorkspaceSnapshotFailed {
+                                error: format!("workspace loader task failed: {error}"),
+                            }
+                        }
+                    }
+                });
+        }
+        Effect::UpsertWorkspaceMembers { store, members } => {
+            let db_path = store.path().to_path_buf();
+            tasks
+                .spawn(async move {
+                    match tokio::task::spawn_blocking(move || {
+                            let mut store = store;
+                            let mut failures = Vec::new();
+                            for member in members.iter().cloned() {
+                                let session_id = member.key.session_id.to_string();
+                                if let Err(error) = store.insert_member(member) {
+                                    let retryable = matches!(
+                                &error,
+                                xai_grok_dashboard_store::StoreError::Busy { .. }
+                            );
+                                    failures
+                                        .push(WorkspaceMemberUpsertFailure {
+                                            session_id,
+                                            error: error.to_string(),
+                                            retryable,
+                                        });
+                                }
+                            }
+                            let snapshot = store
+                                .snapshot()
+                                .map_err(|error| error.to_string());
+                            (store, snapshot, failures, members)
+                        })
+                        .await
+                    {
+                        Ok((store, snapshot, failures, attempted)) => {
+                            TaskResult::WorkspaceMembersUpserted {
+                                store,
+                                snapshot,
+                                failures,
+                                attempted,
+                            }
+                        }
+                        Err(error) => {
+                            TaskResult::WorkspaceMembersUpsertTaskFailed {
+                                db_path,
+                                error: format!("workspace writer task failed: {error}"),
                             }
                         }
                     }
@@ -3527,7 +4003,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::LoadCardDetail { source, session_id, cwd, generation } => {
+        Effect::LoadCardDetail { host, generation, source, session_id, cwd, seq } => {
             tasks
                 .spawn(async move {
                     use crate::app::app_view::CardDetail;
@@ -3559,9 +4035,11 @@ pub(crate) fn execute(
                             first_prompt_preview: String::new(),
                         });
                     TaskResult::CardDetailLoaded {
+                        host,
+                        generation,
                         source,
                         session_id: result_session_id,
-                        generation,
+                        seq,
                         detail,
                     }
                 });
@@ -3756,6 +4234,7 @@ pub(crate) fn execute(
             cancel_subagents,
             trigger,
             rewind_if_no_output,
+            rewind_prompt_id,
         } => {
             let tx = acp_tx.clone();
             let trigger_str = trigger.map(|t| t.as_wire_str());
@@ -3773,16 +4252,12 @@ pub(crate) fn execute(
                         ),
                     );
                     let send_start = std::time::Instant::now();
-                    let mut meta = serde_json::json!({ "cancelSubagents": cancel_subagents });
-                    if let Some(t) = trigger_str {
-                        meta["cancelTrigger"] = t.into();
-                    }
-                    if rewind_if_no_output {
-                        meta["rewindIfNoOutput"] = true.into();
-                        meta["rewindIfPristine"] = true.into();
-                    }
-                    let req = acp::CancelNotification::new(session_id.clone())
-                        .meta(meta.as_object().cloned());
+                    let meta = rewind_order::cancel_meta(
+                        cancel_subagents,
+                        trigger_str,
+                        rewind_if_no_output.then_some(rewind_prompt_id.as_deref()).flatten(),
+                    );
+                    let req = acp::CancelNotification::new(session_id.clone()).meta(Some(meta));
                     let result = acp_send(req, &tx).await;
                     ulog::info(
                         "cancel.acp_send.done",
@@ -4829,6 +5304,48 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::SwitchModelWithWindow { agent_id, request_id, session_id, model_id, source_model_id, effort, window } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                use xai_grok_shell::sampling::types::{
+                    CONTEXT_WINDOW_META_KEY, REASONING_EFFORT_META_KEY,
+                    context_window_meta_value, reasoning_effort_meta_value,
+                };
+                let mut meta = acp::Meta::new();
+                meta.insert(CONTEXT_WINDOW_META_KEY.to_owned(), context_window_meta_value(window));
+                if let Some(effort) = effort {
+                    meta.insert(REASONING_EFFORT_META_KEY.to_owned(), reasoning_effort_meta_value(effort));
+                }
+                let req = acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(Some(meta));
+                let result = acp_send(req, &tx).await.map(|_| ()).map_err(|error| {
+                    if xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError::from_acp_error(&error).is_some() {
+                        SwitchModelError::Other("This model needs a new session. Switch to it first, then select the context window.".into())
+                    } else {
+                        SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                    }
+                });
+                TaskResult::ModelWindowSwitchComplete { agent_id, request_id, session_id, model_id, source_model_id, effort, window, result }
+            });
+        }
+        Effect::SwitchContextWindow { agent_id, request_id, session_id, model_id, effort, window } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                use xai_grok_shell::sampling::types::{
+                    CONTEXT_WINDOW_META_KEY, REASONING_EFFORT_META_KEY,
+                    context_window_meta_value, reasoning_effort_meta_value,
+                };
+                let mut meta = acp::Meta::new();
+                meta.insert(CONTEXT_WINDOW_META_KEY.to_owned(), context_window_meta_value(window));
+                if let Some(effort) = effort {
+                    meta.insert(REASONING_EFFORT_META_KEY.to_owned(), reasoning_effort_meta_value(effort));
+                }
+                let req = acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(Some(meta));
+                let result = acp_send(req, &tx).await.map(|_| ()).map_err(|error| {
+                    SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                });
+                TaskResult::ContextWindowComplete { agent_id, request_id, session_id, model_id, effort, window, result }
+            });
+        }
         Effect::ProbeClipboardAttachment { ctx, change_count } => {
             tasks
                 .spawn(async move {
@@ -5114,6 +5631,22 @@ pub(crate) fn execute(
                                 error,
                             }
                         }
+                    }
+                });
+        }
+        Effect::PersistFeatureOverride { feature, saved } => {
+            tasks
+                .spawn(async move {
+                    let result = xai_grok_shell::util::config::set_feature_override(
+                            feature,
+                            saved,
+                        )
+                        .await
+                        .map(|()| saved)
+                        .map_err(|e| e.to_string());
+                    TaskResult::FeatureOverridePersisted {
+                        feature,
+                        result,
                     }
                 });
         }
@@ -5614,44 +6147,22 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchSkillsList { agent_id, session_id: _ } => {
+        Effect::FetchSkillsList { agent_id, session_id, refresh, fetch } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "cwd": "."
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/skills/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize skills/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                Vec<
-                                    xai_grok_tools::implementations::skills::types::SkillInfo,
-                                >,
-                            >(inner.get("skills").cloned().unwrap_or_default())
-                                .map_err(|_| "couldn't load skills".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(&format!("couldn't load skills: {e}")),
-                            )
-                        }
-                    };
-                    TaskResult::SkillsListLoaded {
-                        agent_id,
-                        result,
-                    }
-                });
+            tasks.spawn(async move {
+                use xai_grok_shell::extensions::skills::{SKILLS_LIST_METHOD, SkillsListRequest};
+                let params = SkillsListRequest { cwd: ".".to_owned(), session_id: Some(session_id.clone()), refresh };
+                let req = acp::ExtRequest::new(SKILLS_LIST_METHOD,
+                    serde_json::value::to_raw_value(&params).expect("serialize skills/list params").into());
+                let result = match acp_send(req, &tx).await {
+                    Ok(resp) => crate::acp::skills_listing::parse_reply(resp.0.get()).map_err(|error| {
+                        tracing::warn!(%error, "skills list reply did not parse");
+                        "couldn't load skills".to_string()
+                    }),
+                    Err(error) => Err(sanitize_user_error(&format!("couldn't load skills: {error}"))),
+                };
+                TaskResult::SkillsListLoaded { agent_id, session_id, fetch, result }
+            });
         }
         Effect::FetchWorkflowsList { agent_id, session_id } => {
             let tx = acp_tx.clone();
@@ -5695,7 +6206,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::ToggleSkill { agent_id, session_id: _, skill_name, enabled } => {
+        Effect::ToggleSkill { agent_id, session_id, fetch, skill_name, enabled } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -5712,17 +6223,10 @@ pub(crate) fn execute(
                     );
                     let result = match acp_send(req, &tx).await {
                         Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            let parsed = serde_json::from_value::<
-                                Vec<
-                                    xai_grok_tools::implementations::skills::types::SkillInfo,
-                                >,
-                            >(inner.get("skills").cloned().unwrap_or_default())
-                                .map_err(|_| "couldn't toggle skill".to_string());
+                            let parsed = crate::acp::skills_listing::parse_reply(resp.0.get()).map_err(|error| {
+                                tracing::warn!(%error, "skills toggle reply did not parse");
+                                "couldn't toggle skill".to_string()
+                            });
                             if parsed.is_ok() {
                                 let refresh = acp::ExtRequest::new(
                                     "x.ai/skills/refresh-baseline",
@@ -5742,6 +6246,8 @@ pub(crate) fn execute(
                     };
                     TaskResult::SkillsToggleDone {
                         agent_id,
+                        session_id,
+                        fetch,
                         result,
                     }
                 });
@@ -6292,10 +6798,14 @@ pub(crate) fn execute(
             title,
             cwd,
             kind,
+            generation,
+            binding_epoch,
         } => {
             let tx = acp_tx.clone();
+            let mut ticket = title_mutation_ticket(&session_id);
             tasks
                 .spawn(async move {
+                    ticket.wait_turn().await;
                     match session_rename_rpc(
                             &tx,
                             actions::RenameSessionRequest::for_rename(
@@ -6311,12 +6821,16 @@ pub(crate) fn execute(
                             TaskResult::RenameSessionComplete {
                                 agent_id,
                                 title,
+                                generation,
+                                binding_epoch,
                             }
                         }
                         Err(error) => {
                             TaskResult::RenameSessionFailed {
                                 agent_id,
                                 error,
+                                generation,
+                                binding_epoch,
                             }
                         }
                     }
@@ -6329,10 +6843,14 @@ pub(crate) fn execute(
             kind,
             previous_display_name,
             previous_generated_title,
+            generation,
+            binding_epoch,
         } => {
             let tx = acp_tx.clone();
+            let mut ticket = title_mutation_ticket(&session_id);
             tasks
                 .spawn(async move {
+                    ticket.wait_turn().await;
                     match session_rename_rpc(
                             &tx,
                             actions::RenameSessionRequest::for_reset(
@@ -6346,6 +6864,8 @@ pub(crate) fn execute(
                         Ok(()) => {
                             TaskResult::ResetSessionTitleComplete {
                                 agent_id,
+                                generation,
+                                binding_epoch,
                             }
                         }
                         Err(error) => {
@@ -6354,6 +6874,8 @@ pub(crate) fn execute(
                                 error,
                                 previous_display_name,
                                 previous_generated_title,
+                                generation,
+                                binding_epoch,
                             }
                         }
                     }
@@ -6418,12 +6940,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::SetCodingDataSharing {
-            agent_id,
-            opted_in,
-            rollback_to_opted_in,
-            seq,
-        } => {
+        Effect::SetCodingDataSharing { agent_id, opted_in, seq } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -6445,7 +6962,6 @@ pub(crate) fn execute(
                                     return TaskResult::CodingDataSharingFailed {
                                         agent_id,
                                         error: format!("malformed response: {e}"),
-                                        rollback_to_opted_in,
                                         seq,
                                     };
                                 }
@@ -6461,7 +6977,6 @@ pub(crate) fn execute(
                                 return TaskResult::CodingDataSharingFailed {
                                     agent_id,
                                     error: msg,
-                                    rollback_to_opted_in,
                                     seq,
                                 };
                             }
@@ -6480,7 +6995,6 @@ pub(crate) fn execute(
                             TaskResult::CodingDataSharingFailed {
                                 agent_id,
                                 error: format!("{e}"),
-                                rollback_to_opted_in,
                                 seq,
                             }
                         }
@@ -6557,34 +7071,96 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::SendFeedback { agent_id, session_id, feedback_text } => {
+        Effect::SendFeedback {
+            agent_id,
+            session_id,
+            feedback_text,
+            images,
+            metadata,
+            request_trace_upload_token,
+            draft,
+            origin,
+        } => {
             use xai_grok_shell::session::ClientType;
-            use xai_grok_shell::session::acp_types::ClientFeedbackInput;
+            use xai_grok_shell::session::acp_types::{
+                ClientFeedbackInput, FeedbackDraftEditedBody, FeedbackDraftSendRequest,
+            };
             let terminal_info = Some(
                 crate::terminal::terminal_context().feedback_info(),
             );
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
-                    let input = ClientFeedbackInput {
-                        session_id: session_id.0.to_string(),
-                        client_type: ClientType::Tui,
-                        rating_type: None,
-                        rating_value: None,
-                        feedback_text: Some(feedback_text.clone()),
-                        feedback_categories: vec![],
-                        context_type: None,
-                        turn_number: None,
-                        request_id: None,
-                        client_version: Some(xai_grok_version::version().to_string()),
-                        metadata: None,
-                        terminal_info,
+                    let image_count = draft
+                        .as_ref()
+                        .map(|draft| draft.images.len())
+                        .unwrap_or_else(|| images.len());
+                    let images = if draft.is_some() {
+                        Vec::new()
+                    } else {
+                        match tokio::task::spawn_blocking(move || encode_feedback_images(images)).await {
+                            Ok(Ok(images)) => images,
+                            Ok(Err(error)) => return TaskResult::FeedbackFailed {
+                                agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
+                                error,
+                            },
+                            Err(_) => return TaskResult::FeedbackFailed {
+                                agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
+                                error: "Could not prepare feedback attachments.".to_owned(),
+                            },
+                        }
                     };
-                    let raw_params = match serde_json::value::to_raw_value(&input) {
+                    let raw_params = if let Some(draft) = draft {
+                        serde_json::value::to_raw_value(&FeedbackDraftSendRequest {
+                            session_id: session_id.0.to_string(),
+                            draft_id: draft.draft_id,
+                            request_trace_upload_token,
+                            edited_body: FeedbackDraftEditedBody {
+                                input: xai_grok_feedback::FeedbackDraftInput {
+                                    title: draft.title,
+                                    details: draft.details,
+                                    area: draft.area,
+                                    r#type: draft.r#type,
+                                    task_category: draft.task_category,
+                                    failure_mode: draft.failure_mode,
+                                },
+                                images: draft.images,
+                                client_version: Some(xai_grok_version::version().to_string()),
+                                terminal_info,
+                            },
+                        })
+                    } else {
+                        serde_json::value::to_raw_value(&ClientFeedbackInput {
+                            session_id: session_id.0.to_string(),
+                            client_type: ClientType::Tui,
+                            rating_type: None,
+                            rating_value: None,
+                            feedback_text: Some(feedback_text.clone()),
+                            feedback_categories: vec![],
+                            images,
+                            context_type: None,
+                            turn_number: None,
+                            request_id: None,
+                            client_version: Some(xai_grok_version::version().to_string()),
+                            metadata,
+                            terminal_info,
+                            request_trace_upload_token,
+                        })
+                    };
+                    let raw_params = match raw_params {
                         Ok(v) => v,
                         Err(e) => {
                             return TaskResult::FeedbackFailed {
                                 agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
                                 error: sanitize_user_error(
                                     &format!(
                                 "couldn't serialize feedback: {e}"
@@ -6598,19 +7174,392 @@ pub(crate) fn execute(
                         raw_params.into(),
                     );
                     match acp_send(request, &tx).await {
-                        Ok(_) => {
+                        Ok(response) => {
+                            let parsed = serde_json::from_str::<
+                                xai_grok_shell::session::FeedbackResponse,
+                            >(response.0.get());
                             TaskResult::FeedbackComplete {
                                 agent_id,
+                                origin,
+                                outcome: parsed
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|response| response.outcome)
+                                    .unwrap_or(xai_grok_shell::session::FeedbackOutcome::Submitted),
+                                trace_upload_token: parsed
+                                    .ok()
+                                    .and_then(|response| response.trace_upload_token),
                             }
                         }
                         Err(e) => {
                             TaskResult::FeedbackFailed {
                                 agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
                                 error: sanitize_user_error(
                                     &format!("couldn't send feedback: {e}"),
                                 ),
                             }
                         }
+                    }
+                });
+        }
+        Effect::FeedbackDraftRequest {
+            agent_id,
+            session_id,
+            request,
+        } => {
+            let tx = acp_tx.clone();
+            const FEEDBACK_DRAFT_ACP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+            tasks.spawn(async move {
+                match request {
+                    crate::views::feedback_modal::FeedbackDraftRequest::List {
+                        modal_id,
+                        generation,
+                    } => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftListComplete {
+                                    agent_id,
+                                    modal_id,
+                                    generation,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft list: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/list",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map_err(|error| sanitize_user_error(&error.to_string()))
+                                .and_then(|response| {
+                                    #[derive(serde::Deserialize)]
+                                    struct DraftListResponse {
+                                        drafts: Vec<xai_grok_feedback::FeedbackDraft>,
+                                    }
+                                    serde_json::from_str::<DraftListResponse>(response.0.get())
+                                        .map(|response| response.drafts)
+                                        .map_err(|error| sanitize_user_error(&error.to_string()))
+                                }),
+                            Err(_elapsed) => Err("feedback draft list timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftListComplete {
+                            agent_id,
+                            modal_id,
+                            generation,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Load(load) => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                            "draft_id": load.draft_id,
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftLoadComplete {
+                                    agent_id,
+                                    load,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft get: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/get",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map_err(|error| sanitize_user_error(&error.to_string()))
+                                .and_then(|response| {
+                                    #[derive(serde::Deserialize)]
+                                    struct DraftGetResponse {
+                                        draft: xai_grok_feedback::FeedbackDraft,
+                                    }
+                                    serde_json::from_str::<DraftGetResponse>(response.0.get())
+                                        .map(|response| response.draft)
+                                        .map_err(|error| sanitize_user_error(&error.to_string()))
+                                }),
+                            Err(_elapsed) => Err("feedback draft load timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftLoadComplete {
+                            agent_id,
+                            load,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Delete(delete) => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                            "draft_id": delete.draft_id,
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftDeleteComplete {
+                                    agent_id,
+                                    delete,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft delete: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/delete",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map(|_| ())
+                                .map_err(|error| sanitize_user_error(&error.to_string())),
+                            Err(_elapsed) => Err("feedback draft delete timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftDeleteComplete {
+                            agent_id,
+                            delete,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Update(update) => {
+                        let raw_params = match serde_json::value::to_raw_value(
+                            &xai_grok_shell::session::FeedbackDraftUpdateRequest {
+                                session_id: session_id.0.to_string(),
+                                draft_id: update.draft_id.clone(),
+                                input: xai_grok_feedback::FeedbackDraftInput {
+                                    title: update.title.clone(),
+                                    details: update.details.clone(),
+                                    area: update.area.clone(),
+                                    r#type: update.r#type,
+                                    task_category: update.task_category,
+                                    failure_mode: update.failure_mode,
+                                },
+                            },
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftUpdateComplete {
+                                    agent_id,
+                                    update,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft update: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/update",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map(|_| ())
+                                .map_err(|error| sanitize_user_error(&error.to_string())),
+                            Err(_elapsed) => Err("feedback draft update timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftUpdateComplete {
+                            agent_id,
+                            update,
+                            result,
+                        }
+                    }
+                }
+            });
+        }
+        Effect::RehydrateFeedbackImage {
+            agent_id,
+            modal_id,
+            image_identity,
+            path,
+        } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    xai_grok_feedback::read_regular_capped(&path, 16 * 1024 * 1024)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|_| Err("Could not restore a feedback image.".to_owned()));
+                TaskResult::FeedbackImageRehydrated {
+                    agent_id,
+                    modal_id,
+                    image_identity,
+                    result,
+                }
+            });
+        }
+        Effect::FetchMemoryList { agent_id, session_id } => {
+            use xai_grok_shell::extensions::memory::{
+                MEMORY_LIST_METHOD, MemoryListRequest, MemoryListing,
+            };
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let req_body = MemoryListRequest {
+                        session_id: session_id.0.to_string(),
+                    };
+                    let req = acp::ExtRequest::new(
+                        MEMORY_LIST_METHOD,
+                        serde_json::value::to_raw_value(&req_body)
+                            .expect("serialize memory/list params")
+                            .into(),
+                    );
+                    let result = match acp_send(req, &tx).await {
+                        Ok(resp) => {
+                            serde_json::from_str::<MemoryListing>(resp.0.get())
+                                .map_err(|_| "Couldn't read the shell's reply.".to_string())
+                        }
+                        Err(e) => {
+                            Err(
+                                sanitize_user_error(&format!(
+                        "Couldn't load memory: {e}"
+                    )),
+                            )
+                        }
+                    };
+                    TaskResult::MemoryListLoaded {
+                        agent_id,
+                        result,
+                    }
+                });
+        }
+        Effect::MemoryToggle { agent_id, session_id, enabled } => {
+            use xai_grok_shell::extensions::memory::{
+                MEMORY_TOGGLE_METHOD, MemoryToggleRequest, MemoryToggleResponse,
+            };
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let req_body = MemoryToggleRequest {
+                        session_id: session_id.0.to_string(),
+                        enabled,
+                    };
+                    let req = acp::ExtRequest::new(
+                        MEMORY_TOGGLE_METHOD,
+                        serde_json::value::to_raw_value(&req_body)
+                            .expect("serialize memory/toggle params")
+                            .into(),
+                    );
+                    let result = match acp_send(req, &tx).await {
+                        Ok(resp) => {
+                            serde_json::from_str::<MemoryToggleResponse>(resp.0.get())
+                                .map_err(|_| "Couldn't read the shell's reply.".to_string())
+                        }
+                        Err(e) => {
+                            Err(
+                                sanitize_user_error(
+                                    &format!(
+                        "Couldn't change memory state: {e}"
+                    ),
+                                ),
+                            )
+                        }
+                    };
+                    TaskResult::MemoryToggleResult {
+                        agent_id,
+                        result,
+                    }
+                });
+        }
+        Effect::MemoryFlush { agent_id, session_id } => {
+            use xai_grok_shell::extensions::memory::{
+                MEMORY_FLUSH_METHOD, MemoryFlushResponse,
+            };
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let result = memory_command_request::<
+                        MemoryFlushResponse,
+                    >(MEMORY_FLUSH_METHOD, &session_id, &tx)
+                        .await;
+                    TaskResult::MemoryFlushComplete {
+                        agent_id,
+                        result,
+                    }
+                });
+        }
+        Effect::MemoryDream { agent_id, session_id } => {
+            use xai_grok_shell::extensions::memory::{
+                MEMORY_DREAM_METHOD, MemoryDreamResponse,
+            };
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let result = memory_command_request::<
+                        MemoryDreamResponse,
+                    >(MEMORY_DREAM_METHOD, &session_id, &tx)
+                        .await;
+                    TaskResult::MemoryDreamComplete {
+                        agent_id,
+                        result,
+                    }
+                });
+        }
+        Effect::MemoryForget { agent_id, session_id, path, expected_content_hash } => {
+            use xai_grok_shell::extensions::memory::{
+                MEMORY_FORGET_METHOD, MemoryForgetRequest, MemoryForgetResponse,
+            };
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let req_body = MemoryForgetRequest {
+                        session_id: session_id.0.to_string(),
+                        path: path.clone(),
+                        expected_content_hash,
+                    };
+                    let req = acp::ExtRequest::new(
+                        MEMORY_FORGET_METHOD,
+                        serde_json::value::to_raw_value(&req_body)
+                            .expect("serialize memory/forget params")
+                            .into(),
+                    );
+                    let result = match acp_send(req, &tx).await {
+                        Ok(resp) => {
+                            serde_json::from_str::<MemoryForgetResponse>(resp.0.get())
+                                .map_err(|_| "Couldn't read the shell's reply.".to_string())
+                        }
+                        Err(e) => {
+                            Err(
+                                sanitize_user_error(
+                                    &format!(
+                        "Couldn't delete the note: {e}"
+                    ),
+                                ),
+                            )
+                        }
+                    };
+                    TaskResult::MemoryForgetResult {
+                        agent_id,
+                        path,
+                        result,
                     }
                 });
         }
@@ -6624,14 +7573,17 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
+                    use xai_grok_shell::extensions::memory::{
+                        MEMORY_REWRITE_METHOD, MemoryRewriteRequest,
+                    };
                     let request = acp::ExtRequest::new(
-                        "x.ai/memory/rewrite",
+                        MEMORY_REWRITE_METHOD,
                         serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "sessionId": session_id.0.to_string(),
-                        "rawText": raw_text,
-                        "contextSummary": context_summary,
-                    }),
+                                &MemoryRewriteRequest {
+                                    session_id: session_id.0.to_string(),
+                                    raw_text: raw_text.clone(),
+                                    context_summary,
+                                },
                             )
                             .expect("serialize memory/rewrite params")
                             .into(),
@@ -6719,6 +7671,7 @@ pub(crate) fn execute(
                                 agent_id,
                                 result: Ok(answer),
                                 minimal_request_id,
+                                skipped_image_numbers: Vec::new(),
                             }
                         }
                         Err(e) => {
@@ -6728,6 +7681,7 @@ pub(crate) fn execute(
                                     sanitize_user_error(&format!("side question failed: {e}")),
                                 ),
                                 minimal_request_id,
+                                skipped_image_numbers: Vec::new(),
                             }
                         }
                     }
@@ -6773,39 +7727,13 @@ pub(crate) fn execute(
             interjection_id,
             blocks,
         } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = build_interject_params(
-                        &session_id,
-                        &text,
-                        &interjection_id,
-                        blocks.as_deref(),
-                    );
-                    let request = acp::ExtRequest::new(
-                        "x.ai/interject",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize interject params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(_) => {
-                            TaskResult::InterjectQueued {
-                                agent_id,
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::InterjectFailed {
-                                agent_id,
-                                error: sanitize_user_error(
-                                    &format!("couldn't send interjection: {e}"),
-                                ),
-                                text,
-                                blocks,
-                            }
-                        }
-                    }
-                });
+            spawn_ordered_interjects(
+                tasks,
+                acp_tx,
+                agent_id,
+                session_id,
+                vec![(text, interjection_id, blocks)],
+            );
         }
         Effect::SendWorkingDirectoryMutation {
             agent_id,
@@ -7031,62 +7959,11 @@ pub(crate) fn execute(
         }
         Effect::FetchRewindPoints { agent_id, session_id } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/rewind/points",
-                        serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "sessionId": session_id.0.to_string()
-                    }),
-                            )
-                            .expect("serialize rewind/points params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            if let Some(err) = wrapper
-                                .get("error")
-                                .filter(|v| !v.is_null())
-                            {
-                                return TaskResult::RewindPointsFailed {
-                                    agent_id,
-                                    error: err.as_str().unwrap_or("unknown error").to_string(),
-                                };
-                            }
-                            let result_val = wrapper
-                                .get("result")
-                                .cloned()
-                                .unwrap_or(wrapper.clone());
-                            match serde_json::from_value::<
-                                crate::views::rewind::RewindPointsResponse,
-                            >(result_val) {
-                                Ok(r) => {
-                                    TaskResult::RewindPointsLoaded {
-                                        agent_id,
-                                        points: r.rewind_points,
-                                    }
-                                }
-                                Err(e) => {
-                                    TaskResult::RewindPointsFailed {
-                                        agent_id,
-                                        error: format!("invalid response: {e}"),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::RewindPointsFailed {
-                                agent_id,
-                                error: sanitize_user_error(&e.to_string()),
-                            }
-                        }
-                    }
-                });
+            tasks.spawn(async move { rewind_order::fetch(&tx, agent_id, session_id).await });
+        }
+        Effect::CancelTurnThenFetchRewindPoints { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { rewind_order::cancel_then_fetch(&tx, agent_id, session_id).await });
         }
         Effect::RewindExecute { agent_id, session_id, target_prompt_index } => {
             let tx = acp_tx.clone();
@@ -7139,7 +8016,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::DeepSearchSessions { query, seq } => {
+        Effect::DeepSearchSessions { host, generation, query, seq, headless_policy } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -7152,6 +8029,7 @@ pub(crate) fn execute(
                         "query": query,
                         "limit": 20,
                         "includeContent": true,
+                        "headless": headless_policy.as_wire_str(),
                     });
                         let request = acp::ExtRequest::new(
                             "x.ai/session/search",
@@ -7204,6 +8082,8 @@ pub(crate) fn execute(
                         tokio::time::sleep(retry_interval).await;
                     }
                     TaskResult::DeepSearchResults {
+                        host,
+                        generation,
                         results,
                         seq,
                     }
@@ -7876,6 +8756,77 @@ pub(crate) fn rewind_execute_params(
         "mode": REWIND_MODE_WIRE,
     })
 }
+/// Send interjections oldest-first in one task so ACP order matches the effect vector.
+pub(crate) fn spawn_ordered_interjects(
+    tasks: &mut JoinSet<TaskResult>,
+    acp_tx: &AcpAgentTx,
+    agent_id: crate::app::agent::AgentId,
+    session_id: acp::SessionId,
+    items: Vec<(String, String, Option<Vec<acp::ContentBlock>>)>,
+) {
+    let tx = acp_tx.clone();
+    tasks
+        .spawn(async move {
+            let mut pending: std::collections::VecDeque<_> = items.into();
+            while let Some((text, interjection_id, blocks)) = pending.pop_front() {
+                let params = build_interject_params(
+                    &session_id,
+                    &text,
+                    &interjection_id,
+                    blocks.as_deref(),
+                );
+                let request = acp::ExtRequest::new(
+                    "x.ai/interject",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize interject params")
+                        .into(),
+                );
+                if let Err(e) = acp_send(request, &tx).await {
+                    let mut leftover = vec![(text, interjection_id, blocks)];
+                    leftover.extend(pending);
+                    return TaskResult::InterjectFailed {
+                        agent_id,
+                        error: sanitize_user_error(
+                            &format!("couldn't send interjection: {e}"),
+                        ),
+                        remaining: leftover,
+                    };
+                }
+            }
+            TaskResult::InterjectQueued {
+                agent_id,
+            }
+        });
+}
+/// Consume a leading `SendInterject` plus consecutive same-session ones; spawn them in order.
+/// Returns `Some(effect)` when `first` was not an interject.
+pub(crate) fn take_coalesced_interjects(
+    first: Effect,
+    rest: &mut std::iter::Peekable<impl Iterator<Item = Effect>>,
+    tasks: &mut JoinSet<TaskResult>,
+    acp_tx: &AcpAgentTx,
+) -> Option<Effect> {
+    let Effect::SendInterject { agent_id, session_id, text, interjection_id, blocks } = first
+    else {
+        return Some(first);
+    };
+    let mut items = vec![(text, interjection_id, blocks)];
+    while let Some(
+        Effect::SendInterject { agent_id: next_agent, session_id: next_session, .. },
+    ) = rest.peek()
+    {
+        if *next_agent != agent_id || *next_session != session_id {
+            break;
+        }
+        let Some(Effect::SendInterject { text, interjection_id, blocks, .. }) = rest
+            .next() else {
+            break;
+        };
+        items.push((text, interjection_id, blocks));
+    }
+    spawn_ordered_interjects(tasks, acp_tx, agent_id, session_id, items);
+    None
+}
 /// Build the `x.ai/interject` params. The optional structured `content`
 /// (text + images) is omitted ENTIRELY when `None` so the legacy wire
 /// shape stays byte-identical. Extracted from the spawn for testability.
@@ -7899,6 +8850,26 @@ fn build_interject_params(
 #[cfg(test)]
 mod kimi_serialization_invariant_tests {
     use super::{KimiMutationQueue, kimi_key_apply_owned_at_lock};
+
+    #[tokio::test]
+    async fn title_mutation_tickets_order_per_session_without_blocking_others() {
+        let sid = agent_client_protocol::SessionId::new("title-ordered-test");
+        let other = agent_client_protocol::SessionId::new("title-other-test");
+        let mut first = super::title_mutation_ticket(&sid);
+        let mut second = super::title_mutation_ticket(&sid);
+        let mut independent = super::title_mutation_ticket(&other);
+        first.wait_turn().await;
+        independent.wait_turn().await;
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            second.wait_turn().await;
+            let _ = started_tx.send(());
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut started_rx).await.is_err());
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx).await.unwrap().unwrap();
+        task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn fifo_ticket_preserves_enqueue_order_when_successor_runs_first() {
@@ -8037,3 +9008,28 @@ mod kimi_serialization_invariant_tests {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod active_registry_warning_tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_registry_registration_creates_visible_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("active_sessions.json"), b"bad registry").unwrap();
+        let registration = xai_grok_shell::active_sessions::register_reporting_in(
+            root.path(),
+            xai_grok_shell::active_sessions::ActiveSession {
+                session_id: "warning-test".into(),
+                pid: std::process::id(),
+                cwd: "/tmp".into(),
+                opened_at: chrono::Utc::now(),
+            },
+        );
+        let warning = active_session_registration_warning(registration).unwrap();
+        assert!(warning.contains("corrupted"));
+        assert!(warning.contains("active_sessions.json.corrupt"));
+        assert_eq!(std::fs::read(root.path().join("active_sessions.json.corrupt")).unwrap(), b"bad registry");
+        assert!(active_session_registration_warning(Ok(None)).is_none());
+    }
+}

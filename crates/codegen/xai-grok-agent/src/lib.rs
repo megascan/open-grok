@@ -16,6 +16,7 @@ pub mod prompt;
 pub mod repo;
 pub mod system_reminder;
 pub mod timing;
+pub mod tool_list;
 
 pub use agent::Agent;
 pub use builder::AgentBuilder;
@@ -25,5 +26,5 @@ pub use config::preset_names;
 pub use config::toolset_for_preset;
 pub use config::workspace_grok_build_toolset;
 pub use error::AgentBuildError;
-pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
+pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext, RenderedPrompt};
 pub use system_reminder::ReminderPolicy;

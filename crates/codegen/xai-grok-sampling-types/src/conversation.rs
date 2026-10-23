@@ -89,9 +89,11 @@ pub enum SyntheticReason {
     CompactionMeta,
     /// Runtime-injected `<system-reminder>` message. Not real user input.
     SystemReminder,
-    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at
-    /// session spawn. Invariant: once placed, never replaced (would bust the
-    /// KV-cache prefix).
+    /// Continue reminder after a salvaged Length truncation.
+    /// Distinct from [`Self::SystemReminder`] so report assembly joins segments around exactly this reminder and no other.
+    LengthContinue,
+    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at session spawn.
+    /// Invariant: once placed, never replaced (replacing it would bust the KV-cache prefix).
     ProjectInstructions,
     /// Injected by the auto-continue logic after compaction so the agent
     /// keeps working.  Not real user input.
@@ -162,6 +164,7 @@ impl SyntheticReason {
             | Self::AgentMessage => true,
             Self::CompactionMeta
             | Self::SystemReminder
+            | Self::LengthContinue
             | Self::ProjectInstructions
             | Self::AutoContinue
             | Self::AutoRecovery
@@ -1062,6 +1065,76 @@ impl From<ToolDefinition> for ToolSpec {
 // Conversation Request
 // ============================================================================
 
+/// What the sampler does with a completed response whose stop reason is `Length` (max_tokens truncation).
+///
+/// `Length` can arrive far below any client budget (e.g. an engine-side window clamp after a runaway generation).
+/// Callers that can use partial text opt into `CompletePartial`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LengthPolicy {
+    /// Fail the attempt with `MaxTokensTruncation` (legacy behavior).
+    Fail,
+    /// Complete a response whose tool calls all carry complete arguments; text-only and empty `Length` still fail.
+    /// `Length` is usually context exhaustion (the output budget is the window minus the prompt), so retrying cannot succeed.
+    /// Executing the calls advances the turn toward compaction.
+    /// The default: a caller that does not choose gets its tool calls run and its text-only truncation failed.
+    #[default]
+    CompleteToolCalls,
+    /// Additionally complete with partial text; empty `Length` still fails.
+    CompletePartial,
+}
+
+/// Outcome of applying a [`LengthPolicy`] to a completed response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthVerdict {
+    /// The stop reason is not `Length`; the policy does not apply.
+    Pass,
+    /// A `Length` stop delivered with its partial text content.
+    Salvage,
+    /// A `Length` stop delivered with its completed tool calls.
+    SalvageToolCalls,
+    /// A `Length` stop the policy rejects (`MaxTokensTruncation`).
+    Fail,
+}
+
+impl LengthPolicy {
+    /// The fail-vs-salvage decision for a completed response, including the `Length` stop-reason check.
+    /// Pure; the sampler's `apply_length_policy` wraps it with the error mapping and salvage breadcrumb.
+    /// That keeps the actor path (`drive_l2`) and the direct-collect path from diverging.
+    ///
+    /// Tool calls salvage under every policy except `Fail`, but only with complete arguments.
+    /// The xAI server never emits a completed `tool_calls` entry for a truncated call.
+    /// The JSON check guards providers that close a block they cut mid-arguments.
+    /// Empty Length fails regardless of policy (the outcome is deterministic under a fixed cap; the Empty resample family would retry endlessly).
+    /// All transports retain Length on truncated tool-bearing responses so this gate runs before dispatch.
+    pub fn verdict(self, response: &ConversationResponse) -> LengthVerdict {
+        if response.stop_reason != Some(StopReason::Length) {
+            return LengthVerdict::Pass;
+        }
+        let tool_calls = response.tool_calls();
+        if !tool_calls.is_empty() {
+            let all_arguments_complete = tool_calls.iter().all(|call| {
+                call.is_custom()
+                    || call.arguments.trim().is_empty()
+                    || serde_json::from_str::<serde::de::IgnoredAny>(&call.arguments).is_ok()
+            });
+            return match (self, all_arguments_complete) {
+                (LengthPolicy::Fail, _)
+                | (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, false) => {
+                    LengthVerdict::Fail
+                }
+                (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, true) => {
+                    LengthVerdict::SalvageToolCalls
+                }
+            };
+        }
+        if self == LengthPolicy::CompletePartial && response.empty_reason().is_none() {
+            LengthVerdict::Salvage
+        } else {
+            LengthVerdict::Fail
+        }
+    }
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -1087,6 +1160,8 @@ pub struct ConversationRequest {
     pub x_grok_req_id: Option<String>,
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    /// Turn-level resubmit attempt (absent on first submissions); sent as `x-grok-transient-retry` so the proxy can count retry traffic.
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -1108,6 +1183,8 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// What the sampler does when the response stops with `Length`.
+    pub length_policy: LengthPolicy,
 }
 
 /// Location of a custom-output image whose requested detail is `original`.
@@ -1695,11 +1772,16 @@ impl ConversationRequest {
                     (Some(crate::ResponsesDialect::Xai), BackendToolKind::XSearch(call)) => {
                         Some(x_search_call_wire_value(call))
                     }
-                    // DeepSeek Responses has no opaque provider-native history
-                    // carriers today; keep the match explicit so new dialects
+                    // DeepSeek, Meta, and user-supplied vanilla Responses
+                    // endpoints have no opaque provider-native history
+                    // carriers; keep the match explicit so new dialects
                     // fail closed until their replay contract is defined.
                     (
-                        Some(crate::ResponsesDialect::DeepSeek | crate::ResponsesDialect::Meta),
+                        Some(
+                            crate::ResponsesDialect::DeepSeek
+                            | crate::ResponsesDialect::Meta
+                            | crate::ResponsesDialect::OpenAi,
+                        ),
                         _,
                     ) => None,
                     _ => None,
@@ -2395,6 +2477,14 @@ impl ConversationItem {
             prior_turn_interrupt: None,
             prompt_index: None,
         })
+    }
+
+    pub fn length_continue_reminder(content: impl Into<String>) -> Self {
+        let mut item = Self::user(content);
+        if let Self::User(user) = &mut item {
+            user.synthetic_reason = Some(SyntheticReason::LengthContinue);
+        }
+        item
     }
 
     /// Create a user message with multiple content parts.
@@ -3958,6 +4048,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
             x_grok_turn_idx: req.x_grok_turn_idx,
+            x_grok_transient_retry: req.x_grok_transient_retry,
             x_grok_agent_id: req.x_grok_agent_id,
             x_grok_deployment_id: req.x_grok_deployment_id,
             x_grok_user_id: req.x_grok_user_id,
@@ -4869,6 +4960,17 @@ pub fn repair_dangling_tool_calls(
     conversation: &mut Vec<ConversationItem>,
     reason: DanglingToolCallReason,
 ) -> usize {
+    repair_dangling_tool_calls_with(conversation, |_, name| {
+        synthetic_dangling_result_text(name, reason)
+    })
+}
+
+/// `resolve(tool_call_id, tool_name)` is only asked for tool calls that still
+/// have no result; answered calls keep their existing result.
+pub fn repair_dangling_tool_calls_with(
+    conversation: &mut Vec<ConversationItem>,
+    mut resolve: impl FnMut(&str, &str) -> String,
+) -> usize {
     // Phase 1: forward scan to find every assistant with unanswered tool calls.
     // We record (insert_position, synthetic_items) for each repair site.
     let mut repairs: Vec<(usize, Vec<ConversationItem>)> = Vec::new();
@@ -4909,7 +5011,7 @@ pub fn repair_dangling_tool_calls(
                 .iter()
                 .filter(|(_, _, _, call_id)| !answered.contains(call_id))
                 .map(|(id, name, is_custom, call_id)| {
-                    let text = synthetic_dangling_result_text(name, reason);
+                    let text = resolve(id.as_ref(), name);
                     if *is_custom {
                         ConversationItem::custom_tool_output(
                             CustomToolOutputItem::text(call_id, text).with_name(name),
@@ -4977,7 +5079,7 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
     false
 }
 
-fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
+pub fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
     // Exhaustive match — no `_ =>` guard — so adding a new variant is a
     // compile-time error at every call site that renders these messages.
     match reason {
@@ -5550,9 +5652,535 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
     }
 }
 
+pub fn build_google_ai_studio_request(
+    req: &ConversationRequest,
+) -> crate::google_ai_studio::GenerateContentRequest {
+    use crate::google_ai_studio::{
+        Blob, Content, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration,
+        GenerateContentRequest, GenerationConfig, Part, ThinkingConfig, Tool, ToolConfig,
+    };
+    use std::collections::HashMap;
+
+    let mut system_parts: Vec<Part> = Vec::new();
+    let mut contents: Vec<Content> = Vec::new();
+    let mut tool_call_names: HashMap<String, String> = HashMap::new();
+
+    let content_parts_to_ai_studio_parts = |parts: &[ContentPart]| -> Vec<Part> {
+        parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Part::text(text.as_ref().to_owned()),
+                ContentPart::Image { url } => {
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some((header, data)) = rest.split_once(',') {
+                            let mime_type = header
+                                .strip_suffix(";base64")
+                                .unwrap_or("image/png")
+                                .to_string();
+                            Part {
+                                inline_data: Some(Blob {
+                                    mime_type,
+                                    data: data.to_string(),
+                                }),
+                                ..Default::default()
+                            }
+                        } else {
+                            Part::text(format!("[invalid image: {url}]"))
+                        }
+                    } else {
+                        Part::text(format!("[image: {url}]"))
+                    }
+                }
+            })
+            .collect()
+    };
+
+    let mut pending_user_parts: Vec<Part> = Vec::new();
+
+    let flush_user_parts = |pending: &mut Vec<Part>, contents: &mut Vec<Content>| {
+        if !pending.is_empty() {
+            contents.push(Content::user(std::mem::take(pending)));
+        }
+    };
+
+    for item in &req.items {
+        match item {
+            ConversationItem::System(s) => {
+                system_parts.push(Part::text(s.content.as_ref().to_owned()));
+            }
+            ConversationItem::User(u) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let parts = content_parts_to_ai_studio_parts(&u.content);
+                contents.push(Content::user(parts));
+            }
+            ConversationItem::Assistant(a) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let mut parts = Vec::new();
+                if !a.content.is_empty() {
+                    parts.push(Part::text(a.content.as_ref().to_owned()));
+                }
+                for tc in &a.tool_calls {
+                    tool_call_names.insert(tc.id.to_string(), tc.name.clone());
+                    let args = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    parts.push(Part {
+                        function_call: Some(crate::google_ai_studio::FunctionCall {
+                            name: tc.name.clone(),
+                            args,
+                            id: Some(tc.id.to_string()),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                if !parts.is_empty() {
+                    contents.push(Content::model(parts));
+                }
+            }
+            ConversationItem::ToolResult(t) => {
+                let name = tool_call_names
+                    .get(&t.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| t.tool_call_id.clone());
+                let response = match serde_json::from_str::<serde_json::Value>(&t.content) {
+                    Ok(val @ serde_json::Value::Object(_)) => val,
+                    _ => serde_json::json!({ "output": t.content.as_ref() }),
+                };
+                pending_user_parts.push(Part {
+                    function_response: Some(crate::google_ai_studio::FunctionResponse {
+                        name,
+                        response,
+                        id: Some(t.tool_call_id.clone()),
+                    }),
+                    ..Default::default()
+                });
+                for img in &t.images {
+                    if let ContentPart::Image { url } = img {
+                        if let Some(rest) = url.strip_prefix("data:") {
+                            if let Some((header, data)) = rest.split_once(',') {
+                                let mime_type = header
+                                    .strip_suffix(";base64")
+                                    .unwrap_or("image/png")
+                                    .to_string();
+                                pending_user_parts.push(Part {
+                                    inline_data: Some(Blob {
+                                        mime_type,
+                                        data: data.to_string(),
+                                    }),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                let name = output.name.clone().unwrap_or_else(|| {
+                    tool_call_names
+                        .get(&output.call_id)
+                        .cloned()
+                        .unwrap_or_else(|| output.call_id.clone())
+                });
+                let response = serde_json::json!({ "output": output.text_content() });
+                pending_user_parts.push(Part {
+                    function_response: Some(crate::google_ai_studio::FunctionResponse {
+                        name,
+                        response,
+                        id: Some(output.call_id.clone()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            ConversationItem::BackendToolCall(b) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                contents.push(Content::model(vec![Part::text(b.text_summary())]));
+            }
+            ConversationItem::Reasoning(r) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let text = reasoning_item_text(r);
+                if !text.is_empty() {
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part {
+                            thought: Some(true),
+                            text: Some(text),
+                            ..Default::default()
+                        }],
+                    });
+                }
+            }
+        }
+    }
+
+    flush_user_parts(&mut pending_user_parts, &mut contents);
+
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(Content {
+            role: None,
+            parts: system_parts,
+        })
+    };
+
+    let tools = if req.tools.is_empty() {
+        None
+    } else {
+        Some(vec![Tool {
+            function_declarations: Some(
+                req.tools
+                    .iter()
+                    .map(|t| FunctionDeclaration {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: Some(t.parameters.clone()),
+                    })
+                    .collect(),
+            ),
+        }])
+    };
+
+    let tool_config = req.tool_choice.as_ref().map(|tc| ToolConfig {
+        function_calling_config: Some(match tc {
+            ConversationToolChoice::Auto => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Auto),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Required => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Any),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Function(name) => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Any),
+                allowed_function_names: Some(vec![name.clone()]),
+            },
+            ConversationToolChoice::None => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::None),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Custom(_) => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Auto),
+                allowed_function_names: None,
+            },
+        }),
+    });
+
+    let thinking_config = req.reasoning_effort.map(|effort| {
+        let budget = match effort {
+            crate::ReasoningEffort::None => Some(0),
+            crate::ReasoningEffort::Minimal => Some(1024),
+            crate::ReasoningEffort::Low => Some(2048),
+            crate::ReasoningEffort::Medium => Some(8192),
+            crate::ReasoningEffort::High
+            | crate::ReasoningEffort::Xhigh
+            | crate::ReasoningEffort::Max
+            | crate::ReasoningEffort::Ultra => Some(16384),
+        };
+        ThinkingConfig {
+            thinking_budget: budget,
+            include_thoughts: Some(true),
+        }
+    });
+
+    let generation_config = if req.temperature.is_some()
+        || req.top_p.is_some()
+        || req.max_output_tokens.is_some()
+        || thinking_config.is_some()
+    {
+        Some(GenerationConfig {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_output_tokens: req.max_output_tokens,
+            thinking_config,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    GenerateContentRequest {
+        contents,
+        system_instruction,
+        tools,
+        tool_config,
+        generation_config,
+        safety_settings: None,
+    }
+}
+
+impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationItem {
+    fn from(resp: crate::google_ai_studio::GenerateContentResponse) -> Self {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(candidate) = resp.candidates.into_iter().next() {
+            if let Some(c) = candidate.content {
+                for part in c.parts {
+                    if part.thought == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part.text {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&text);
+                    }
+                    if let Some(fc) = part.function_call {
+                        let id = fc
+                            .id
+                            .unwrap_or_else(|| format!("call_{}_{}", tool_calls.len(), fc.name));
+                        tool_calls.push(ToolCall {
+                            id: Arc::<str>::from(id),
+                            name: fc.name,
+                            arguments: Arc::<str>::from(fc.args.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        ConversationItem::Assistant(AssistantItem {
+            content: Arc::<str>::from(content),
+            tool_calls,
+            model_id: resp.model_version,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        })
+    }
+}
+
+impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationResponse {
+    fn from(resp: crate::google_ai_studio::GenerateContentResponse) -> Self {
+        use crate::google_ai_studio::FinishReason;
+
+        let model = resp.model_version.clone().unwrap_or_default();
+        let usage = resp.usage_metadata.as_ref().map(|u| TokenUsage {
+            prompt_tokens: u.prompt_token_count.unwrap_or(0),
+            completion_tokens: u.candidates_token_count.unwrap_or(0),
+            total_tokens: u.total_token_count.unwrap_or(0),
+            reasoning_tokens: 0,
+            cached_prompt_tokens: u.cached_content_token_count.unwrap_or(0),
+            cache_creation_prompt_tokens: 0,
+        });
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut stop_reason = StopReason::Stop;
+
+        if let Some(candidate) = resp.candidates.into_iter().next() {
+            if let Some(finish_reason) = candidate.finish_reason {
+                stop_reason = match finish_reason {
+                    FinishReason::Stop => StopReason::Stop,
+                    FinishReason::MaxTokens => StopReason::Length,
+                    FinishReason::Safety
+                    | FinishReason::Blocklist
+                    | FinishReason::ProhibitedContent
+                    | FinishReason::Spii
+                    | FinishReason::ImageSafety => StopReason::ContentFilter,
+                    _ => StopReason::Stop,
+                };
+            }
+            if let Some(c) = candidate.content {
+                for part in c.parts {
+                    if part.thought == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part.text {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&text);
+                    }
+                    if let Some(fc) = part.function_call {
+                        let id = fc
+                            .id
+                            .unwrap_or_else(|| format!("call_{}_{}", tool_calls.len(), fc.name));
+                        tool_calls.push(ToolCall {
+                            id: Arc::<str>::from(id),
+                            name: fc.name,
+                            arguments: Arc::<str>::from(fc.args.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        let items = vec![ConversationItem::Assistant(AssistantItem {
+            content: Arc::<str>::from(content),
+            tool_calls,
+            model_id: Some(model),
+            model_fingerprint: None,
+            reasoning_effort: None,
+        })];
+
+        ConversationResponse {
+            items,
+            usage,
+            stop_reason: Some(stop_reason),
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: Vec::new(),
+            stop_message: None,
+            message_id: None,
+            raw_stop_reason: None,
+            stop_sequence: None,
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod google_ai_studio_tests {
+    use super::*;
+    use crate::google_ai_studio::{
+        Candidate, Content, FinishReason, FunctionCallingMode, GenerateContentResponse, Part,
+        UsageMetadata,
+    };
+    use crate::{
+        ConversationRequest, ConversationToolChoice, ReasoningEffort, StopReason, ToolSpec,
+    };
+
+    #[test]
+    fn build_request_maps_system_user_assistant_and_tools() {
+        let request = ConversationRequest {
+            items: vec![
+                ConversationItem::system("You are a helpful assistant."),
+                ConversationItem::user("Hello!"),
+                ConversationItem::Assistant(AssistantItem {
+                    content: Arc::<str>::from("Calling a tool"),
+                    tool_calls: vec![ToolCall {
+                        id: Arc::<str>::from("call_1"),
+                        name: "bash".to_string(),
+                        arguments: Arc::<str>::from(r#"{"cmd":"echo hi"}"#),
+                    }],
+                    model_id: None,
+                    model_fingerprint: None,
+                    reasoning_effort: None,
+                }),
+                ConversationItem::tool_result("call_1", r#"{"stdout":"hi"}"#),
+            ],
+            tools: vec![ToolSpec {
+                name: "bash".to_string(),
+                description: Some("Execute a bash command".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" }
+                    }
+                }),
+            }],
+            tool_choice: Some(ConversationToolChoice::Auto),
+            reasoning_effort: Some(ReasoningEffort::High),
+            temperature: Some(0.7),
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        let mapped = build_google_ai_studio_request(&request);
+
+        // System instruction
+        assert_eq!(
+            mapped.system_instruction,
+            Some(Content {
+                role: None,
+                parts: vec![Part::text("You are a helpful assistant.")],
+            })
+        );
+
+        // Contents
+        assert_eq!(mapped.contents.len(), 3);
+        assert_eq!(mapped.contents[0].role, Some("user".to_string()));
+        assert_eq!(mapped.contents[0].parts, vec![Part::text("Hello!")]);
+
+        assert_eq!(mapped.contents[1].role, Some("model".to_string()));
+        assert_eq!(mapped.contents[1].parts.len(), 2);
+        assert_eq!(mapped.contents[1].parts[0], Part::text("Calling a tool"));
+        assert_eq!(
+            mapped.contents[1].parts[1]
+                .function_call
+                .as_ref()
+                .unwrap()
+                .name,
+            "bash"
+        );
+
+        assert_eq!(mapped.contents[2].role, Some("user".to_string()));
+        assert_eq!(mapped.contents[2].parts.len(), 1);
+        let fn_resp = mapped.contents[2].parts[0]
+            .function_response
+            .as_ref()
+            .unwrap();
+        assert_eq!(fn_resp.name, "bash");
+        assert_eq!(fn_resp.response, serde_json::json!({ "stdout": "hi" }));
+
+        // Tools
+        let tools = mapped.tools.expect("tools present");
+        assert_eq!(tools.len(), 1);
+        let decls = tools[0].function_declarations.as_ref().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "bash");
+
+        // Tool config
+        let tool_config = mapped.tool_config.expect("tool_config present");
+        assert_eq!(
+            tool_config.function_calling_config.unwrap().mode,
+            Some(FunctionCallingMode::Auto)
+        );
+
+        // Generation config
+        let gen_config = mapped.generation_config.expect("gen_config present");
+        assert_eq!(gen_config.temperature, Some(0.7));
+        assert_eq!(gen_config.max_output_tokens, Some(4096));
+        let thinking = gen_config.thinking_config.expect("thinking present");
+        assert_eq!(thinking.thinking_budget, Some(16384));
+        assert_eq!(thinking.include_thoughts, Some(true));
+    }
+
+    #[test]
+    fn response_converts_to_conversation_response() {
+        let wire = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![
+                        Part {
+                            thought: Some(true),
+                            text: Some("Internal thought...".to_string()),
+                            ..Default::default()
+                        },
+                        Part::text("Final answer."),
+                        Part::function_call("read_file", serde_json::json!({ "path": "file.txt" })),
+                    ],
+                }),
+                finish_reason: Some(FinishReason::Stop),
+                finish_message: None,
+                index: Some(0),
+            }],
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(15),
+                candidates_token_count: Some(25),
+                total_token_count: Some(40),
+                cached_content_token_count: Some(5),
+            }),
+            model_version: Some("gemini-2.5-flash".to_string()),
+        };
+
+        let resp = ConversationResponse::from(wire);
+        assert_eq!(resp.items.len(), 1);
+        let assistant = resp.assistant().expect("assistant item");
+        assert_eq!(assistant.content.as_ref(), "Final answer.");
+        assert_eq!(assistant.tool_calls.len(), 1);
+        assert_eq!(assistant.tool_calls[0].name, "read_file");
+        assert_eq!(resp.stop_reason, Some(StopReason::Stop));
+
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 15);
+        assert_eq!(usage.completion_tokens, 25);
+        assert_eq!(usage.total_tokens, 40);
+        assert_eq!(usage.cached_prompt_tokens, 5);
+    }
+}
 
 #[cfg(test)]
 mod compaction_item_bridge_tests {
@@ -5792,6 +6420,7 @@ mod tests {
             crate::ApiBackend::ChatCompletions,
             crate::ApiBackend::Responses,
             crate::ApiBackend::Messages,
+            crate::ApiBackend::GoogleAiStudio,
         ] {
             let on_wire = match backend {
                 crate::ApiBackend::Responses => {
@@ -5811,6 +6440,13 @@ mod tests {
                     let mapped = build_messages_request(&request());
                     serde_json::to_value(&mapped)
                         .expect("messages request serializes")
+                        .get("prompt_cache_key")
+                        .is_some()
+                }
+                crate::ApiBackend::GoogleAiStudio => {
+                    let mapped = build_google_ai_studio_request(&request());
+                    serde_json::to_value(&mapped)
+                        .expect("google ai studio request serializes")
                         .get("prompt_cache_key")
                         .is_some()
                 }
@@ -10002,17 +10638,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_cwd_empty_source_noop() {
-        // Edge case: source and target are the same (no transform needed)
-        let mut items = vec![ConversationItem::user("Hello at /some/path/file.rs")];
-
-        transform_conversation_cwd(&mut items, "/some/path", "/some/path");
-
-        // Content should be unchanged
-        assert_eq!(items[0].text_content(), "Hello at /some/path/file.rs");
-    }
-
-    #[test]
     fn test_transform_cwd_mixed_conversation_full() {
         // Full conversation with all item types and multiple path occurrences
         let src = "/worktree/abc";
@@ -10938,7 +11563,6 @@ mod tests {
         ];
         assert_eq!(dedup_duplicate_tool_results(&mut conv), 1);
         assert_eq!(conv.len(), 3); // assistant + 2 tool_results
-        // c1 should be the real content (last occurrence)
         let c1_results: Vec<_> = conv
             .iter()
             .filter_map(|item| {
@@ -11580,20 +12204,6 @@ mod tests {
 
     // ── SyntheticReason tests ─────────────────────────────────────────────────
 
-    /// Real user messages must have `synthetic_reason = None`.
-    #[test]
-    fn user_message_has_no_synthetic_reason() {
-        let item = ConversationItem::user("hello");
-        if let ConversationItem::User(u) = item {
-            assert!(
-                u.synthetic_reason.is_none(),
-                "real user messages must not have a synthetic_reason"
-            );
-        } else {
-            panic!("expected User variant");
-        }
-    }
-
     /// Historical `doom_loop_warning` tags deserialize as Unknown after removal.
     #[test]
     fn historical_doom_loop_warning_deserializes_as_unknown() {
@@ -12025,6 +12635,93 @@ mod tests {
         assert_eq!(
             resp.empty_reason(),
             Some(crate::error::EmptyReason::NoVisibleContent)
+        );
+    }
+
+    #[test]
+    fn length_policy_verdict_gate() {
+        let length = |item: ConversationItem| {
+            let mut r = make_response(item);
+            r.stop_reason = Some(StopReason::Length);
+            r
+        };
+        let call = |arguments: &str| ToolCall {
+            id: "tc1".into(),
+            name: "do_thing".into(),
+            arguments: arguments.into(),
+        };
+        let text = length(ConversationItem::assistant("partial"));
+        let empty = length(ConversationItem::assistant(""));
+        let complete_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": 1}",
+        )]));
+        let empty_args_tools = length(ConversationItem::assistant_tool_calls(vec![call("")]));
+        let truncated_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": \"trunc",
+        )]));
+        let mixed_tools = length(ConversationItem::assistant_tool_calls(vec![
+            call("{\"x\": 1}"),
+            call("{\"x\": \"trunc"),
+        ]));
+        let stop = make_response(ConversationItem::assistant("done"));
+
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompleteToolCalls);
+
+        assert_eq!(LengthPolicy::Fail.verdict(&text), LengthVerdict::Fail);
+        assert_eq!(
+            LengthPolicy::Fail.verdict(&complete_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(LengthPolicy::Fail.verdict(&stop), LengthVerdict::Pass);
+
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty_args_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&truncated_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&mixed_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&text),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&stop),
+            LengthVerdict::Pass
+        );
+
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&text),
+            LengthVerdict::Salvage
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&empty),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&truncated_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&stop),
+            LengthVerdict::Pass
         );
     }
 
@@ -13736,5 +14433,29 @@ mod tests {
         assert!(safe_input[0].to_string().contains("latest request"));
         assert!(!safe_input[0].to_string().contains("opaque-server-summary"));
         assert_eq!(request.raw_codex_input_replacements()[0].value, raw);
+    }
+
+    #[test]
+    fn test_transform_cwd_empty_source_noop() {
+        // Edge case: source and target are the same (no transform needed)
+        let mut items = vec![ConversationItem::user("Hello at /some/path/file.rs")];
+
+        transform_conversation_cwd(&mut items, "/some/path", "/some/path");
+
+        // Content should be unchanged
+        assert_eq!(items[0].text_content(), "Hello at /some/path/file.rs");
+    }
+
+    #[test]
+    fn user_message_has_no_synthetic_reason() {
+        let item = ConversationItem::user("hello");
+        if let ConversationItem::User(u) = item {
+            assert!(
+                u.synthetic_reason.is_none(),
+                "real user messages must not have a synthetic_reason"
+            );
+        } else {
+            panic!("expected User variant");
+        }
     }
 }

@@ -2353,3 +2353,205 @@ fn paint_window_extends_through_offscreen_verb_group_members() {
     assert_eq!(content_y0, virtual_y[range.start]);
     assert_eq!(range.end, header + 50);
 }
+
+/// Verify every contiguous subrange against the pre-optimization sum.
+fn assert_cached_range_heights(cache: &LayoutCache) {
+    for start in 0..=cache.entries.len() {
+        for end in start..=cache.entries.len() {
+            let expected: usize = cache.entries[start..end]
+                .iter()
+                .map(|entry| entry.height as usize + entry.gap_after as usize)
+                .sum();
+            assert_eq!(
+                cache.height_of_range(start..end),
+                expected,
+                "{start}..{end}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_range_height_matches_sum_with_hidden_gaps_and_large_totals() {
+    let mut cache = make_cache(&[u16::MAX, 0, 0, 3, 8]);
+    // Hidden group rows may share the same y, and gaps need not be one row.
+    cache.entries[1].gap_after = 0;
+    cache.entries[2].gap_after = 0;
+    cache.entries[3].gap_after = 0;
+    let mut y = 0usize;
+    for (position, entry) in cache.virtual_y.iter_mut().zip(&cache.entries) {
+        *position = y;
+        y += entry.height as usize + entry.gap_after as usize;
+    }
+    assert!(y > u16::MAX as usize);
+    assert_cached_range_heights(&cache);
+}
+
+fn assert_state_height_matches_sum(state: &mut ScrollbackState) {
+    let range = state.visible_entry_range();
+    let cache = state.layout_cache.as_ref().expect("prepared layout");
+    assert_cached_range_heights(cache);
+    let expected_content: usize = cache.entries[range]
+        .iter()
+        .map(|entry| entry.height as usize + entry.gap_after as usize)
+        .sum();
+    assert_eq!(state.total_height, expected_content + state.pin_reserve_pad);
+    state.compute_total_height_from_cache();
+    assert_eq!(state.total_height, expected_content + state.pin_reserve_pad);
+
+    let cache = state.layout_cache.as_ref().unwrap();
+    let range = state.visible_entry_range();
+    let base_y = cache.virtual_y.get(range.start).copied().unwrap_or(0);
+    let relative: Vec<_> = cache
+        .prompt_descriptors
+        .iter()
+        .filter(|prompt| range.contains(&prompt.entry_idx))
+        .map(|prompt| PromptDescriptor {
+            y_virtual: prompt.y_virtual.saturating_sub(base_y),
+            ..*prompt
+        })
+        .collect();
+    for prompt in &cache.prompt_descriptors {
+        assert_eq!(prompt.y_virtual, cache.virtual_y[prompt.entry_idx]);
+    }
+    for scroll in [
+        0,
+        1,
+        state.scroll_offset,
+        expected_content / 2,
+        expected_content,
+    ] {
+        assert_eq!(
+            state.sticky_layout_for_range(range.clone(), scroll, state.viewport_height),
+            compute_sticky_layout(scroll, state.viewport_height, &relative),
+            "sticky geometry at scroll {scroll}, range {range:?}",
+        );
+    }
+}
+
+#[test]
+fn cached_range_height_tracks_streaming_turns_width_and_pin_reserve() {
+    let _theme = pin_theme();
+    let mut state = ScrollbackState::new();
+    state.begin_batch();
+    state.push_block(stub_block("pre-turn"));
+    state.push_block(user_block("question 中 e\u{301}"));
+    let first_agent = state.push_block(agent_block("first reply"));
+    let second_prompt = state.push_block(user_block("second question"));
+    state.push_block(agent_block("second reply"));
+    state.end_batch();
+    state.prepare_layout(40, 8);
+    assert_state_height_matches_sum(&mut state);
+
+    state.push_block(stub_block("appended"));
+    state.prepare_layout(40, 8);
+    assert_state_height_matches_sum(&mut state);
+
+    assert!(state.push_chunk_to_agent(first_agent, " — streaming\nline two\nline three"));
+    state.prepare_layout(40, 8);
+    assert_state_height_matches_sum(&mut state);
+    state.prepare_layout(20, 8);
+    assert_state_height_matches_sum(&mut state);
+    state.set_appearance(state.appearance().clone());
+    state.prepare_layout(20, 8);
+    assert_state_height_matches_sum(&mut state);
+
+    state.set_view_mode(ViewMode::SingleTurn);
+    let prompt_idx = state.index_of_id(second_prompt).unwrap();
+    state.set_selected(Some(prompt_idx));
+    // Switch ranges and stream before the next frame. The previous total is
+    // still for AllTurns when the dirty-height fast path starts.
+    assert!(state.visible_entry_range().start > 0);
+    let first_idx = state.index_of_id(first_agent).unwrap();
+    let old_height = state.get_cached_entry_height(first_idx).unwrap();
+    assert!(state.push_chunk_to_agent(first_agent, &"\nextra streamed line".repeat(10)));
+    state.prepare_layout(20, 8);
+    assert_ne!(
+        state.get_cached_entry_height(first_idx).unwrap(),
+        old_height
+    );
+    assert_state_height_matches_sum(&mut state);
+
+    // Page flip applies to a newly appended prompt, before its response can
+    // overflow the viewport and intentionally release the reserve.
+    state.set_view_mode(ViewMode::AllTurns);
+    let new_prompt = state.push_block(user_block("new turn"));
+    let new_prompt_idx = state.index_of_id(new_prompt).unwrap();
+    state.prepare_layout(20, 8);
+    state.follow_new_turn(Some(new_prompt_idx), true);
+    state.prepare_layout(20, 8);
+    assert!(state.is_pin_reserve_active());
+    assert_state_height_matches_sum(&mut state);
+    state.release_pin_reserve();
+    assert_state_height_matches_sum(&mut state);
+    state.reveal_entry_line(prompt_idx, 0);
+    assert_eq!(state.selected(), Some(prompt_idx));
+    state.prepare_layout(20, 8);
+    assert_state_height_matches_sum(&mut state);
+}
+
+#[test]
+fn multiple_dirty_heights_keep_prompt_positions_equal_to_prefixes() {
+    let mut state = ScrollbackState::new();
+    for _ in 0..6 {
+        state.push_block(stub_block("entry"));
+    }
+    let mut cache = make_cache(&[10; 6]);
+    cache.prompt_descriptors = [1, 3, 5]
+        .into_iter()
+        .map(|entry_idx| PromptDescriptor {
+            entry_idx,
+            y_virtual: cache.virtual_y[entry_idx],
+            full_height: 10,
+            min_height: 2,
+            sticky: true,
+        })
+        .collect();
+    // update_dirty_entry_heights has already applied these height changes.
+    cache.entries[0].height = 20;
+    cache.entries[2].height = 15;
+    cache.entries[4].height = 8;
+    state.layout_cache = Some(cache);
+    state.patch_virtual_y_for_dirty(&[(4, -2), (0, 10), (2, 5)]);
+    let cache = state.layout_cache.as_ref().unwrap();
+    for prompt in &cache.prompt_descriptors {
+        assert_eq!(prompt.y_virtual, cache.virtual_y[prompt.entry_idx]);
+    }
+    assert_cached_range_heights(cache);
+}
+
+/// Opt-in timing; no assertion depends on elapsed time.
+#[test]
+#[ignore = "opt-in synthetic performance measurement"]
+fn scrollback_perf_benchmark_height() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    for count in [10_000usize, 100_000] {
+        let cache = make_cache(&vec![3; count]);
+        let iterations = 1_000;
+        let expected: usize = cache
+            .entries
+            .iter()
+            .map(|entry| entry.height as usize + entry.gap_after as usize)
+            .sum();
+        assert_eq!(cache.height_of_range(0..count), expected);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let sum: usize = black_box(&cache.entries)
+                .iter()
+                .map(|entry| entry.height as usize + entry.gap_after as usize)
+                .sum();
+            black_box(sum);
+        }
+        let baseline = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(black_box(&cache).height_of_range(0..black_box(count)));
+        }
+        eprintln!(
+            "height entries={count} iterations={iterations} reference={baseline:?} optimized={:?}; reference visits {} entries, optimized reads one layout and two prefix positions per iteration",
+            start.elapsed(),
+            count * iterations
+        );
+    }
+}

@@ -17,7 +17,8 @@ pub use grok_build::bash::{BashError, BashToolInput};
 pub use grok_build::{
     AskUserQuestionTool, BashTool, EnterPlanModeTool, ExitPlanModeTool, FollowupAgentTaskTool,
     GrepTool, KillTaskTool, ListAgentsTool, ListDirTool, ReadFileTool, SearchReplaceTool,
-    SendAgentMessageTool, SwarmWaitTool, TaskOutputTool, TaskTool, TodoWriteTool, WaitAgentTool,
+    SendAgentMessageTool, SendFeedbackTool, SendSubagentMessageDisposition,
+    SendSubagentMessageTool, SwarmWaitTool, TaskOutputTool, TaskTool, TodoWriteTool, WaitAgentTool,
     WaitTasksTool, WebFetchTool, WebRunTool, WebSearchTool,
 };
 pub use memory::{ExperienceSearchImpl, MemoryGetImpl, MemorySearchImpl};
@@ -25,6 +26,9 @@ pub use opencode::{
     OpenCodeBashTool, OpenCodeEditTool, OpenCodeGlobTool, OpenCodeGrepTool, OpenCodeReadTool,
     OpenCodeSkillTool, OpenCodeTodoWriteTool, OpenCodeWriteTool,
 };
+pub fn extra_write_qualified_ids() -> Vec<String> {
+    Vec::new()
+}
 pub use search_tool::{SEARCH_TOOL_NAME, SearchTool};
 pub use use_tool::{USE_TOOL_NAME, UseTool, UseToolInput};
 pub use web_search::WebSearchConfig;

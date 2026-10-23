@@ -40,6 +40,18 @@ pub(crate) enum SessionLiveState {
 /// `session/new` and `session/load` responses. Defined here so the shell that
 /// publishes it and the clients that read it share one spelling.
 pub const SCHEDULER_BACKGROUND_LOOPS_META_KEY: &str = "x.ai/schedulerBackgroundLoops";
+pub(crate) struct WorkGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl WorkGuard {
+    pub(crate) fn new(active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        active_work.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self(active_work)
+    }
+}
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.
@@ -59,6 +71,7 @@ pub struct SessionHandle {
     /// resolve. The roster reads this synchronously to surface `NeedsInput`
     /// Never persisted.
     pub pending_interactions: crate::session::pending_interaction::PendingInteractions,
+    pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Session info (id, cwd) - cached for quick access without querying persistence
     pub info: crate::session::info::Info,
     /// Resolved turn limit for this session; lets a spawned subagent inherit
@@ -77,19 +90,13 @@ pub struct SessionHandle {
     /// notifications to the client via the gateway. See
     /// [`SessionActor::gateway_enabled`] for details.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// MCP server configs for this session (merged local + client-provided).
-    /// Stored on the handle so forked sessions can inherit the parent's
-    /// MCP servers without requiring a round-trip through the session actor.
-    ///
-    /// **Note:** This is a snapshot from `spawn_session_actor` time. If the
-    /// client later sends `UpdateMcpServers`, the handle's copy is NOT updated.
-    /// This is fine for forks that happen immediately after spawn, but callers
-    /// that need the latest MCP state should query the session actor via command.
-    pub mcp_servers: Vec<acp::McpServer>,
-    /// Client-provided MCP servers after vendor `mcps` kill-switch admission
-    /// (still pre-merge with disk/plugins/managed). Hot-reloads re-merge from
-    /// this seed so disabled-vendor servers rejected at ingress cannot reappear
-    /// merely because on-disk attribution vanished mid-session.
+    pub status_line_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Admitted MCP servers (disk, client, and the current agent.md overlay).
+    /// Shared with the actor's `McpState`: config commits publish here, and forks
+    /// snapshot the cell so they see the current seat's servers and headers.
+    pub mcp_servers: super::mcp_servers::AdmittedMcpServers,
+    /// Client-provided MCP servers as admitted by the vendor `mcps` kill-switch, before merging with disk/plugin/managed servers.
+    /// Writers assign this through `with_resident_mut` before enqueue. The actor keeps its own copy, updated from `UpdateMcpServers.client_seed`.
     pub initial_client_mcp_servers: Vec<acp::McpServer>,
     /// Stable display path for forked sessions (original project path).
     ///
@@ -116,6 +123,7 @@ pub struct SessionHandle {
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
+    pub(crate) context_window_selection: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether this session's scheduled fires run as detached background
     /// subagents. Copied from the value the spawn resolved for the session's
     /// [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec), so
@@ -156,6 +164,11 @@ pub struct SessionHandle {
     /// Set via `x.ai/debug/arm_auto_compact`.
     pub force_compact: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub permission_handle: xai_grok_workspace::permission::PermissionHandle,
+    /// Keeps the workspace mode-change fence registered for external children.
+    /// A proxy cannot prove its remote mode and has no local registration.
+    pub(crate) sandbox_mode_lease_registration: Option<
+        std::sync::Arc<xai_grok_workspace::sandbox_mode_fence::SandboxModeLeaseRegistration>,
+    >,
     /// The parent SessionActor's live `Auth401AttributionCallback`
     /// (if any). Exposed on the handle so
     /// `MvpAgent::build_subagent_spawn_context` can copy it into the
@@ -188,6 +201,15 @@ pub struct SessionHandle {
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
 }
 impl SessionHandle {
+    pub(crate) fn set_status_line_wanted(&self, wanted: bool) {
+        self.status_line_enabled
+            .store(wanted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_status_snapshot(&self) {
+        let _ = self.cmd_tx.send(SessionCommand::EmitStatusSnapshot);
+    }
+
     /// Last assistant `model_id` / `model_fingerprint` in conversation (global, not turn-scoped).
     pub(crate) async fn get_model_metadata(&self) -> xai_chat_state::ModelMetadata {
         let (tx, rx) = oneshot::channel();
@@ -359,23 +381,23 @@ impl SessionHandle {
     /// Snapshot the session's client-registered hooks for subagent inheritance. A dead actor
     /// or dropped reply fails open to no hooks, warned since it drops the inherited deny gate.
     pub(crate) async fn snapshot_client_hooks(&self) -> crate::extensions::hooks::ClientHooks {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(SessionCommand::SnapshotClientHooks { respond_to: tx })
-            .is_err()
-        {
+        self.try_snapshot_client_hooks().await.unwrap_or_else(|| {
             tracing::warn!(
                 "snapshot_client_hooks: session actor gone; subagent inherits no client hooks"
             );
-            return Default::default();
-        }
-        rx.await.unwrap_or_else(|_| {
-            tracing::warn!(
-                "snapshot_client_hooks: reply dropped; subagent inherits no client hooks"
-            );
             Default::default()
         })
+    }
+    /// A missing actor or reply is not sufficient evidence to authorize an
+    /// external child that cannot enforce client hooks.
+    pub(crate) async fn try_snapshot_client_hooks(
+        &self,
+    ) -> Option<crate::extensions::hooks::ClientHooks> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::SnapshotClientHooks { respond_to: tx })
+            .ok()?;
+        rx.await.ok()
     }
     /// Snapshot the session's resolved ordinary-tool inputs for verbatim-fork
     /// inheritance. The child applies the shared provider/mode surface policy.
@@ -429,6 +451,8 @@ impl SessionHandle {
     }
     /// Replace the live session's client-registered hooks (see `SessionCommand::SetClientHooks`).
     pub(crate) fn set_client_hooks(&self, hooks: crate::extensions::hooks::ClientHooks) {
+        let mut tracker = self.plan_mode.lock();
+        tracker.client_hooks_will_change();
         let _ = self.cmd_tx.send(SessionCommand::SetClientHooks { hooks });
     }
     pub(crate) async fn get_mcp_status(&self) -> crate::extensions::mcp::McpStatusSnapshot {

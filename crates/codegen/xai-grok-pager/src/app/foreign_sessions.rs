@@ -177,7 +177,6 @@ struct ForeignScanCoordinatorInner {
 
 impl Drop for ForeignScanCoordinatorInner {
     fn drop(&mut self) {
-        // An already-running spawn_blocking closure remains non-cancellable.
         if let Some(handle) = self.abort_handle.get_mut().take() {
             handle.abort();
         }
@@ -324,12 +323,11 @@ pub(crate) fn is_foreign_picker_source(source: &str) -> bool {
 }
 
 pub(crate) fn badge_for_picker_source(source: &str) -> &'static str {
-    if source == "conversation" {
-        "chat"
-    } else {
-        ForeignPickerSource::from_picker_source(source)
+    match source {
+        "conversation" => "chat",
+        _ => ForeignPickerSource::from_picker_source(source)
             .map(ForeignPickerSource::picker_source)
-            .unwrap_or("")
+            .unwrap_or(""),
     }
 }
 
@@ -434,6 +432,8 @@ pub(crate) fn map_summary(summary: ForeignSessionSummary) -> SessionPickerEntry 
     let updated_at = chrono::DateTime::<chrono::Utc>::from(summary.updated_at);
     let cwd = summary.cwd.to_string_lossy().into_owned();
     SessionPickerEntry {
+        last_recap: None,
+        session_kind: None,
         id: summary.native_id,
         summary: summary.title,
         updated_at,
@@ -544,6 +544,8 @@ mod tests {
     fn picker_entry(id: &str, source: &str, timestamp: i64) -> SessionPickerEntry {
         let timestamp = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: timestamp,

@@ -39,7 +39,7 @@ pub fn find_latest_compaction_checkpoint(
 ) -> io::Result<Option<CompactionCheckpointInfo>> {
     use crate::session::storage::RawLinePeek;
 
-    let raw_contents = match std::fs::read_to_string(updates_path) {
+    let raw_contents = match xai_file_utils::session_file::read_to_string(updates_path) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => return Ok(None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -94,7 +94,7 @@ pub fn replay_to_prompt(
     session_dir: &Path,
     target_prompt_index: usize,
 ) -> io::Result<ReplayResult> {
-    let Some(iter) = UpdatesIterator::open(updates_path)? else {
+    let Some(mut iter) = UpdatesIterator::open(updates_path)? else {
         return Ok(ReplayResult {
             conversation: vec![],
             prompt_index_reached: 0,
@@ -105,7 +105,7 @@ pub fn replay_to_prompt(
 
     let mut state = ReplayState::new(target_prompt_index);
 
-    for update_result in iter {
+    for update_result in iter.by_ref() {
         let update = match update_result {
             Ok(u) => u,
             Err(e) => {
@@ -119,6 +119,8 @@ pub fn replay_to_prompt(
             break;
         }
     }
+
+    iter.finish()?;
 
     // Flush any trailing partial messages.
     state.flush_pending_user();
@@ -192,6 +194,8 @@ struct ReplayState {
     current_user_text: String,
 
     current_user_prompt_index: Option<usize>,
+    /// Whether this run was sent by an agent instead of a human.
+    current_user_is_agent: bool,
 
     /// True once any user chunk with `_meta.promptIndex` has been seen.
     /// Unnumbered user runs after that are mid-turn phantoms (not turns).
@@ -229,6 +233,7 @@ impl ReplayState {
             in_user_message: false,
             current_user_text: String::new(),
             current_user_prompt_index: None,
+            current_user_is_agent: false,
             seen_prompt_index_marker: false,
             current_agent_text: String::new(),
             has_pending_agent: false,
@@ -517,6 +522,12 @@ impl ReplayState {
             .and_then(|m| m.get("promptIndex"))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let chunk_is_agent = chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("syntheticReason"))
+            .and_then(|value| value.as_str())
+            == Some("agent_message");
         if chunk_prompt_index.is_some() {
             self.seen_prompt_index_marker = true;
         }
@@ -526,14 +537,17 @@ impl ReplayState {
             self.in_user_message = true;
             self.current_user_text.clear();
             self.current_user_prompt_index = chunk_prompt_index;
-        } else if chunk_prompt_index != self.current_user_prompt_index
-            && (chunk_prompt_index.is_some() || self.current_user_prompt_index.is_some())
+            self.current_user_is_agent = chunk_is_agent;
+        } else if chunk_is_agent != self.current_user_is_agent
+            || (chunk_prompt_index != self.current_user_prompt_index
+                && (chunk_prompt_index.is_some() || self.current_user_prompt_index.is_some()))
         {
             // New run: promptIndex changed, or transition between marked/unmarked.
             self.flush_pending_user();
             self.in_user_message = true;
             self.current_user_text.clear();
             self.current_user_prompt_index = chunk_prompt_index;
+            self.current_user_is_agent = chunk_is_agent;
         } else if self.current_user_prompt_index.is_none() {
             self.current_user_prompt_index = chunk_prompt_index;
         }
@@ -600,17 +614,21 @@ impl ReplayState {
         }
         let text = std::mem::take(&mut self.current_user_text);
         let pi = self.current_user_prompt_index.take();
+        let mut item = if self.current_user_is_agent {
+            ConversationItem::agent_message(text)
+        } else {
+            ConversationItem::user(text)
+        };
         if let Some(pi) = pi {
-            let mut item = ConversationItem::user(text);
             item.set_prompt_index(pi);
             self.conversation.push(item);
             self.prompt_counter += 1;
         } else if !self.seen_prompt_index_marker {
-            self.conversation.push(ConversationItem::user(text));
+            self.conversation.push(item);
             self.prompt_counter += 1;
         } else {
             // Mid-turn phantom after markers: keep text, do not count.
-            self.conversation.push(ConversationItem::user(text));
+            self.conversation.push(item);
         }
     }
 
@@ -1081,6 +1099,43 @@ mod tests {
     }
 
     #[test]
+    fn gzip_checkpoint_and_rewind_replay_match_plain() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("updates.jsonl");
+        let updates = [
+            make_user_update_pi("s", "first", 0),
+            make_user_update_pi("s", "second", 1),
+        ];
+        let expected = replay_updates(&updates, tmp.path(), 1);
+        let raw = std::fs::read(&path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let mut bytes = encoder.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let actual = replay_to_prompt(&path, tmp.path(), 1).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual.conversation).unwrap(),
+            serde_json::to_value(expected.conversation).unwrap()
+        );
+        assert_eq!(actual.prompt_index_reached, expected.prompt_index_reached);
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(replay_to_prompt(&path, tmp.path(), 1).is_err());
+
+        let checkpoint = make_checkpoint("compressed-checkpoint", 2, None);
+        let envelope =
+            crate::session::storage::SessionUpdateEnvelope::from_update(&checkpoint).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        serde_json::to_writer(&mut encoder, &envelope).unwrap();
+        encoder.write_all(b"\n").unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let checkpoint = find_latest_compaction_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(checkpoint.checkpoint_id, "compressed-checkpoint");
+        assert_eq!(checkpoint.prompt_index_at_compaction, 2);
+    }
+
+    #[test]
     fn test_find_latest_checkpoint_none() {
         let tmp = TempDir::new().unwrap();
         let updates_path = tmp.path().join("updates.jsonl");
@@ -1252,5 +1307,31 @@ mod tests {
         assert_eq!(result.conversation.len(), 2);
         assert_eq!(result.conversation[0].text_content(), "sys");
         assert_eq!(result.conversation[1].text_content(), "summary2");
+    }
+    #[test]
+    fn adjacent_agent_and_user_chunks_keep_distinct_authority() {
+        let mut state = ReplayState::new(10);
+        let human = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("human")))
+            .meta(serde_json::json!({"promptIndex": 0}).as_object().cloned());
+        let agent = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("agent")))
+            .meta(
+                serde_json::json!({"promptIndex": 0, "syntheticReason": "agent_message"})
+                    .as_object()
+                    .cloned(),
+            );
+        state.handle_user_chunk(&human);
+        state.handle_user_chunk(&agent);
+        state.flush_pending_user();
+        assert_eq!(state.conversation.len(), 2);
+        match (&state.conversation[0], &state.conversation[1]) {
+            (ConversationItem::User(human), ConversationItem::User(agent)) => {
+                assert!(human.synthetic_reason.is_none());
+                assert_eq!(
+                    agent.synthetic_reason,
+                    Some(xai_grok_sampling_types::SyntheticReason::AgentMessage)
+                );
+            }
+            _ => panic!("expected separate user and agent messages"),
+        }
     }
 }

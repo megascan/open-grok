@@ -3,8 +3,8 @@
 //! launch, [`collect_crashed`] finds orphaned entries (dead PIDs).
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol as acp;
 use chrono::{DateTime, Utc};
@@ -30,6 +30,11 @@ pub fn register(session: ActiveSession) -> io::Result<()> {
     register_in(&crate::util::grok_home::grok_home(), session)
 }
 
+/// Register and return the saved corrupt-registry path so callers can warn users.
+pub fn register_reporting(session: ActiveSession) -> io::Result<Option<PathBuf>> {
+    register_reporting_in(&crate::util::grok_home::grok_home(), session)
+}
+
 /// Non-blocking unregister for signal handlers. Returns `Ok(false)` on
 /// lock contention; the orphan is cleaned up by `collect_crashed` next launch.
 pub fn try_unregister(session_id: &acp::SessionId) -> io::Result<bool> {
@@ -44,10 +49,15 @@ pub fn collect_crashed() -> io::Result<Vec<ActiveSession>> {
 // -- Injectable-root variants (`_in`) for testing ---------------------------
 
 pub fn register_in(root: &Path, session: ActiveSession) -> io::Result<()> {
-    with_locked_state(root, |sessions| {
+    register_reporting_in(root, session).map(|_| ())
+}
+
+pub fn register_reporting_in(root: &Path, session: ActiveSession) -> io::Result<Option<PathBuf>> {
+    with_locked_state_report(root, |sessions| {
         sessions.retain(|s| s.session_id != session.session_id);
         sessions.push(session);
     })
+    .map(|(_, backup)| backup)
 }
 
 pub fn unregister_in(root: &Path, session_id: &acp::SessionId) -> io::Result<()> {
@@ -73,12 +83,19 @@ pub fn collect_crashed_in(root: &Path) -> io::Result<Vec<ActiveSession>> {
 
 pub fn list_in(root: &Path) -> io::Result<Vec<ActiveSession>> {
     let data_path = root.join(DATA_FILENAME);
-    read_data_file(&data_path)
+    read_data_file(&data_path, false).map(|(sessions, _)| sessions)
 }
 
 // -- Internal: locked read-modify-write -------------------------------------
 
 fn with_locked_state<F, R>(root: &Path, mutate: F) -> io::Result<R>
+where
+    F: FnOnce(&mut Vec<ActiveSession>) -> R,
+{
+    with_locked_state_report(root, mutate).map(|(result, _)| result)
+}
+
+fn with_locked_state_report<F, R>(root: &Path, mutate: F) -> io::Result<(R, Option<PathBuf>)>
 where
     F: FnOnce(&mut Vec<ActiveSession>) -> R,
 {
@@ -112,21 +129,25 @@ where
         Ok(()) => {
             let result = locked_mutate(&data_path, &tmp_path, mutate);
             let _ = lock_file.unlock();
-            result.map(Some)
+            result.map(|(value, _)| Some(value))
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-fn locked_mutate<F, R>(data_path: &Path, tmp_path: &Path, mutate: F) -> io::Result<R>
+fn locked_mutate<F, R>(
+    data_path: &Path,
+    tmp_path: &Path,
+    mutate: F,
+) -> io::Result<(R, Option<PathBuf>)>
 where
     F: FnOnce(&mut Vec<ActiveSession>) -> R,
 {
-    let mut sessions = read_data_file(data_path)?;
+    let (mut sessions, backup) = read_data_file(data_path, true)?;
     let result = mutate(&mut sessions);
     write_data_file_atomic(tmp_path, data_path, &sessions)?;
-    Ok(result)
+    Ok((result, backup))
 }
 
 fn open_lock_file(path: &Path) -> io::Result<File> {
@@ -138,23 +159,105 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn read_data_file(path: &Path) -> io::Result<Vec<ActiveSession>> {
+fn read_data_file(
+    path: &Path,
+    backup_corrupt: bool,
+) -> io::Result<(Vec<ActiveSession>, Option<PathBuf>)> {
     match fs::read(path) {
-        Ok(bytes) if bytes.is_empty() => Ok(Vec::new()),
         Ok(bytes) => match serde_json::from_slice::<Vec<ActiveSession>>(&bytes) {
-            Ok(sessions) => Ok(sessions),
+            Ok(sessions) => Ok((sessions, None)),
             Err(e) => {
+                let backup = if backup_corrupt {
+                    Some(backup_corrupt_file(path, &bytes)?)
+                } else {
+                    None
+                };
+                let sessions = salvage_sessions(&bytes);
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "active_sessions.json is corrupted, starting with empty list"
+                    backup = ?backup,
+                    recovered = sessions.len(),
+                    "active_sessions.json is corrupted; salvaged readable sessions"
                 );
-                Ok(Vec::new())
+                Ok((sessions, backup))
             }
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), None)),
         Err(e) => Err(e),
     }
+}
+
+/// Recover complete JSON objects even when another row or the array tail is damaged.
+/// String escapes and nested objects must not be mistaken for row boundaries.
+fn salvage_sessions(bytes: &[u8]) -> Vec<ActiveSession> {
+    let mut sessions = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' if start.is_some() => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(begin) = start.take()
+                        && let Some(row) = bytes.get(begin..=i)
+                        && let Ok(session) = serde_json::from_slice::<ActiveSession>(row)
+                    {
+                        sessions.push(session);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sessions
+}
+
+fn backup_corrupt_file(path: &Path, bytes: &[u8]) -> io::Result<std::path::PathBuf> {
+    for suffix in 0u64.. {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(if suffix == 0 {
+            ".corrupt".to_string()
+        } else {
+            format!(".corrupt.{suffix}")
+        });
+        let backup = std::path::PathBuf::from(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    let _ = fs::remove_file(&backup);
+                    return Err(error);
+                }
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn write_data_file_atomic(
@@ -264,6 +367,60 @@ mod tests {
         lock_file.lock_exclusive().unwrap();
         assert!(!try_unregister_in(dir.path(), &s.session_id).unwrap());
         lock_file.unlock().unwrap();
+        assert_eq!(list_in(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrupt_registry_salvages_complete_rows_and_preserves_each_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(DATA_FILENAME);
+        let first = make_session("alive", std::process::id());
+        let row = serde_json::to_string(&first).unwrap();
+        let corrupt = format!("[{row}, {{\"pid\": \"bad\"}}, {{\"session_id\":");
+        fs::write(&path, &corrupt).unwrap();
+
+        assert_eq!(list_in(dir.path()).unwrap(), vec![first.clone()]);
+        let backup =
+            register_reporting_in(dir.path(), make_session("new", std::process::id())).unwrap();
+        assert_eq!(
+            backup.as_deref(),
+            Some(dir.path().join("active_sessions.json.corrupt").as_path())
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("active_sessions.json.corrupt")).unwrap(),
+            corrupt
+        );
+        let sessions = list_in(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&first));
+        assert!(
+            register_reporting_in(dir.path(), make_session("new", std::process::id()))
+                .unwrap()
+                .is_none()
+        );
+
+        let next_corrupt = b"[invalid";
+        fs::write(&path, next_corrupt).unwrap();
+        register_in(dir.path(), make_session("last", std::process::id())).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("active_sessions.json.corrupt.1")).unwrap(),
+            next_corrupt
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("active_sessions.json.corrupt")).unwrap(),
+            corrupt
+        );
+    }
+
+    #[test]
+    fn empty_existing_registry_is_backed_up_before_registration() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(DATA_FILENAME), b"").unwrap();
+        register_in(dir.path(), make_session("new", std::process::id())).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("active_sessions.json.corrupt")).unwrap(),
+            b""
+        );
         assert_eq!(list_in(dir.path()).unwrap().len(), 1);
     }
 

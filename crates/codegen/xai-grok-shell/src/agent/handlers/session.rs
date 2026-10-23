@@ -326,6 +326,7 @@ fn acp_list_response_meta(
                 PartialReason::NoOauth => "no_oauth",
             }),
         },
+        build_list_complete: result.build_list_complete,
         list_scope: result.scope.is_relaxed().then_some(result.scope.as_str()),
     };
     match serde_json::to_value(meta) {
@@ -404,7 +405,8 @@ pub(crate) async fn handle_list_sessions(
     )
     .await;
 
-    let meta = acp_list_response_meta(&result);
+    let row_count = result.rows.len();
+    let mut meta = acp_list_response_meta(&result);
     // Drop rows the ACP schema cannot represent (non-absolute cwd), matching
     // upstream `into_session_info().try_into().ok()` filtering.
     let sessions: Vec<acp::SessionInfo> = result
@@ -412,6 +414,14 @@ pub(crate) async fn handle_list_sessions(
         .into_iter()
         .filter_map(|row| try_acp_session_info(row.into_session_info()))
         .collect();
+    if sessions.len() != row_count
+        && let Some(meta) = &mut meta
+    {
+        meta.insert(
+            "x.ai/buildListComplete".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
 
     tracing::debug!(
         cwd = cwd.as_deref().unwrap_or("<all>"),

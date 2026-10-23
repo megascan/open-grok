@@ -7,6 +7,7 @@ mod fs;
 mod journal;
 mod view;
 
+use std::collections::HashSet;
 use std::fs as std_fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -133,6 +134,7 @@ enum TestFault {
     Journal(RelocationPhase, AtomicWriteFault),
     RemoveBarrier,
     NamespaceBarrier,
+    FinalizeNamespaceBarrier,
     ReadyAfterRenameThenNamespaceBarrier,
     CwdMarker(AtomicWriteFault),
 }
@@ -349,6 +351,24 @@ impl RelocationStorage {
         Ok(())
     }
 
+    /// Recover each journal independently for a listing. Failed or busy
+    /// transactions must be excluded even if finalization removed the journal.
+    pub(crate) fn recover_all_for_listing(&self) -> Result<HashSet<String>> {
+        let mut excluded = HashSet::new();
+        for session_id in RelocationView::journal_ids(&self.grok_home)? {
+            let result = self.acquire(&session_id).and_then(|lease| {
+                let (_, terminal) = self.recover(&lease)?;
+                self.finalize_terminal(&lease, &terminal)
+            });
+            if let Err(error) = result {
+                tracing::warn!(%session_id, %error, "excluding relocation from session listing");
+                excluded.insert(session_id);
+            }
+        }
+        journal::sweep_stale_leases(&self.grok_home);
+        Ok(excluded)
+    }
+
     pub(crate) fn authority(&self, session_id: &str) -> Result<RelocationAuthority> {
         let journal = self.read_journal(session_id)?;
         let cwd = if has_target_authority(journal.phase) {
@@ -393,6 +413,12 @@ impl RelocationStorage {
         }
         let path = journal::journal_path(&self.grok_home, &lease.session_id);
         std_fs::remove_file(&path).map_err(|e| fs::io_error("remove", &path, e))?;
+        #[cfg(test)]
+        if self.fault == Some(TestFault::FinalizeNamespaceBarrier) {
+            return Err(RelocationError::Inconsistent(
+                "injected finalization namespace barrier failure".into(),
+            ));
+        }
         self.sync_journal_namespace()
     }
 

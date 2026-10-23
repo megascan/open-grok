@@ -141,6 +141,584 @@ fn background_request(output_file: PathBuf) -> TerminalRunRequest {
     }
 }
 
+#[tokio::test]
+async fn revoked_terminal_create_is_rejected_or_cleaned_up_after_late_reply() {
+    use xai_acp_lib::AcpClientMessage;
+    for background in [false, true] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter = Arc::new(AcpTerminalAdapter::new(
+            GatewaySender::new(tx),
+            acp::SessionId::new("cancel-test"),
+        ));
+        let (handle, _receiver) = ToolNotificationHandle::bridge_channel();
+        let guard = handle.begin_turn_delivery();
+        let scope = guard.scope();
+        let mut request = background_request(PathBuf::from("/tmp/cancel-test.log"));
+        request.notification_handle = handle.with_delivery_scope(Some(scope.clone()));
+        let worker = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                if background {
+                    adapter.run_background(request).await.map(|_| ())
+                } else {
+                    adapter.run(request).await.map(|_| ())
+                }
+            })
+        };
+        let Some(AcpClientMessage::CreateTerminal(create)) = rx.recv().await else {
+            panic!("expected create");
+        };
+        scope.revoke();
+        adapter.kill_foreground_commands().await;
+        adapter.kill_all_background_tasks().await;
+        create
+            .response_tx
+            .send(Ok(acp::CreateTerminalResponse::new("late")))
+            .unwrap();
+        let Some(AcpClientMessage::KillTerminalCommand(kill)) = rx.recv().await else {
+            panic!("expected kill");
+        };
+        kill.response_tx
+            .send(Ok(acp::KillTerminalResponse::new()))
+            .unwrap();
+        let Some(AcpClientMessage::ReleaseTerminal(release)) = rx.recv().await else {
+            panic!("expected release");
+        };
+        release
+            .response_tx
+            .send(Ok(acp::ReleaseTerminalResponse::new()))
+            .unwrap();
+        assert!(worker.await.unwrap().is_err());
+        assert!(adapter.tasks.lock().unwrap().is_empty());
+        assert!(adapter.foreground.lock().unwrap().is_empty());
+
+        let mut rejected = background_request(PathBuf::from("/tmp/cancel-test.log"));
+        rejected.notification_handle = handle.with_delivery_scope(Some(scope));
+        assert!(adapter.run_background(rejected).await.is_err());
+        assert!(rx.try_recv().is_err(), "revoked start reached the client");
+
+        let (fresh, _fresh_rx) = ToolNotificationHandle::bridge_channel();
+        let fresh_guard = fresh.begin_turn_delivery();
+        assert!(!fresh_guard.scope().is_revoked());
+    }
+}
+
+#[tokio::test]
+async fn owner_scoped_sweeps_only_kill_that_sessions_acp_terminals() {
+    use xai_acp_lib::AcpClientMessage;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let killed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = killed.clone();
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                AcpClientMessage::KillTerminalCommand(args) => {
+                    seen.lock()
+                        .unwrap()
+                        .push(args.request.terminal_id.0.to_string());
+                    let _ = args.response_tx.send(Ok(acp::KillTerminalResponse::new()));
+                }
+                AcpClientMessage::ReleaseTerminal(args) => {
+                    let _ = args
+                        .response_tx
+                        .send(Ok(acp::ReleaseTerminalResponse::new()));
+                }
+                _ => {}
+            }
+        }
+    });
+    let adapter = AcpTerminalAdapter::new(GatewaySender::new(tx), acp::SessionId::new("shared"));
+    {
+        let mut foreground = adapter.foreground.lock().unwrap();
+        foreground.insert("fg-child".into(), Some("child".into()));
+        foreground.insert("fg-parent".into(), Some("parent".into()));
+    }
+    {
+        let mut tasks = adapter.tasks.lock().unwrap();
+        let child = TrackedTask {
+            owner_session_id: Some("child".into()),
+            ..Default::default()
+        };
+        let parent = TrackedTask {
+            owner_session_id: Some("parent".into()),
+            ..Default::default()
+        };
+        tasks.insert("bg-child".into(), child);
+        tasks.insert("bg-parent".into(), parent);
+    }
+    adapter.kill_foreground_commands_by_owner("child").await;
+    adapter.kill_all_background_tasks_by_owner("child").await;
+    let mut ids = killed.lock().unwrap().clone();
+    ids.sort();
+    assert_eq!(ids, ["bg-child", "fg-child"]);
+    assert!(adapter.foreground.lock().unwrap().contains_key("fg-parent"));
+    let tasks = adapter.tasks.lock().unwrap();
+    assert!(tasks["bg-child"].explicitly_killed);
+    assert!(!tasks["bg-parent"].explicitly_killed);
+}
+
+#[tokio::test]
+async fn reparent_live_tasks_delivers_start_then_completion_to_parent() {
+    use xai_acp_lib::AcpClientMessage;
+    use xai_grok_tools::notification::ToolNotification;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if let AcpClientMessage::ReleaseTerminal(args) = message {
+                let _ = args
+                    .response_tx
+                    .send(Ok(acp::ReleaseTerminalResponse::new()));
+            }
+        }
+    });
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(tx),
+        acp::SessionId::new("s"),
+    ));
+    let backend: Arc<dyn TerminalBackend> = adapter.clone();
+    let (child_tx, mut child_rx) = tokio::sync::mpsc::unbounded_channel();
+    let child_handle = ToolNotificationHandle::from_sender(child_tx);
+    let (parent_tx, mut parent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let parent_handle = ToolNotificationHandle::from_sender(parent_tx);
+
+    // A child with no tasks must complete normally.
+    backend
+        .reparent_notifications(
+            "empty",
+            "parent",
+            parent_handle.clone(),
+            Arc::downgrade(&backend),
+        )
+        .await
+        .unwrap();
+    assert!(parent_rx.try_recv().is_err());
+    {
+        let mut tasks = adapter.tasks.lock().unwrap();
+        tasks.insert(
+            "child-task".into(),
+            TrackedTask {
+                owner_session_id: Some("child".into()),
+                raw_command: "echo child".into(),
+                tool_call_id: "call-child".into(),
+                notification_handle: Some(child_handle.clone()),
+                ..Default::default()
+            },
+        );
+        tasks.insert(
+            "sibling-task".into(),
+            TrackedTask {
+                owner_session_id: Some("sibling".into()),
+                ..Default::default()
+            },
+        );
+        tasks.insert(
+            "finished-task".into(),
+            TrackedTask {
+                owner_session_id: Some("child".into()),
+                completed: true,
+                ..Default::default()
+            },
+        );
+    }
+    backend
+        .reparent_notifications("child", "parent", parent_handle, Arc::downgrade(&backend))
+        .await
+        .unwrap();
+    super::super::exit_watcher::complete_and_release(
+        &adapter.gateway,
+        &adapter.session_id,
+        &adapter.terminal_id("child-task"),
+        &adapter.tasks,
+        &child_handle,
+        "child-task",
+        out("done", Some(0), None),
+    )
+    .await;
+    match parent_rx.recv().await.unwrap() {
+        ToolNotification::BashExecutionBackgrounded(event) => {
+            assert_eq!(event.task_id, "child-task");
+            assert_eq!(event.base.tool_call_id, "call-child");
+            assert_eq!(event.base.command, "echo child");
+        }
+        other => panic!("expected background start, got {other:?}"),
+    }
+    match parent_rx.recv().await.unwrap() {
+        ToolNotification::TaskCompleted(event) => {
+            assert_eq!(event.task_id, "child-task");
+            assert_eq!(event.owner_session_id.as_deref(), Some("parent"));
+        }
+        other => panic!("expected task completion, got {other:?}"),
+    }
+    assert!(child_rx.try_recv().is_err());
+    assert!(parent_rx.try_recv().is_err());
+    let tasks = adapter.tasks.lock().unwrap();
+    assert_eq!(
+        tasks["sibling-task"].owner_session_id.as_deref(),
+        Some("sibling")
+    );
+    assert_eq!(
+        tasks["finished-task"].owner_session_id.as_deref(),
+        Some("child")
+    );
+}
+
+#[tokio::test]
+async fn reparent_monitor_preserves_command_and_description() {
+    use xai_grok_tools::notification::ToolNotification;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(tx),
+        acp::SessionId::new("s"),
+    ));
+    let backend: Arc<dyn TerminalBackend> = adapter.clone();
+    adapter.tasks.lock().unwrap().insert(
+        "monitor".into(),
+        TrackedTask {
+            kind: TaskKind::Monitor,
+            owner_session_id: Some("child".into()),
+            raw_command: "tail -f server.log".into(),
+            display_command: Some("[monitor] server logs".into()),
+            tool_call_id: "monitor-call".into(),
+            ..Default::default()
+        },
+    );
+    let (parent_tx, mut parent_rx) = tokio::sync::mpsc::unbounded_channel();
+    backend
+        .reparent_notifications(
+            "child",
+            "parent",
+            ToolNotificationHandle::from_sender(parent_tx),
+            Arc::downgrade(&backend),
+        )
+        .await
+        .unwrap();
+    match parent_rx.recv().await.unwrap() {
+        ToolNotification::BashExecutionBackgrounded(event) => {
+            assert_eq!(event.base.command, "tail -f server.log");
+            assert_eq!(event.monitor_description.as_deref(), Some("server logs"));
+            assert_eq!(event.description.as_deref(), Some("server logs"));
+        }
+        other => panic!("expected monitor start, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn child_runtime_shutdown_preserves_parent_watcher_and_output() {
+    use xai_acp_lib::AcpClientMessage;
+    use xai_grok_tools::notification::ToolNotification;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.log");
+    let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (wait_tx, mut wait_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (released_tx, mut released_rx) = tokio::sync::mpsc::unbounded_channel();
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client_exited = exited.clone();
+    tokio::spawn(async move {
+        while let Some(message) = gateway_rx.recv().await {
+            match message {
+                AcpClientMessage::CreateTerminal(args) => {
+                    let _ = args
+                        .response_tx
+                        .send(Ok(acp::CreateTerminalResponse::new("child-terminal")));
+                }
+                AcpClientMessage::WaitForTerminalExit(args) => {
+                    let _ = wait_tx.send(args.response_tx);
+                }
+                AcpClientMessage::TerminalOutput(args) => {
+                    let response = if client_exited.load(std::sync::atomic::Ordering::SeqCst) {
+                        acp::TerminalOutputResponse::new("first\nsecond\n", false)
+                            .exit_status(Some(acp::TerminalExitStatus::new().exit_code(Some(0))))
+                    } else {
+                        acp::TerminalOutputResponse::new("first\n", false)
+                    };
+                    let _ = args.response_tx.send(Ok(response));
+                }
+                AcpClientMessage::ReleaseTerminal(args) => {
+                    let _ = released_tx.send(());
+                    let _ = args
+                        .response_tx
+                        .send(Ok(acp::ReleaseTerminalResponse::new()));
+                }
+                _ => {}
+            }
+        }
+    });
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(gateway_tx),
+        acp::SessionId::new("parent"),
+    ));
+    let backend: Arc<dyn TerminalBackend> = adapter.clone();
+    let (child_tx, mut child_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (parent_tx, mut parent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut request = background_request(path.clone());
+    request.kind = TaskKind::Bash;
+    request.owner_session_id = Some("child".into());
+    request.notification_handle = ToolNotificationHandle::from_sender(child_tx);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let child_backend = adapter.clone();
+    let child = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let _ = started_tx.send(child_backend.run_background(request).await);
+            let _ = stop_rx.await;
+        });
+    });
+    let started = started_rx.await.unwrap().unwrap();
+    let wait = wait_rx.recv().await.unwrap();
+    backend
+        .reparent_notifications(
+            "child",
+            "parent",
+            ToolNotificationHandle::from_sender(parent_tx),
+            Arc::downgrade(&backend),
+        )
+        .await
+        .unwrap();
+    stop_tx.send(()).unwrap();
+    tokio::task::spawn_blocking(move || child.join().unwrap())
+        .await
+        .unwrap();
+    exited.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait.send(Ok(acp::WaitForTerminalExitResponse::new(
+        acp::TerminalExitStatus::new().exit_code(Some(0)),
+    )))
+    .unwrap();
+    assert!(
+        matches!(parent_rx.recv().await.unwrap(), ToolNotification::BashExecutionBackgrounded(event) if event.task_id == started.task_id)
+    );
+    assert!(
+        matches!(parent_rx.recv().await.unwrap(), ToolNotification::TaskCompleted(event) if event.task_id == started.task_id && event.owner_session_id.as_deref() == Some("parent"))
+    );
+    assert!(child_rx.try_recv().is_err());
+    assert_eq!(
+        tokio::fs::read_to_string(path).await.unwrap(),
+        "first\nsecond\n"
+    );
+    released_rx.recv().await.unwrap();
+    assert!(released_rx.try_recv().is_err());
+    assert!(parent_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn teardown_claim_and_reparent_are_serialized_by_owner() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(tx),
+        acp::SessionId::new("parent"),
+    ));
+    let backend: Arc<dyn TerminalBackend> = adapter.clone();
+    adapter.tasks.lock().unwrap().insert(
+        "task".into(),
+        TrackedTask {
+            owner_session_id: Some("child".into()),
+            ..Default::default()
+        },
+    );
+    backend
+        .reparent_notifications(
+            "child",
+            "parent",
+            ToolNotificationHandle::noop(),
+            Arc::downgrade(&backend),
+        )
+        .await
+        .unwrap();
+    assert!(
+        adapter
+            .claim_background_for_teardown(Some("child"))
+            .is_empty()
+    );
+    assert!(!adapter.tasks.lock().unwrap()["task"].kill_result_delivered);
+
+    adapter
+        .tasks
+        .lock()
+        .unwrap()
+        .get_mut("task")
+        .unwrap()
+        .owner_session_id = Some("child".into());
+    assert_eq!(
+        adapter.claim_background_for_teardown(Some("child")),
+        ["task"]
+    );
+    assert!(
+        backend
+            .reparent_notifications(
+                "child",
+                "parent",
+                ToolNotificationHandle::noop(),
+                Arc::downgrade(&backend)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        adapter.tasks.lock().unwrap()["task"]
+            .owner_session_id
+            .as_deref(),
+        Some("child")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_teardown_bounds_unresponsive_client_and_retains_unconfirmed_tasks() {
+    use xai_acp_lib::AcpClientMessage;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(tx),
+        acp::SessionId::new("s"),
+    ));
+    adapter
+        .foreground
+        .lock()
+        .unwrap()
+        .insert("fg-child".into(), Some("child".into()));
+    adapter
+        .foreground
+        .lock()
+        .unwrap()
+        .insert("fg-sibling".into(), Some("sibling".into()));
+    {
+        let mut tasks = adapter.tasks.lock().unwrap();
+        tasks.insert(
+            "bg-child".into(),
+            TrackedTask {
+                owner_session_id: Some("child".into()),
+                ..Default::default()
+            },
+        );
+        tasks.insert(
+            "bg-sibling".into(),
+            TrackedTask {
+                owner_session_id: Some("sibling".into()),
+                ..Default::default()
+            },
+        );
+    }
+    let cleanup = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                adapter.kill_foreground_commands_by_owner("child"),
+                adapter.kill_all_background_tasks_by_owner("child")
+            );
+        })
+    };
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        match rx.recv().await.unwrap() {
+            AcpClientMessage::KillTerminalCommand(args) => held.push(args),
+            _ => panic!("expected kill"),
+        }
+    }
+    tokio::time::advance(Duration::from_secs(6)).await;
+    cleanup.await.unwrap();
+    assert_eq!(held.len(), 2);
+    assert!(adapter.foreground.lock().unwrap().contains_key("fg-child"));
+    assert!(
+        adapter
+            .foreground
+            .lock()
+            .unwrap()
+            .contains_key("fg-sibling")
+    );
+    let tasks = adapter.tasks.lock().unwrap();
+    assert!(!tasks["bg-child"].explicitly_killed);
+    assert!(tasks["bg-child"].kill_result_delivered);
+    assert!(!tasks["bg-sibling"].kill_result_delivered);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn foreground_wait_failure_after_unconfirmed_kill_keeps_terminal_record() {
+    use xai_acp_lib::AcpClientMessage;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let adapter = Arc::new(AcpTerminalAdapter::new(
+        GatewaySender::new(tx),
+        acp::SessionId::new("s"),
+    ));
+    let run = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            adapter
+                .run(background_request(PathBuf::from("/tmp/unused-acp.log")))
+                .await
+        })
+    };
+    let Some(AcpClientMessage::CreateTerminal(create)) = rx.recv().await else {
+        panic!("expected create")
+    };
+    create
+        .response_tx
+        .send(Ok(acp::CreateTerminalResponse::new("foreground")))
+        .unwrap();
+    let Some(AcpClientMessage::WaitForTerminalExit(wait)) = rx.recv().await else {
+        panic!("expected wait")
+    };
+    let cleanup = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.kill_foreground_commands_by_owner("owner-1").await })
+    };
+    let Some(AcpClientMessage::KillTerminalCommand(kill)) = rx.recv().await else {
+        panic!("expected kill")
+    };
+    tokio::time::advance(Duration::from_secs(6)).await;
+    cleanup.await.unwrap();
+    drop(wait.response_tx);
+    let Some(AcpClientMessage::ReleaseTerminal(release)) = rx.recv().await else {
+        panic!("expected release")
+    };
+    release
+        .response_tx
+        .send(Ok(acp::ReleaseTerminalResponse::new()))
+        .unwrap();
+    assert!(run.await.unwrap().is_err());
+    assert!(
+        adapter
+            .foreground
+            .lock()
+            .unwrap()
+            .contains_key("foreground")
+    );
+    drop(kill);
+}
+
+#[tokio::test]
+async fn client_terminal_refuses_foreground_and_background_after_sandbox_tightens() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Guard(AtomicBool);
+    #[async_trait::async_trait]
+    impl AcpTerminalSandboxGuard for Guard {
+        async fn requires_local_enforcement(&self) -> Result<bool, ComputerError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let guard = Arc::new(Guard(AtomicBool::new(false)));
+    let mut adapter = AcpTerminalAdapter::new(GatewaySender::new(tx), acp::SessionId::new("s"));
+    adapter.sandbox_guard = Some(guard.clone());
+    guard.0.store(true, Ordering::SeqCst);
+    let foreground = adapter
+        .run(background_request(PathBuf::from("/tmp/not-created.log")))
+        .await
+        .err()
+        .expect("foreground must be refused");
+    let background = adapter
+        .run_background(background_request(PathBuf::from("/tmp/not-created.log")))
+        .await
+        .err()
+        .expect("background must be refused");
+    assert!(foreground.to_string().contains("sandbox enforcement"));
+    assert!(background.to_string().contains("sandbox enforcement"));
+    assert!(rx.try_recv().is_err(), "no terminal request may escape");
+}
+
 #[tokio::test(start_paused = true)]
 async fn run_background_records_snapshots_and_threads_task_kind() {
     use xai_grok_tools::notification::types::ToolNotification;

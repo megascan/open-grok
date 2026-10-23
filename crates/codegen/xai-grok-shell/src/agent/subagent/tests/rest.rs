@@ -335,7 +335,6 @@ fn compaction_no_prefix_passes_through() {
 #[test]
 fn resumed_from_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-resumed".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -384,7 +383,6 @@ fn resumed_from_field_in_meta_roundtrips() {
 #[test]
 fn resumed_from_none_not_serialized_in_meta() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-fresh".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -433,7 +431,6 @@ fn backward_compat_meta_without_resumed_from() {
 #[test]
 fn snapshot_ref_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-snap".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -484,7 +481,6 @@ fn backward_compat_meta_without_snapshot_ref() {
 /// Minimal completed-status meta for the snapshot-ref persistence tests.
 fn snapshot_test_meta(id: &str) -> SubagentMeta {
     SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: id.into(),
         parent_session_id: "session-A".into(),
         child_session_id: format!("child-{id}"),
@@ -634,6 +630,8 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
     let wt = temp.path().join("subagent-glue-1");
     xai_fast_worktree::WorktreeBuilder::new(&repo, &wt)
         .standalone(true)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id("glue-1")
         .create()
         .unwrap();
     std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
@@ -657,7 +655,26 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
             &snapshot_ref,
             "completed"
         ));
+    // Production removal only removes clean, inactive managed worktrees.
+    // This isolated fixture can declare its test owner inactive after snapshot.
+    let reset = std::process::Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(&wt)
+        .status()
+        .unwrap();
+    assert!(reset.success());
+    let db = xai_grok_workspace::worktree::open_db().unwrap();
+    let mut record = db.get(wt.to_str().unwrap()).unwrap().unwrap();
+    record.creator_pid = None;
+    db.register(&record).unwrap();
     crate::session::worktree::remove_subagent_worktree(&wt).await.unwrap();
+    let snap = std::process::Command::new("git")
+        .args(["show", &format!("{ref_name}:tracked.txt")])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(snap.status.success());
+    assert_eq!(snap.stdout, b"edited");
     let data = std::fs::read_to_string(meta_dir.join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
     assert_eq!(reread.snapshot_ref.as_deref(), Some(ref_name));
@@ -666,10 +683,51 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
             "worktree dir should be removed after the sequence"
         );
 }
+/// The normal completion path retains a dirty, current-process worktree when
+/// conservative cleanup rejects it. A snapshot must not force rehydration on
+/// top of that retained worktree.
+#[tokio::test]
+async fn retained_dirty_snapshot_resumes_only_with_proven_identity() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+    let wt = temp.path().join("subagent-retained");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &wt)
+        .standalone(true)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id("retained-owner")
+        .create().unwrap();
+    std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
+    let snapshot = crate::session::worktree::snapshot_subagent_worktree(
+        &wt, &repo, "refs/open-grok/subagents/retained-owner",
+    ).await.unwrap();
+    assert!(crate::session::worktree::remove_subagent_worktree(&wt).await.is_err());
+    assert_eq!(super::super::prepare_resume_subagent_worktree(
+        &wt, &repo, "retained-owner", Some(&snapshot),
+    ).await.unwrap(), wt);
+    assert_eq!(std::fs::read_to_string(wt.join("tracked.txt")).unwrap(), "edited");
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &wt, &repo, "wrong-owner", Some(&snapshot),
+    ).await.is_err());
+    let missing = temp.path().join("missing");
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &missing, &repo, "retained-owner", None,
+    ).await.is_err());
+    let occupied = temp.path().join("unmanaged");
+    std::fs::create_dir(&occupied).unwrap();
+    assert!(super::super::prepare_resume_subagent_worktree(
+        &occupied, &repo, "retained-owner", Some(&snapshot),
+    ).await.is_err());
+}
+
 #[test]
 fn subagent_session_metadata_roundtrip() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-1".into(),
         parent_session_id: "parent-1".into(),
         child_session_id: "child-1".into(),
@@ -731,7 +789,6 @@ fn subagent_session_metadata_roundtrip() {
 #[test]
 fn subagent_session_metadata_non_forked() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-2".into(),
         parent_session_id: "parent-2".into(),
         child_session_id: "child-2".into(),
@@ -797,7 +854,6 @@ fn subagent_session_metadata_backward_compat_deserialization() {
 #[test]
 fn upload_lifecycle_spawn_then_completion_preserves_fields() {
     let spawn_meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-lifecycle".into(),
         parent_session_id: "parent-1".into(),
         child_session_id: "child-1".into(),
@@ -882,7 +938,6 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
 #[test]
 fn upload_lifecycle_failure_preserves_error() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-fail".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -932,7 +987,6 @@ fn initial_context_source_resumed_variant() {
 #[test]
 fn session_metadata_session_kind_for_resumed() {
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-resume".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -1032,7 +1086,6 @@ fn resume_prefix_len_counts_consecutive_system_head() {
 #[test]
 fn resume_source_worktree_reuse() {
     let source_with_worktree = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-wt".into(),
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/worktree".into(),
@@ -1052,7 +1105,6 @@ fn resume_source_worktree_reuse() {
         "should reuse source worktree"
     );
     let source_without_worktree = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-no-wt".into(),
         child_session_id: "child-no-wt".into(),
         child_cwd: "/workspace".into(),
@@ -1098,7 +1150,6 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let existing = dir.path().to_string_lossy().into_owned();
     let present = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-present".into(),
         child_session_id: "child-present".into(),
         child_cwd: existing.clone(),
@@ -1129,7 +1180,6 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
 #[test]
 fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-wt".into(),
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/whatever".into(),
@@ -1233,7 +1283,6 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         .join(uuid::Uuid::now_v7().to_string());
     let _ = std::fs::create_dir_all(&dir);
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-dur".into(),
         parent_session_id: "parent-dur".into(),
         child_session_id: "child-dur".into(),
@@ -1274,7 +1323,6 @@ fn durable_fallback_rejects_running_status() {
     let parent_dir = dir.join("subagents").join("sa-running");
     let _ = std::fs::create_dir_all(&parent_dir);
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-running".into(),
         parent_session_id: "parent-x".into(),
         child_session_id: "child-running".into(),
@@ -1358,7 +1406,6 @@ fn drain_cancelled_finish_broadcasts(
 /// A `running` meta with no terminal counterpart, as left by a dead process.
 fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
     SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: id.into(),
         parent_session_id: parent_session_id.into(),
         child_session_id: format!("child-{id}"),
@@ -1556,7 +1603,6 @@ async fn reconcile_dedups_replay_and_running_meta_sources() {
 #[test]
 fn resume_rejects_conflicting_subagent_type() {
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-gp".into(),
         child_session_id: "child-gp".into(),
         child_cwd: "/workspace".into(),
@@ -1576,7 +1622,6 @@ fn resume_rejects_conflicting_subagent_type() {
 #[test]
 fn resume_rejects_conflicting_persona() {
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-impl".into(),
         child_session_id: "child-impl".into(),
         child_cwd: "/workspace".into(),
@@ -1594,7 +1639,6 @@ fn resume_rejects_conflicting_persona() {
 #[test]
 fn resume_allows_matching_identity() {
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-ok".into(),
         child_session_id: "child-ok".into(),
         child_cwd: "/workspace".into(),
@@ -1612,7 +1656,6 @@ fn resume_allows_matching_identity() {
 #[test]
 fn resume_identity_does_not_gate_on_model() {
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "sub-model".into(),
         child_session_id: "child-model".into(),
         child_cwd: "/workspace".into(),
@@ -1644,7 +1687,6 @@ fn durable_meta_roundtrips_effective_model_id() {
         .join(uuid::Uuid::now_v7().to_string());
     let _ = std::fs::create_dir_all(&dir);
     let meta = SubagentMeta {
-        antigravity_conversation_id: None,
         subagent_id: "sa-model".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -1714,7 +1756,6 @@ fn resume_route_pins_overlapping_slug_to_its_provider_profile() {
     ]);
 
     let source = ResumeSourceData {
-        antigravity_conversation_id: None,
         subagent_id: "source".into(),
         child_session_id: "child".into(),
         child_cwd: "/workspace".into(),
@@ -1754,8 +1795,7 @@ fn resume_route_pins_overlapping_slug_to_its_provider_profile() {
 fn resume_window_safety_rejects_instead_of_swapping() {
     let estimated_tokens: u64 = 100_000;
     let child_window: u64 = 256_000;
-    const SAFE_RESUME_PERCENT: u64 = 80;
-    let threshold = child_window * SAFE_RESUME_PERCENT / 100;
+    let threshold = resume_token_limit(child_window, 80);
     assert!(
             estimated_tokens <= threshold,
             "100k tokens should be within 80% of 256k window"
@@ -2798,13 +2838,20 @@ fn resolve_inherited_pool_missing_parent_returns_none() {
 /// mcpServers, but they do inherit already-connected parent servers.
 #[test]
 fn plugin_agents_inherit_parent_mcp_pool_by_default() {
+    let mut plugin_def = xai_grok_agent::config::AgentDefinition::general_purpose();
+    plugin_def.plugin_name = Some("test-plugin".into());
+    plugin_def.mcp_servers = vec![xai_grok_agent::config::McpServerRef::Inline {
+        name: "owned".into(),
+        config: serde_json::json!({"command": "owned-server"}),
+    }];
     assert!(
-        !super::agent_owned_mcp_servers_allowed(true),
+        crate::session::agent_mcp::materialize_agent_mcp_servers(
+            &plugin_def,
+            &[],
+            std::path::Path::new("/tmp"),
+        )
+        .is_empty(),
         "plugin agents must not declare agent-owned mcpServers"
-    );
-    assert!(
-        super::agent_owned_mcp_servers_allowed(false),
-        "non-plugin agents may declare agent-owned mcpServers"
     );
     let pool = make_pool(&["atlassian", "github"]);
     let inherited = super::resolve_inherited_mcp_pool(
@@ -2856,6 +2903,7 @@ fn make_test_skill(
         disable_model_invocation: false,
         has_user_specified_description: false,
         paths: None,
+        origin: None,
         body: None,
     }
 }

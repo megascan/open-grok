@@ -177,6 +177,76 @@ fn set_text_preserves_cursor_clamped_across_grow_and_shrink() {
 }
 
 #[test]
+fn restore_elements_skips_out_of_bounds_ranges() {
+    let mut textarea = ta_with("short");
+    textarea.restore_elements([(0..5, ElementKind(1), None), (0..6, ElementKind(1), None)]);
+
+    let ranges: Vec<_> = textarea
+        .elements()
+        .iter()
+        .map(|element| element.range.clone())
+        .collect();
+    assert_eq!(ranges, vec![0..5]);
+}
+
+#[test]
+fn restore_element_returns_id_over_existing_text() {
+    let mut textarea = ta_with("see [Image #1] now");
+    textarea.clear_history();
+
+    let id = textarea
+        .restore_element(4..14, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("expected a registered element"));
+
+    assert_eq!(textarea.text(), "see [Image #1] now");
+    let elem = textarea
+        .elements()
+        .first()
+        .unwrap_or_else(|| panic!("expected an element"));
+    assert_eq!(
+        (elem.id, elem.range.clone(), elem.kind),
+        (id, 4..14, ElementKind(3))
+    );
+    assert!(
+        !textarea.can_undo(),
+        "restore_element must not record an undo step"
+    );
+}
+
+#[test]
+fn restore_element_rejects_overlapping_range() {
+    let mut textarea = ta_with("[Image #1] tail");
+    textarea
+        .restore_element(0..10, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("first registration must succeed"));
+
+    assert_eq!(textarea.restore_element(5..12, ElementKind(3), None), None);
+    assert_eq!(textarea.restore_element(0..10, ElementKind(1), None), None);
+    assert_eq!(textarea.restore_element(0..100, ElementKind(3), None), None);
+    assert_eq!(textarea.elements().len(), 1);
+}
+
+#[test]
+fn restore_element_accepts_adjacent_range() {
+    let mut textarea = ta_with("[Image #1][Image #2]");
+    textarea
+        .restore_element(0..10, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("first registration must succeed"));
+
+    assert!(
+        textarea
+            .restore_element(10..20, ElementKind(3), None)
+            .is_some()
+    );
+    let ranges: Vec<_> = textarea
+        .elements()
+        .iter()
+        .map(|element| element.range.clone())
+        .collect();
+    assert_eq!(ranges, vec![0..10, 10..20]);
+}
+
+#[test]
 fn set_text_restores_zero_length_element_metadata_through_history() {
     let mut textarea = TextArea::new();
     let id = textarea.insert_element("", ElementKind(7), None);
@@ -3344,6 +3414,64 @@ fn undo_stack_depth_capped() {
     assert_eq!(count, 5);
     // We've undone 5 set_text calls, landing on the 5th oldest state.
     assert_eq!(ta.text(), "v4");
+}
+
+#[test]
+fn undo_history_is_bounded_by_bytes_across_stack_and_redo() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 96;
+    for i in 0..10 {
+        ta.set_text(&format!("{i}{}", "x".repeat(30)));
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+    while ta.undo() {
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+    while ta.redo() {
+        assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+    }
+}
+
+#[test]
+fn oversized_deleted_paste_does_not_remain_in_undo_history() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 64;
+    ta.set_text(&"large paste".repeat(100));
+    ta.set_text("");
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.redo.is_empty());
+    assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
+}
+
+#[test]
+fn oversized_group_can_cancel_but_is_not_retained_after_commit() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 64;
+    let paste = "large paste".repeat(100);
+    ta.set_text(&paste);
+    ta.begin_undo_group();
+    ta.set_text("");
+    ta.cancel_undo_group();
+    assert_eq!(ta.text(), paste);
+    ta.begin_undo_group();
+    ta.set_text("");
+    ta.end_undo_group();
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.group_checkpoint.is_none());
+}
+
+#[test]
+fn oversized_element_display_is_counted_in_undo_history() {
+    let mut ta = TextArea::new();
+    ta.undo.max_bytes = 128;
+    ta.insert_element(
+        "x",
+        ElementKind(1),
+        Some(Line::from("large display".repeat(100))),
+    );
+    ta.set_text("");
+    assert!(ta.undo.stack.is_empty());
+    assert!(ta.undo.retained_bytes() <= ta.undo.max_bytes);
 }
 
 #[test]

@@ -10,6 +10,7 @@
 //! telemetry.
 
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
@@ -560,7 +561,7 @@ fn cmd_uninstall(name: &str, confirm: bool, keep_data: bool) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        Err(e @ UninstallError::NotFound { .. }) => bail!("{e}"),
+        Err(e @ (UninstallError::NotFound { .. } | UninstallError::Failed(_))) => bail!("{e}"),
     }
 }
 
@@ -1021,7 +1022,7 @@ fn marketplace_remove(
 
     let identity = source_identity(source);
 
-    let uninstalled = plugin::uninstall_marketplace_source_plugins(&identity);
+    let uninstalled = plugin::uninstall_marketplace_source_plugins(&identity)?;
 
     let config_path = xai_grok_config::grok_home().join("config.toml");
     let mut removed_from_config = false;
@@ -1247,7 +1248,7 @@ mod tests {
     #[test]
     fn marketplace_update_force_syncs_fresh_git_cache() {
         if !git_available() {
-            eprintln!("skipping git-dependent test: git binary not available");
+            std::eprintln!("skipping git-dependent test: git binary not available");
             return;
         }
         let remote = tempfile::tempdir().unwrap();

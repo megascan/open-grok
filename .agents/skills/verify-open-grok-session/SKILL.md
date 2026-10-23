@@ -21,7 +21,11 @@ For the parent and relevant child, inspect:
 4. `compaction_checkpoints/<id>.json` for every referenced checkpoint.
 5. `chat_history.jsonl`, `prompt_context.json`, or `system_prompt.txt` only when the question requires their content.
 
-Use `rg`/`jq` against explicit resolved paths. Preserve event order rather than counting strings alone.
+Use `rg`/`jq` against explicit resolved paths. Core `updates.jsonl` and
+`chat_history.jsonl` files may contain gzip bytes despite their names: check
+`file <path>` and pipe `gzip -dc <path>` into the inspection command when needed.
+See the gzip storage section in `docs/agents/sessions.md`. Preserve event order
+rather than counting strings alone.
 
 ## Prove the requested behavior
 

@@ -45,13 +45,16 @@ Hard reject when plan mode is Active and the access is an edit that is not the s
 
 | Situation | Result |
 | --- | --- |
-| Active + edit `session_dir/plan.md` | Allow (later plan-file auto-approve) |
+| Active + supported edit `session_dir/plan.md` | Allow with a per-call plan-file capability (later plan-file auto-approve) |
 | Active + any other `AccessKind::Edit` | Reject (tool result to model; turn continues) |
-| Active + `apply_patch` | Always reject (targets unknown until parse) |
+| Active + `apply_patch` | Allow only nonempty add/update hunks targeting the plan file; reject moves, deletes, mixed targets, and invalid patches |
+| Active + an edit tool without plan capability support | Reject, including dynamic OpenCode edit |
 | Active + bash / read / MCP / web | **Not** gated here |
 | Inactive | No plan gate |
 
 **Invariant:** this gate lives in the **shell**, not only in the permission manager. YOLO / always-approve does **not** bypass it. Do not “fix” plan mode only inside `PermissionHandle`.
+
+The gate runs before hooks and again on rewritten input. Each accepted plan edit obtains a capability from the active local filesystem and carries it through direct or nested dispatch, including when a hook forces a prompt. At startup the Unix local backend pins the configured Open Grok home, then traverses its session descendants without following symlinks and performs anchored I/O without writing through hard links. A symlinked configured home remains supported; unsupported backends fail closed. The path check alone is not a write-time boundary. After waiting on a file lock, dispatch rechecks plan mode so an edit prepared before mid-turn activation cannot run without the capability.
 
 ### 2. PreToolUse hooks
 
@@ -61,7 +64,7 @@ Hard reject when plan mode is Active and the access is an edit that is not the s
 
 ### 3. Plan-file auto-approve
 
-When `AccessKind::Edit(path)` and the plan tracker says that path is the session `plan.md`, the permission manager request is skipped for that call.
+When a supported edit targets the session `plan.md`, or every hunk of a patch adds or updates that file, the permission manager request is skipped unless a hook asks for approval. The plan-file capability remains mandatory either way.
 
 ### 4. `PermissionHandle::request`
 
@@ -70,7 +73,7 @@ Inside the permission actor (`manager.rs`), roughly:
 1. **Compiled policy** on the access (direct evaluate).
 2. For **Bash**: also `evaluate_bash_command_policy` (per-segment deny/ask) and `evaluate_shell_file_access` (readers/writers/redirects vs Read/Edit rules).
 3. Policy **deny** → `Decision::PolicyDeny` (before YOLO).
-4. Policy/shell **Ask** blocks YOLO and auto fast-paths (forced prompt).
+4. Policy **Ask** blocks auto fast-paths and remembered edit grants. Shell-gate **Ask** also blocks YOLO.
 5. **YOLO / always-approve** → `Allow` (unless shell-forced ask; deny already returned).
 6. **Session grants** (remembered bash prefixes, MCP tools/servers, web_fetch domains, session allow-edits) before auto classifier.
 7. **Auto mode** (fast-path allowlist / classifier) when enabled and not force-prompted.
@@ -87,13 +90,15 @@ Defined in `permission/types.rs`. Built from `ToolInput` via `From<&ToolInput>`.
 | --- | --- |
 | `Read(Option<path>)` | `read_file`, `list_dir`, skill/todo/task-control (path often `None`) |
 | `Grep { path, glob }` | `grep` |
-| `Edit(path_or_label)` | `search_replace`, `write`, hashline edit; `apply_patch` uses label `"apply_patch"` |
+| `Edit(path_or_label)` | `search_replace`, `write`, hashline edit; `apply_patch` carries every parsed source and destination path alongside the label `"apply_patch"` |
 | `Bash(command)` | `bash`, `monitor` |
 | `MCPTool { name, input }` | MCP / `use_tool` (args kept for classifier + telemetry) |
 | `WebFetch(url)` | `web_fetch` |
 | `WebSearch(query)` | `web_search` |
 
 Rules filter by `ToolFilter` (`Any`, `Bash`, `Edit`, `Read`, `Grep`, `Mcp`, `WebFetch`, `WebSearch`). **Read rules also govern Grep** at evaluation time (grep reads file contents).
+
+Patch paths are resolved from the execution cwd after hook rewrites. A deny or ask on any target applies to the whole patch; an allow automatically approves it only when every target is allowed. Move source and destination are both checked, and invalid or empty patches fail closed.
 
 ## Decision kinds
 
@@ -314,8 +319,11 @@ Custom `deny` lists are kernel-enforced (read + write/rename); globs supported w
 - `SandboxManager::apply` is **irreversible** for the process lifetime; `install()` stores global state (`OnceLock`).
 - Profile for a **session** is persisted on the session summary (`sandbox_profile`).
 - On **resume**: saved profile is restored; a **different** `--sandbox` is **refused** (cannot widen or silently tighten mid-life of a session). Matching profile or omit flag is OK.
-- New session resolution: requirements → CLI / env → config → `workspace`.
-  An explicit `off` remains available; saved resume profiles still take priority
+- New session resolution: requirements → CLI / env → config → `off`.
+  `/sandbox` opens the restart-required OS sandbox setting without enabling it.
+  Its boolean UI maps to `[sandbox] profile = "workspace"` (on) or `"off"` (off),
+  through the local feature-setting persistence path; the profile stays a string
+  on disk. Saved resume profiles still take priority
   over the default so existing sessions do not silently change confinement.
 - Helpers: `is_active()`, `profile_name()`, `should_restrict_child_network()`, `should_auto_allow_bash()` (optional bash auto-approve when sandbox active + configured), violation log `~/.opengrok/sandbox-events.jsonl`.
 - `enforce` feature (default on Unix): without it, helpers still compile but enforcement is a no-op.

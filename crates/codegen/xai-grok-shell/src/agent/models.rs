@@ -1490,6 +1490,24 @@ impl ModelsManager {
         Ok(warning)
     }
 
+    /// Write a whole endpoint's model list at once, then rebuild the catalog a
+    /// single time. Selecting five models from a new server must not leave the
+    /// picker half-updated if one row fails.
+    pub(crate) async fn upsert_custom_models(
+        &self,
+        records: Vec<crate::custom_models::CustomModelRecord>,
+    ) -> anyhow::Result<Vec<String>> {
+        let (written, warnings) = crate::util::config::upsert_custom_models(records).await?;
+        if !written.is_empty() {
+            let mut cfg = self.inner.cfg.read().clone();
+            for (key, model) in written {
+                cfg.config_models.insert(key, model);
+            }
+            self.apply_config(cfg);
+        }
+        Ok(warnings)
+    }
+
     pub(crate) async fn delete_custom_model(&self, key: &str) -> anyhow::Result<()> {
         crate::util::config::delete_custom_model(key).await?;
         self.apply_custom_model_delete(key);
@@ -1882,6 +1900,34 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
+    /// Whether `model_id` accepts this effort on the wire.
+    pub(crate) fn model_supports_reasoning_effort_value(
+        &self,
+        model_id: &str,
+        effort: ReasoningEffort,
+    ) -> bool {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
+            .is_some_and(|entry| resolution::model_offers_reasoning_effort(entry.info(), effort))
+    }
+
+    /// Id to send at `effort`. Fork catalogs do not remap slugs per effort.
+    pub(crate) fn model_for_effort(
+        &self,
+        model_id: &str,
+        _effort: ReasoningEffort,
+    ) -> Option<String> {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .contains_key(model_id)
+            .then(|| model_id.to_owned())
+    }
+
     /// Service tiers advertised for `model_id` (Codex Fast/Flex routing).
     pub fn model_service_tiers(
         &self,
@@ -1987,6 +2033,12 @@ impl ModelsManager {
             .and_then(|entry| entry.info().stream_tool_calls)
     }
 
+    pub(crate) fn model_subagent_rate_limit_max_attempts(&self, model_id: &str) -> Option<u32> {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .and_then(|entry| entry.info().subagent_rate_limit_max_attempts)
+    }
+
     /// Resolve the effective Codex reasoning-summary mode by catalog key or
     /// routing slug. The authenticated models.json snapshot remains
     /// authoritative across client rebuilds and subagent inheritance.
@@ -2012,21 +2064,35 @@ impl ModelsManager {
         model_id: &str,
     ) -> Option<CodexCompactionMetadata> {
         let cfg = self.inner.cfg.read().clone();
-        let (routing_slug, session_effective) = {
+        let (routing_slug, session_effective, embedded) = {
             let catalog = self.inner.catalog.read();
             let models = &catalog.models;
             let entry = config::find_model_by_id(models, model_id)?;
             if entry.info.provider != xai_grok_sampling_types::ModelProvider::Codex {
                 return None;
             }
-            (entry.info.model.clone(), entry.info.context_window.get())
+            let embedded =
+                entry
+                    .info
+                    .codex_model
+                    .raw_context_window()
+                    .map(|_| CodexCompactionMetadata {
+                        auto_compact_token_limit: entry.info.codex_model.compact_limit(),
+                        comp_hash: entry.info.codex_model.comp_hash.clone(),
+                    });
+            (
+                entry.info.model.clone(),
+                entry.info.context_window.get(),
+                embedded,
+            )
         };
-        let live = self
-            .inner
-            .codex_catalog
-            .read()
-            .as_ref()
-            .and_then(|catalog| catalog.compaction_metadata(&routing_slug));
+        let live = embedded.or_else(|| {
+            self.inner
+                .codex_catalog
+                .read()
+                .as_ref()
+                .and_then(|catalog| catalog.compaction_metadata(&routing_slug))
+        });
         if let Some(limit) = crate::agent::model_context::overridden_auto_compact_token_limit(
             &cfg,
             session_effective,
@@ -2037,6 +2103,49 @@ impl ModelsManager {
             });
         }
         live
+    }
+
+    /// Resolve metadata from the same final catalog as model selection, including
+    /// user context overrides. Never inherit it across providers or backends.
+    pub fn codex_model_metadata(
+        &self,
+        model_id: &str,
+    ) -> xai_grok_sampling_types::CodexModelMetadata {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .filter(|entry| {
+                entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && entry.info.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+            })
+            .map(|entry| entry.info.codex_metadata())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn codex_persistent_mode(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .ui
+            .codex_persistent_mode
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn experimental_context_enabled(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .features
+            .context_management
+            .experimental_mode
+    }
+
+    pub(crate) fn codex_guardian_review(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .ui
+            .codex_guardian_review
+            .unwrap_or(false)
     }
 
     pub(crate) fn model_compactions_remaining(
@@ -2113,6 +2222,41 @@ impl ModelsManager {
     pub(crate) async fn wait_for_first_catalog(&self) {
         self.wait_for_first_catalog_inner(crate::util::config::resolve_remote_fetch_enabled())
             .await;
+    }
+
+    /// One lock read, so ids, families, and the fetch state come from one catalog generation.
+    pub(crate) fn task_model_catalog_snapshot(
+        &self,
+        remote_fetch_enabled: bool,
+    ) -> task_model_policy::TaskModelCatalogSnapshot {
+        use task_model_policy::{CatalogAuthority, EligibleTaskModel};
+        let is_session_auth = self.is_session_auth();
+        let cat = self.inner.catalog.read();
+        task_model_policy::TaskModelCatalogSnapshot {
+            eligible: cat
+                .models
+                .iter()
+                .filter(|(_, e)| e.info.is_picker_eligible(is_session_auth))
+                .map(|(id, e)| EligibleTaskModel {
+                    id: id.clone(),
+                    // Provider identity comes from model metadata, never from a
+                    // server-reported family string: xAI-minted entries are the
+                    // first-party family, everything else is third-party.
+                    model_family: Some(
+                        if e.info.provider == xai_grok_sampling_types::ModelProvider::Xai {
+                            "xai".to_string()
+                        } else {
+                            "third_party".to_string()
+                        },
+                    ),
+                })
+                .collect(),
+            authority: if cat.has_fetched_real_catalog || !remote_fetch_enabled {
+                CatalogAuthority::Complete
+            } else {
+                CatalogAuthority::Provisional
+            },
+        }
     }
 
     async fn wait_for_first_catalog_inner(&self, remote_fetch_enabled: bool) -> bool {
@@ -3048,6 +3192,9 @@ mod cache;
 mod endpoint;
 mod fetch;
 mod resolution;
+mod settings_cache;
+pub mod startup_prefetch;
+pub(crate) mod task_model_policy;
 
 pub(crate) use cache::*;
 pub(crate) use endpoint::*;
@@ -3057,6 +3204,7 @@ pub use fetch::{
     start_early_prefetch_settings_only, start_early_prefetch_with_auth,
 };
 pub(crate) use resolution::*;
+pub(crate) use settings_cache::*;
 
 #[cfg(test)]
 mod tests;

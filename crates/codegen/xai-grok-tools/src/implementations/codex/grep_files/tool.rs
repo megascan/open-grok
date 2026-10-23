@@ -78,7 +78,7 @@ async fn run_rg_search(
     limit: usize,
     cwd: &Path,
 ) -> Result<Vec<String>, String> {
-    let rg_exec = rg_path();
+    let rg_exec = rg_path().map_err(|error| error.to_string())?;
     let mut command = Command::new(rg_exec);
     command
         .current_dir(cwd)
@@ -144,6 +144,10 @@ impl crate::types::tool_metadata::ToolMetadata for CodexGrepFilesTool {
 
     fn tool_namespace(&self) -> ToolNamespace {
         ToolNamespace::Codex
+    }
+
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("path")
     }
 
     fn description_template(&self) -> &str {

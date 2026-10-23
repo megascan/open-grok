@@ -30,14 +30,15 @@
 //!
 //! ## Why some fields are channel senders
 //!
-//! Several `ToolBridge` resources (e.g. `UserQuestionSender`,
-//! `SubagentBackendResource`) are backed by the `tx` half of channels
-//! whose `rx` halves are owned by long-lived coordinator tasks spawned
-//! in `spawn_session_actor`. The subagent channels are wrapped in a
-//! `ChannelBackend` behind `SubagentBackendResource`. On rebuild, we
-//! must reuse the **same** senders so the existing coordinator keeps
-//! receiving requests; we cannot mint a fresh channel without orphaning
-//! the running coordinator.
+//! Several `ToolBridge` resources (e.g. `UserQuestionSender`, `SubagentBackendResource`) are backed by the `tx` halves of channels.
+//! The `rx` halves are owned by long-lived coordinator tasks spawned in `spawn_session_actor`.
+//! The subagent channels are wrapped in a `ChannelBackend` behind `SubagentBackendResource`.
+//! On rebuild, we must reuse the **same** senders so the existing coordinator keeps receiving requests.
+//! A fresh channel would orphan the running coordinator.
+use crate::agent::models::task_model_policy::{
+    LatchedTaskModelSelection, TaskModelPolicyInputs, TaskModelSelection,
+    latch_task_model_presentation, presentation_applied_event, rejection_sink,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,6 +146,27 @@ fn standalone_web_search_active(
         && candidates.effective_source_for(crate::tools::config::WebSearchSourceTarget::Codex)
             == crate::tools::config::WebSearchSource::Native
 }
+/// The live memory-v2 file-access policy shared by spawn, the `/memory` toggle, and rebuilds.
+/// The lock never escapes: readers get a clone, writers replace the value.
+pub(crate) struct MemoryV2AccessSlot(
+    parking_lot::Mutex<Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>>,
+);
+impl MemoryV2AccessSlot {
+    pub(crate) fn new(
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    ) -> Self {
+        Self(parking_lot::Mutex::new(access))
+    }
+    pub(crate) fn get(&self) -> Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource> {
+        self.0.lock().clone()
+    }
+    pub(crate) fn set(
+        &self,
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    ) {
+        *self.0.lock() = access;
+    }
+}
 /// Cached recipe for building a session-scoped [`Agent`].
 ///
 /// See module docs for the invariant: this is the only construction
@@ -152,13 +174,20 @@ fn standalone_web_search_active(
 /// derived — the spec lives behind an [`Arc`] and is shared by clone of
 /// that `Arc`.
 pub(crate) struct AgentRebuildSpec {
+    pub context_management:
+        Option<xai_grok_tools::implementations::codex::context_management::ContextManagementStore>,
     pub working_directory: PathBuf,
     pub terminal_backend: Arc<dyn TerminalBackend>,
+    /// The same workspace launch policy used by the terminal, retained for
+    /// static shell tools across agent rebuilds.
+    pub sandbox_launch: Option<Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
     pub tools_notification_handle: ToolNotificationHandle,
     pub bridge_state_path: PathBuf,
     pub session_env: Arc<HashMap<String, String>>,
     pub models_manager: crate::agent::models::ModelsManager,
+    pub task_model_policy: TaskModelPolicyInputs,
+    pub task_model_selection: LatchedTaskModelSelection,
     pub compaction_policy: CompactionPolicy,
     pub reminder_policy: ReminderPolicy,
     /// Restart-scoped Settings preference. The active model's provider,
@@ -171,6 +200,10 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
+    /// Live v2 file-access policy. `None` while v2 memory is off; the `/memory` toggle
+    /// replaces it so a later zero-turn rebuild renders the same prompt as a fresh spawn.
+    pub memory_v2_access: MemoryV2AccessSlot,
+    pub memory_v2_exposed: bool,
     pub web_search: parking_lot::RwLock<ResolvedWebSearchState>,
     pub active_sampling_config: parking_lot::RwLock<xai_grok_sampler::SamplerConfig>,
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
@@ -187,6 +220,7 @@ pub(crate) struct AgentRebuildSpec {
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
     pub video_gen_config: VideoGenConfig,
+    pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
     pub app_builder_deployer_config: AppBuilderDeployerConfig,
     pub write_file_enabled: bool,
     pub subagents_enabled: bool,
@@ -209,6 +243,10 @@ pub(crate) struct AgentRebuildSpec {
     pub attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
     pub tool_params_json: ResolvedToolParamsJson,
     pub subagent_event_tx: Option<UnboundedSender<SubagentEvent>>,
+    pub subagent_coordinator_sender: Option<
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    >,
+    pub active_agent_messages_enabled: bool,
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
     pub user_question_tx: UnboundedSender<UserQuestionRequest>,
     pub subagent_depth: u32,
@@ -303,13 +341,17 @@ impl AgentRebuildSpec {
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     ) -> Result<Agent, AgentBuildError> {
         let Self {
+            context_management,
             working_directory,
             terminal_backend,
+            sandbox_launch,
             fs_backend,
             tools_notification_handle,
             bridge_state_path,
             session_env,
             models_manager,
+            task_model_policy,
+            task_model_selection,
             compaction_policy,
             reminder_policy,
             tool_mode_preference,
@@ -318,6 +360,8 @@ impl AgentRebuildSpec {
             memory_global_path,
             memory_workspace_path,
             memory_backend,
+            memory_v2_access,
+            memory_v2_exposed,
             web_search,
             active_sampling_config,
             chat_state_handle,
@@ -327,6 +371,7 @@ impl AgentRebuildSpec {
             web_fetch_config,
             image_gen_config,
             video_gen_config,
+            media_gen_batch_limits: _,
             app_builder_deployer_config,
             write_file_enabled,
             subagents_enabled,
@@ -347,6 +392,8 @@ impl AgentRebuildSpec {
             attribution_callback,
             tool_params_json,
             subagent_event_tx,
+            subagent_coordinator_sender,
+            active_agent_messages_enabled,
             monitor_event_buffer,
             user_question_tx,
             subagent_depth,
@@ -382,6 +429,21 @@ impl AgentRebuildSpec {
                 .get_or_insert_with(Default::default)
                 .web_search = Some(cfg_opts);
         }
+        let session_env = {
+            let mut env = session_env.as_ref().clone();
+            env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
+            Arc::new(env)
+        };
+        let mut presentation =
+            latch_task_model_presentation(models_manager, task_model_policy).await;
+        // These names refer to a separate child transport; they are never
+        // added to the parent chat-model catalog.
+        if presentation.selection == TaskModelSelection::Selectable
+            && let Some(catalog) =
+                crate::agent::antigravity_acp::cached_catalog(&crate::util::grok_home::grok_home())
+        {
+            presentation.model_slugs.extend(catalog.child_model_names());
+        }
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
@@ -392,6 +454,7 @@ impl AgentRebuildSpec {
         .with_reminder_policy(reminder_policy.clone())
         .with_memory_enabled(*memory_enabled)
         .with_memory_paths(memory_global_path.clone(), memory_workspace_path.clone())
+        .with_memory_v2_access(memory_v2_access.get(), *memory_v2_exposed)
         .with_is_non_interactive(*is_non_interactive)
         .with_system_prompt_label(system_prompt_label.clone())
         .with_session_env(session_env.clone())
@@ -409,27 +472,18 @@ impl AgentRebuildSpec {
         .with_web_fetch_config(web_fetch_config.clone())
         .with_write_file_enabled(*write_file_enabled)
         .with_fs(fs_backend.clone())
+        .with_mcp_file_input_preparation()
         .with_subagents_enabled(*subagents_enabled)
+        .with_active_agent_messages_enabled(*active_agent_messages_enabled && *subagent_depth == 0)
         .with_subagent_toggle(subagent_toggle.clone())
         .with_background_workflows_enabled(*background_workflows_enabled)
-        .with_task_model_slugs({
-            let mut slugs = models_manager
-                .available()
-                .keys()
-                .map(|model_id| model_id.0.to_string())
-                .collect::<Vec<_>>();
-            // `antigravity:*` slugs advertise the Antigravity CLI roster when
-            // the feature is enabled + signed in. Cache-backed and
-            // non-blocking: the first rebuild after startup may miss them
-            // while the probe runs, but spawn-side validation is independent
-            // of this advertisement.
-            slugs.extend(crate::agent::antigravity::advertised_slugs_nonblocking());
-            slugs
-        })
+        .with_task_model_slugs(presentation.model_slugs.clone())
+        .with_task_model_selection(presentation.selection)
         .with_ask_user_question_enabled(*ask_user_question_enabled)
         .with_async_user_messages_enabled(
             *subagent_depth == 0 && active_sampling_config.read().supports_async_user_messages(),
         )
+        .with_context_management(context_management.clone())
         .with_native_agents_enabled({
             let sampling = active_sampling_config.read();
             (*subagents_enabled || *subagent_depth > 0)
@@ -494,6 +548,14 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let mut agent = builder.build().await?;
+        if let Some(launch) = sandbox_launch {
+            agent
+                .tool_bridge()
+                .update_resource(xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(
+                    launch.clone(),
+                ))
+                .await;
+        }
         agent.set_tool_mode(
             crate::agent::config::effective_tool_mode(
                 xai_grok_sampling_types::ModelProvider::Xai,
@@ -508,13 +570,25 @@ impl AgentRebuildSpec {
         agent
             .tool_bridge()
             .update_resource(TaskModelValidator::new(move |requested| {
-                if crate::agent::antigravity::is_antigravity_slug(requested) {
-                    // Cheap cache-backed gate; the coordinator re-checks
-                    // authoritatively (async) at spawn time.
-                    return crate::agent::antigravity::task_slug_error_nonblocking(requested);
+                if requested.starts_with("antigravity-acp:") {
+                    return crate::agent::antigravity_acp::cached_catalog(
+                        &crate::util::grok_home::grok_home(),
+                    )
+                    .and_then(|catalog| catalog.resolve_child_model(requested).map(str::to_owned))
+                    .map_or_else(|| Some("Antigravity model is not available in the signed-in account catalog".to_owned()), |_| None);
                 }
                 model_validator.task_model_error(requested)
             }))
+            .await;
+        task_model_selection.set(presentation.selection);
+        xai_grok_telemetry::session_ctx::log_event(presentation_applied_event(
+            &presentation,
+            task_model_policy,
+            *prompt_audience,
+        ));
+        agent
+            .tool_bridge()
+            .update_resource(rejection_sink(session_id_str.clone()))
             .await;
         if let Some(event_tx) = subagent_event_tx.clone() {
             use xai_grok_tools::implementations::grok_build::task::backend::{
@@ -524,10 +598,12 @@ impl AgentRebuildSpec {
                 AgentMailboxIdentity, MaxSubagentDepth, SessionIdResource, SubagentDepthCounter,
                 SubagentEventSender,
             };
-            let backend = SubagentBackendResource(Arc::new(ChannelBackend::for_session(
-                event_tx.clone(),
-                session_id_str.clone(),
-            )));
+            let backend = SubagentBackendResource(Arc::new(match subagent_coordinator_sender {
+                Some(sender) => {
+                    ChannelBackend::for_coordinator_session(sender.clone(), session_id_str.clone())
+                }
+                None => ChannelBackend::for_session(event_tx.clone(), session_id_str.clone()),
+            }));
             agent.tool_bridge().update_resource(backend).await;
             agent
                 .tool_bridge()
@@ -637,6 +713,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         Vec::new(),
         xai_grok_sampling_types::SamplingConfig {
+            max_request_bytes: None,
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,
@@ -657,17 +734,28 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         tokio_util::sync::CancellationToken::new(),
     );
     Arc::new(AgentRebuildSpec {
+        context_management: None,
         working_directory: std::env::temp_dir(),
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(
                 xai_grok_tools::computer::local::SearchShadowConfig::default(),
             ),
         ),
+        sandbox_launch: None,
         fs_backend: Arc::new(xai_grok_tools::computer::local::LocalFs),
         tools_notification_handle: ToolNotificationHandle::noop(),
         bridge_state_path: std::env::temp_dir().join("test_tool_state.json"),
         session_env: Arc::new(HashMap::new()),
         models_manager: crate::agent::models::ModelsManager::default(),
+        task_model_policy: TaskModelPolicyInputs {
+            inheritance: crate::agent::config::Resolved::new(
+                false,
+                crate::agent::config::ConfigSource::Default,
+            ),
+            remote_fetch_enabled: false,
+            forked_selection: None,
+        },
+        task_model_selection: LatchedTaskModelSelection::default(),
         compaction_policy: CompactionPolicy::default(),
         reminder_policy: ReminderPolicy::default(),
         tool_mode_preference: None,
@@ -676,6 +764,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_global_path: None,
         memory_workspace_path: None,
         memory_backend: None,
+        memory_v2_access: MemoryV2AccessSlot::new(None),
+        memory_v2_exposed: false,
         web_search: parking_lot::RwLock::new(ResolvedWebSearchState::resolved_for(
             crate::tools::config::WebSearchCandidates::disabled(),
             &active_sampling_config,
@@ -688,6 +778,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
         video_gen_config: VideoGenConfig::default(),
+        media_gen_batch_limits: Default::default(),
         app_builder_deployer_config: AppBuilderDeployerConfig::default(),
         write_file_enabled: true,
         subagents_enabled: false,
@@ -708,6 +799,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         attribution_callback: None,
         tool_params_json: ResolvedToolParamsJson::default(),
         subagent_event_tx: None,
+        subagent_coordinator_sender: None,
+        active_agent_messages_enabled: false,
         monitor_event_buffer: None,
         user_question_tx: uq_tx,
         subagent_depth: 0,
@@ -1295,7 +1388,7 @@ mod tests {
                 let first_description = task_description(&first);
                 assert!(
                     first_description
-                    .contains("You may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
+                    .contains("If the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
                          - alpha-public\n\
                          - zeta-public")
                 );
@@ -1320,7 +1413,7 @@ mod tests {
                 let rebuilt_description = task_description(&rebuilt);
                 assert!(
                     rebuilt_description
-                    .contains("You may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
+                    .contains("If the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
                          - alpha-public\n\
                          - beta-public\n\
                          - zeta-public")

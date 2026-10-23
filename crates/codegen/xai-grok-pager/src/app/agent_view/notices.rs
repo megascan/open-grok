@@ -10,6 +10,9 @@ use crate::app::actions::Action;
 use std::time::Instant;
 
 impl AgentView {
+    const ITERM2_RESIZE_PREVIEW_QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+    const ITERM2_RESIZE_TICK_MARGIN: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Show a brief toast message (e.g., "Copied!").
     ///
     /// Displayed for ~3 seconds (90 ticks at 30fps). Previous transient toast
@@ -210,12 +213,34 @@ impl AgentView {
     /// frame's worth of events, and a refusal burns nothing.
     pub(crate) fn note_terminal_resize(&mut self) {
         self.terminal_size_stale = true;
+        self.last_resize_at = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn resize_hides_prompt_preview(&self) -> bool {
+        self.within_resize_quiet(std::time::Duration::ZERO)
+    }
+
+    pub(crate) fn resize_preview_needs_tick(&self) -> bool {
+        self.within_resize_quiet(Self::ITERM2_RESIZE_TICK_MARGIN)
+    }
+
+    fn within_resize_quiet(&self, margin: std::time::Duration) -> bool {
+        use crate::terminal::image::{GraphicsProtocol, prompt_preview_graphics_protocol};
+        prompt_preview_graphics_protocol() == GraphicsProtocol::ITerm2
+            && self.last_resize_at.is_some_and(|resized_at| {
+                resized_at.elapsed() < Self::ITERM2_RESIZE_PREVIEW_QUIET + margin
+            })
     }
 
     /// Set or clear the sticky status banner (process-wide indicators should
     /// use [`Self::set_sticky_toast_recursive`] on every agent view).
     pub fn set_sticky_toast(&mut self, msg: Option<&str>) {
         self.sticky_toast = msg.map(|m| crate::glyphs::sanitize_toast_message(m).into_owned());
+    }
+
+    pub(in crate::app) fn release_hook_block_hold(&mut self) {
+        self.session.hook_block_hold = false;
+        self.session.blocked_prompt = None;
     }
 
     /// Propagate sticky status to this view and every nested subagent view.
@@ -333,6 +358,24 @@ impl AgentView {
         false
     }
 
+    /// Tick the memory modal's transient copy message. Returns true if it just expired.
+    pub fn tick_memory_modal_status(&mut self) -> bool {
+        match self.active_modal.as_mut() {
+            Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) => state.tick_status(),
+            _ => false,
+        }
+    }
+
+    /// A memory-modal copy message is counting down, so the animation tick must keep running.
+    pub fn memory_modal_status_needs_tick(&self) -> bool {
+        match self.active_modal.as_ref() {
+            Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) => {
+                state.status_is_transient()
+            }
+            _ => false,
+        }
+    }
+
     /// Tick the extensions modal's transient result notice. Returns true if it
     /// just expired (needs a redraw to erase the badge / status line).
     pub fn tick_extensions_result_notice(&mut self) -> bool {
@@ -364,6 +407,119 @@ impl AgentView {
             }
         }
     }
+
+    pub(crate) fn open_untrusted_url_or_show(&mut self, url: &str) {
+        use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
+        use crate::scrollback::block::RenderBlock;
+        use crate::terminal::hyperlinks::SchemeFilter;
+
+        match try_open_url(url, SchemeFilter::Standard) {
+            OpenUrlResult::Opened | OpenUrlResult::RejectedScheme => {}
+            OpenUrlResult::BrowserUnavailable => {
+                self.scrollback
+                    .push_block(RenderBlock::system(browser_unavailable_message(url)));
+                self.show_toast("Browser unavailable - URL shown above");
+            }
+        }
+    }
+
+    /// Re-bind orphan `[Image #N]` text to the images the composer still holds, then name the
+    /// placeholders no record backs. Logged against this session; the caller queues the message on
+    /// `AppView::pending_image_notices`.
+    pub(crate) fn unbound_image_placeholder_notice(&mut self) -> Option<String> {
+        self.prompt.rebind_image_placeholders();
+        let unbound = self.prompt.unbound_image_placeholders();
+        if unbound.is_empty() {
+            return None;
+        }
+        let numbers = image_number_list(&unbound);
+        let message = if unbound.len() == 1 {
+            format!("Image {numbers} not attached — placeholder sent as text")
+        } else {
+            format!("Images {numbers} not attached — placeholders sent as text")
+        };
+        crate::unified_log::warn(
+            "prompt.image_placeholder_unbound",
+            self.session.session_id.as_ref().map(|s| s.0.as_ref()),
+            Some(serde_json::json!({
+                "display_numbers": unbound,
+                "attached": self.prompt.images.len(),
+            })),
+        );
+        Some(message)
+    }
+
+    /// Attached images whose bytes could not be loaded for the wire, logged against this session.
+    pub(crate) fn skipped_image_send_notice(&self, display_numbers: &[usize]) -> Option<String> {
+        if display_numbers.is_empty() {
+            return None;
+        }
+        let numbers = image_number_list(display_numbers);
+        let noun = if display_numbers.len() == 1 {
+            "Image"
+        } else {
+            "Images"
+        };
+        crate::unified_log::warn(
+            "prompt.image_send_skipped",
+            self.session.session_id.as_ref().map(|s| s.0.as_ref()),
+            Some(serde_json::json!({ "display_numbers": display_numbers })),
+        );
+        Some(format!("{noun} {numbers} couldn't be read — not sent"))
+    }
+
+    /// Composer images a submission cannot carry, logged against this session; the caller releases
+    /// the records.
+    pub(crate) fn images_dropped_by_command_notice(
+        &self,
+        count: usize,
+        dropped_by: ImagesDroppedBy,
+    ) -> String {
+        let (message, ctx) = match dropped_by {
+            ImagesDroppedBy::CompactCommand => (
+                "Images not sent with /compact — paste them again".to_owned(),
+                serde_json::json!({ "count": count, "reason": "compact_command" }),
+            ),
+            ImagesDroppedBy::SkillPrompt => (
+                "Images not sent with a skill prompt — paste them again".to_owned(),
+                serde_json::json!({ "count": count, "reason": "skill_prompt" }),
+            ),
+            ImagesDroppedBy::SlashAction(command) => (
+                format!("Images not sent with /{command} — paste them again"),
+                serde_json::json!({
+                    "count": count,
+                    "reason": "slash_action",
+                    "command": command,
+                }),
+            ),
+        };
+        crate::unified_log::info(
+            "prompt.images_dropped_by_command",
+            self.session.session_id.as_ref().map(|s| s.0.as_ref()),
+            Some(ctx),
+        );
+        message
+    }
+}
+
+/// Which submission left the composer images behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImagesDroppedBy {
+    /// `/compact` queued as a command row.
+    CompactCommand,
+    /// Skill injection: the wire carries the skill blocks only.
+    SkillPrompt,
+    /// A slash command whose result cannot carry images; holds the command token.
+    SlashAction(String),
+}
+
+/// `#1, #3` for a toast.
+fn image_number_list(display_numbers: &[usize]) -> String {
+    display_numbers
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

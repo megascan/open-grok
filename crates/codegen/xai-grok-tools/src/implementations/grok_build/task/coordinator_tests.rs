@@ -1,16 +1,261 @@
 use super::*;
+#[tokio::test]
+async fn a_delivered_foreground_result_empties_the_live_set() {
+    let harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("settled", false)).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["settled".to_owned()],
+        "a running turn-blocking child is live"
+    );
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["settled".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success && !result.backgrounded);
+    assert_eq!(
+        drained.await.expect("drain fires when the set empties"),
+        SubagentOutstandingReply::default(),
+        "finish_child wakes the parked drain exactly when the result is delivered"
+    );
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await,
+        SubagentOutstandingReply::default(),
+        "a delivered foreground result leaves the live set empty"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_resolves_when_child_backgrounds_at_deadline() {
+    let harness = harness(false, std::time::Duration::from_secs(1));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("slow", false)).await }
+    });
+    tokio::task::yield_now().await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["slow".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let interim = spawn.await.unwrap().unwrap();
+    assert!(interim.backgrounded);
+    assert_eq!(
+        drained
+            .await
+            .expect("deadline handoff wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "an auto-backgrounded child leaves the turn-blocking set and is background_live"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_resolves_when_caller_goes_away() {
+    let harness = harness(false, std::time::Duration::from_secs(600));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("abandoned", false)).await }
+    });
+    tokio::task::yield_now().await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["abandoned".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    spawn.abort();
+    let _ = spawn.await;
+
+    let before = tokio::time::Instant::now();
+    assert_eq!(
+        drained
+            .await
+            .expect("caller abandonment wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "the parked drain resolves via the abandonment reap, not a completion"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "the drain resolves on abandonment, never advancing to the foreground deadline"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn drain_resolves_when_queued_spawn_is_cancelled() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let mut filler = request("filler", true);
+    filler.parent_prompt_id = Some("other".to_owned());
+    let _filler = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(filler).await }
+    });
+    harness
+        .requests
+        .recv()
+        .await
+        .expect("filler occupies the slot");
+
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("queued", false)).await }
+    });
+    await_queued(&harness.backend, 1).await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["queued".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a queued turn-blocking spawn keeps the drain parked"
+    );
+
+    harness.backend.cancel_parent_prompt("prompt").await;
+    assert_eq!(
+        drained.await.expect("remove_queued wakes the parked drain"),
+        SubagentOutstandingReply::default(),
+        "a cancelled queued spawn leaves the scope empty"
+    );
+    let result = queued.await.expect("join").expect("spawn round-trips");
+    assert!(
+        result.cancelled,
+        "the queued spawn was cancelled: {result:?}"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn drain_resolves_when_pending_child_starts_background() {
+    let mut harness = harness(true, std::time::Duration::from_secs(60));
+    let mut blocking = request("bg-def", false);
+    blocking.subagent_type = "background-default".to_owned();
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(blocking).await }
+    });
+    harness.requests.recv().await.expect("bg-def admitted");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["bg-def".to_owned()],
+    );
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["bg-def".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a pending turn-blocking child keeps the drain parked"
+    );
+
+    let _ = harness.start.send(());
+    assert_eq!(harness.started.recv().await.as_deref(), Some("bg-def"));
+    assert_eq!(
+        drained
+            .await
+            .expect("Started handoff wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "a definition_background child is background_live once started"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success && !result.backgrounded);
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn two_parked_drains_on_one_scope_both_fire() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("fanout", false)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("fanout"));
+
+    let mut first = wait_prompt_drained(&harness.backend, "prompt");
+    let mut second = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["fanout".to_owned()],
+    );
+    assert!(
+        first.try_recv().is_err() && second.try_recv().is_err(),
+        "a live child keeps both drains parked"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success);
+    assert_eq!(
+        first.await.expect("first waiter fires"),
+        SubagentOutstandingReply::default(),
+    );
+    assert_eq!(
+        second.await.expect("second waiter fires"),
+        SubagentOutstandingReply::default(),
+        "the second waiter on the scope must also fire"
+    );
+    harness.actor.abort();
+}
+
 use crate::implementations::grok_build::task::admission::{LimitBehavior, SubagentLimits};
 use crate::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
+use crate::implementations::grok_build::task::types::SubagentWaitPromptDrainedRequest;
 use crate::implementations::grok_build::task::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDeliveryStatus,
-    NativeAgentMessage, NativeAgentOperation, NativeAgentRecord, NativeAgentSpawn,
-    SubagentCancelRequest, SubagentCancelTarget, SubagentClearUsageNotAppliedRequest,
-    SubagentCompletionsRequest, SubagentContextRequest, SubagentListActiveRequest,
-    SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest, SubagentOutstandingReply,
-    SubagentOutstandingRequest, SubagentOwner, SubagentRegistryCounts, SubagentRequest,
-    SubagentSnapshotStatus,
+    HandedOffForegroundSubagent, NativeAgentMessage, NativeAgentOperation, NativeAgentRecord,
+    NativeAgentSpawn, SubagentCancelRequest, SubagentCancelTarget,
+    SubagentClearUsageNotAppliedRequest, SubagentCompletionsRequest, SubagentContextRequest,
+    SubagentListActiveRequest, SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest,
+    SubagentOutstandingReply, SubagentOutstandingRequest, SubagentOwner, SubagentRegistryCounts,
+    SubagentRequest, SubagentResumeLookup, SubagentSnapshotStatus,
 };
 use tokio_util::sync::CancellationToken;
+use xai_tool_types::HandedOffSubagentState;
 
 #[path = "native_tests.rs"]
 mod native_tests;
@@ -59,10 +304,15 @@ impl ChildControl for TestControl {
 struct TestRunner {
     wait_before_start: bool,
     wait_after_cancel: bool,
+    supports_wake: bool,
+    /// Type returned for a resume source that is not in the completed map.
+    durable_resume_type: Option<&'static str>,
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
     requests: mpsc::UnboundedSender<SubagentRequest>,
+    wake_origins: mpsc::UnboundedSender<Option<WakeOrigin>>,
+    resume_sources: mpsc::UnboundedSender<SubagentResumeLookup>,
     started: mpsc::UnboundedSender<String>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
     followups: mpsc::UnboundedSender<AgentMailboxMessage>,
@@ -95,6 +345,10 @@ impl ChildRunner for TestRunner {
         Ok(())
     }
 
+    fn supports_wake(&self) -> bool {
+        self.supports_wake
+    }
+
     fn deliver_root_followup(&self, _root: &str, message: &AgentMailboxMessage) -> bool {
         message.native.is_some() && self.followups.send(message.clone()).is_ok()
     }
@@ -105,6 +359,8 @@ impl ChildRunner for TestRunner {
         let mut start = self.start.subscribe();
         let mut finish = self.finish.subscribe();
         let requests = self.requests.clone();
+        let wake_origins = self.wake_origins.clone();
+        let resume_sources = self.resume_sources.clone();
         let started = self.started.clone();
         let queue_waits = self.queue_waits.clone();
         let followups = self.followups.clone();
@@ -114,11 +370,30 @@ impl ChildRunner for TestRunner {
                 request,
                 cancellation,
                 reporter,
+                wake_origin,
+                admission_generation: _,
                 queued_for,
                 session_running,
             } = run;
+            let _ = wake_origins.send(wake_origin);
             let _ = queue_waits.send((request.id.clone(), queued_for, session_running));
+            if request.id == "identity-resume" {
+                let source_id = request
+                    .resume_from
+                    .clone()
+                    .unwrap_or_else(|| "identity-source".to_owned());
+                let source = reporter
+                    .resume_source(&source_id, &request.parent_session_id)
+                    .await;
+                let _ = resume_sources.send(source);
+            }
             let _ = requests.send(request.clone());
+            if request.id == "resolved-type-source" {
+                assert!(
+                    reporter.set_resolved_subagent_type("plan".to_owned()).await,
+                    "pending record must accept the source type"
+                );
+            }
             if wait_before_start {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -159,6 +434,15 @@ impl ChildRunner for TestRunner {
                 };
             }
             let _ = started.send(request.id.clone());
+            if request.id == "stamp-queued-sibling" {
+                let _ = start.recv().await;
+                assert!(
+                    reporter
+                        .set_resolved_subagent_type_for("queued-resume", "plan".to_owned())
+                        .await,
+                    "queued record must take the resolved type"
+                );
+            }
             let result = tokio::select! {
                 _ = cancellation.cancelled() => {
                     if wait_after_cancel {
@@ -201,6 +485,10 @@ impl ChildRunner for TestRunner {
         Box::pin(std::future::ready(SubagentDescribeOutcome::Unavailable))
     }
 
+    fn durable_resume_type(&self, _resume_id: &str, _parent_session_id: &str) -> Option<String> {
+        self.durable_resume_type.map(str::to_owned)
+    }
+
     fn on_completed(&self, completion: ChildCompletion<Self::CompletionData>) {
         let _ = self.completions.send(completion.disposition);
     }
@@ -217,7 +505,7 @@ fn cancelled_result(request: &SubagentRequest) -> SubagentResult {
     }
 }
 
-fn request(id: &str, background: bool) -> SubagentRequest {
+pub(super) fn request(id: &str, background: bool) -> SubagentRequest {
     SubagentRequest {
         id: id.to_owned(),
         prompt: "work".to_owned(),
@@ -235,6 +523,7 @@ fn request(id: &str, background: bool) -> SubagentRequest {
         context: SubagentContextRequest::FRESH,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
+        tool_call_id: Some(format!("call-{id}")),
     }
 }
 
@@ -244,10 +533,13 @@ struct Harness {
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedReceiver<CompletionDisposition>,
     requests: mpsc::UnboundedReceiver<SubagentRequest>,
+    wake_origins: mpsc::UnboundedReceiver<Option<WakeOrigin>>,
+    resume_sources: mpsc::UnboundedReceiver<SubagentResumeLookup>,
     started: mpsc::UnboundedReceiver<String>,
     queue_waits: mpsc::UnboundedReceiver<(String, Option<std::time::Duration>, usize)>,
     followups: mpsc::UnboundedReceiver<AgentMailboxMessage>,
     actor: tokio::task::JoinHandle<()>,
+    mailbox_settlement_tx: mpsc::UnboundedSender<MailboxSettlement>,
     interruptions: Arc<std::sync::atomic::AtomicUsize>,
     registry: Arc<std::sync::Mutex<HashMap<String, Vec<NativeAgentRecord>>>>,
 }
@@ -271,36 +563,51 @@ fn harness_with_options(
     wait_after_cancel: bool,
     config: CoordinatorConfig,
 ) -> Harness {
+    harness_with_wake(wait_before_start, wait_after_cancel, false, config, None)
+}
+
+fn harness_with_wake(
+    wait_before_start: bool,
+    wait_after_cancel: bool,
+    supports_wake: bool,
+    config: CoordinatorConfig,
+    durable_resume_type: Option<&'static str>,
+) -> Harness {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (start, _) = tokio::sync::broadcast::channel(4);
     let (finish, _) = tokio::sync::broadcast::channel(4);
     let (completion_tx, completions) = mpsc::unbounded_channel();
     let (request_tx, requests) = mpsc::unbounded_channel();
+    let (wake_origin_tx, wake_origins) = mpsc::unbounded_channel();
+    let (resume_source_tx, resume_sources) = mpsc::unbounded_channel();
     let (started_tx, started) = mpsc::unbounded_channel();
     let (queue_wait_tx, queue_waits) = mpsc::unbounded_channel();
     let (followup_tx, followups) = mpsc::unbounded_channel();
     let interruptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let actor = tokio::spawn(
-        SubagentCoordinator::new(
-            command_rx,
-            TestRunner {
-                wait_before_start,
-                wait_after_cancel,
-                start: start.clone(),
-                finish: finish.clone(),
-                completions: completion_tx,
-                requests: request_tx,
-                started: started_tx,
-                queue_waits: queue_wait_tx,
-                followups: followup_tx,
-                interruptions: interruptions.clone(),
-                registry: registry.clone(),
-            },
-            config,
-        )
-        .run(),
+    let coordinator = SubagentCoordinator::new(
+        command_rx,
+        TestRunner {
+            wait_before_start,
+            wait_after_cancel,
+            supports_wake,
+            durable_resume_type,
+            start: start.clone(),
+            finish: finish.clone(),
+            completions: completion_tx,
+            requests: request_tx,
+            wake_origins: wake_origin_tx,
+            resume_sources: resume_source_tx,
+            started: started_tx,
+            queue_waits: queue_wait_tx,
+            followups: followup_tx,
+            interruptions: interruptions.clone(),
+            registry: registry.clone(),
+        },
+        config,
     );
+    let mailbox_settlement_tx = coordinator.mailbox_settlement_tx.clone();
+    let actor = tokio::spawn(coordinator.run());
     Harness {
         // Unbound by default so tests can set request.parent_session_id
         // freely (e.g. nested reparent). ParentSession APIs must use
@@ -310,10 +617,13 @@ fn harness_with_options(
         finish,
         completions,
         requests,
+        wake_origins,
+        resume_sources,
         started,
         queue_waits,
         followups,
         actor,
+        mailbox_settlement_tx,
         interruptions,
         registry,
     }
@@ -350,6 +660,24 @@ async fn outstanding(backend: &ChannelBackend, prompt_id: &str) -> SubagentOutst
         }))
         .expect("actor command channel open");
     response_rx.await.expect("outstanding response")
+}
+
+fn wait_prompt_drained(
+    backend: &ChannelBackend,
+    prompt_id: &str,
+) -> oneshot::Receiver<SubagentOutstandingReply> {
+    let (respond_to, response_rx) = oneshot::channel();
+    backend
+        .sender()
+        .send(SubagentEvent::WaitPromptDrained(
+            SubagentWaitPromptDrainedRequest {
+                parent_session_id: "parent".to_owned(),
+                prompt_id: prompt_id.to_owned(),
+                respond_to,
+            },
+        ))
+        .expect("actor command channel open");
+    response_rx
 }
 
 #[tokio::test]
@@ -407,6 +735,38 @@ async fn foreground_deadline_hands_off_without_stopping_child() {
     let disposition = harness.completions.recv().await.unwrap();
     assert!(disposition.backgrounded);
     assert!(disposition.should_surface);
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn hand_off_takes_awaited_foreground_reply_before_caller_drops() {
+    let mut harness = harness(false, std::time::Duration::from_secs(600));
+    let backend = parent_backend(&harness);
+    let spawn = tokio::spawn({
+        let backend = backend.clone();
+        async move { backend.spawn(request("blocking", false)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("blocking"));
+
+    let handed_off = backend.hand_off_foreground_for_prompt("prompt").await;
+    assert_eq!(
+        vec![HandedOffForegroundSubagent {
+            subagent_id: "blocking".to_owned(),
+            tool_call_id: "call-blocking".to_owned(),
+            description: "test child".to_owned(),
+            state: HandedOffSubagentState::Running,
+        }],
+        handed_off
+    );
+    let error = spawn.await.unwrap().unwrap_err();
+    assert!(error.detail.contains("result channel dropped"), "{error:?}");
+    assert_eq!(
+        handed_off,
+        backend.hand_off_foreground_for_prompt("prompt").await
+    );
+
+    let _ = harness.finish.send(());
+    assert!(harness.completions.recv().await.unwrap().backgrounded);
     harness.actor.abort();
 }
 
@@ -1049,6 +1409,272 @@ async fn teardown_drain_deadline_reopens_spawns() {
 
     let _ = harness.finish.send(());
     let _ = child.await;
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn resolved_subagent_type_is_what_resume_source_returns() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        let mut req = request("resolved-type-source", false);
+        req.subagent_type = "general-purpose".to_owned();
+        async move { backend.spawn(req).await }
+    });
+    assert_eq!(
+        harness.started.recv().await.as_deref(),
+        Some("resolved-type-source")
+    );
+    let _ = harness.finish.send(());
+    spawn.await.unwrap().unwrap();
+
+    let mut resume = request("identity-resume", false);
+    resume.resume_from = Some("resolved-type-source".to_owned());
+    resume.subagent_type = "general-purpose".to_owned();
+    let resume_spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(resume).await }
+    });
+    let SubagentResumeLookup::Completed(source) = harness.resume_sources.recv().await.unwrap()
+    else {
+        panic!("expected completed resume source")
+    };
+    assert_eq!(source.subagent_type, "plan");
+    let _ = harness.finish.send(());
+    let result = resume_spawn.await.unwrap().unwrap();
+    assert_eq!(result.subagent_type, "plan");
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_resume_inherits_the_source_type_before_admission() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+
+    let mut source = request("source", true);
+    source.subagent_type = "plan".to_owned();
+    let source_spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(source).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("source"));
+    let _ = harness.finish.send(());
+    source_spawn.await.unwrap().unwrap();
+
+    let held = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("held", true)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("held"));
+
+    let mut resume = request("queued-resume", true);
+    resume.subagent_type = "general-purpose".to_owned();
+    resume.resume_from = Some("source".to_owned());
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(resume).await }
+    });
+    await_queued(&harness.backend, 1).await;
+
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("queued resume stays queryable");
+    assert_eq!(snapshot.subagent_type, "plan");
+    assert!(matches!(
+        snapshot.status,
+        SubagentSnapshotStatus::Initializing
+    ));
+
+    let (respond_to, outcome) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::Cancel(SubagentCancelRequest {
+            parent_session_id: Some("parent".to_owned()),
+            target: SubagentCancelTarget::SubagentId("queued-resume".to_owned()),
+            respond_to,
+        }))
+        .expect("actor command channel open");
+    assert!(matches!(
+        outcome.await.unwrap(),
+        SubagentCancelOutcome::Cancelled
+    ));
+    let result = queued.await.expect("join").expect("spawn round-trips");
+    assert!(result.cancelled, "cancel must resolve the queued resume");
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("cancelled queued resume stays queryable");
+    assert_eq!(snapshot.subagent_type, "plan");
+    assert!(matches!(
+        snapshot.status,
+        SubagentSnapshotStatus::Cancelled { .. }
+    ));
+
+    let _ = harness.finish.send(());
+    assert!(
+        held.await
+            .expect("join")
+            .expect("spawn round-trips")
+            .success
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_resume_inherits_a_durable_source_type_before_admission() {
+    let mut harness = harness_with_wake(
+        false,
+        false,
+        false,
+        limited(1, LimitBehavior::Queue),
+        Some("explore"),
+    );
+
+    let held = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("held", true)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("held"));
+
+    let mut resume = request("queued-resume", true);
+    resume.subagent_type = "general-purpose".to_owned();
+    resume.resume_from = Some("disk-only".to_owned());
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(resume).await }
+    });
+    await_queued(&harness.backend, 1).await;
+
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("queued resume stays queryable");
+    assert_eq!(snapshot.subagent_type, "explore");
+
+    let (respond_to, outcome) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::Cancel(SubagentCancelRequest {
+            parent_session_id: Some("parent".to_owned()),
+            target: SubagentCancelTarget::SubagentId("queued-resume".to_owned()),
+            respond_to,
+        }))
+        .expect("actor command channel open");
+    assert!(matches!(
+        outcome.await.unwrap(),
+        SubagentCancelOutcome::Cancelled
+    ));
+    let result = queued.await.expect("join").expect("spawn round-trips");
+    assert!(result.cancelled, "cancel must resolve the queued resume");
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("cancelled queued resume stays queryable");
+    assert_eq!(snapshot.subagent_type, "explore");
+
+    let _ = harness.finish.send(());
+    assert!(
+        held.await
+            .expect("join")
+            .expect("spawn round-trips")
+            .success
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn resolved_subagent_type_updates_a_queued_record() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let held = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("stamp-queued-sibling", true)).await }
+    });
+    assert_eq!(
+        harness.started.recv().await.as_deref(),
+        Some("stamp-queued-sibling")
+    );
+
+    let mut queued_request = request("queued-resume", true);
+    queued_request.subagent_type = "general-purpose".to_owned();
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(queued_request).await }
+    });
+    await_queued(&harness.backend, 1).await;
+    assert_eq!(
+        harness
+            .backend
+            .query("queued-resume", false, None)
+            .await
+            .expect("queued spawn")
+            .subagent_type,
+        "general-purpose"
+    );
+
+    let _ = harness.start.send(());
+    for _ in 0..400 {
+        if harness
+            .backend
+            .query("queued-resume", false, None)
+            .await
+            .is_some_and(|snapshot| snapshot.subagent_type == "plan")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("queued spawn");
+    assert_eq!(snapshot.subagent_type, "plan");
+
+    let (respond_to, outcome) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::Cancel(SubagentCancelRequest {
+            parent_session_id: Some("parent".to_owned()),
+            target: SubagentCancelTarget::SubagentId("queued-resume".to_owned()),
+            respond_to,
+        }))
+        .expect("actor command channel open");
+    assert!(matches!(
+        outcome.await.unwrap(),
+        SubagentCancelOutcome::Cancelled
+    ));
+    assert!(
+        queued
+            .await
+            .expect("join")
+            .expect("spawn round-trips")
+            .cancelled
+    );
+    let snapshot = harness
+        .backend
+        .query("queued-resume", false, None)
+        .await
+        .expect("cancelled queued spawn stays queryable");
+    assert_eq!(snapshot.subagent_type, "plan");
+    assert!(matches!(
+        snapshot.status,
+        SubagentSnapshotStatus::Cancelled { .. }
+    ));
+
+    let _ = harness.finish.send(());
+    assert!(
+        held.await
+            .expect("join")
+            .expect("spawn round-trips")
+            .success
+    );
     harness.actor.abort();
 }
 
@@ -2038,6 +2664,106 @@ async fn followup_task_queues_mail_for_active_child() {
 }
 
 #[tokio::test]
+async fn cancelled_mailbox_waiter_does_not_consume_later_messages() {
+    use super::super::types::AgentMailboxWaitRequest;
+
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("wait-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("wait-child"));
+
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "wait-child");
+    for steering in [false, true] {
+        let (respond_to, receiver) = oneshot::channel();
+        harness
+            .backend
+            .sender()
+            .send(SubagentEvent::WaitAgentMessages(AgentMailboxWaitRequest {
+                identity: child.clone(),
+                timeout_ms: 60_000,
+                respond_to,
+            }))
+            .unwrap();
+        // A subsequent coordinator request is a barrier ensuring the waiter
+        // was installed before cancellation.
+        harness.backend.list_agents(root.clone()).await;
+        drop(receiver);
+        let message = if steering {
+            mailbox_message("steer", &root, "wait-child", "steer")
+        } else {
+            followup_message("followup", &root, "wait-child", "later")
+        };
+        let output = harness
+            .backend
+            .send_agent_message(root.clone(), "wait-child", message)
+            .await
+            .unwrap();
+        if steering {
+            assert_eq!(output.status, AgentMessageDeliveryStatus::Delivered);
+            assert_eq!(harness.followups.recv().await.unwrap().body, "steer");
+        } else {
+            assert_eq!(output.status, AgentMessageDeliveryStatus::Queued);
+            let inbox = harness.backend.wait_agent_messages(child.clone(), 0).await;
+            assert_eq!(inbox.messages.len(), 1);
+            assert_eq!(inbox.messages[0].body, "later");
+            inbox.receipt.unwrap().commit();
+            harness.backend.list_agents(root.clone()).await;
+        }
+    }
+
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancelled_immediate_mailbox_drain_leaves_messages_in_order() {
+    use super::super::types::AgentMailboxWaitRequest;
+
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("drain-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("drain-child"));
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "drain-child");
+    for (id, body) in [("f1", "first"), ("f2", "second")] {
+        harness
+            .backend
+            .send_agent_message(
+                root.clone(),
+                "drain-child",
+                followup_message(id, &root, "drain-child", body),
+            )
+            .await
+            .unwrap();
+    }
+    let (respond_to, receiver) = oneshot::channel();
+    drop(receiver);
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::WaitAgentMessages(AgentMailboxWaitRequest {
+            identity: child.clone(),
+            timeout_ms: 0,
+            respond_to,
+        }))
+        .unwrap();
+    let inbox = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(
+        inbox
+            .messages
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
 async fn team_mailbox_rejects_foreign_scope_and_self_send() {
     let mut harness = harness(true, std::time::Duration::from_secs(60));
     let backend = harness.backend.clone();
@@ -2069,6 +2795,121 @@ async fn team_mailbox_rejects_foreign_scope_and_self_send() {
     assert!(error.contains("itself"));
 
     spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn team_mailbox_rejects_finished_child_without_wake() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("done-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(
+        harness.started.recv().await.expect("child started"),
+        "done-child"
+    );
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    let _ = harness.completions.recv().await;
+
+    let root = mailbox_identity("parent", "parent");
+    let error = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "done-child",
+            mailbox_message("m1", &root, "done-child", "keep going"),
+        )
+        .await
+        .expect_err("finished child stays closed without wake");
+    assert!(error.contains("has finished"), "error: {error}");
+
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn team_mailbox_wakes_finished_child() {
+    let mut harness = harness_with_wake(false, false, true, CoordinatorConfig::default(), None);
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("wake-child", true)).await });
+    let first = harness.requests.recv().await.expect("first spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
+    assert_eq!(first.id, "wake-child");
+    assert_eq!(
+        harness.started.recv().await.expect("child started"),
+        "wake-child"
+    );
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    let _ = harness.completions.recv().await;
+
+    let root = mailbox_identity("parent", "parent");
+    let output = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "wake-child",
+            mailbox_message("m1", &root, "wake-child", "keep going"),
+        )
+        .await
+        .expect("wake accepted");
+    assert_eq!(output.status, AgentMessageDeliveryStatus::Delivered);
+    assert_eq!(output.message_id, "m1");
+
+    let woken = harness.requests.recv().await.expect("wake spawn");
+    let wake = harness.wake_origins.recv().await.unwrap().unwrap();
+    assert_eq!(wake.message_id, "m1");
+    assert_eq!(wake.agent_id, "wake-child");
+    assert!(
+        matches!(wake.source, WakeSource::Agent { agent_id, kind: super::super::types::AgentMailboxMessageKind::Message } if agent_id == "parent")
+    );
+    assert_eq!(woken.id, "wake-child");
+    assert_eq!(woken.prompt, "keep going");
+    assert_eq!(woken.resume_from.as_deref(), Some("wake-child"));
+    assert!(woken.run_in_background);
+
+    let _ = harness.finish.send(());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_completed_child_wake_retains_original_sender_and_message_id() {
+    let mut harness = harness_with_wake(false, false, true, limited(1, LimitBehavior::Queue), None);
+    let backend = harness.backend.clone();
+    let first = tokio::spawn(async move { backend.spawn(request("wake-child", true)).await });
+    harness.requests.recv().await.expect("first spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
+    harness.started.recv().await.expect("first started");
+    let _ = harness.finish.send(());
+    let _ = first.await;
+    harness.completions.recv().await.expect("first completed");
+
+    let backend = harness.backend.clone();
+    let busy = tokio::spawn(async move { backend.spawn(request("busy", true)).await });
+    harness.requests.recv().await.expect("busy spawn");
+    assert_eq!(harness.wake_origins.recv().await, Some(None));
+    harness.started.recv().await.expect("busy started");
+
+    let root = mailbox_identity("parent", "parent");
+    let sent = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "wake-child",
+            mailbox_message("original-id", &root, "wake-child", "follow up"),
+        )
+        .await
+        .expect("wake queued");
+    assert_eq!(sent.status, AgentMessageDeliveryStatus::Queued);
+    assert_eq!(sent.message_id, "original-id");
+    let _ = harness.finish.send(());
+    let _ = busy.await;
+    harness.completions.recv().await.expect("busy completed");
+    harness.requests.recv().await.expect("queued wake started");
+    let wake = harness.wake_origins.recv().await.unwrap().unwrap();
+    assert_eq!(wake.message_id, "original-id");
+    assert!(matches!(wake.source, WakeSource::Agent { agent_id, .. } if agent_id == "parent"));
+    let _ = harness.finish.send(());
     harness.actor.abort();
 }
 
@@ -2778,5 +3619,534 @@ async fn workflow_spawns_bypass_the_session_concurrent_limit() {
             .expect("spawn round-trips")
             .success
     );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_admission_is_delivered_before_start_and_shutdown_is_terminal() {
+    use crate::notification::{BridgeToolNotification, ToolNotificationHandle};
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let filler = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("occupied", true)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("occupied"));
+    let (notifications, mut rx) = ToolNotificationHandle::bridge_channel();
+    let reservation = notifications.reserve_subagent_admission().unwrap();
+    let BridgeToolNotification::ExternalStart(receipt) = rx.recv().await.unwrap() else {
+        panic!("expected receipt")
+    };
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move {
+            backend
+                .spawn_reserved(request("queued-admission", false), Some(reservation))
+                .await
+        }
+    });
+    let BridgeToolNotification::SubagentAdmitted {
+        id,
+        generation,
+        acknowledgement,
+    } = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected admission")
+    };
+    assert_eq!(id, "queued-admission");
+    acknowledgement.send(Ok(())).unwrap();
+    assert_eq!(receipt.await.unwrap(), Ok(()));
+    await_queued(&harness.backend, 1).await;
+    assert!(
+        harness.started.try_recv().is_err(),
+        "queued child has not started"
+    );
+    harness.actor.abort();
+    let _ = harness.actor.await;
+    let BridgeToolNotification::SubagentAdmissionEnded {
+        id,
+        generation: terminal_generation,
+        error,
+    } = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected shutdown terminal")
+    };
+    assert_eq!(id, "queued-admission");
+    assert_eq!(terminal_generation, generation);
+    assert!(error.is_none());
+    filler.abort();
+    queued.abort();
+}
+
+#[tokio::test]
+async fn mailbox_successful_send_then_unpolled_drop_redelivers() {
+    let mut harness = harness(true, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("receipt-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "receipt-child");
+    for (id, body) in [("f1", "first"), ("f2", "second")] {
+        harness
+            .backend
+            .send_agent_message(
+                root.clone(),
+                "receipt-child",
+                followup_message(id, &root, "receipt-child", body),
+            )
+            .await
+            .unwrap();
+    }
+    let (respond_to, receiver) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::WaitAgentMessages(
+            super::super::types::AgentMailboxWaitRequest {
+                identity: child.clone(),
+                timeout_ms: 0,
+                respond_to,
+            },
+        ))
+        .unwrap();
+    // The coordinator has already sent the response; do not poll the receiver.
+    harness.backend.list_agents(root.clone()).await;
+    drop(receiver);
+    harness.backend.list_agents(root.clone()).await;
+    let delivery = harness.backend.wait_agent_messages(child.clone(), 0).await;
+    assert_eq!(
+        delivery
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["f1", "f2"]
+    );
+    assert!(delivery.messages.iter().all(|m| m.from_agent_id == "parent"
+        && m.to_agent_id == "receipt-child"
+        && m.kind == AgentMailboxMessageKind::FollowupTask));
+    delivery.receipt.unwrap().commit();
+    harness.backend.list_agents(root).await;
+    assert!(
+        harness
+            .backend
+            .wait_agent_messages(child, 0)
+            .await
+            .messages
+            .is_empty()
+    );
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_waiter_send_then_unpolled_drop_redelivers() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("waiting-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "waiting-child");
+    for steering in [false, true] {
+        let (respond_to, receiver) = oneshot::channel();
+        harness
+            .backend
+            .sender()
+            .send(SubagentEvent::WaitAgentMessages(
+                super::super::types::AgentMailboxWaitRequest {
+                    identity: child.clone(),
+                    timeout_ms: 60_000,
+                    respond_to,
+                },
+            ))
+            .unwrap();
+        harness.backend.list_agents(root.clone()).await;
+        let message = if steering {
+            mailbox_message("steer", &root, "waiting-child", "steering")
+        } else {
+            followup_message("followup", &root, "waiting-child", "work")
+        };
+        let expected = message.clone();
+        let output = harness
+            .backend
+            .send_agent_message(root.clone(), "waiting-child", message)
+            .await
+            .unwrap();
+        assert_eq!(output.status, AgentMessageDeliveryStatus::Queued);
+        drop(receiver);
+        harness.backend.list_agents(root.clone()).await;
+        let delivery = harness.backend.wait_agent_messages(child.clone(), 0).await;
+        assert_eq!(delivery.messages.as_slice(), &[expected]);
+        delivery.receipt.unwrap().commit();
+        harness.backend.list_agents(root.clone()).await;
+    }
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_polled_drop_and_concurrent_wait_preserve_fifo() {
+    let mut harness = harness(true, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("fifo-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "fifo-child");
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "fifo-child",
+            followup_message("f1", &root, "fifo-child", "first"),
+        )
+        .await
+        .unwrap();
+    let first = harness.backend.wait_agent_messages(child.clone(), 0).await;
+    assert_eq!(first.messages[0].message_id, "f1");
+    let (respond_to, mut second) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::WaitAgentMessages(
+            super::super::types::AgentMailboxWaitRequest {
+                identity: child.clone(),
+                timeout_ms: 60_000,
+                respond_to,
+            },
+        ))
+        .unwrap();
+    harness.backend.list_agents(root.clone()).await;
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "fifo-child",
+            followup_message("f2", &root, "fifo-child", "second"),
+        )
+        .await
+        .unwrap();
+    assert!(second.try_recv().is_err());
+    // A forged stale settlement cannot release or remove the current batch.
+    harness
+        .mailbox_settlement_tx
+        .send(MailboxSettlement {
+            key: MailboxKey::from(&child),
+            generation: uuid::Uuid::now_v7(),
+            committed: true,
+        })
+        .unwrap();
+    harness.backend.list_agents(root.clone()).await;
+    assert!(second.try_recv().is_err());
+    drop(first);
+    let second = second.await.unwrap();
+    assert_eq!(
+        second
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["f1", "f2"]
+    );
+    second.receipt.unwrap().commit();
+    harness.backend.list_agents(root).await;
+    assert!(
+        harness
+            .backend
+            .wait_agent_messages(child, 0)
+            .await
+            .messages
+            .is_empty()
+    );
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_reserved_messages_count_against_capacity_and_batch_limit() {
+    let mut harness = harness(true, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("full-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "full-child");
+    for i in 0..128 {
+        let id = format!("f{i}");
+        harness
+            .backend
+            .send_agent_message(
+                root.clone(),
+                "full-child",
+                followup_message(&id, &root, "full-child", &id),
+            )
+            .await
+            .unwrap();
+    }
+    let first = harness.backend.wait_agent_messages(child.clone(), 0).await;
+    assert_eq!(first.messages.len(), 20);
+    assert!(
+        harness
+            .backend
+            .send_agent_message(
+                root.clone(),
+                "full-child",
+                followup_message("overflow", &root, "full-child", "overflow")
+            )
+            .await
+            .is_err()
+    );
+    first.receipt.unwrap().commit();
+    harness.backend.list_agents(root.clone()).await;
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "full-child",
+            followup_message("after", &root, "full-child", "after"),
+        )
+        .await
+        .unwrap();
+    let second = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(second.messages.len(), 20);
+    assert_eq!(second.messages[0].message_id, "f20");
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_rollback_keeps_new_steering_behind_backlog() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("barrier-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "barrier-child");
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "barrier-child",
+            followup_message("f1", &root, "barrier-child", "first"),
+        )
+        .await
+        .unwrap();
+    let first = harness.backend.wait_agent_messages(child.clone(), 0).await;
+    drop(first);
+    harness.backend.list_agents(root.clone()).await;
+    let sent = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "barrier-child",
+            mailbox_message("m2", &root, "barrier-child", "second"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.status, AgentMessageDeliveryStatus::Queued);
+    assert!(harness.followups.try_recv().is_err());
+    let delivery = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(
+        delivery
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["f1", "m2"]
+    );
+    delivery.receipt.unwrap().commit();
+    spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_completion_does_not_overtake_or_remove_reserved_steering() {
+    let mut harness = harness_with_wake(false, false, true, CoordinatorConfig::default(), None);
+    let req = request("native-race", true);
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(req).await }
+    });
+    harness.requests.recv().await.unwrap();
+    harness.wake_origins.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "native-race");
+    let (respond_to, receiver) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::WaitAgentMessages(
+            super::super::types::AgentMailboxWaitRequest {
+                identity: child.clone(),
+                timeout_ms: 60_000,
+                respond_to,
+            },
+        ))
+        .unwrap();
+    harness.backend.list_agents(root.clone()).await;
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "native-race",
+            mailbox_message("original", &root, "native-race", "first"),
+        )
+        .await
+        .unwrap();
+    let delivery = receiver.await.unwrap();
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    harness.completions.recv().await.unwrap();
+    let next = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "native-race",
+            followup_message("newer", &root, "native-race", "second"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.status, AgentMessageDeliveryStatus::Queued);
+    assert!(harness.requests.try_recv().is_err());
+    drop(delivery);
+    let wake = harness.requests.recv().await.unwrap();
+    let origin = harness.wake_origins.recv().await.unwrap().unwrap();
+    assert_eq!(wake.id, "native-race");
+    assert_eq!(
+        wake.prompt,
+        "Agent messages are queued. Call wait_agent to receive them."
+    );
+    assert_eq!(origin.message_id, "original");
+    assert!(
+        matches!(origin.source, WakeSource::Agent { agent_id, kind: AgentMailboxMessageKind::Message } if agent_id == "parent")
+    );
+    let retained = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(
+        retained
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["original", "newer"]
+    );
+    retained.receipt.unwrap().commit();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_completed_passive_batch_retries_on_same_identity_after_steering() {
+    let mut harness = harness_with_wake(false, false, true, CoordinatorConfig::default(), None);
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("retry-child", true)).await }
+    });
+    harness.requests.recv().await.unwrap();
+    harness.wake_origins.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "retry-child");
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "retry-child",
+            followup_message("f1", &root, "retry-child", "first"),
+        )
+        .await
+        .unwrap();
+    let delivery = harness.backend.wait_agent_messages(child.clone(), 0).await;
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    harness.completions.recv().await.unwrap();
+    drop(delivery);
+    harness.backend.list_agents(root.clone()).await;
+    assert!(
+        harness.requests.try_recv().is_err(),
+        "passive mail must not wake a child"
+    );
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "retry-child",
+            mailbox_message("m2", &root, "retry-child", "second"),
+        )
+        .await
+        .unwrap();
+    let wake = harness.requests.recv().await.unwrap();
+    assert_eq!(wake.id, child.agent_id);
+    assert!(wake.prompt.contains("wait_agent"));
+    let retained = harness.backend.wait_agent_messages(child, 0).await;
+    assert_eq!(
+        retained
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["f1", "m2"]
+    );
+    retained.receipt.unwrap().commit();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn mailbox_native_completion_activity_is_not_blocked_or_duplicated_by_reservation() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let mut req = request("named-child", true);
+    req.runtime_overrides.native_agent = Some(NativeAgentSpawn {
+        task_name: "worker".into(),
+        ..Default::default()
+    });
+    harness.backend.spawn(req).await.unwrap();
+    harness.requests.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let root = mailbox_identity("parent", "parent");
+    let child = mailbox_identity("parent", "named-child");
+    harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "named-child",
+            followup_message("f1", &root, "named-child", "first"),
+        )
+        .await
+        .unwrap();
+    let delivery = harness.backend.wait_agent_messages(child, 0).await;
+    let _ = harness.finish.send(());
+    harness
+        .backend
+        .query("named-child", true, Some(1_000))
+        .await
+        .unwrap();
+    let activity = harness
+        .backend
+        .native_agent(root.clone(), NativeAgentOperation::Wait { timeout_ms: 0 })
+        .await
+        .unwrap();
+    assert_eq!(activity["updates"], serde_json::json!(["/root/worker"]));
+    delivery.receipt.unwrap().commit();
+    harness.backend.list_agents(root.clone()).await;
+    let activity = harness
+        .backend
+        .native_agent(root, NativeAgentOperation::Wait { timeout_ms: 0 })
+        .await
+        .unwrap();
+    assert_eq!(activity["timed_out"], true);
     harness.actor.abort();
 }

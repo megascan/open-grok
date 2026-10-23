@@ -108,7 +108,7 @@ pub async fn fork_session(
 
     let target_info_for_copy = target_info.clone();
     let result = tokio::task::spawn_blocking(move || {
-        storage.copy_session_data_sync(&source_info, &target_info_for_copy, options)
+        storage.copy_new_session_data_sync(&source_info, &target_info_for_copy, options)
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;

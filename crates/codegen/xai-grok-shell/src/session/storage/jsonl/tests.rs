@@ -34,6 +34,28 @@ fn create_test_notification() -> acp::SessionNotification {
 fn create_test_plan_state() -> TodoState {
     TodoState::default()
 }
+#[test]
+fn bounded_chat_history_read_rejects_byte_and_item_overflow() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join(crate::session::storage::CHAT_HISTORY_FILE);
+    let line = serde_json::to_string(&ConversationItem::user("bounded")).unwrap();
+    std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+    let adapter = JsonlStorageAdapter::with_explicit_session_dir(temp_dir.path().to_path_buf());
+    assert!(
+        adapter
+            .load_chat_history_bounded_from_dir(temp_dir.path(), line.len(), 10)
+            .unwrap_err()
+            .to_string()
+            .contains("byte")
+    );
+    assert!(
+        adapter
+            .load_chat_history_bounded_from_dir(temp_dir.path(), 1_024, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("item")
+    );
+}
 #[tokio::test]
 async fn write_compaction_segment_numbers_and_indexes_resume_safely() {
     use crate::extensions::notification::CompactionSegmentFile;
@@ -94,6 +116,7 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
             &model,
             None,
             Some(Some(ReasoningEffort::High)),
+            Some(std::num::NonZeroU64::new(500_000)),
             Some(policy),
         )
         .await
@@ -110,20 +133,23 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
         Some(policy),
         "model identity and its resolved transport must share one summary patch",
     );
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection.map(std::num::NonZeroU64::get), Some(500_000));
     adapter.update_current_model(&info, &model).await.unwrap();
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection.map(std::num::NonZeroU64::get), Some(500_000));
     assert_eq!(
             adapter.read_summary_sync(&info).unwrap().reasoning_effort,
             Some(ReasoningEffort::High),
             "model-only update must not wipe the persisted effort",
         );
     adapter
-        .update_current_model_and_agent(&info, &model, None, Some(None), None)
+        .update_current_model_and_agent(&info, &model, None, Some(None), Some(None), None)
         .await
         .unwrap();
     assert_eq!(
             adapter.read_summary_sync(&info).unwrap().reasoning_effort,
             None,
         );
+    assert_eq!(adapter.read_summary_sync(&info).unwrap().context_window_selection, None);
 }
 #[tokio::test]
 async fn mark_ever_used_codex_is_monotonic_and_previous_turn_model_persists() {
@@ -258,6 +284,18 @@ async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
     assert_eq!(loaded.workflow_runs.len(), 1);
     assert_eq!(loaded.workflow_runs[0].script, "complete(\"ok\");");
     assert_eq!(loaded.workflow_runs[0].args, serde_json::json!({"objective": "ship"}));
+    assert_eq!(loaded.workflow_runs[0].effort, None);
+    std::fs::write(run_dir.join("effort"), "high").unwrap();
+    let with_effort = adapter.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(
+        with_effort.workflow_runs[0].effort,
+        Some(xai_grok_sampling_types::ReasoningEffort::High)
+    );
+    std::fs::write(run_dir.join("effort"), "HIGH").unwrap();
+    assert!(adapter.load_session_without_updates(&info).await.unwrap().workflow_runs.is_empty());
+    std::fs::write(run_dir.join("effort"), "x".repeat(1025)).unwrap();
+    assert!(adapter.load_session_without_updates(&info).await.unwrap().workflow_runs.is_empty());
+    std::fs::remove_file(run_dir.join("effort")).unwrap();
     let mut legacy = manifest.clone();
     legacy.version = 2;
     adapter.write_workflow_run_state(&info, &legacy).await.unwrap();
@@ -1230,6 +1268,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        context_window_selection: None,
         resolved_tool_policy: None,
         previous_turn_model: None,
         ever_used_codex: false,
@@ -1255,11 +1294,12 @@ fn write_test_summary(
         generated_title: None,
         title_is_manual: false,
         worktree_label: None,
-        agent_name: None,
+        agent: Default::default(),
         sandbox_profile: None,
         reasoning_effort: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        last_recap: None,
         cache_affinity_id: None,
     };
     let json = serde_json::to_vec_pretty(&summary).unwrap();
@@ -2322,6 +2362,7 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
     let chat = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
+            max_request_bytes: None,
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,
@@ -2564,4 +2605,144 @@ async fn explicit_session_dir_does_not_tighten_parent() {
             0o755,
             "caller-owned parent must not be chmod'd in Explicit mode"
         );
+}
+
+#[tokio::test]
+async fn list_sessions_recent_skips_headless_without_shorting_the_page() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/workspace");
+    let now = chrono::Utc::now();
+    let times: Vec<_> = (0..4).map(|item| now - chrono::Duration::hours(item)).collect();
+    for (item, (id, kind)) in [
+        ("h-new", Some("headless")),
+        ("h-mid", Some("headless")),
+        ("i-old", None),
+        ("i-older", None),
+    ]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = write_test_summary(tmp.path(), &cwd, id, times[item], None, None, kind);
+        set_mtime(&dir.join("summary.json"), times[item]);
+    }
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let recent = adapter.list_sessions_recent(2).await.unwrap();
+    let ids: Vec<&str> = recent.iter().map(|summary| summary.info.id.0.as_ref()).collect();
+    assert_eq!(
+            ids,
+            ["i-old", "i-older"],
+            "headless rows are skipped and their slots refilled from older candidates"
+        );
+}
+
+#[tokio::test]
+async fn list_sessions_recent_bounds_reads_on_headless_dominated_store() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = crate::util::grok_home::encode_cwd_dirname("/workspace");
+    let now = chrono::Utc::now();
+    let newest_interactive = 40;
+    for item in 0..50 {
+        let id = format!("s{item}");
+        let kind = (item != newest_interactive).then_some("headless");
+        let ts = now - chrono::Duration::minutes(item);
+        let dir = write_test_summary(tmp.path(), &cwd, &id, ts, None, None, kind);
+        set_mtime(&dir.join("summary.json"), ts);
+    }
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let recent = adapter.list_sessions_recent(2).await.unwrap();
+    assert!(
+            recent.is_empty(),
+            "interactive rows past the read bound must not force a full scan"
+        );
+}
+
+#[tokio::test]
+async fn usage_json_rewrites_session_and_appends_turns() {
+    use crate::session::usage_file::{SessionUsageFile, UsageSummary};
+    use xai_chat_state::UsageLedger;
+    use xai_grok_sampling_types::TokenUsage;
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let tu = |prompt, completion| TokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        reasoning_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
+    };
+    let mut ledger = UsageLedger::default();
+    ledger.record_main_loop_call("grok-4", &tu(100, 20), Some(10), Some(50));
+    let mut file = SessionUsageFile::new(info.id.to_string());
+    let first = UsageSummary::from_ledger(&ledger);
+    file.apply_turn(1, "t1", &first, None);
+    adapter.write_usage(&info, &file).await.unwrap();
+    ledger.record_main_loop_call("grok-4", &tu(40, 10), Some(10), Some(20));
+    let mut loaded = adapter.read_usage(&info).await.unwrap().unwrap();
+    loaded.apply_turn(2, "t2", &UsageSummary::from_ledger(&ledger), Some(&first));
+    adapter.write_usage(&info, &loaded).await.unwrap();
+    let persisted = adapter.read_usage(&info).await.unwrap().unwrap();
+    assert_eq!(persisted.turns.len(), 2);
+    assert_eq!(persisted.turns[0].usage.input_tokens, 100);
+    assert_eq!(persisted.turns[1].usage.input_tokens, 40);
+    assert_eq!(persisted.session.input_tokens, 140);
+    assert_eq!(persisted.session.turn_count, 2);
+    let raw = std::fs::read_to_string(adapter.session_dir(&info).join("usage.json"))
+        .unwrap();
+    assert!(raw.contains("\"turns\""));
+    assert!(raw.contains("\"session\""));
+}
+
+#[tokio::test]
+async fn concurrent_usage_turns_preserve_every_writer() {
+    use crate::session::usage_file::UsageSummary;
+    let temp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(12));
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let adapter = adapter.clone();
+        let info = info.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let live = UsageSummary { input_tokens: 1, model_calls: 1, ..Default::default() };
+            barrier.wait().await;
+            adapter.record_usage_turn(&info, 1, "now".into(), &live, None, (None, None)).await.unwrap()
+        }));
+    }
+    let mut written = Vec::new();
+    for task in tasks { written.push(task.await.unwrap().1.unwrap()); }
+    written.sort_unstable();
+    written.dedup();
+    assert_eq!(written.len(), 12);
+    let usage = adapter.read_usage(&info).await.unwrap().unwrap();
+    assert_eq!(usage.turns.len(), 12);
+    assert_eq!(usage.session.input_tokens, 12);
+    assert_eq!(usage.session.turn_count, 12);
+
+    let current = UsageSummary { input_tokens: 2, model_calls: 2, ..Default::default() };
+    let previous = UsageSummary { input_tokens: 1, model_calls: 1, ..Default::default() };
+    adapter.record_usage_turn(&info, 1, "later".into(), &current, Some(&previous), (Some(1), Some(written[0]))).await.unwrap();
+    let usage = adapter.read_usage(&info).await.unwrap().unwrap();
+    assert_eq!(usage.turns.len(), 12);
+    assert_eq!(usage.session.input_tokens, 13);
+}
+
+#[tokio::test]
+async fn corrupt_usage_json_does_not_read_as_missing() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let path = adapter.session_dir(&info).join("usage.json");
+    std::fs::write(&path, "{not-json").unwrap();
+    let err = adapter.read_usage(&info).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let err = adapter.record_usage_turn(&info, 1, "now".into(), &Default::default(), None, (None, None)).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
 }

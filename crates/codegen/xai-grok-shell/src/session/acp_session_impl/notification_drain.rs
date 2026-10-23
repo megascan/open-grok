@@ -3,6 +3,18 @@
 
 use super::*;
 
+fn stopped_agent_message_is_held(state: &State) -> bool {
+    state.notifications_suppressed
+        && state.pending_inputs.front().is_some_and(|input| {
+            matches!(
+                &input.origin,
+                super::PromptOrigin::AgentMessage { .. }
+                    | super::PromptOrigin::PeerSessionMessage { .. }
+                    | super::PromptOrigin::ParentAgentMessage { .. }
+            )
+        })
+}
+
 /// Maximum number of pending notifications before oldest are dropped.
 pub(super) const MAX_PENDING_NOTIFICATIONS: usize = 50;
 
@@ -114,7 +126,7 @@ impl SessionActor {
 
     pub(super) async fn maybe_start_running_task(
         self: Arc<Self>,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) {
         // Fast path under the lock: nothing to promote.
         let may_combine;
@@ -130,7 +142,7 @@ impl SessionActor {
                 );
                 return;
             }
-            if state.running_task.is_some() {
+            if state.running_task.is_some() || state.finalization_gate.is_active() {
                 let queue_depth = state.pending_inputs.len();
                 if queue_depth > 0 {
                     xai_grok_telemetry::unified_log::debug(
@@ -160,6 +172,9 @@ impl SessionActor {
             if state.pending_inputs.is_empty() {
                 return;
             }
+            if stopped_agent_message_is_held(&state) {
+                return;
+            }
             // A merge needs 2+ queued prompts; sample here so the common
             // single-prompt promote skips the config disk read below.
             may_combine = state.pending_inputs.len() >= 2;
@@ -174,9 +189,31 @@ impl SessionActor {
                 .combine_queued_prompts
                 .unwrap_or(false);
 
+        // A `/memory` toggle during the previous turn could not swap the prompt; do it before this
+        // turn samples. Takes `state` briefly on its own, so it stays outside the lock below.
+        if self
+            .memory
+            .prompt_sync_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.sync_v2_memory_prompt().await
+                == super::memory_control::MemoryPromptSync::RenderFailed
+        {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                session_id = %self.session_info.id.0,
+                "memory prompt sync failed again at turn promotion; this turn samples with the \
+                 previous memory section"
+            );
+        }
+
         let mut state = self.state.lock().await;
         // Re-check after the await gap.
-        if state.running_task.is_some() || state.pending_inputs.is_empty() {
+        if state.running_task.is_some()
+            || state.finalization_gate.is_active()
+            || state.lifecycle_mutation.is_some()
+            || state.pending_inputs.is_empty()
+            || state.hook_block_held()
+        {
             return;
         }
 
@@ -202,6 +239,9 @@ impl SessionActor {
                         None => true,
                     }
                 }
+                Some(
+                    super::PromptOrigin::GoalSummary | super::PromptOrigin::GoalClassifierNudge,
+                ) => !self.goal_loop_active(),
                 _ => false,
             };
             if !stale {
@@ -211,24 +251,41 @@ impl SessionActor {
                 Self::respond_removed_prompt(item.respond_to);
             }
         }
+        if stopped_agent_message_is_held(&state) {
+            return;
+        }
 
         // GC stale edit-holds: an id that is no longer queued (promoted,
         // removed, or whose fire-and-forget `release_edit` was dropped) can
         // never be edited again, so drop it to bound the set over a long session.
-        if !state.combine_edit_holds.is_empty() {
+        if !state.edit_holds.is_empty() {
             let live: std::collections::HashSet<String> = state
                 .pending_inputs
                 .iter()
                 .map(|i| i.prompt_id.clone())
                 .collect();
-            state.combine_edit_holds.retain(|id| live.contains(id));
+            state.edit_holds.retain(|id, since| {
+                live.contains(id) && since.elapsed() < super::prompt_queue::EDIT_HOLD_TTL
+            });
+        }
+
+        if state
+            .pending_inputs
+            .front()
+            .is_some_and(|front| state.edit_holds.contains_key(&front.prompt_id))
+        {
+            return;
         }
 
         if combine_queued {
-            let holds: Vec<String> = state.combine_edit_holds.iter().cloned().collect();
+            let holds: Vec<String> = state.edit_holds.keys().cloned().collect();
             let skip: Vec<&str> = holds.iter().map(String::as_str).collect();
             SessionActor::combine_front_pending_inputs(&mut state.pending_inputs, &skip);
         }
+
+        // Bind the rewind boundary before spawning the task. The task may be
+        // cancelled before it ever increments the chat index.
+        let prompt_index_at_start = self.chat_state_handle.get_prompt_index().await;
 
         // Start the next pending user prompt. Pull all needed fields from the
         // queue head in one `front_mut` scope so we can mutate `state` again
@@ -249,6 +306,8 @@ impl SessionActor {
             origin,
             running_display,
             tool_overrides_update,
+            initial_child_prompt_ready,
+            traceparent,
         ) = {
             let Some(front) = state.pending_inputs.front_mut() else {
                 return;
@@ -270,9 +329,14 @@ impl SessionActor {
                 front.origin.clone(),
                 running_display,
                 front.tool_overrides_update.take(),
+                front.initial_child_prompt_ready.take(),
+                front.traceparent.clone(),
             )
         };
         self.apply_tool_overrides_update(tool_overrides_update);
+        if matches!(origin, super::PromptOrigin::ParentAgentMessage { .. }) {
+            self.tool_context.parent_interject.set_pending(false);
+        }
         if matches!(origin, super::PromptOrigin::User) {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(false);
@@ -326,20 +390,29 @@ impl SessionActor {
         self.turn_report.start_next_turn();
         state.running_task = Some(AgentTask::new_prompt(
             self.clone(),
-            prompt_id,
-            prompt_blocks,
-            prompt_mode,
-            trace_gcs_config,
-            artifact_tracker,
-            client_identifier,
-            screen_mode,
-            verbatim,
-            send_now,
-            json_schema,
+            TurnInputRequest {
+                prompt_id,
+                input_origin: InputOrigin::new(origin),
+                prompt_blocks,
+                prompt_mode,
+                trace_gcs_config,
+                artifact_tracker,
+                client_identifier,
+                screen_mode,
+                verbatim,
+                send_now,
+                json_schema,
+                persist_ack,
+                parsed_prompt_tx,
+                traceparent,
+            },
+            self.turn_report.epoch(),
+            prompt_index_at_start,
             completion_tx,
-            persist_ack,
-            parsed_prompt_tx,
         ));
+        if let Some(ready) = initial_child_prompt_ready {
+            let _ = ready.send(());
+        }
     }
 
     /// Drain pending notifications into a single batched turn, if idle and not suppressed.
@@ -354,7 +427,7 @@ impl SessionActor {
     /// single lock acquisition to avoid interleaving.
     pub(super) async fn maybe_drain_notifications(
         self: Arc<Self>,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) {
         // Auto-wake notification turns are DROPPED both while the goal loop is
         // active (a bg-task / monitor "completed" turn would pull a weak model
@@ -622,6 +695,8 @@ impl SessionActor {
             parsed_prompt_tx: None,
             queue_meta: None,
             send_now: false,
+            initial_child_prompt_ready: None,
+            traceparent: None,
         });
 
         tracing::info!(

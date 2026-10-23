@@ -11,6 +11,27 @@ use std::path::PathBuf;
 use std::time::Instant;
 use xai_grok_shell::extensions::notification::RetryState;
 use xai_grok_shell::extensions::notification::SessionUpdate as XaiSessionUpdate;
+pub(super) fn test_agent(app: &AppView, id: AgentId) -> &AgentView {
+    let Some(agent) = app.agents.get(&id) else {
+        panic!("expected agent {id:?}");
+    };
+    agent
+}
+pub(super) fn test_subagent<'a>(parent: &'a AgentView, sid: &str) -> &'a AgentView {
+    let Some(child) = parent.subagent_views.get(sid) else {
+        panic!("expected subagent {sid}");
+    };
+    child.as_ref()
+}
+pub(super) fn json_set(
+    value: &mut serde_json::Value,
+    key: impl Into<String>,
+    v: serde_json::Value,
+) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(key.into(), v);
+    }
+}
 pub(super) fn make_session(session_id: Option<&str>) -> AgentSession {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     AgentSession {
@@ -39,6 +60,9 @@ pub(super) fn make_session(session_id: Option<&str>) -> AgentSession {
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        pending_context_switch: None,
+        hook_block_hold: false,
+        blocked_prompt: None,
         provider_rebind_pending: false,
         user_model_preference: None,
         deferred_model_switch: None,
@@ -112,7 +136,7 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         prompt: None,
         child_cwd: None,
         worktree_path: None,
-        child_updates_replayed: false,
+        transcript: Default::default(),
     }
 }
 #[test]
@@ -943,6 +967,9 @@ pub(super) fn prompt_complete_ext_with_prompt_id(
                 prompt_id: Some(prompt_id.to_string()),
                 agent_result: None,
                 cancel_trigger: None,
+                cancellation_category: None,
+                cancellation_context: None,
+                error_kind: None,
                 meta: None,
             },
         )
@@ -996,6 +1023,8 @@ pub(super) fn xai_turn_completed_notif(
             prompt_id: prompt_id.into(),
             stop_reason: stop_reason.into(),
             agent_result: None,
+            error_kind: None,
+            elapsed_ms: None,
             usage: None,
         },
         meta: Some(serde_json::json!({ "isReplay": is_replay })),
@@ -1022,6 +1051,8 @@ pub(super) fn xai_wake_turn_completed_notif(
             prompt_id: prompt_id.into(),
             stop_reason: "end_turn".into(),
             agent_result: None,
+            error_kind: None,
+            elapsed_ms: None,
             usage: None,
         },
         meta: Some(meta),
@@ -1463,9 +1494,18 @@ pub(super) fn write_child_updates_jsonl(
     child_sid: &str,
     content: &str,
 ) {
+    write_child_updates_jsonl_under_cwd(grok_home, "/tmp", child_sid, content);
+}
+
+pub(super) fn write_child_updates_jsonl_under_cwd(
+    grok_home: &std::path::Path,
+    cwd: &str,
+    child_sid: &str,
+    content: &str,
+) {
     let sessions_dir = grok_home
         .join("sessions")
-        .join(urlencoding::encode("/tmp").as_ref())
+        .join(xai_grok_config::encode_cwd_dirname(cwd))
         .join(child_sid);
     std::fs::create_dir_all(&sessions_dir).unwrap();
     std::fs::write(sessions_dir.join("summary.json"), "{}").unwrap();
@@ -1485,6 +1525,20 @@ pub(super) fn child_scrollback_tool_call_count(
         })
         .count()
 }
+pub(super) fn child_scrollback_session_event_count(
+    agent: &AgentView,
+    child_sid: &str,
+) -> usize {
+    let child = agent.subagent_views.get(child_sid).expect("child subagent view");
+    (0..child.scrollback.len())
+        .filter(|index| {
+            child.scrollback.entry(*index).is_some_and(|entry| {
+                matches!(entry.block, RenderBlock::SessionEvent(_))
+            })
+        })
+        .count()
+}
+
 pub(super) fn child_tool_line(child_sid: &str) -> String {
     format!(
             r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"tool_call","toolCallId":"tc1","title":"Read foo","kind":"read","locations":[{{"path":"/tmp/foo"}}]}}}}}}"#
@@ -1936,6 +1990,7 @@ pub(super) fn model_changed_ext(
         update: XaiSessionUpdate::ModelChanged {
             model_id: model_id.to_string(),
             reasoning_effort: reasoning_effort.map(String::from),
+            context_window_selection: None,
         },
         meta: None,
     };
@@ -1952,6 +2007,7 @@ pub(super) fn model_changed_ext_with_event(
         update: XaiSessionUpdate::ModelChanged {
             model_id: model_id.to_string(),
             reasoning_effort: None,
+            context_window_selection: None,
         },
         meta: Some(serde_json::json!({ "eventId": event_id })),
     };
@@ -2022,6 +2078,7 @@ pub(super) fn seed_owner_agent_with_open_modal(app: &mut AppView) {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".into(),
             wire_source: McpWireSource::Local,
             plugin_name: None,

@@ -2,21 +2,22 @@
 
 Sandbox mode restricts what the agent process and its spawned commands can access on your filesystem and network using OS-level kernel primitives (Landlock on Linux, Seatbelt on macOS). The kernel enforces these limits for the process lifetime.
 
-New sessions use the `workspace` sandbox by default: the agent can read the
-system, but writes are limited to the current workspace, `~/.opengrok/`, and
-temporary directories. Pass `--sandbox off` or set `[sandbox] profile = "off"`
-only when unrestricted filesystem access is explicitly required.
+Sandbox mode is **off by default**. Run `/sandbox`, then enable **OS sandbox**
+to opt in to the `workspace` profile. Opening `/sandbox` alone does not enable it.
+The preference is saved for new sessions; restart Open Grok to apply it.
+When enabled, the agent can read the system, but writes are limited to the
+current workspace, `~/.opengrok/`, and temporary directories.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run with the default workspace sandbox
+# Run without sandboxing (the default)
 open-grok
 
-# Explicitly disable sandboxing when unrestricted access is required
-open-grok --sandbox off
+# Explicitly enable the workspace sandbox for this launch
+open-grok --sandbox workspace
 
 # Read-only mode (read everywhere, write only to ~/.opengrok/ + temp dirs)
 open-grok --sandbox read-only
@@ -31,8 +32,8 @@ open-grok --sandbox strict
 
 | Profile               | FS Read            | FS Write                                       | Child Network | Use Case                          |
 | --------------------- | ------------------ | ---------------------------------------------- | ------------- | --------------------------------- |
-| `off`                 | Unrestricted       | Unrestricted                                   | Unrestricted  | Explicitly disable sandboxing     |
-| `workspace` (default) | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`      | Allowed       | Normal development                |
+| `off` (default)       | Unrestricted       | Unrestricted                                   | Unrestricted  | No sandbox                        |
+| `workspace`           | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Allowed       | Opt-in workspace confinement      |
 | `devbox`              | Everywhere         | All top-level dirs except `/data`              | Allowed       | Disposable dev VMs                |
 | `read-only`           | Everywhere         | `~/.opengrok/` + `/tmp` + `/var/tmp`               | Blocked¹      | Exploration, code review          |
 | `strict`              | CWD + system paths | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Blocked¹      | Untrusted code                    |
@@ -51,15 +52,18 @@ To block specific files (e.g. `.env` or credential paths) on top of a profile, d
 
 **strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.opengrok/`, and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
 
-### Direct global hook write protection
+### Direct global write protection
 
-Under `workspace`, `read-only`, and `strict` (and custom profiles that extend those bases), the Grok state directory remains writable for session/runtime files, but the kernel **write-denies** the Grok-owned direct disk paths used as user-global hook sources (they stay readable):
+Under `workspace`, `read-only`, and `strict` (and custom profiles that extend those bases), the Open Grok state directory remains writable for session/runtime files, but the kernel **write-denies** the Grok-owned direct disk paths used as user-global hook sources (they stay readable), plus its configuration and trust files. Built-in `strict` can read `~/.opengrok` (they stay readable); writes are CWD + `~/.opengrok/sessions` + temp, not the whole tree. Write-deny still applies where the profile grants write:
 
 - `~/.opengrok/hooks/` (hook directory)
 - `~/.opengrok/hooks-paths` (registry file; not loaded as hook JSON — only its absolute targets are)
 - Absolute targets listed in `hooks-paths` (relative lines are ignored; missing targets refuse sandbox start)
+- `~/.opengrok/config.toml`, `~/.opengrok/trusted_folders.toml`, `~/.opengrok/managed_config.toml`, `~/.opengrok/requirements.toml`, `~/.opengrok/sandbox.toml` (settings, folder trust, managed policy, requirements, and sandbox profiles)
 
-On first launch under these profiles, Grok creates a real empty `hooks/` directory and empty `hooks-paths` file when they are missing (never symlinks or wrong types). Claude/Cursor global settings are **not** covered by this write-deny; discovery of those vendors remains separately gated by compatibility settings.
+Because these files are read-only under these profiles, a change that would be saved to them applies to the current session only. Accepting a folder-trust prompt, switching the model with `/model`, and changing the permission mode (`/auto` or Shift+Tab) take effect for the session but are not saved. To save folder trust, run `open-grok --trust` in the directory before starting the sandbox. To change the default model or permission mode, edit `~/.opengrok/config.toml` directly.
+
+On first launch under these profiles, Open Grok creates a real empty `hooks/` directory and empty `hooks-paths` file when they are missing (never symlinks or wrong types). Claude/Cursor global settings are **not** covered by this write-deny; discovery of those vendors remains separately gated by compatibility settings.
 
 A symlinked `$OPENGROK_HOME` or a `hooks-paths` entry with a symlink component is refused at sandbox start (prevents retargeting). Existing parent directories of protected paths are pinned so they cannot be renamed out from under the deny (siblings remain writable). On Linux, nested user namespaces are disabled inside bubblewrap so mount binds cannot be rearranged. Project hooks remain gated by folder trust. The `devbox` profile does not apply this protection (disposable VMs). Profiles that require it refuse to start if the kernel policy cannot be applied (including Linux without verified read-only mounts).
 
@@ -176,7 +180,7 @@ The sandbox is applied to the **entire Open Grok process** at startup using kern
 - `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
 - Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
 
-When a non-`off` sandbox profile is selected (the default, CLI, `GROK_SANDBOX`,
+When a non-`off` sandbox profile is explicitly selected (CLI, `GROK_SANDBOX`,
 config, or a managed requirement):
 
 - The agent runs **in-process**, not through the shared leader, so tool calls stay in this process when the profile is enforced. If leader mode would otherwise have been on, a one-line note at startup says so
@@ -213,7 +217,13 @@ Profile resolution order for a **new** session:
 
 1. An explicit `--sandbox <profile>` flag or `GROK_SANDBOX` environment variable
 2. The `[sandbox] profile` in your config
-3. `workspace` (the secure default)
+3. `off` (no sandbox)
+
+Managed requirements take precedence over these choices. `/sandbox` saves
+`[sandbox] profile = "workspace"` when enabled and `profile = "off"` when disabled;
+it does not override CLI/environment choices or managed requirements. Disabling
+also requires restarting, and resumed sessions keep their saved profile. Start a
+new session after restarting to use the changed preference.
 
 ---
 

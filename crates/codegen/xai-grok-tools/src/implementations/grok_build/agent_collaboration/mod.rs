@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageSendOutput,
-    ListAgentsOutput, WaitAgentMessagesOutput,
+    ListAgentsOutput, MailboxReceiptSlot, WaitAgentMessagesOutput,
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_metadata::{ToolMetadata, shared_resources};
@@ -290,11 +290,27 @@ impl xai_tool_runtime::Tool for WaitAgentTool {
         input: WaitAgentInput,
     ) -> Result<WaitAgentMessagesOutput, xai_tool_runtime::ToolError> {
         let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS);
+        let receipt_slot = ctx.get::<MailboxReceiptSlot>().ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom(
+                "mailbox_delivery_unsupported",
+                "This dispatcher cannot safely deliver agent mailbox messages",
+            )
+        })?;
         let (backend, identity) = collaboration_resources_async(&ctx).await?;
-        Ok(backend
+        let delivery = backend
             .backend()
             .wait_agent_messages(identity, timeout_ms)
-            .await)
+            .await;
+        if !delivery.output.messages.is_empty() && delivery.receipt.is_none() {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "mailbox_delivery_unsupported",
+                "The mailbox backend did not provide a delivery receipt",
+            ));
+        }
+        if let Some(receipt) = delivery.receipt {
+            receipt_slot.put(receipt);
+        }
+        Ok(delivery.output)
     }
 }
 

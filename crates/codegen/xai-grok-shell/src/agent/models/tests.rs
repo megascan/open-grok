@@ -58,6 +58,53 @@ fn test_manager() -> ModelsManager {
 }
 
 #[test]
+fn codex_context_override_reaches_manager_compaction_and_acp() {
+    let manager = test_manager();
+    let mut entry =
+        ModelEntry::fallback("catalog-context-model", &config::EndpointsConfig::default());
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    entry.info.codex_model = xai_grok_sampling_types::CodexModelMetadata {
+        context_window: Some(272_000),
+        max_context_window: Some(372_000),
+        comp_hash: Some("3000".into()),
+        upgrade: Some(xai_grok_sampling_types::CodexModelUpgrade {
+            model: "replacement".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let entry = config::ConfigModelOverride {
+        max_context_window: Some(1_000_000),
+        ..Default::default()
+    }
+    .apply(
+        "context-alias",
+        Some(entry),
+        &config::EndpointsConfig::default(),
+    );
+    manager
+        .inner
+        .catalog
+        .write()
+        .models
+        .insert("context-alias".into(), entry.clone());
+    for id in ["context-alias", "catalog-context-model"] {
+        let metadata = manager.codex_compaction_metadata(id).unwrap();
+        assert_eq!(metadata.auto_compact_token_limit, Some(900_000));
+        assert_eq!(metadata.comp_hash.as_deref(), Some("3000"));
+    }
+    let acp = config::to_acp_model_info(&IndexMap::from([("context-alias".into(), entry)]));
+    let info = &acp[&acp::ModelId::new("context-alias")];
+    let meta = info.meta.as_ref().unwrap();
+    assert_eq!(meta["totalContextTokens"], 950_000);
+    assert_eq!(meta["rawContextTokens"], 1_000_000);
+    assert_eq!(meta["maxContextTokens"], 372_000);
+    assert_eq!(meta["codexUpgrade"]["model"], "replacement");
+    assert!(info.description.as_ref().unwrap().contains("replacement"));
+}
+
+#[test]
 fn model_capability_opt_ins_resolve_aliases_and_reject_other_providers() {
     let manager = test_manager();
     let mut entry = ModelEntry::fallback("catalog-test-model", &config::EndpointsConfig::default());
@@ -698,6 +745,68 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
 }
 
 #[test]
+fn subagent_rate_limit_model_lookup_resolves_key_slug_and_unset() {
+    let manager = test_manager();
+    let mut entry = ModelEntry::fallback("retry-slug", &config::EndpointsConfig::default());
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Custom;
+    entry.info.subagent_rate_limit_max_attempts = Some(8);
+    manager.insert_test_entry("retry-key", entry.clone());
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-key"),
+        Some(8)
+    );
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+        Some(8)
+    );
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("missing"),
+        None
+    );
+    entry.info.subagent_rate_limit_max_attempts = Some(0);
+    manager.insert_test_entry("retry-key", entry.clone());
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+        Some(0)
+    );
+    entry.info.subagent_rate_limit_max_attempts = None;
+    manager.insert_test_entry("retry-key", entry);
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-key"),
+        None
+    );
+}
+
+#[test]
+fn subagent_rate_limit_model_lookup_tracks_config_reload() {
+    let manager = test_manager();
+    for attempts in [8, 0, 12] {
+        let config = config_from_toml(&format!(
+            r#"
+            [model.retry-key]
+            provider = "custom"
+            model = "retry-slug"
+            base_url = "https://model.invalid/v1"
+            subagent_rate_limit_max_attempts = {attempts}
+        "#
+        ));
+        manager.apply_config(config);
+        assert_eq!(
+            manager.model_subagent_rate_limit_max_attempts("retry-key"),
+            Some(attempts)
+        );
+        assert_eq!(
+            manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+            Some(attempts)
+        );
+        assert_eq!(
+            manager.models()["retry-key"].info.provider,
+            xai_grok_sampling_types::ModelProvider::Custom
+        );
+    }
+}
+
+#[test]
 fn default_model_honors_allowlist_when_no_default_set() {
     let cfg = config_from_toml(
         r#"
@@ -946,6 +1055,73 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
         catalog["plain-model"].info.reasoning_effort, None,
         "non-reasoning default model must NOT be stamped with persisted effort",
     );
+}
+
+#[test]
+fn openrouter_catalog_enabled_models_are_an_optional_allowlist() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    for (enabled, selected) in [
+        (vec![], true),
+        (vec!["openrouter:vendor/reasoner".to_string()], true),
+        (vec!["vendor/reasoner".to_string()], true),
+        (vec!["openrouter:vendor/other".to_string()], false),
+    ] {
+        let mut cfg = config::Config::default();
+        cfg.models.openrouter_enabled_models = enabled;
+        cfg.config_models.insert(
+            "openrouter:vendor/reasoner".to_string(),
+            config::ConfigModelOverride {
+                model: Some("vendor/reasoner".to_string()),
+                provider: Some(ModelProvider::OpenRouter),
+                ..Default::default()
+            },
+        );
+        cfg.config_models.insert(
+            "unrelated".to_string(),
+            config::ConfigModelOverride {
+                provider: Some(ModelProvider::Custom),
+                ..Default::default()
+            },
+        );
+        let catalog = resolve_model_catalog(&cfg, None);
+        assert_eq!(catalog.contains_key("openrouter:vendor/reasoner"), selected);
+        assert!(catalog.contains_key("unrelated"));
+    }
+}
+
+#[test]
+fn openrouter_persisted_reasoning_effort_obeys_advertised_menu() {
+    use xai_grok_sampling_types::{ModelProvider, ReasoningEffortOption};
+
+    for (effort, expected) in [
+        (ReasoningEffort::Low, Some(ReasoningEffort::Low)),
+        // A stale effort the live menu no longer offers falls back to the
+        // menu's first option.
+        (ReasoningEffort::Max, Some(ReasoningEffort::Low)),
+    ] {
+        let mut cfg = config::Config::default();
+        let id = "openrouter:vendor/reasoner";
+        cfg.models.default = Some(id.to_string());
+        cfg.models.default_reasoning_effort = Some(effort);
+        cfg.models.openrouter_enabled_models = vec![id.to_string()];
+        cfg.config_models.insert(
+            id.to_string(),
+            config::ConfigModelOverride {
+                provider: Some(ModelProvider::OpenRouter),
+                reasoning_efforts: vec![ReasoningEffortOption {
+                    id: "low".to_string(),
+                    value: ReasoningEffort::Low,
+                    label: "Low".to_string(),
+                    description: None,
+                    default: false,
+                }],
+                ..Default::default()
+            },
+        );
+        let catalog = resolve_model_catalog(&cfg, None);
+        assert_eq!(catalog[id].info.reasoning_effort, expected);
+    }
 }
 
 #[test]
@@ -2090,6 +2266,8 @@ fn make_entry_config_with_id(
     name: Option<&str>,
 ) -> config::ModelEntryConfig {
     config::ModelEntryConfig {
+        notice: None,
+        context_windows: Vec::new(),
         id: id.map(|s| s.to_owned()),
         model: model.to_owned(),
         base_url: "https://test.api/v1".to_owned(),
@@ -2107,10 +2285,12 @@ fn make_entry_config_with_id(
         tool_mode: None,
         subagent_context_default: None,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         apply_patch_tool_type: None,
         context_window: std::num::NonZeroU64::new(200_000).unwrap(),
+        max_request_bytes: None,
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
         extra_headers: IndexMap::new(),
@@ -2119,12 +2299,15 @@ fn make_entry_config_with_id(
         agent_type: config::default_agent_type(),
         inference_idle_timeout_secs: None,
         max_retries: None,
+        subagent_rate_limit_max_attempts: None,
         hidden: false,
         supported_in_api: true,
         auth_scheme: None,
         reasoning_effort: None,
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
+        reasoning_effort_server_default: false,
+        variants: Vec::new(),
         supports_reasoning_summary_parameter: false,
         default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
         supports_backend_search: false,

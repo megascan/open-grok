@@ -179,7 +179,7 @@ pub(super) async fn watch_for_exit(
 }
 
 /// Releases even when the task is gone, so the client terminal is not leaked.
-async fn complete_and_release(
+pub(super) async fn complete_and_release(
     gateway: &GatewaySender,
     session_id: &acp::SessionId,
     terminal_id: &acp::TerminalId,
@@ -188,15 +188,16 @@ async fn complete_and_release(
     task_id: &str,
     out: SnapshotOutput,
 ) {
-    let snapshot = {
+    {
         let mut guard = tasks.lock().unwrap();
-        guard.get_mut(task_id).map(|task| {
+        if let Some(task) = guard.get_mut(task_id) {
             task.mark_completed(out.clone());
-            task.to_snapshot(task_id, out)
-        })
-    };
-    if let Some(snapshot) = snapshot {
-        notification_handle.send_task_complete(snapshot);
+            let snapshot = task.to_snapshot(task_id, out);
+            task.notification_handle
+                .as_ref()
+                .unwrap_or(notification_handle)
+                .send_task_complete(snapshot);
+        }
     }
     release_terminal(gateway, session_id, terminal_id).await;
 }

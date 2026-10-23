@@ -6,9 +6,12 @@ mod crash_handler;
 mod display_refresh;
 mod features;
 mod mcp;
+mod prompt_suggest;
+mod session_recap;
 mod system_prompt;
 mod tool_approvals;
 mod toolset;
+mod turn_summary;
 mod ui;
 mod version;
 
@@ -18,9 +21,12 @@ pub use crash_handler::*;
 pub use display_refresh::*;
 pub use features::*;
 pub use mcp::*;
+pub(crate) use prompt_suggest::*;
+pub use session_recap::*;
 pub use system_prompt::*;
 pub use tool_approvals::*;
 pub use toolset::*;
+pub use turn_summary::*;
 pub use ui::*;
 pub use version::*;
 

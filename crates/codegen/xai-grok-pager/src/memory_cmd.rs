@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -87,8 +88,10 @@ fn run_clear(storage: &MemoryStorage, targets: &[ClearTarget], skip_confirm: boo
     }
 
     if !skip_confirm {
-        print!("\nAre you sure? [y/N] ");
-        std::io::stdout().flush()?;
+        let mut stdout = std::io::stdout().lock();
+        write!(stdout, "\nAre you sure? [y/N] ")?;
+        stdout.flush()?;
+        drop(stdout);
 
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;

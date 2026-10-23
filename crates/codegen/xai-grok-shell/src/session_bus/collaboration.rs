@@ -89,7 +89,12 @@ impl SessionCollaborationBackend for ShellSessionCollaboration {
         let path = xai_grok_config::sessions_cwd_dir(&live.session.cwd)
             .join(session_id)
             .join("updates.jsonl");
-        let contents = match tokio::fs::read_to_string(&path).await {
+        let read = tokio::task::spawn_blocking(move || {
+            xai_file_utils::session_file::read_to_string(&path)
+        })
+        .await
+        .map_err(|error| ToolError::custom("read_failed", error.to_string()))?;
+        let contents = match read {
             Ok(contents) => contents,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {

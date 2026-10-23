@@ -64,10 +64,30 @@ pub(crate) struct FeedbackRequestDismiss {
     pub request_id: String,
 }
 
+/// How a feedback POST resolved. Unknown newer wire values map to [`Self::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FeedbackOutcome {
+    Submitted,
+    SubmittedCleanupFailed,
+    LocalOnly,
+    OutcomeUnknown,
+    /// Unknown wire variant from a newer shell. Treat like [`Self::OutcomeUnknown`].
+    #[serde(other)]
+    Other,
+}
+
 /// Response from submitting user feedback
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FeedbackResponse {
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<FeedbackOutcome>,
+    /// Single-use capability returned only for a successful, explicitly consented modal report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_upload_token: Option<String>,
 }
 
 /// Input from client for feedback submission.
@@ -107,6 +127,9 @@ pub struct ClientFeedbackInput {
     #[serde(default)]
     pub feedback_text: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage>,
+
     /// Feedback categories (e.g., ["accuracy", "speed", "helpfulness"])
     #[serde(default)]
     pub feedback_categories: Vec<String>,
@@ -135,6 +158,49 @@ pub struct ClientFeedbackInput {
     /// Terminal environment snapshot from the client.
     #[serde(default)]
     pub terminal_info: Option<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackTerminalInfo>,
+
+    /// Ask the shell to mint a one-shot upload capability after this report succeeds.
+    #[serde(default)]
+    pub request_trace_upload_token: bool,
+}
+
+/// `x.ai/feedback/drafts/update` params, built by the pager and parsed by the shell.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeedbackDraftUpdateRequest {
+    pub session_id: String,
+    pub draft_id: xai_grok_feedback::FeedbackDraftId,
+    #[serde(flatten)]
+    pub input: xai_grok_feedback::FeedbackDraftInput,
+}
+
+/// The `draft_id` variant of `x.ai/feedback` params, built by the pager and parsed by the shell.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeedbackDraftSendRequest {
+    pub session_id: String,
+    pub draft_id: xai_grok_feedback::FeedbackDraftId,
+    #[serde(default)]
+    pub request_trace_upload_token: bool,
+    pub edited_body: FeedbackDraftEditedBody,
+}
+
+/// `edited_body` of [`FeedbackDraftSendRequest`]: the edited draft plus the pager's client context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeedbackDraftEditedBody {
+    #[serde(flatten)]
+    pub input: xai_grok_feedback::FeedbackDraftInput,
+    #[serde(default)]
+    pub images: Vec<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_info: Option<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackTerminalInfo>,
+}
+
+/// Pager attestation on the one-shot `x.ai/feedback/upload-trace` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackTraceUploadIntent {
+    SendThisSession,
 }
 
 impl ClientFeedbackInput {
@@ -206,6 +272,7 @@ impl ClientFeedbackInput {
         );
         s.turn_number = turn_number;
         s.feedback_categories = self.feedback_categories.clone();
+        s.images = self.images.clone();
         s.model_id = model_id;
         s.resolved_model_id = resolved_model_id;
         s.model_fingerprint = model_fingerprint;
@@ -225,6 +292,36 @@ impl ClientFeedbackInput {
     /// Get the request_id if this is solicited feedback
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod feedback_image_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_images_default_empty_and_forward_to_submission() {
+        let mut input: ClientFeedbackInput = serde_json::from_value(serde_json::json!({
+            "session_id": "session", "client_type": "tui", "feedback_text": "feedback",
+        }))
+        .unwrap();
+        assert!(input.images.is_empty());
+        assert!(
+            serde_json::to_value(&input)
+                .unwrap()
+                .get("images")
+                .is_none()
+        );
+        input.images.push(
+            prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage {
+                data: "aGk=".into(),
+                mime_type: "image/png".into(),
+                file_name: Some("shot.png".into()),
+            },
+        );
+        let submission = input.to_submission(None, None, None, None);
+        assert_eq!(submission.images[0].data, "aGk=");
+        assert_eq!(submission.images[0].file_name.as_deref(), Some("shot.png"));
     }
 }
 
@@ -582,6 +679,9 @@ pub struct FeedbackContext {
     pub context_tokens_used: u64,
     pub context_window_tokens: u64,
     pub session_cwd: String,
+    pub reasoning_effort: Option<crate::sampling::ReasoningEffort>,
+    pub model_id: Option<String>,
+    pub model_fingerprint: Option<String>,
 }
 
 // ── Startup hints ───────────────────────────────────────────────────────
@@ -600,9 +700,8 @@ pub struct StartupHints {
     pub non_interactive: bool,
     #[serde(default)]
     pub skip_git_status: bool,
-    /// Leading conversation items to preserve verbatim across compaction (the
-    /// immutable head): spawn-injected items for a fresh subagent, or just the
-    /// System head for a `resume_from` subagent so the resumed body stays compactable.
+    /// Leading conversation items to preserve verbatim across compaction (the immutable head).
+    /// A fresh subagent's head is its spawn-injected items; a `resume_from` subagent's is just the System head so the resumed body stays compactable.
     #[serde(default)]
     pub inherited_prefix_len: Option<usize>,
     /// When true, this session is a subagent child and its prompts should
@@ -648,6 +747,9 @@ pub struct StartupHints {
             xai_grok_tools::implementations::grok_build::task::types::SubagentStatusEvent,
         >,
     >,
+    /// Parent project cwd for child/worktree overlay kill-switch. Not on the wire.
+    #[serde(skip)]
+    pub parent_cwd: Option<PathBuf>,
     /// Runtime-only gate for Codex v2's multi-agent policy injection. Flat
     /// children set this false so per-turn config reconstruction cannot
     /// re-enable delegation instructions after spawn.

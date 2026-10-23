@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 // Glob deny entries (detection, macOS regex translation, Linux launch-time
 // expansion) live in a submodule; re-exported so call sites use `deny::…`.
-#[cfg(all(feature = "enforce", unix))]
+#[cfg(any(all(feature = "enforce", unix), target_os = "macos"))]
 mod glob;
 
 /// Whether a raw config entry is a glob pattern rather than an exact path. True
@@ -22,6 +22,10 @@ pub(crate) fn is_glob(entry: &str) -> bool {
 }
 #[cfg(all(feature = "enforce", target_os = "linux"))]
 pub(crate) use glob::{DENY_GLOB_CAPS, expand_deny_globs};
+#[cfg(target_os = "macos")]
+pub(crate) use glob::{
+    anchored_glob_regex, seatbelt_regex_filter, split_glob_root, validate_deny_glob,
+};
 #[cfg(all(feature = "enforce", unix))]
 pub(crate) use glob::{apply_deny_globs_to_capability_set, partition_deny_entries};
 

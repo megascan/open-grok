@@ -187,7 +187,7 @@ async fn compute_all_changes(
             }
             Hunk::DeleteFile { path } => {
                 let resolved = cwd.join(path);
-                match read_current(&overlay, fs, &resolved).await {
+                match read_current(&overlay, fs, &resolved, false).await {
                     Ok(original_content) => {
                         valid_paths.push(path.display().to_string());
                         overlay.insert(resolved.clone(), None);
@@ -207,7 +207,7 @@ async fn compute_all_changes(
                 chunks,
             } => {
                 let resolved = cwd.join(path);
-                let original_content = match read_current(&overlay, fs, &resolved).await {
+                let original_content = match read_current(&overlay, fs, &resolved, true).await {
                     Ok(c) => c,
                     Err(e) => {
                         errors.push(format!(
@@ -223,6 +223,31 @@ async fn compute_all_changes(
                         valid_paths.push(path.display().to_string());
                         if let Some(dest) = move_path {
                             let resolved_dest = cwd.join(dest);
+                            // A dangling destination link may resolve to a file
+                            // created by an earlier hunk during the write phase.
+                            // Do not follow it when its target cannot be checked now.
+                            if std::fs::symlink_metadata(&resolved_dest)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                                && dunce::canonicalize(&resolved_dest).is_err()
+                            {
+                                errors.push(format!(
+                                    "Cannot move to an unresolved symbolic link: {}",
+                                    resolved_dest.display()
+                                ));
+                                valid_paths.pop();
+                                continue;
+                            }
+                            if crate::util::lock_path::lock_path_for_path(&resolved, cwd)
+                                == crate::util::lock_path::lock_path_for_path(&resolved_dest, cwd)
+                            {
+                                errors.push(format!(
+                                    "Cannot move {} to the same file: {}",
+                                    resolved.display(),
+                                    resolved_dest.display()
+                                ));
+                                valid_paths.pop();
+                                continue;
+                            }
                             overlay.insert(resolved.clone(), None);
                             overlay.insert(resolved_dest.clone(), Some(new_content.clone()));
                             changes.push(FileChange::Move {
@@ -263,11 +288,12 @@ async fn read_current(
     overlay: &HashMap<PathBuf, Option<String>>,
     fs: &Arc<dyn AsyncFileSystem>,
     path: &std::path::Path,
+    require_utf8: bool,
 ) -> Result<String, String> {
     match overlay.get(path) {
         Some(Some(content)) => Ok(content.clone()),
         Some(None) => Err("file was deleted by an earlier hunk in this patch".to_string()),
-        None => read_file_as_string(fs, path).await,
+        None => read_file_as_string(fs, path, require_utf8).await,
     }
 }
 
@@ -310,9 +336,14 @@ fn build_failure_message(
 async fn read_file_as_string(
     fs: &Arc<dyn AsyncFileSystem>,
     path: &std::path::Path,
+    require_utf8: bool,
 ) -> Result<String, String> {
     let bytes = fs.read_file(path).await.map_err(|e| format!("{e}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    if require_utf8 {
+        String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_owned())
+    } else {
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
 
 /// Build the codex-style summary string.
@@ -389,7 +420,8 @@ impl xai_tool_runtime::Tool for ApplyPatchTool {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
 
-        let (cwd, fs, notification_handle);
+        let plan_file = ctx.extensions.get::<crate::types::resources::PlanFile>();
+        let (cwd, mut fs, notification_handle);
         {
             cwd = crate::types::tool_metadata::resolve_cwd(&ctx, &resources).await?;
             let res = resources.lock().await;
@@ -399,7 +431,7 @@ impl xai_tool_runtime::Tool for ApplyPatchTool {
         let tool_call_id = ctx.call_id.as_str().to_owned();
 
         // ── Phase 1: Parse ───────────────────────────────────────
-        let parsed = match parser::parse_patch(&input.patch) {
+        let mut parsed = match parser::parse_patch(&input.patch) {
             Ok(p) => p,
             Err(e) => {
                 let msg = match &e {
@@ -419,6 +451,34 @@ impl xai_tool_runtime::Tool for ApplyPatchTool {
             ));
         }
 
+        if let Some(plan) = &plan_file {
+            for hunk in &mut parsed.hunks {
+                let path = match hunk {
+                    Hunk::AddFile { path, .. }
+                    | Hunk::UpdateFile {
+                        path,
+                        move_path: None,
+                        ..
+                    } => path,
+                    Hunk::DeleteFile { .. }
+                    | Hunk::UpdateFile {
+                        move_path: Some(_), ..
+                    } => {
+                        return Ok(ApplyPatchOutput::ApplicationError(
+                            "Only plan-file additions and updates are permitted.".to_owned(),
+                        ));
+                    }
+                };
+                if let Err(error) = plan.check_path(&cwd.join(&*path)) {
+                    return Ok(ApplyPatchOutput::ApplicationError(format!(
+                        "Invalid plan file target: {error}"
+                    )));
+                }
+                *path = plan.path().to_path_buf();
+            }
+            fs = plan.filesystem();
+        }
+
         // ── Phase 2: Compute all changes in memory (no writes yet) ───
         let changes = match compute_all_changes(&cwd, &fs, &parsed.hunks).await {
             Ok(c) => c,
@@ -432,7 +492,9 @@ impl xai_tool_runtime::Tool for ApplyPatchTool {
             match change {
                 FileChange::Add { path, content } => {
                     // Create parent directories if needed.
-                    ensure_parent_dirs(path).await?;
+                    if plan_file.is_none() {
+                        ensure_parent_dirs(path).await?;
+                    }
                     fs.write_file(path, content.as_bytes()).await.map_err(|e| {
                         xai_tool_runtime::ToolError::execution(
                             xai_tool_protocol::ToolId::new("apply_patch").expect("valid"),
@@ -724,6 +786,179 @@ mod tests {
             }
             other => panic!("Expected Success, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn move_to_same_file_rejects_all_hunks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        for destination in ["a.txt", "./a.txt", "dir/../a.txt"] {
+            std::fs::write(tmp.path().join("a.txt"), "old\n").unwrap();
+            std::fs::write(tmp.path().join("good.txt"), "before\n").unwrap();
+            let patch = wrap_patch(&format!(
+                "*** Update File: good.txt\n@@\n-before\n+after\n\
+                 *** Update File: a.txt\n*** Move to: {destination}\n@@\n-old\n+new"
+            ));
+            let result = xai_tool_runtime::Tool::run(
+                &ApplyPatchTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                make_input(&patch),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, ApplyPatchOutput::ApplicationError(ref msg) if msg.contains("same file")),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"old\n");
+            assert_eq!(
+                std::fs::read(tmp.path().join("good.txt")).unwrap(),
+                b"before\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_to_symlink_alias_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "old\n").unwrap();
+        std::os::unix::fs::symlink("a.txt", tmp.path().join("alias.txt")).unwrap();
+        let patch = wrap_patch("*** Update File: a.txt\n*** Move to: alias.txt\n@@\n-old\n+new");
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            test_ctx(test_resources(tmp.path()).into_shared()),
+            make_input(&patch),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, ApplyPatchOutput::ApplicationError(ref msg) if msg.contains("same file")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"old\n");
+        assert_eq!(
+            std::fs::read(tmp.path().join("alias.txt")).unwrap(),
+            b"old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_to_dangling_alias_of_added_file_rejects_all_hunks() {
+        let tmp = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("a.txt", tmp.path().join("alias.txt")).unwrap();
+        let patch = wrap_patch(
+            "*** Add File: a.txt\n+old\n\
+             *** Update File: a.txt\n*** Move to: alias.txt\n@@\n-old\n+new",
+        );
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            test_ctx(test_resources(tmp.path()).into_shared()),
+            make_input(&patch),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, ApplyPatchOutput::ApplicationError(_)),
+            "{result:?}"
+        );
+        assert!(!tmp.path().join("a.txt").exists());
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("alias.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_non_utf8_without_applying_other_hunks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("good.txt"), "before\n").unwrap();
+        let invalid = b"\xff\nhello\n";
+        std::fs::write(tmp.path().join("invalid.txt"), invalid).unwrap();
+        let patch = wrap_patch(
+            "*** Update File: good.txt\n@@\n-before\n+after\n\
+             *** Update File: invalid.txt\n@@\n-hello\n+HELLO",
+        );
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            test_ctx(test_resources(tmp.path()).into_shared()),
+            make_input(&patch),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, ApplyPatchOutput::ApplicationError(ref msg) if msg.contains("UTF-8")),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("invalid.txt")).unwrap(),
+            invalid
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("good.txt")).unwrap(),
+            b"before\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_restricts_patch_targets_and_symlink_swaps() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = cwd.join("plan.md");
+        let outside = cwd.join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let shared = test_resources(&cwd).into_shared();
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            ctx,
+            make_input(&wrap_patch("*** Add File: plan.md\n+one")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ApplyPatchOutput::Success { .. }));
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            ctx,
+            make_input(&wrap_patch("*** Update File: plan.md\n@@\n-one\n+two")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ApplyPatchOutput::Success { .. }));
+        assert_eq!(std::fs::read(&plan_path).unwrap(), b"two\n");
+
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            ctx,
+            make_input(&wrap_patch(
+                "*** Update File: outside.txt\n@@\n-outside\n+changed",
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ApplyPatchOutput::ApplicationError(_)));
+        std::fs::remove_file(&plan_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &plan_path).unwrap();
+        let mut ctx = test_ctx(shared);
+        ctx.extensions.insert(plan);
+        let result = xai_tool_runtime::Tool::run(
+            &ApplyPatchTool,
+            ctx,
+            make_input(&wrap_patch("*** Add File: plan.md\n+changed")),
+        )
+        .await;
+        assert!(result.is_err() || matches!(result, Ok(ApplyPatchOutput::ApplicationError(_))));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
     }
 
     // ── Multiple files in one patch ──────────────────────────────

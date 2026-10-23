@@ -27,6 +27,10 @@ Location: `~/.opengrok/config.toml`. If the file is missing, Open Grok uses its 
 [cli]
 auto_update = true                     # check for updates on launch
 
+[agent]
+# name = "grok-build"                  # default agent on interactive `grok` (no --plan / --agent-profile)
+# definition = "/path/to/agent.md"     # path wins over name if both are set
+
 [models]
 default = "grok-4.5"                   # model used for new sessions
 web_search = "grok-4.5"                # model used by the web_search tool
@@ -68,8 +72,7 @@ group_tool_verbs = true                # fold runs of read/search/list tool call
                                        # — and finished thoughts among them — into one row (default: true)
 collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat summaries and merge
                                        # back-to-back same-file edits into one row, expand for the
-                                       # diffs (default: false; pager.toml [scrollback.blocks.edit]
-                                       # expanded_by_default/line_summary override its fold shape)
+                                       # diffs (default: false)
 page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
                                        # response starts on a fresh page (default: true); set false
                                        # so sending never moves the scroll position
@@ -146,6 +149,18 @@ used for image generation. Known ChatGPT Free accounts are not eligible.
 Restart Open Grok after changing the setting. Video generation remains
 xAI-only.
 
+### Default agent
+
+Interactive `open-grok` uses `[agent]` in `config.toml` when you do not pass `--plan`, `--ask-user`, or `--agent-profile`:
+
+```toml
+[agent]
+name = "my-custom-agent"
+# definition = "/path/to/agent.md"   # path wins over name
+```
+
+`definition` is a markdown file with YAML frontmatter. `name` is a built-in or discovered agent (`~/.opengrok/agents/`, `.opengrok/agents/`). If the named agent is missing, Open Grok uses `GROK_AGENT`, then the built-in default. `--agent-profile`, `--plan`, and `--ask-user` still override that session.
+
 #### Input Mode
 
 `[ui] simple_mode` controls how you edit text in the **prompt** — the input editor. It has nothing to do with how you move around the scrollback; that's [`vim_mode`](#vim-mode).
@@ -192,8 +207,8 @@ You can also override this with `GROK_DEFAULT_SELECTED_PERMISSION`, which is han
 
 | Value | Behavior |
 |-------|----------|
-| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — it cancels a running turn, and while idle follows the clear / rewind policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
-| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). Mid-turn `Esc` is swallowed in this mode (`Ctrl+C` cancels); minimal mode keeps Esc-cancel regardless. |
+| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — mid-turn it names `Ctrl+C` as the cancel binding, and while idle it follows the clear / rewind policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
+| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). Mid-turn `Esc` is swallowed in every mode (`Ctrl+C` cancels). |
 
 Toggle `vim_mode` at runtime with `/vim-mode`, or from the settings pane
 (`/settings` → **Vim scrollback navigation**). Grok writes the change to
@@ -390,7 +405,8 @@ context_window = 1040000
 
 DeepSeek API direct is a separate API-key-only provider. Configure it from
 Settings or `/login deepseek`, or export `DEEPSEEK_API_KEY`. Open Grok refreshes
-the curated direct catalog against DeepSeek's models endpoint and keeps these
+the model list from DeepSeek's `GET /models` endpoint (names, context windows,
+output limits, and reasoning levels included) and keeps these
 credentials isolated from Fireworks-hosted DeepSeek models. V4 Pro uses Chat
 Completions; V4 Flash (0731) uses DeepSeek's native Responses API:
 
@@ -482,6 +498,9 @@ Priority for `[mcp_servers]` and `[plugins]`: `.opengrok/config.toml` (current d
 ### Memory
 
 Persist knowledge across sessions (requires `--experimental-memory` or `GROK_MEMORY=1`).
+An explicit `[memory] enabled = false` turns it off even when a managed remote
+setting enables it. Notes recorded by earlier versions are carried over
+automatically. See [13-memory.md](13-memory.md).
 
 ```toml
 [memory]
@@ -504,6 +523,12 @@ min_score = 0.0                       # score threshold for first-turn injection
 [memory.embedding]
 model = "embedding-model"             # embedding model name
 dimensions = 1024                     # vector dimensions
+
+# Isolated topic/observation pipeline (Grok Build 1.0.32+).
+# Selecting this does not read or write ~/.opengrok/memory/.
+[memory_v2]
+enabled = false
+# rollout = "active"                  # off | record_only | shadow | active
 ```
 
 ### Subagents
@@ -879,8 +904,8 @@ dim_accent = 0.5                      # dimming factor for collapsed accents (0.
 [scrollback.blocks.edit]
 indent = true                         # indent diff content
 vpad = false                          # vertical padding
-# expanded_by_default = true          # unset: follows [ui] collapsed_edit_blocks in config.toml
-                                      # (flag on = collapsed one-liner); uncomment to pin either shape
+# expanded_by_default = true          # Unset follows Collapsed edit blocks. When that setting is on,
+                                      # edits start collapsed even if this line is true.
 dual_line_numbers = false             # two-column line numbers (old + new)
 # line_summary = false                # show +N/-M in the collapsed header; unset follows the same flag
 hunk_separator = "…"                  # separator between diff hunks (default: "…")
@@ -998,6 +1023,14 @@ The key ones. See the README for the complete list.
 | `.opengrok/agents/` | Project-scoped agent definitions |
 | `.opengrok/hooks/` | Project-scoped hooks |
 | `.opengrok/lsp.json` | LSP server configuration |
+
+### How Grok saves `config.toml`
+
+Writes to **`~/.opengrok/config.toml`** (`/settings`, `/vim-mode`, and other user-config saves) follow a leaf symlink. The atomic rename writes the referent (a file in your dotfiles repo). The link stays a link. If the link is dangling, the write creates the referent as a regular file.
+
+Writes to a **project** `.opengrok/config.toml` (MCP / plugin / permission edits) **replace** a leaf symlink with a regular file. That keeps a later save from following the link out of the repository.
+
+A user `config.toml` that cannot be parsed is not overwritten. Fix the syntax (or restore a backup) and save again.
 
 ---
 

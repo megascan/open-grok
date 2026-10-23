@@ -19,8 +19,8 @@ use super::ctx::{
 };
 use super::notes::{handle_btw_response, handle_memory_note_saved};
 use super::prompt::{
-    defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
-    handle_suggestion_debounce_expired,
+    defer_to_open_reload_window, handle_compact_complete, handle_memory_command_complete,
+    handle_prompt_response, handle_suggestion_debounce_expired,
 };
 use super::queue::push_and_page_flip;
 use super::rewind::{
@@ -43,25 +43,30 @@ use super::session::load::{
     handle_session_restored, handle_session_search_debounce_expired, remove_session_from_pickers,
 };
 use super::session::modal::remove_agent_and_cleanup;
+use super::session::picker_routing::PickerRequest;
 use super::settings::ui::{apply_setting_rollback, refresh_open_settings_modals};
 use super::status::{
     handle_coding_data_sharing_failed, handle_coding_data_sharing_updated,
     handle_context_info_complete, handle_session_cache_result, handle_session_usage_result,
-    scrub_error_for_toast, usage_modal_state_mut,
+    scrub_error_for_toast, toast_persist_failure, usage_modal_state_mut,
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
     handle_mcp_toggle_done, handle_plugins_list_loaded, handle_skills_toggle_done,
 };
-use super::turn::handle_bg_task_killed;
+use super::turn::{clear_pending_kill, handle_bg_task_killed};
+use crate::app::acp_handler::task_view_by_session_id;
 use crate::app::actions::{
     ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure, ClipboardPasteTarget,
     DoctorFixTarget, DoctorPlanningOutcome, Effect, ProbedAttachment, SubagentKillOutcome,
     TaskResult,
 };
 use crate::app::agent::AgentId;
+use crate::app::agent_view::AgentDeferredSend;
 use crate::app::app_view::{ActiveView, AppView, AuthState, PrimaryProvider};
+use crate::app::dispatch::settings;
 use crate::scrollback::block::RenderBlock;
+use crate::scrollback::blocks::MemoryCommandKind;
 use agent_client_protocol as acp;
 pub(super) fn unregister_session_effect(session_id: Option<acp::SessionId>) -> Vec<Effect> {
     session_id
@@ -182,12 +187,18 @@ fn apply_clipboard_paste_result(
     app: &mut AppView,
 ) -> ClipboardPasteCompletion {
     match ctx.target.clone() {
-        ClipboardPasteTarget::AgentPrompt { agent_id, .. } => app
-            .agents
-            .get_mut(&agent_id)
-            .map_or(ClipboardPasteCompletion::Dropped, |agent| {
-                agent.complete_clipboard_attachment_paste(ctx, image, file_urls)
-            }),
+        ClipboardPasteTarget::AgentPrompt { agent_id, .. } => {
+            app.agents
+                .get_mut(&agent_id)
+                .map_or(ClipboardPasteCompletion::Dropped, |agent| {
+                    let completion =
+                        agent.complete_clipboard_attachment_paste(ctx, image, file_urls);
+                    if !matches!(completion, ClipboardPasteCompletion::Dropped) {
+                        agent.refresh_deferred_paste_identity();
+                    }
+                    completion
+                })
+        }
         ClipboardPasteTarget::DashboardDispatch | ClipboardPasteTarget::DashboardPeek { .. } => app
             .dashboard
             .as_mut()
@@ -200,15 +211,50 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
     match target {
         ClipboardPasteTarget::AgentPrompt { agent_id, .. } => {
             let is_active = app.active_view == ActiveView::Agent(*agent_id);
+            let blocked_by_app = app.reconnect_pending || app.esc_owned_before_agent();
             let Some(agent) = app.agents.get_mut(agent_id) else {
                 return vec![];
             };
+            let prompt_send = matches!(
+                agent.deferred_send,
+                Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+            );
+            if prompt_send && agent.paste_probe_in_flight == 0 {
+                if !agent.deferred_paste_matches() {
+                    agent.cancel_stale_deferred_paste();
+                    return std::mem::take(&mut agent.pending_effects);
+                }
+                let blocked = !is_active
+                    || blocked_by_app
+                    || agent.load_failed
+                    || agent.active_subagent.is_some()
+                    || agent.active_modal.is_some()
+                    || agent.extensions_modal.is_some()
+                    || agent.agents_modal.is_some()
+                    || agent.question_view.is_some()
+                    || agent.feedback_modal.is_some()
+                    || agent.elicitation_view.is_some()
+                    || agent.plan_approval_view.is_some()
+                    || agent.cancel_turn_view.is_some()
+                    || agent.rewind_state.is_some()
+                    || !matches!(
+                        agent.prompt_mode,
+                        crate::app::agent_view::PromptMode::Normal
+                    );
+                if blocked {
+                    if !agent.deferred_paste_hold_reported {
+                        agent.scrollback.push_block(RenderBlock::system(
+                            "Submitted prompt is waiting for its original session to be available.",
+                        ));
+                        agent.deferred_paste_hold_reported = true;
+                    }
+                    return std::mem::take(&mut agent.pending_effects);
+                }
+            }
             let resend = agent.take_deferred_send_after_paste();
-            let action = if is_active {
-                resend.and_then(|kind| agent.build_deferred_send_action(kind))
-            } else {
-                None
-            };
+            let action = resend
+                .filter(|kind| is_active || matches!(kind, AgentDeferredSend::Stash))
+                .and_then(|kind| agent.resume_deferred_send(kind));
             let mut effects = std::mem::take(&mut agent.pending_effects);
             if let Some(action) = action {
                 effects.extend(dispatch(action, app));
@@ -216,12 +262,33 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
             effects
         }
         ClipboardPasteTarget::DashboardDispatch | ClipboardPasteTarget::DashboardPeek { .. } => {
+            let blocked_by_app = app.reconnect_pending || app.esc_owned_before_agent();
             let Some(dashboard) = app.dashboard.as_mut() else {
                 return vec![];
             };
-            let resends = dashboard.take_deferred_sends_after_paste();
             let mut effects = std::mem::take(&mut dashboard.pending_effects);
-            if matches!(app.active_view, ActiveView::AgentDashboard) {
+            let blocked = !matches!(app.active_view, ActiveView::AgentDashboard)
+                || blocked_by_app
+                || dashboard.settings_modal.is_some()
+                || dashboard.shortcuts_modal.is_some()
+                || dashboard.location_picker.is_some()
+                || dashboard.worktree_dialog.is_some()
+                || dashboard.usage_modal.is_some()
+                || dashboard.rename.is_some()
+                || dashboard.search_mode;
+            if blocked
+                && dashboard.paste_probe_in_flight == 0
+                && (dashboard.deferred_dispatch_send.is_some()
+                    || dashboard.deferred_peek_send.is_some())
+                && !dashboard.deferred_paste_hold_reported
+            {
+                dashboard.set_error_toast(
+                    "Submitted prompt is waiting for the dashboard to be available",
+                );
+                dashboard.deferred_paste_hold_reported = true;
+            }
+            if !blocked {
+                let resends = dashboard.take_deferred_sends_after_paste();
                 for action in resends {
                     effects.extend(dispatch(action, app));
                 }
@@ -229,6 +296,40 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
             effects
         }
     }
+}
+
+/// Retry a paste-dependent submission after its original surface becomes
+/// available again. The normal dispatcher retains all send gates.
+pub(in crate::app) fn resume_focused_deferred_paste(app: &mut AppView) -> Vec<Effect> {
+    let target = match app.active_view {
+        ActiveView::Agent(id)
+            if app.agents.get(&id).is_some_and(|agent| {
+                agent.paste_probe_in_flight == 0
+                    && matches!(
+                        agent.deferred_send,
+                        Some(AgentDeferredSend::SendPrompt | AgentDeferredSend::Interject)
+                    )
+            }) =>
+        {
+            ClipboardPasteTarget::AgentPrompt {
+                agent_id: id,
+                binding_epoch: app.agents[&id].session_binding_epoch,
+                images_dir: None,
+                feedback_tool_call_id: None,
+            }
+        }
+        ActiveView::AgentDashboard
+            if app.dashboard.as_ref().is_some_and(|dashboard| {
+                dashboard.paste_probe_in_flight == 0
+                    && (dashboard.deferred_dispatch_send.is_some()
+                        || dashboard.deferred_peek_send.is_some())
+            }) =>
+        {
+            ClipboardPasteTarget::DashboardDispatch
+        }
+        _ => return vec![],
+    };
+    drain_clipboard_target(&target, app)
 }
 
 fn settings_modal_is_open(app: &AppView) -> bool {
@@ -567,10 +668,12 @@ fn handle_kimi_model_rebind_complete(
         // the pager now considers current before releasing the queue.
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -815,10 +918,12 @@ fn handle_fireworks_model_rebind_complete(
         // model the pager now considers current before releasing the queue.
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1048,10 +1153,12 @@ fn handle_deepseek_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1262,10 +1369,12 @@ fn handle_meta_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1469,10 +1578,12 @@ fn handle_wafer_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1806,10 +1917,12 @@ fn handle_runinfra_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2014,10 +2127,12 @@ fn handle_gemini_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2091,10 +2206,12 @@ fn handle_zai_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2312,10 +2429,12 @@ fn handle_opencode_go_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2545,10 +2664,12 @@ fn handle_openrouter_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2717,7 +2838,7 @@ fn handle_swarm_prompt_setup_failed(
     }
 
     agent.session.finish_turn(&mut agent.scrollback);
-    agent.mark_turn_finished();
+    agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
     agent.activity_started_at = None;
     agent.last_activity = None;
     agent.show_toast(&format!("Swarm setup failed — prompt restored: {error}"));
@@ -2780,7 +2901,25 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
     if result.ends_startup() {
         app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Ok);
     }
+    if !matches!(
+        &result,
+        TaskResult::WorkspaceMembersUpserted { .. }
+            | TaskResult::WorkspaceMembersUpsertTaskFailed { .. }
+    ) {
+        crate::app::workspace_sync::request(app);
+    }
     match result {
+        TaskResult::ActiveSessionRegistrationWarning {
+            session_id,
+            message,
+        } => {
+            if let Some(agent) = find_agent_by_session_id(&mut app.agents, &session_id.0) {
+                agent.scrollback.push_block(RenderBlock::system(message));
+            } else {
+                app.show_toast(&message);
+            }
+            vec![]
+        }
         TaskResult::PerplexityWebSearchUpdated {
             enabled,
             api_key_configured,
@@ -3040,9 +3179,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 after_gemini_session_ready(app, agent_id, effects)
             }
         }
-        TaskResult::SessionFailed { agent_id, error } => {
-            handle_session_failed(app, agent_id, error)
-        }
+        TaskResult::SessionFailed {
+            agent_id,
+            error,
+            timed_out,
+        } => handle_session_failed(app, agent_id, error, timed_out),
         TaskResult::WorktreeSessionCreated {
             agent_id,
             session_id,
@@ -3104,8 +3245,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_degree,
             resume_session_id,
         ),
-        TaskResult::WorktreeSessionFailed { agent_id, error } => {
-            handle_worktree_session_failed(app, agent_id, error)
+        TaskResult::WorktreeSessionFailed {
+            agent_id,
+            error,
+            orphaned_worktree_root,
+            timed_out,
+        } => {
+            handle_worktree_session_failed(app, agent_id, error, orphaned_worktree_root, timed_out)
         }
         TaskResult::ForkSessionReady {
             agent_id,
@@ -3250,12 +3396,25 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
         } => handle_codex_session_load_auth_required(app, agent_id, session_id),
         TaskResult::SessionListLoaded {
+            host,
+            generation,
             sessions,
             partial,
             scope,
             seq,
             query,
-        } => handle_session_list_loaded(app, sessions, partial, scope, seq, query),
+        } => handle_session_list_loaded(
+            app,
+            PickerRequest {
+                host,
+                generation,
+                seq,
+            },
+            sessions,
+            partial,
+            scope,
+            query,
+        ),
         TaskResult::ForeignSessionsScanned { entries, seq } => {
             handle_foreign_sessions_scanned(app, entries, seq)
         }
@@ -3286,12 +3445,36 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.apply_foreign_resume_detection(launch_token, &canonical_cwd, hint);
             vec![]
         }
-        TaskResult::SessionListFailed { error, seq, query } => {
-            handle_session_list_failed(app, error, seq, query)
-        }
-        TaskResult::SessionSearchDebounceExpired { query, seq } => {
-            handle_session_search_debounce_expired(app, query, seq)
-        }
+        TaskResult::SessionListFailed {
+            host,
+            generation,
+            error,
+            seq,
+            query,
+        } => handle_session_list_failed(
+            app,
+            PickerRequest {
+                host,
+                generation,
+                seq,
+            },
+            error,
+            query,
+        ),
+        TaskResult::SessionSearchDebounceExpired {
+            host,
+            generation,
+            query,
+            seq,
+        } => handle_session_search_debounce_expired(
+            app,
+            PickerRequest {
+                host,
+                generation,
+                seq,
+            },
+            query,
+        ),
         TaskResult::RosterLoaded { sessions } => {
             app.leader_roster = sessions;
             app.dashboard_sessions_loading = false;
@@ -3307,12 +3490,136 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.dashboard_sessions_loading = false;
             vec![]
         }
+        TaskResult::WorkspaceSnapshotLoaded { store, snapshot } => {
+            app.workspace_writes_disabled = !matches!(
+                store.schema_state(),
+                xai_grok_dashboard_store::SchemaState::Current
+            );
+            app.workspace_store = Some(store);
+            app.workspace_snapshot = Some(snapshot);
+            app.workspace_store_loading = false;
+            app.workspace_write_in_flight = false;
+            app.workspace_retry_metadata.clear();
+            app.workspace_failed_metadata.clear();
+            app.dashboard_sessions_loading = false;
+            vec![]
+        }
+        TaskResult::WorkspaceSnapshotFailed { error } => {
+            tracing::warn!(error = %error, "dashboard workspace load failed");
+            app.workspace_store_loading = false;
+            app.workspace_write_in_flight = false;
+            app.dashboard_sessions_loading = false;
+            app.show_toast(&format!("Could not load dashboard workspace: {error}"));
+            vec![]
+        }
+        TaskResult::WorkspaceMembersUpserted {
+            store,
+            snapshot,
+            failures,
+            attempted,
+        } => {
+            app.workspace_writes_disabled = !matches!(
+                store.schema_state(),
+                xai_grok_dashboard_store::SchemaState::Current
+            );
+            app.workspace_write_in_flight = false;
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let db_path = store.path().to_path_buf();
+                    tracing::warn!(error = %error, "workspace snapshot after write failed");
+                    app.workspace_store = None;
+                    app.workspace_store_loading = true;
+                    app.workspace_sync_requested = true;
+                    app.show_toast("Dashboard workspace changed; refreshing");
+                    return vec![Effect::LoadWorkspaceSnapshot { db_path }];
+                }
+            };
+            app.workspace_store = Some(store);
+            app.workspace_snapshot = Some(snapshot);
+            let failed_ids: std::collections::HashSet<_> = failures
+                .iter()
+                .map(|failure| failure.session_id.clone())
+                .collect();
+            for member in &attempted {
+                if !failed_ids.contains(member.key.session_id.as_ref()) {
+                    app.workspace_retry_metadata.remove(&member.key.session_id);
+                    app.workspace_failed_metadata.remove(&member.key.session_id);
+                }
+            }
+            if !failures.is_empty() {
+                let failure = &failures[0];
+                tracing::warn!(
+                    failed = failures.len(),
+                    session_id = failure.session_id,
+                    error = failure.error,
+                    "dashboard workspace sync partially failed"
+                );
+                app.show_toast(&format!(
+                    "Could not sync {} dashboard session{}",
+                    failures.len(),
+                    if failures.len() == 1 { "" } else { "s" }
+                ));
+            }
+            if app.workspace_writes_disabled {
+                app.workspace_sync_requested = false;
+                app.show_toast("Dashboard workspace is read-only in this Open Grok version");
+            } else {
+                let mut request_retry = false;
+                for member in attempted {
+                    let Some(failure) = failures
+                        .iter()
+                        .find(|failure| failure.session_id == member.key.session_id.as_ref())
+                    else {
+                        continue;
+                    };
+                    let already_retried = app
+                        .workspace_retry_metadata
+                        .get(&member.key.session_id)
+                        .is_some_and(|metadata| metadata == &member.metadata);
+                    if failure.retryable && !already_retried {
+                        app.workspace_retry_metadata
+                            .insert(member.key.session_id.clone(), member.metadata.clone());
+                        app.workspace_failed_metadata.remove(&member.key.session_id);
+                        request_retry = true;
+                    } else {
+                        app.workspace_retry_metadata.remove(&member.key.session_id);
+                        app.workspace_failed_metadata
+                            .insert(member.key.session_id, member.metadata);
+                    }
+                }
+                if request_retry {
+                    app.workspace_sync_requested = true;
+                }
+            }
+            vec![]
+        }
+        TaskResult::WorkspaceMembersUpsertTaskFailed { db_path, error } => {
+            tracing::error!(error = %error, "dashboard workspace writer failed");
+            app.workspace_store = None;
+            app.workspace_write_in_flight = false;
+            app.workspace_store_loading = true;
+            app.show_toast("Dashboard workspace writer failed; reopening");
+            vec![Effect::LoadWorkspaceSnapshot { db_path }]
+        }
         TaskResult::CardDetailLoaded {
+            host,
+            generation,
             source,
             session_id,
-            generation,
+            seq,
             detail,
-        } => handle_card_detail_loaded(app, source, session_id, generation, detail),
+        } => handle_card_detail_loaded(
+            app,
+            PickerRequest {
+                host,
+                generation,
+                seq,
+            },
+            source,
+            session_id,
+            detail,
+        ),
         TaskResult::SessionRestored {
             agent_id,
             local_session_id,
@@ -3451,6 +3758,128 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         }
         TaskResult::CompactComplete { agent_id, result } => {
             handle_compact_complete(app, agent_id, result)
+        }
+        TaskResult::MemoryFlushComplete { agent_id, result } => handle_memory_command_complete(
+            app,
+            agent_id,
+            MemoryCommandKind::Flush,
+            result.map(|r| (r.summary(), r.succeeded())),
+        ),
+        TaskResult::MemoryDreamComplete { agent_id, result } => handle_memory_command_complete(
+            app,
+            agent_id,
+            MemoryCommandKind::Dream,
+            result.map(|r| (r.summary(), r.succeeded())),
+        ),
+        TaskResult::ModelWindowSwitchComplete {
+            agent_id,
+            request_id,
+            session_id,
+            model_id,
+            source_model_id,
+            effort,
+            window,
+            result,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            if agent.session.session_id.as_ref() != Some(&session_id)
+                || agent.session.pending_context_switch.as_ref()
+                    != Some(&(session_id.clone(), model_id.clone(), window, request_id))
+                || !agent.session.model_switch_pending
+            {
+                return vec![];
+            }
+            agent.session.pending_context_switch = None;
+            if agent.session.models.current != source_model_id {
+                agent.session.model_switch_pending = false;
+                return crate::app::dispatch::maybe_drain_queue(
+                    agent,
+                    &mut app.pending_image_notices,
+                )
+                .effects;
+            }
+            let success = result.is_ok();
+            if success {
+                agent.session.models.context_window_selection = Some(window.get());
+            }
+            let effects = dispatch_task_result(
+                TaskResult::SwitchModelComplete {
+                    agent_id,
+                    model_id: model_id.clone(),
+                    effort,
+                    service_tier: None,
+                    result,
+                    prev_model_id: None,
+                },
+                app,
+            );
+            if success
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && agent.session.session_id.as_ref() == Some(&session_id)
+                && agent.session.models.current.as_ref() == Some(&model_id)
+            {
+                agent.refresh_context_total();
+                agent.scrollback.push_block(RenderBlock::system(format!(
+                    "Context window set to {}",
+                    crate::slash::commands::context_window::format_window(window.get())
+                )));
+            }
+            effects
+        }
+        TaskResult::ContextWindowComplete {
+            agent_id,
+            request_id,
+            session_id,
+            model_id,
+            effort,
+            window,
+            result,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            if agent.session.session_id.as_ref() != Some(&session_id)
+                || agent.session.pending_context_switch.as_ref()
+                    != Some(&(session_id.clone(), model_id.clone(), window, request_id))
+                || !agent.session.model_switch_pending
+            {
+                return vec![];
+            }
+            agent.session.pending_context_switch = None;
+            if agent.session.models.current.as_ref() != Some(&model_id) {
+                // A remote provider switch became authoritative while the request was in flight.
+                // Never overwrite that selection; release only this request's hold.
+                agent.session.model_switch_pending = false;
+                return crate::app::dispatch::maybe_drain_queue(
+                    agent,
+                    &mut app.pending_image_notices,
+                )
+                .effects;
+            }
+            if result.is_ok() {
+                let changed = agent.session.models.get_context_window() != Some(window.get());
+                agent.session.models.context_window_selection = Some(window.get());
+                agent.refresh_context_total();
+                if changed {
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Context window set to {}",
+                        crate::slash::commands::context_window::format_window(window.get())
+                    )));
+                }
+            }
+            dispatch_task_result(
+                TaskResult::SwitchModelComplete {
+                    agent_id,
+                    model_id,
+                    effort,
+                    service_tier: None,
+                    result,
+                    prev_model_id: None,
+                },
+                app,
+            )
         }
         TaskResult::SwitchModelComplete {
             agent_id,
@@ -4274,6 +4703,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             models,
             custom_models,
         } => {
+            // A custom-provider wizard save rides this lane. Resolve it before
+            // the shared staleness guard: the wizard matches its own save
+            // generation exactly, so a newer unrelated mutation must not strand
+            // the wizard on the checklist waiting for a result that already
+            // arrived.
+            super::custom_provider::note_custom_provider_save(app, generation, &error, &warning);
             if stale || generation < super::settings::setters::current_custom_models_generation() {
                 return vec![];
             }
@@ -4308,6 +4743,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
+        TaskResult::CustomProviderDiscovered {
+            generation,
+            error,
+            response,
+        } => super::custom_provider::handle_custom_provider_discovered(
+            app, generation, &error, &response,
+        ),
         TaskResult::OpenCodeGoModelsUpdated {
             configured,
             mutation,
@@ -4555,11 +4997,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             error,
         } => {
             tracing::warn!(task_id = %task_id, error = %error, "Failed to kill bg task");
-            if let Some(agent) = find_agent_by_session_id(&mut app.agents, &session_id)
-                && let Some(task) = agent.session.bg_tasks.get_mut(&task_id)
-            {
-                task.pending_kill = false;
-                task.kill_requested_at = None;
+            if let Some((session, _)) = task_view_by_session_id(app, &session_id) {
+                clear_pending_kill(session, &task_id);
             }
             vec![]
         }
@@ -4664,10 +5103,35 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             use xai_grok_tools::implementations::skills::skill::extract_skill_display_text;
             if let Some(agent) = app.agents.get_mut(&agent_id) {
                 agent.session.prompt_history_loading = false;
-                agent.session.prompt_history = prompts
+                let fetched: Vec<String> = prompts
                     .into_iter()
                     .map(|p| extract_skill_display_text(&p).unwrap_or(p))
                     .collect();
+                let local: std::collections::HashSet<String> = agent
+                    .session
+                    .prompt_history
+                    .iter()
+                    .flat_map(|p| {
+                        let t = p.trim();
+                        [t.to_owned(), t.strip_prefix("! ").unwrap_or(t).to_owned()]
+                    })
+                    .collect();
+                let local_entries = agent.session.prompt_history.len();
+                let fetched_entries = fetched.len();
+                agent
+                    .session
+                    .prompt_history
+                    .extend(fetched.into_iter().filter(|p| !local.contains(p.trim())));
+                agent
+                    .session
+                    .prompt_history
+                    .truncate(crate::app::agent::PROMPT_HISTORY_CAP);
+                tracing::info!(
+                    history.local_entries = local_entries,
+                    history.fetched_entries = fetched_entries,
+                    history.merged_entries = agent.session.prompt_history.len(),
+                    "history.fetch_merged"
+                );
                 if agent.prompt.history_search.is_active() {
                     let history = agent.combined_prompt_history();
                     agent.prompt.history_search.refresh_items(&history);
@@ -4745,6 +5209,60 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::PluginsListLoaded { agent_id, result } => {
             handle_plugins_list_loaded(app, agent_id, result)
         }
+        TaskResult::MemoryListLoaded { agent_id, result } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                match result {
+                    Ok(_)
+                        if !matches!(
+                            agent.active_modal,
+                            None | Some(crate::views::modal::ActiveModal::MemoryBrowser { .. })
+                        ) => {}
+                    Ok(listing) => {
+                        agent.active_modal =
+                            Some(crate::views::modal::ActiveModal::MemoryBrowser {
+                                state: Box::new(
+                                    crate::views::memory_modal::MemoryModalState::from_listing(
+                                        listing,
+                                    ),
+                                ),
+                            });
+                    }
+                    Err(error) => {
+                        agent.scrollback.push_block(RenderBlock::system(error));
+                    }
+                }
+            }
+            vec![]
+        }
+        TaskResult::MemoryToggleResult { agent_id, result } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+                {
+                    state.apply_toggle_result(result);
+                } else {
+                    let text = match result {
+                        Ok(response) => response.message,
+                        Err(error) => error,
+                    };
+                    agent.scrollback.push_block(RenderBlock::system(text));
+                }
+            }
+            vec![]
+        }
+        TaskResult::MemoryForgetResult {
+            agent_id,
+            path,
+            result,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id)
+                && let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+            {
+                state.apply_forget_result(&path, result);
+            }
+            vec![]
+        }
         TaskResult::HooksActionResult { agent_id, result }
         | TaskResult::PluginsActionResult { agent_id, result }
         | TaskResult::MarketplaceActionResult { agent_id, result } => {
@@ -4790,18 +5308,17 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::PluginCtaCatalogLoaded { agent_id, result } => {
             handle_plugin_cta_catalog_loaded(app, agent_id, result)
         }
-        TaskResult::SkillsListLoaded { agent_id, result } => {
-            use crate::views::extensions_modal::TabDataState;
+        TaskResult::SkillsListLoaded {
+            agent_id,
+            session_id,
+            fetch,
+            result,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id)
+                && agent.session.session_id.as_ref() == Some(&session_id)
                 && let Some(ref mut modal) = agent.extensions_modal
+                && modal.show_skills_listing(fetch, result)
             {
-                modal.skills_data = match result {
-                    Ok(skills) => {
-                        modal.seed_skills_groups_once(&skills);
-                        TabDataState::Loaded(skills)
-                    }
-                    Err(e) => TabDataState::Error(e),
-                };
                 modal.pending_action = None;
                 modal.pending_entry_index = None;
             }
@@ -4817,7 +5334,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 && agent.session.session_id.as_ref() == Some(&session_id)
                 && let Some(ref mut modal) = agent.extensions_modal
             {
-                modal.seed_workflows_group_once();
                 modal.workflows_data = match result {
                     Ok(workflows) => TabDataState::Loaded(workflows),
                     Err(e) => TabDataState::Error(e),
@@ -4825,9 +5341,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::SkillsToggleDone { agent_id, result } => {
-            handle_skills_toggle_done(app, agent_id, result)
-        }
+        TaskResult::SkillsToggleDone {
+            agent_id,
+            session_id,
+            fetch,
+            result,
+        } => handle_skills_toggle_done(app, agent_id, session_id, fetch, result),
         TaskResult::ShareSessionComplete {
             agent_id,
             share_url,
@@ -4931,11 +5450,22 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::CodingDataSharingFailed {
             agent_id,
             error,
-            rollback_to_opted_in,
             seq,
-        } => handle_coding_data_sharing_failed(app, agent_id, error, rollback_to_opted_in, seq),
-        TaskResult::RenameSessionComplete { agent_id, title } => {
+        } => handle_coding_data_sharing_failed(app, agent_id, error, seq),
+        TaskResult::RenameSessionComplete {
+            agent_id,
+            title,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, true);
+                if agent.title_mutation_generation != generation {
+                    return vec![];
+                }
                 let safe = crate::views::session_title::sanitize_display_text(&title);
                 agent
                     .scrollback
@@ -4945,8 +5475,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::RenameSessionFailed { agent_id, error } => {
+        TaskResult::RenameSessionFailed {
+            agent_id,
+            error,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, false);
+                if agent.title_mutation_generation == generation {
+                    agent.title_pending_rename = None;
+                }
                 agent
                     .scrollback
                     .push_block(crate::scrollback::block::RenderBlock::system(format!(
@@ -4955,8 +5497,19 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::ResetSessionTitleComplete { agent_id } => {
+        TaskResult::ResetSessionTitleComplete {
+            agent_id,
+            generation,
+            binding_epoch,
+        } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                agent.finish_title_mutation(generation, true);
+                if agent.title_mutation_generation != generation {
+                    return vec![];
+                }
                 agent.title_unpin_committed = false;
                 agent
                     .scrollback
@@ -4969,11 +5522,19 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::ResetSessionTitleFailed {
             agent_id,
             error,
-            previous_display_name,
-            previous_generated_title,
+            previous_display_name: _,
+            previous_generated_title: _,
+            generation,
+            binding_epoch,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
-                if agent.title_unpin_committed {
+                if agent.session_binding_epoch != binding_epoch {
+                    return vec![];
+                }
+                let committed =
+                    agent.title_mutation_generation == generation && agent.title_unpin_committed;
+                agent.finish_title_mutation(generation, committed);
+                if committed {
                     agent.title_unpin_committed = false;
                     agent
                         .scrollback
@@ -4981,8 +5542,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                             "Session title reset to auto",
                         ));
                 } else {
-                    agent.display_name = previous_display_name;
-                    agent.generated_session_title = previous_generated_title;
                     agent
                         .scrollback
                         .push_block(crate::scrollback::block::RenderBlock::system(format!(
@@ -5163,16 +5722,224 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             &session_id,
             format!("Couldn't load prompt cache telemetry: {error}"),
         ),
-        TaskResult::FeedbackComplete { .. } => vec![],
-        TaskResult::FeedbackFailed { agent_id, error } => {
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                agent
-                    .scrollback
-                    .push_block(crate::scrollback::block::RenderBlock::system(format!(
-                        "Couldn't send feedback: {error}"
-                    )));
+        TaskResult::FeedbackComplete {
+            agent_id,
+            origin,
+            outcome,
+            trace_upload_token: _,
+        } => {
+            if let crate::app::actions::FeedbackSendOrigin::Modal {
+                submission_id,
+                modal_id,
+                is_draft,
+            } = origin
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+            {
+                let _ = agent.take_parked_feedback_trace_consent(submission_id);
+                if is_draft {
+                    let has_matching_modal = agent
+                        .feedback_modal
+                        .as_ref()
+                        .is_some_and(|modal| modal.matches_id(modal_id));
+                    if has_matching_modal {
+                        match outcome {
+                            xai_grok_shell::session::FeedbackOutcome::Submitted => {
+                                agent.feedback_modal = None;
+                                agent.promote_pending_elicitation();
+                                agent.scrollback.push_block(
+                                    crate::scrollback::block::RenderBlock::system(
+                                        super::notes::FEEDBACK_THANKS_NOTICE.to_owned(),
+                                    ),
+                                );
+                            }
+                            xai_grok_shell::session::FeedbackOutcome::SubmittedCleanupFailed => {
+                                if let Some(modal) = agent.feedback_modal.as_mut() {
+                                    modal.mark_draft_cleanup_failed();
+                                }
+                            }
+                            xai_grok_shell::session::FeedbackOutcome::LocalOnly => {
+                                if let Some(modal) = agent.feedback_modal.as_mut() {
+                                    modal.mark_draft_send_error(
+                                        "Feedback was saved locally but was not sent. The draft was kept."
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            _ => {
+                                if let Some(modal) = agent.feedback_modal.as_mut() {
+                                    modal.mark_draft_send_error(
+                                        "Feedback was enqueued, but the response did not arrive in time."
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             vec![]
+        }
+        TaskResult::FeedbackFailed {
+            agent_id,
+            origin,
+            feedback_text: _,
+            image_count: _,
+            error,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            let failure = format!("Couldn't send feedback: {error}");
+            if let crate::app::actions::FeedbackSendOrigin::Modal {
+                submission_id,
+                modal_id,
+                is_draft,
+            } = origin
+            {
+                let _ = agent.take_parked_feedback_trace_consent(submission_id);
+                if is_draft {
+                    if let Some(modal) = agent
+                        .feedback_modal
+                        .as_mut()
+                        .filter(|modal| modal.matches_id(modal_id))
+                    {
+                        modal.mark_draft_send_error(format!("{failure}. The draft was kept."));
+                    } else {
+                        agent
+                            .scrollback
+                            .push_block(crate::scrollback::block::RenderBlock::system(failure));
+                    }
+                    return vec![];
+                }
+            }
+            agent
+                .scrollback
+                .push_block(crate::scrollback::block::RenderBlock::system(failure));
+            vec![]
+        }
+        TaskResult::FeedbackDraftListComplete {
+            agent_id,
+            modal_id,
+            generation,
+            result,
+        } => {
+            if let Some(modal) = app
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.feedback_modal.as_mut())
+            {
+                match result {
+                    Ok(rows) => modal.apply_draft_list(modal_id, generation, rows),
+                    Err(error) => modal.fail_draft_list(modal_id, generation, error),
+                }
+            }
+            vec![]
+        }
+        TaskResult::FeedbackDraftLoadComplete {
+            agent_id,
+            load,
+            result,
+        } => {
+            let session_id = app
+                .agents
+                .get(&agent_id)
+                .and_then(|agent| agent.session.session_id.clone());
+            let session_dir = session_id.as_ref().and_then(|sid| {
+                xai_grok_shell::session::persistence::find_session_dir_by_id(sid.0.as_ref())
+            });
+            let request = app
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.feedback_modal.as_mut())
+                .and_then(|modal| {
+                    match result {
+                        Ok(draft) => {
+                            let draft_id = draft.id.clone();
+                            let applied = modal.apply_draft_load(&load, draft);
+                            if applied {
+                                if let Some(session_dir) = session_dir.as_deref() {
+                                    super::inline_feedback::attach_saved_draft_images(
+                                        modal,
+                                        session_dir,
+                                        &draft_id,
+                                    );
+                                }
+                                modal.recapture_write_baseline();
+                            }
+                        }
+                        Err(error) => modal.fail_draft_load(&load, error),
+                    }
+                    modal.take_pending_request()
+                });
+            match (session_id, request) {
+                (Some(session_id), Some(request)) => {
+                    vec![Effect::FeedbackDraftRequest {
+                        agent_id,
+                        session_id,
+                        request,
+                    }]
+                }
+                _ => vec![],
+            }
+        }
+        TaskResult::FeedbackDraftDeleteComplete {
+            agent_id,
+            delete,
+            result,
+        } => {
+            if let Some(modal) = app
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.feedback_modal.as_mut())
+            {
+                match result {
+                    Ok(()) => modal.apply_draft_delete(&delete),
+                    Err(error) => modal.fail_draft_delete(&delete, error),
+                }
+            }
+            vec![]
+        }
+        TaskResult::FeedbackDraftUpdateComplete {
+            agent_id,
+            update,
+            result,
+        } => {
+            if let Some(modal) = app
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.feedback_modal.as_mut())
+            {
+                modal.apply_draft_update_complete(
+                    &update,
+                    result.as_ref().err().map(String::as_str),
+                );
+            }
+            vec![]
+        }
+        TaskResult::FeedbackImageRehydrated {
+            agent_id,
+            modal_id,
+            image_identity,
+            result,
+        } => {
+            let is_active = app.active_view == ActiveView::Agent(agent_id);
+            let resume = app
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.feedback_modal.as_mut())
+                .filter(|modal| modal.matches_id(modal_id))
+                .is_some_and(|modal| {
+                    modal.apply_rehydrated_image(image_identity, result);
+                    is_active && modal.take_deferred_submit()
+                });
+            if resume {
+                dispatch(
+                    crate::app::actions::Action::SubmitFeedbackModal { modal_id },
+                    app,
+                )
+            } else {
+                vec![]
+            }
         }
         TaskResult::MemoryNoteSaved { agent_id, result } => {
             handle_memory_note_saved(app, agent_id, result)
@@ -5251,7 +6018,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             agent_id,
             result,
             minimal_request_id,
-        } => handle_btw_response(app, agent_id, result, minimal_request_id),
+            skipped_image_numbers,
+        } => handle_btw_response(
+            app,
+            agent_id,
+            result,
+            minimal_request_id,
+            &skipped_image_numbers,
+        ),
         TaskResult::InterjectQueued { .. } => vec![],
         TaskResult::WorkingDirectoryMutated {
             agent_id,
@@ -5307,28 +6081,39 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::InterjectFailed {
             agent_id,
             error,
-            text,
-            blocks,
+            remaining,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
-                let id = agent.session.next_queue_id;
-                agent.session.next_queue_id += 1;
-                agent
-                    .session
-                    .pending_prompts
-                    .push_front(crate::app::agent::QueuedPrompt {
-                        id,
-                        text,
-                        kind: crate::app::agent::QueueEntryKind::Prompt,
-                        wire_blocks: blocks,
-                        images: Vec::new(),
-                        display_as_skill: false,
-                        task_id: None,
-                        human_schedule: None,
-                        chip_elements: Vec::new(),
-                        skill_token_ranges: Vec::new(),
-                        combined_texts: Vec::new(),
-                    });
+                for (text, interjection_id, _blocks) in remaining.into_iter().rev() {
+                    agent.self_interjection_ids.remove(&interjection_id);
+                    if let Some(entry_id) =
+                        agent.interjection_painted_blocks.remove(&interjection_id)
+                    {
+                        agent.scrollback.remove_entry(entry_id);
+                    }
+                    let images = agent
+                        .interjection_retry_images
+                        .remove(&interjection_id)
+                        .unwrap_or_default();
+                    let id = agent.session.next_queue_id;
+                    agent.session.next_queue_id += 1;
+                    agent
+                        .session
+                        .pending_prompts
+                        .push_front(crate::app::agent::QueuedPrompt {
+                            id,
+                            text,
+                            kind: crate::app::agent::QueueEntryKind::Prompt,
+                            wire_blocks: None,
+                            images,
+                            display_as_skill: false,
+                            task_id: None,
+                            human_schedule: None,
+                            chip_elements: Vec::new(),
+                            skill_token_ranges: Vec::new(),
+                            combined_texts: Vec::new(),
+                        });
+                }
                 agent.show_toast(&format!("Interjection failed — requeued: {error}"));
             }
             vec![]
@@ -5340,6 +6125,22 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 agent.session.available_commands = commands;
                 agent.session.available_commands_generation += 1;
                 super::super::acp_handler::refresh_workflow_run_capabilities(agent);
+            }
+            vec![]
+        }
+        TaskResult::StatusLineCommandFinished { id, outcome } => {
+            app.on_status_line_command_finished(id, outcome);
+            vec![]
+        }
+        TaskResult::AgentsPluginRegistryLoaded {
+            agent_id,
+            request_id,
+            result,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id)
+                && let Some(modal) = agent.agents_modal.as_mut()
+            {
+                modal.apply_plugin_catalog(request_id, result);
             }
             vec![]
         }
@@ -5458,6 +6259,59 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.welcome_menu_index = Some(0);
             app.welcome_prompt_focused = false;
             effects
+        }
+        TaskResult::AntigravityLoginUrlReady {
+            agent_id,
+            url,
+            opened,
+            copied,
+            shown,
+        } => {
+            if opened {
+                app.show_toast("Complete Antigravity sign-in in your browser.");
+            } else if let Some(url) = url {
+                if let Some(agent_id) = agent_id
+                    && let Some(agent) = app.agents.get_mut(&agent_id)
+                {
+                    agent.active_modal = Some(crate::views::modal::ActiveModal::DocViewer {
+                        title: "Antigravity sign-in".to_owned(),
+                        content: format!("Complete Google sign-in using this link:\n\n{}", url.0),
+                        scroll: 0,
+                        window: crate::views::modal_window::ModalWindowState::new(),
+                        cached_lines: None,
+                        previous_palette: None,
+                        standalone: true,
+                    });
+                } else if copied {
+                    app.show_toast("Antigravity sign-in link copied to clipboard.");
+                } else {
+                    app.show_toast("Could not open Antigravity sign-in. Use open-grok login --antigravity in a terminal.");
+                }
+            }
+            if let Some(shown) = shown {
+                let _ = shown.send(());
+            }
+            vec![]
+        }
+        TaskResult::AntigravityAuthComplete {
+            agent_id,
+            logout,
+            result,
+        } => {
+            if let Some(agent_id) = agent_id
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && matches!(&agent.active_modal, Some(crate::views::modal::ActiveModal::DocViewer { title, .. }) if title == "Antigravity sign-in")
+            {
+                agent.active_modal = None;
+            }
+            let message = match (logout, result) {
+                (false, Ok(())) => "Antigravity connected.".to_owned(),
+                (true, Ok(())) => "Antigravity disconnected.".to_owned(),
+                (false, Err(error)) => format!("Antigravity login failed: {error}"),
+                (true, Err(error)) => format!("Antigravity logout failed: {error}"),
+            };
+            push_codex_auth_result(app, agent_id, message);
+            vec![]
         }
         TaskResult::CodexLoginUrlReady {
             agent_id,
@@ -5663,9 +6517,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             effects
         }
-        TaskResult::DeepSearchResults { results, seq } => {
-            handle_deep_search_results(app, results, seq)
-        }
+        TaskResult::DeepSearchResults {
+            host,
+            generation,
+            results,
+            seq,
+        } => handle_deep_search_results(
+            app,
+            PickerRequest {
+                host,
+                generation,
+                seq,
+            },
+            results,
+        ),
         TaskResult::RewindPointsLoaded { agent_id, points } => {
             handle_rewind_points_loaded(app, agent_id, points)
         }
@@ -5736,6 +6601,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             if crate::settings::is_local_feature_flag(key) {
                 refresh_open_settings_modals(app);
             }
+            settings::handle_setting_persisted(app, key, value);
             vec![]
         }
         TaskResult::SettingPersistFailed {
@@ -5745,8 +6611,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         } => {
             let rollback_effects = apply_setting_rollback(app, key, &rollback_value);
             tracing::warn!(target: "settings", ?key, ?rollback_value, %error, "setting persist failed; rolled back");
-            let scrubbed = scrub_error_for_toast(&error);
-            app.show_toast(&format!("\u{2717} Could not save {key}: {scrubbed}"));
+            toast_persist_failure(app, key, &error);
             rollback_effects
         }
         TaskResult::SettingPersistFailedBestEffort { key, error } => {
@@ -5755,9 +6620,35 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 ?key, %error,
                 "setting persist failed (best-effort); in-memory state stays at optimistic value",
             );
-            let scrubbed = scrub_error_for_toast(&error);
-            app.show_toast(&format!("\u{2717} Could not save {key}: {scrubbed}"));
+            toast_persist_failure(app, key, &error);
             vec![]
         }
+        TaskResult::FeatureOverridePersisted { feature, result } => {
+            settings::handle_feature_override_persisted(app, feature, result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod active_registry_warning_tests {
+    use super::*;
+    use crate::app::dispatch::tests::test_app_with_agent;
+
+    #[test]
+    fn recovered_registry_warning_is_visible_in_the_session() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let warning = "Active session registry was corrupted; backup saved";
+        dispatch_task_result(
+            TaskResult::ActiveSessionRegistrationWarning {
+                session_id: "test-session".into(),
+                message: warning.into(),
+            },
+            &mut app,
+        );
+        let scrollback = &app.agents[&id].scrollback;
+        assert!(scrollback.entries_in_range(0..scrollback.len()).iter().any(
+            |entry| matches!(&entry.block, RenderBlock::System(block) if block.text == warning)
+        ));
     }
 }

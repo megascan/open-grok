@@ -120,12 +120,17 @@ impl SwarmRegistry {
         Self::default()
     }
 
-    pub(super) fn insert(&self, swarm: DetachedSwarm) -> Arc<DetachedSwarm> {
+    pub(super) fn insert(
+        &self,
+        swarm: DetachedSwarm,
+        scope: Option<&crate::notification::BackgroundDeliveryScope>,
+    ) -> Arc<DetachedSwarm> {
         let swarm = Arc::new(swarm);
-        self.inner
-            .swarms
-            .lock()
-            .insert(swarm.swarm_id.clone(), Arc::clone(&swarm));
+        let mut swarms = self.inner.swarms.lock();
+        if scope.is_some_and(crate::notification::BackgroundDeliveryScope::is_session_revoked) {
+            swarm.cancellation.cancel();
+        }
+        swarms.insert(swarm.swarm_id.clone(), Arc::clone(&swarm));
         swarm
     }
 
@@ -188,6 +193,53 @@ impl SwarmRegistry {
     pub fn remove(&self, swarm_id: &str) -> Option<Arc<DetachedSwarm>> {
         self.inner.swarms.lock().remove(swarm_id)
     }
+
+    /// Stop detached schedulers owned by an ending session.
+    pub fn cancel_session(&self, parent_session_id: &str) {
+        for swarm in self.inner.swarms.lock().values() {
+            if swarm.parent_session_id == parent_session_id {
+                swarm.cancellation.cancel();
+            }
+        }
+    }
 }
 
 crate::register_resource!("grok_build", "SwarmRegistry", SwarmRegistry);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn swarm(id: &str) -> DetachedSwarm {
+        DetachedSwarm {
+            swarm_id: id.into(),
+            description: "test".into(),
+            parent_session_id: "same-session".into(),
+            expected_members: 0,
+            slots: SharedMemberSlots::new(0),
+            done: Arc::new(Notify::new()),
+            finished: Arc::new(AtomicBool::new(false)),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn late_detached_swarm_is_cancelled_only_for_destroyed_instance() {
+        let registry = SwarmRegistry::new();
+        let (handle, _rx) = crate::notification::ToolNotificationHandle::bridge_channel();
+        let guard = handle.begin_turn_delivery();
+        let scope = guard.scope();
+        scope.revoke();
+        let interactive = registry.insert(swarm("interactive"), Some(&scope));
+        assert!(!interactive.cancellation.is_cancelled());
+        handle.revoke_session_deliveries();
+        registry.cancel_session("same-session");
+        assert!(interactive.cancellation.is_cancelled());
+        let late = registry.insert(swarm("late"), Some(&scope));
+        assert!(late.cancellation.is_cancelled());
+        let (resumed, _rx) = crate::notification::ToolNotificationHandle::bridge_channel();
+        let resumed_guard = resumed.begin_turn_delivery();
+        let fresh = registry.insert(swarm("fresh"), Some(&resumed_guard.scope()));
+        assert!(!fresh.cancellation.is_cancelled());
+    }
+}

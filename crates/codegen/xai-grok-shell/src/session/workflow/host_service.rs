@@ -17,6 +17,7 @@ use super::schema_contract::{
     SCHEMA_CONTRACT_RETRIES, compile_contract_schema, contract_prompt, validate_contract_output,
 };
 use super::tracker::WorkflowTracker;
+use crate::agent::models::task_model_policy::LatchedTaskModelSelection;
 
 pub(crate) const WORKFLOW_MAX_AGENT_RUNS: u32 =
     (xai_workflow::MAX_AGENT_BUDGET as u32) * (SCHEMA_CONTRACT_RETRIES + 1);
@@ -90,10 +91,12 @@ pub(crate) struct WorkflowHostParams {
     >,
     pub parent_session_id: String,
     pub allow_fork_context: bool,
+    pub effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     pub templates: std::collections::HashMap<String, String>,
     pub telemetry: TelemetryHook,
     pub stats: Arc<WorkflowAgentStats>,
     pub cancel: CancellationToken,
+    pub task_model_selection: LatchedTaskModelSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,8 +495,10 @@ impl HostService {
         let isolation = opts
             .isolation_worktree
             .then_some(xai_tool_types::SubagentIsolationMode::Worktree);
-        let reasoning_effort =
-            normalize_workflow_reasoning_effort(opts.reasoning_effort.as_deref())?;
+        let reasoning_effort = normalize_workflow_reasoning_effort(
+            opts.effort.as_deref().or(opts.reasoning_effort.as_deref()),
+        )?
+        .or_else(|| self.params.effort.map(|effort| effort.to_string()));
         let subagent_type = opts
             .agent_type
             .clone()
@@ -547,7 +552,9 @@ impl HostService {
                         model: opts.model.clone(),
                         reasoning_effort: reasoning_effort.clone(),
                         output_token_budget: None,
-                        model_override_provenance: ModelOverrideProvenance::Tool,
+                        model_override_provenance: ModelOverrideProvenance::Tool {
+                            selection: self.params.task_model_selection.get(),
+                        },
                         capability_mode,
                         isolation,
                         output_schema: None,
@@ -563,6 +570,7 @@ impl HostService {
                     },
                     owner: SubagentOwner::workflow(&self.params.run_id),
                     cancel_token: cancel_token.clone(),
+                    tool_call_id: None,
                 }
             };
 
@@ -1025,10 +1033,12 @@ mod tests {
                 subagent_event_tx,
                 parent_session_id: "parent".into(),
                 allow_fork_context: false,
+                effort: None,
                 templates: Default::default(),
                 telemetry: Arc::new(|_, _, _| {}),
                 stats: Arc::new(WorkflowAgentStats::default()),
                 cancel: CancellationToken::new(),
+                task_model_selection: LatchedTaskModelSelection::default(),
             },
             persist_rx,
         )

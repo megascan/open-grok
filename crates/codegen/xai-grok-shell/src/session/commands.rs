@@ -10,6 +10,7 @@ use crate::session::signals::TurnDeltaSnapshot;
 use agent_client_protocol as acp;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
+use xai_grok_tools::types::skill_discovery_tracker::SkillUpdateKind;
 
 /// Result of an add/remove working-directory mutation: whether the set
 /// changed and the full canonical list afterwards (newest last).
@@ -19,13 +20,18 @@ pub struct WorkingDirectoryChange {
     pub directories: Vec<PathBuf>,
 }
 /// Structured context for a cancelled turn, replacing stringly-typed JSON.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CancellationContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hook_name: Option<String>,
     /// What triggered the cancel (e.g. `"send_now"`, `"esc"`, `"mouse"`);
     /// surfaced as `cancelTrigger` on the turn-end `_meta`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
 /// Failure surface of a `/btw` side question. Kept typed until the ACP
@@ -68,6 +74,49 @@ pub enum PromptCompletionKind {
     /// `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
 }
+pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
+pub const MAX_TURNS_REACHED_CATEGORY: &str = "max_turns_reached";
+pub const ACTION_STATIONARITY_CATEGORY: &str = "action_stationarity";
+/// `_meta.cancellationCategory` of a permission reject that ended the turn.
+pub const PERMISSION_REJECTED_CATEGORY: &str = "PermissionRejected";
+/// `_meta.cancellationCategory` of a dismissed permission prompt that ended the turn.
+pub const PERMISSION_CANCELLED_CATEGORY: &str = "PermissionCancelled";
+
+pub fn meta_category_str(
+    category: xai_grok_session_events::types::CancellationCategory,
+) -> &'static str {
+    use xai_grok_session_events::types::CancellationCategory;
+    match category {
+        CancellationCategory::HookDenied => HOOK_DENIED_CATEGORY,
+        CancellationCategory::PermissionRejected => PERMISSION_REJECTED_CATEGORY,
+        CancellationCategory::PermissionCancelled => PERMISSION_CANCELLED_CATEGORY,
+        CancellationCategory::MidTurnAbort => "MidTurnAbort",
+    }
+}
+
+impl PromptCompletionKind {
+    pub fn cancellation_category_meta(&self) -> Option<String> {
+        match self {
+            Self::Cancelled { category, .. } => {
+                category.map(|category| meta_category_str(category).to_owned())
+            }
+            Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_owned()),
+            Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_owned()),
+            Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
+        }
+    }
+
+    pub fn cancellation_context_meta(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Cancelled {
+                context: Some(context),
+                ..
+            } => serde_json::to_value(context).ok(),
+            _ => None,
+        }
+    }
+}
+
 /// Successful prompt/turn payload returned to the ACP layer and trace uploaders.
 #[derive(Debug, Clone)]
 pub struct PromptTurnOk {
@@ -247,17 +296,111 @@ impl CancelTrigger {
             Self::Client(s) => s,
         }
     }
+    /// Wire names that are a user Stop. One list for the shell and the pager banner.
+    pub fn is_user_gesture_name(name: &str) -> bool {
+        matches!(name, "esc" | "ctrl_c" | "mouse" | "dashboard_stop")
+    }
+    /// Stop click / key only. Unknown `Client` strings stay programmatic so a
+    /// new wire name cannot claim "by user".
+    pub fn is_user_gesture(&self) -> bool {
+        Self::is_user_gesture_name(self.as_str())
+    }
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CancelHistoryDisposition {
+    #[default]
+    Keep,
+    RewindIfNoOutput {
+        prompt_id: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CancelOptions {
     pub cancel_subagents: bool,
     pub kill_background_tasks: bool,
-    pub rewind_if_no_output: bool,
+    pub history: CancelHistoryDisposition,
     pub trigger: Option<CancelTrigger>,
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
+/// Why the catalog is being (re-)advertised; labels the `slash.advertise` unified-log line.
+#[derive(Debug, Clone, Copy)]
+pub enum AdvertiseTrigger {
+    /// A new session pushed its first catalog.
+    SessionStart,
+    /// A loaded session re-pushed its catalog to the reconnecting client.
+    SessionLoad,
+    /// The skill baseline was replaced (disk reload, plugins, bundle sync, `/clear`).
+    SkillsReload,
+    /// A tool call surfaced new skills mid-turn.
+    SkillDiscovery,
+    /// A workflow watcher or an explicit workflow reload saw a change.
+    WorkflowsChanged,
+    /// `set_session_model` swapped in a harness with a different toolset.
+    HarnessRebuild,
+    /// Per-response token-usage meta refresh; the catalog itself is unchanged.
+    UsageMeta,
+}
+impl AdvertiseTrigger {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::SessionLoad => "session_load",
+            Self::SkillsReload => "skills_reload",
+            Self::SkillDiscovery => "skill_discovery",
+            Self::WorkflowsChanged => "workflows_changed",
+            Self::HarnessRebuild => "harness_rebuild",
+            Self::UsageMeta => "usage_meta",
+        }
+    }
+}
+impl From<SkillUpdateKind> for AdvertiseTrigger {
+    fn from(kind: SkillUpdateKind) -> Self {
+        match kind {
+            SkillUpdateKind::Discovery => Self::SkillDiscovery,
+            SkillUpdateKind::BaselineChange => Self::SkillsReload,
+        }
+    }
+}
+pub struct SessionModelSwitch {
+    pub sampling_config: xai_grok_sampler::SamplerConfig,
+    pub use_concise: bool,
+    /// The two models declare differing `model_family`s, so a lossy compaction runs at switch end.
+    pub is_family_switch: bool,
+    /// When `false`, skip the system prompt rewrite (concise/default swap).
+    /// Set to `false` for forked sessions so mid-session model switches cannot contaminate the inherited prompt configuration.
+    pub apply_prompt_override: bool,
+    /// When `true`, suppress the system prompt rewrite even though `apply_prompt_override` may be `true`.
+    /// Set by the model-switch orchestrator immediately after a successful `RebuildAgentForDefinition`.
+    /// The rebuild handler already installed the fresh harness's prompt; the concise/default swap must not clobber it.
+    pub skip_prompt_rewrite: bool,
+    /// Computed by `MvpAgent` against the new model id.
+    /// Per-model remote settings and per-model user TOML overrides then target the right model after a `/model` switch.
+    /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
+    pub auto_compact_threshold_percent: u8,
+    pub system_prompt_label: String,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CurrentModel {
+    pub id: String,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+}
 pub enum SessionCommand {
+    #[expect(
+        private_interfaces,
+        reason = "active-message receipts and telemetry are internal runtime channels"
+    )]
+    ParentAgentMessage {
+        delivery:
+            xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageDelivery,
+        receipt_sink: tokio::sync::mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
+        telemetry: crate::session::telemetry::ActiveAgentMessageParentTelemetry,
+        respond_to: oneshot::Sender<
+            xai_grok_tools::implementations::grok_build::task::coordinator::ActiveMessageAdmission,
+        >,
+    },
+    EmitStatusSnapshot,
     Initialize {
         system_prompt: String,
     },
@@ -273,6 +416,9 @@ pub enum SessionCommand {
     /// reverse-request so the client re-shows approval chrome over a real live
     /// waiter. Fire-and-forget; the actor spawns the round-trip + decision.
     RestorePlanApproval,
+    TitleRenamed {
+        manual: bool,
+    },
     GetToolOverrides {
         respond_to: oneshot::Sender<Option<xai_grok_sampling_types::ToolOverrides>>,
     },
@@ -284,6 +430,9 @@ pub enum SessionCommand {
     },
     Prompt {
         prompt_id: String,
+        /// Explicit provenance for internally produced prompts. Older client
+        /// and runtime callers may leave this unset and use ID-based routing.
+        origin: Option<super::PromptOrigin>,
         prompt_blocks: Vec<acp::ContentBlock>,
         /// Prompt mode parsed from request `_meta.mode`.
         prompt_mode: PromptMode,
@@ -319,12 +468,15 @@ pub enum SessionCommand {
         /// caller so it can use the fully-rendered prompt for metadata.json without
         /// re-parsing. The session sends on this channel right after parsing.
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
+        initial_child_prompt_ready: Option<oneshot::Sender<()>>,
     },
     SessionMode {
         session_mode: acp::SessionModeId,
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
+        context_window_selection: Option<Option<std::num::NonZeroU64>>,
+        supported_context_windows: Vec<std::num::NonZeroU64>,
         /// Catalog key selected by the user. This remains distinct from
         /// `sampling_config.model`, which is the provider routing slug and may
         /// be shared by multiple catalog entries with different metadata.
@@ -384,7 +536,7 @@ pub enum SessionCommand {
         context_window: Option<std::num::NonZeroU64>,
     },
     GetCurrentModel {
-        responds_to: oneshot::Sender<String>,
+        responds_to: oneshot::Sender<CurrentModel>,
     },
     GetCurrentPromptMode {
         responds_to: oneshot::Sender<PromptMode>,
@@ -417,11 +569,28 @@ pub enum SessionCommand {
     /// Trigger an on-demand memory flush for this session.
     ///
     /// Calls `run_memory_flush("user_requested", None)` on the session actor.
-    /// Returns an error if memory is not enabled for this session, or
-    /// `Ok(true/false)` indicating whether a flush actually ran (false if
-    /// another flush was already in progress).
+    /// Capture every completed turn now for `x.ai/memory/flush`.
     FlushMemory {
-        respond_to: oneshot::Sender<acp::Result<bool>>,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryFlushResponse>,
+    },
+    /// Consolidate memory now for `x.ai/memory/dream`, bypassing the automatic gates.
+    MemoryDream {
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryDreamResponse>,
+    },
+    /// List memory files and state for `x.ai/memory/list`.
+    MemoryList {
+        respond_to: oneshot::Sender<Result<crate::extensions::memory::MemoryListing, String>>,
+    },
+    /// Turn memory on or off for `x.ai/memory/toggle`.
+    MemoryToggle {
+        enabled: bool,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryToggleResponse>,
+    },
+    /// Delete one memory note from the `/memory` modal.
+    MemoryForget {
+        path: String,
+        expected_content_hash: String,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryForgetResponse>,
     },
     /// Auto-approve all permission prompts when `enabled`.
     SetYoloMode {
@@ -525,6 +694,10 @@ pub enum SessionCommand {
         next_trace_turn: u64,
         request_id: Option<String>,
     },
+    /// Tell the model, at its next prompt, that the turn a previous process was running never finished.
+    NoteInterruptedTurn {
+        turn: crate::session::interrupted_turn::InterruptedTurn,
+    },
     /// Flush pending writes and copy the current session directory contents to memory.
     /// The caller can then tar.gz + upload to GCS (or similar).
     CopyFile {
@@ -543,6 +716,9 @@ pub enum SessionCommand {
     /// completes (or immediately if configs are unchanged).
     UpdateMcpServers {
         mcp_servers: Vec<acp::McpServer>,
+        /// Admitted client list. `Some` replaces the actor seed; `None` leaves it
+        /// (disk/plugin rematerialize).
+        client_seed: Option<Vec<acp::McpServer>>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Re-apply per-attachment policy (MCP init strategy, delivery tools)
@@ -969,5 +1145,22 @@ mod cancel_trigger_tests {
         ] {
             assert_eq!(trigger.kind(), expected, "{trigger:?}");
         }
+    }
+
+    #[test]
+    fn user_gestures_are_named_stop_clicks() {
+        assert!(CancelTrigger::is_user_gesture_name("esc"));
+        assert!(CancelTrigger::is_user_gesture_name("mouse"));
+        assert!(!CancelTrigger::is_user_gesture_name("send_now"));
+        assert!(CancelTrigger::Esc.is_user_gesture());
+        assert!(CancelTrigger::CtrlC.is_user_gesture());
+        assert!(CancelTrigger::from_client("mouse").is_user_gesture());
+        assert!(CancelTrigger::from_client("dashboard_stop").is_user_gesture());
+        assert!(!CancelTrigger::from_client("some_future_gesture").is_user_gesture());
+        assert!(!CancelTrigger::from_client("host_interrupt").is_user_gesture());
+        assert!(!CancelTrigger::SendNow.is_user_gesture());
+        assert!(!CancelTrigger::Shutdown.is_user_gesture());
+        assert!(!CancelTrigger::SessionClose.is_user_gesture());
+        assert!(!CancelTrigger::SessionDelete.is_user_gesture());
     }
 }

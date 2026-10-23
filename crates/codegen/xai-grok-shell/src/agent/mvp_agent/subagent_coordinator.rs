@@ -7,6 +7,12 @@ use xai_grok_tools::implementations::grok_build::task::coordinator;
 struct ShellChildRunner {
     agent_ref: LocalRef<MvpAgent>,
 }
+pub(super) fn subagent_channels() -> (
+    xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    coordinator::SubagentCoordinatorReceiver,
+) {
+    coordinator::SubagentCoordinator::<ShellChildRunner>::channel()
+}
 impl coordinator::ChildRunner for ShellChildRunner {
     type Control = crate::agent::subagent::ShellChildRuntime;
     type CompletionData = crate::agent::subagent::ShellCompletionData;
@@ -92,17 +98,28 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 let parent_sid = acp::SessionId::new(parent_sid);
                 this.resident_handle(&parent_sid)
             };
-            if let Some(handle) = parent_handle {
-                ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
-                ctx.client_hooks = handle.snapshot_client_hooks().await;
-                if run.request.context.may_fork() {
-                    let parent_tools = handle.snapshot_tool_definitions().await;
+            if let Some(handle) = parent_handle.as_ref() {
+                let (parent_mcp_pool, client_hooks, parent_tools) = tokio::join!(
+                    handle.snapshot_mcp_pool(),
+                    handle.snapshot_client_hooks(),
+                    async {
+                        if run.request.context.may_fork() {
+                            Some(handle.snapshot_tool_definitions().await)
+                        } else {
+                            None
+                        }
+                    },
+                );
+                ctx.parent_mcp_pool = parent_mcp_pool;
+                ctx.client_hooks = client_hooks;
+                if let Some(parent_tools) = parent_tools {
                     ctx.parent_tool_snapshot = (!parent_tools.function_tools.is_empty()
                         || parent_tools.resolved_policy.is_some())
                     .then_some(parent_tools);
                 }
             }
-            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway).await
+            crate::agent::subagent::run_shell_child(run, ctx, &this.gateway, parent_handle.as_ref())
+                .await
         })
     }
     fn validate_type(
@@ -146,6 +163,9 @@ impl coordinator::ChildRunner for ShellChildRunner {
     fn on_completed(&self, completion: coordinator::ChildCompletion<Self::CompletionData>) {
         let gateway = self.agent_ref.get().gateway.clone();
         crate::agent::subagent::present_child_completion(completion, &gateway);
+    }
+    fn supports_wake(&self) -> bool {
+        true
     }
     fn deliver_root_followup(
         &self,
@@ -300,7 +320,9 @@ impl MvpAgent {
             buffer_completions: true,
             buffered_completion_output_cap: None,
         };
-        tokio::task::spawn_local(coordinator::SubagentCoordinator::new(rx, runner, config).run());
+        tokio::task::spawn_local(
+            coordinator::SubagentCoordinator::from_channel(rx, runner, config).run(),
+        );
         let (trace_tx, mut trace_rx) = tokio::sync::mpsc::unbounded_channel::<
             crate::upload::turn::SyntheticTurnTraceRequest,
         >();
@@ -554,9 +576,26 @@ impl MvpAgent {
             auth: self.current_or_buffered_auth(),
             parent_cwd: parent_cwd.clone(),
             parent_session_id: parent_session_id.to_string(),
+            active_message_telemetry:
+                crate::session::telemetry::ActiveAgentMessageTelemetrySource::new(
+                    parent_session_id.to_string(),
+                    parent_handle
+                        .as_ref()
+                        .map(|parent| {
+                            parent
+                                .tool_context
+                                .active_message_parent_prompt_index
+                                .clone()
+                        })
+                        .unwrap_or_default(),
+                    provider_boundary.clone(),
+                    self.product_analytics_enabled(),
+                ),
             inherited_tool_overrides,
             yolo_mode,
             subagent_event_tx: self.subagent_event_tx.clone(),
+            subagent_coordinator_sender: Some(self.subagent_coordinator_sender.clone()),
+            sampling_gate: Some(self.subagent_sampling_semaphore.clone()),
             parent_depth,
             subagents_max_depth: self.cfg.borrow().subagents_max_depth,
             workflow_max_concurrent_agents: self.cfg.borrow().workflow_max_concurrent_agents,
@@ -633,7 +672,7 @@ impl MvpAgent {
                 .and_then(|h| h.allowed_subagent_types.clone()),
             parent_mcp_configs: parent_handle
                 .as_ref()
-                .map(|h| h.mcp_servers.clone())
+                .map(|h| h.mcp_servers.snapshot())
                 .unwrap_or_default(),
             managed_mcp_state: self.managed_mcp_cache.clone(),
             parent_mcp_pool: None,

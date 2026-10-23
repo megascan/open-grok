@@ -59,6 +59,11 @@ pub trait ToolMetadata: Send + Sync {
         self.kind().is_read_only()
     }
 
+    /// Canonical argument naming the file for client-side per-path ordering.
+    fn lock_path_param(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Notification variant tags this tool may emit during execution.
     /// Default: none. Tags match `ToolNotification`'s serde `type` discriminator
     /// (the keys of [`notification_schema_catalog`](crate::notification::notification_schema_catalog)).
@@ -83,12 +88,20 @@ pub trait ToolMetadata: Send + Sync {
         crate::types::template_renderer::strip_template_markers(self.description_template())
     }
 
-    /// Build the tool definition for a given contract version.
-    ///
-    /// Default: renders `description_template()` via the `TemplateRenderer`
-    /// and remaps schema parameter names. Override for tools that need
-    /// params-aware descriptions or schemas (e.g., BashTool removes
-    /// `is_background` when disabled).
+    /// The input schema this tool advertises under `contract_version`, when it differs from `input_schema`.
+    /// The registry fills `${{ params.<kind>.* }}` from this schema.
+    fn advertised_input_schema(
+        &self,
+        _contract_version: Option<&str>,
+        _input_schema: &serde_json::Value,
+        _effective_params: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Build the tool definition for a given contract version. Default: renders `description_template()` via the
+    /// `TemplateRenderer` and remaps schema parameter names. Override for tools that need params-aware descriptions or
+    /// schemas (e.g., BashTool removes `is_background` when disabled).
     fn versioned_definition(
         &self,
         _contract_version: Option<&str>,

@@ -4,6 +4,361 @@
 use super::*;
 
 #[test]
+fn failed_title_reset_cannot_undo_newer_rename_or_binding() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().display_name = Some("old".into());
+    let effects = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let [
+        Effect::ResetSessionTitle {
+            generation,
+            binding_epoch,
+            previous_display_name,
+            previous_generated_title,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected title reset");
+    };
+    let failure = TaskResult::ResetSessionTitleFailed {
+        agent_id: id,
+        generation: *generation,
+        binding_epoch: *binding_epoch,
+        previous_display_name: previous_display_name.clone(),
+        previous_generated_title: previous_generated_title.clone(),
+        error: "reset failed".into(),
+    };
+    dispatch(
+        Action::RenameSession {
+            title: "new".into(),
+        },
+        &mut app,
+    );
+    dispatch(Action::TaskComplete(failure), &mut app);
+    assert_eq!(app.agents[&id].display_name.as_deref(), Some("new"));
+
+    let effects = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let [
+        Effect::ResetSessionTitle {
+            generation,
+            binding_epoch,
+            previous_display_name,
+            previous_generated_title,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected title reset");
+    };
+    let failure = TaskResult::ResetSessionTitleFailed {
+        agent_id: id,
+        generation: *generation,
+        binding_epoch: *binding_epoch,
+        previous_display_name: previous_display_name.clone(),
+        previous_generated_title: previous_generated_title.clone(),
+        error: "reset failed".into(),
+    };
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.bind_session_id(acp::SessionId::new("different-session"));
+    agent.display_name = Some("different title".into());
+    dispatch(Action::TaskComplete(failure), &mut app);
+    assert_eq!(
+        app.agents[&id].display_name.as_deref(),
+        Some("different title")
+    );
+}
+
+#[test]
+fn consecutive_failed_title_resets_keep_original_pin() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().display_name = Some("old".into());
+    let first = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let effects = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let [
+        Effect::ResetSessionTitle {
+            generation,
+            binding_epoch,
+            previous_display_name,
+            previous_generated_title,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected second reset");
+    };
+    let [
+        Effect::ResetSessionTitle {
+            generation: first_generation,
+            previous_display_name: first_display,
+            previous_generated_title: first_generated,
+            ..
+        },
+    ] = first.as_slice()
+    else {
+        panic!("expected first reset");
+    };
+    dispatch(
+        Action::TaskComplete(TaskResult::ResetSessionTitleFailed {
+            agent_id: id,
+            generation: *generation,
+            binding_epoch: *binding_epoch,
+            previous_display_name: previous_display_name.clone(),
+            previous_generated_title: previous_generated_title.clone(),
+            error: "reset failed".into(),
+        }),
+        &mut app,
+    );
+    // Results can reach the UI out of order even though the RPCs are FIFO.
+    dispatch(
+        Action::TaskComplete(TaskResult::ResetSessionTitleFailed {
+            agent_id: id,
+            generation: *first_generation,
+            binding_epoch: *binding_epoch,
+            previous_display_name: first_display.clone(),
+            previous_generated_title: first_generated.clone(),
+            error: "first reset failed".into(),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.agents[&id].display_name.as_deref(), Some("old"));
+}
+
+#[test]
+fn earlier_successful_reset_prevents_later_failure_restoring_the_pin() {
+    for completion_in_order in [true, false] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().display_name = Some("old".into());
+        let first = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+        let [
+            Effect::ResetSessionTitle {
+                generation: first_generation,
+                binding_epoch,
+                ..
+            },
+        ] = first.as_slice()
+        else {
+            panic!("expected first reset");
+        };
+        let second = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+        let [
+            Effect::ResetSessionTitle {
+                generation,
+                previous_display_name,
+                previous_generated_title,
+                ..
+            },
+        ] = second.as_slice()
+        else {
+            panic!("expected second reset");
+        };
+        let success = TaskResult::ResetSessionTitleComplete {
+            agent_id: id,
+            generation: *first_generation,
+            binding_epoch: *binding_epoch,
+        };
+        let failure = TaskResult::ResetSessionTitleFailed {
+            agent_id: id,
+            generation: *generation,
+            binding_epoch: *binding_epoch,
+            previous_display_name: previous_display_name.clone(),
+            previous_generated_title: previous_generated_title.clone(),
+            error: "reset failed".into(),
+        };
+        let outcomes = if completion_in_order {
+            [success, failure]
+        } else {
+            [failure, success]
+        };
+        for outcome in outcomes {
+            dispatch(Action::TaskComplete(outcome), &mut app);
+        }
+        assert_eq!(app.agents[&id].display_name, None);
+    }
+}
+
+#[test]
+fn older_reset_success_cannot_cross_an_intervening_rename() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().display_name = Some("old".into());
+    let first = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let [
+        Effect::ResetSessionTitle {
+            generation: first_generation,
+            binding_epoch,
+            ..
+        },
+    ] = first.as_slice()
+    else {
+        panic!("expected first reset");
+    };
+    let rename = dispatch(
+        Action::RenameSession {
+            title: "new".into(),
+        },
+        &mut app,
+    );
+    let [
+        Effect::RenameSession {
+            generation: rename_generation,
+            ..
+        },
+    ] = rename.as_slice()
+    else {
+        panic!("expected rename");
+    };
+    let second = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    let [
+        Effect::ResetSessionTitle {
+            generation,
+            previous_display_name,
+            previous_generated_title,
+            ..
+        },
+    ] = second.as_slice()
+    else {
+        panic!("expected second reset");
+    };
+    dispatch(
+        Action::TaskComplete(TaskResult::ResetSessionTitleComplete {
+            agent_id: id,
+            generation: *first_generation,
+            binding_epoch: *binding_epoch,
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::RenameSessionComplete {
+            agent_id: id,
+            title: "new".into(),
+            generation: *rename_generation,
+            binding_epoch: *binding_epoch,
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::ResetSessionTitleFailed {
+            agent_id: id,
+            generation: *generation,
+            binding_epoch: *binding_epoch,
+            previous_display_name: previous_display_name.clone(),
+            previous_generated_title: previous_generated_title.clone(),
+            error: "failed".into(),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.agents[&id].display_name.as_deref(), Some("new"));
+}
+
+#[test]
+fn failed_renames_then_failed_reset_restore_confirmed_predecessor() {
+    for first_rename_succeeds in [false, true] {
+        for reverse_results in [false, true] {
+            let mut app = test_app_with_agent();
+            let id = AgentId(0);
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.display_name = Some("old".into());
+            agent.generated_session_title = Some("old".into());
+            let first = dispatch(
+                Action::RenameSession {
+                    title: "first".into(),
+                },
+                &mut app,
+            );
+            let second = dispatch(
+                Action::RenameSession {
+                    title: "invalid title".into(),
+                },
+                &mut app,
+            );
+            let reset = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+            let [
+                Effect::RenameSession {
+                    generation: first_generation,
+                    binding_epoch,
+                    ..
+                },
+            ] = first.as_slice()
+            else {
+                panic!("expected first rename");
+            };
+            let [
+                Effect::RenameSession {
+                    generation: second_generation,
+                    ..
+                },
+            ] = second.as_slice()
+            else {
+                panic!("expected second rename");
+            };
+            let [
+                Effect::ResetSessionTitle {
+                    generation: reset_generation,
+                    previous_display_name,
+                    previous_generated_title,
+                    ..
+                },
+            ] = reset.as_slice()
+            else {
+                panic!("expected reset");
+            };
+            let first_result = if first_rename_succeeds {
+                TaskResult::RenameSessionComplete {
+                    agent_id: id,
+                    title: "first".into(),
+                    generation: *first_generation,
+                    binding_epoch: *binding_epoch,
+                }
+            } else {
+                TaskResult::RenameSessionFailed {
+                    agent_id: id,
+                    error: "first rename failed".into(),
+                    generation: *first_generation,
+                    binding_epoch: *binding_epoch,
+                }
+            };
+            let mut outcomes = vec![
+                first_result,
+                TaskResult::RenameSessionFailed {
+                    agent_id: id,
+                    error: "title rejected".into(),
+                    generation: *second_generation,
+                    binding_epoch: *binding_epoch,
+                },
+                TaskResult::ResetSessionTitleFailed {
+                    agent_id: id,
+                    error: "reset failed".into(),
+                    generation: *reset_generation,
+                    binding_epoch: *binding_epoch,
+                    previous_display_name: previous_display_name.clone(),
+                    previous_generated_title: previous_generated_title.clone(),
+                },
+            ];
+            if reverse_results {
+                outcomes.reverse();
+            }
+            for outcome in outcomes {
+                dispatch(Action::TaskComplete(outcome), &mut app);
+            }
+            let expected = if first_rename_succeeds {
+                "first"
+            } else {
+                "old"
+            };
+            assert_eq!(app.agents[&id].display_name.as_deref(), Some(expected));
+            assert_eq!(
+                app.agents[&id].generated_session_title.as_deref(),
+                Some(expected)
+            );
+            assert!(app.agents[&id].title_mutations.is_none());
+        }
+    }
+}
+
+#[test]
 fn open_extensions_modal_no_session_sets_flag_no_fetches() {
     use crate::views::extensions_modal::ExtensionsTab;
     let mut app = test_app_with_agent();
@@ -83,8 +438,6 @@ fn session_created_with_flag_but_modal_closed_clears_flag_no_fetches() {
     assert!(!app.agents[&id].pending_extensions_fetch);
 }
 
-// ── /new dispatcher tests ─────────────────────────────────────────────
-
 #[test]
 fn dispatch_new_session_opens_question_modal_in_git_repo() {
     let mut app = new_session_test_app();
@@ -134,8 +487,6 @@ fn dispatch_new_session_skips_modal_in_non_git_repo() {
         "non-git path must not open the modal"
     );
 }
-
-// ── Session close (shared with dashboard) ─────────────────────────────
 
 #[test]
 fn close_inactive_agent_drops_it() {

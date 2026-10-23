@@ -3,6 +3,196 @@ use xai_grok_tools::computer::types::TaskKind;
 use xai_grok_tools::types::TaskSnapshot;
 
 #[tokio::test]
+async fn delayed_background_start_delivery_blocks_turn_response() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (config, mut gateway_rx, _persistence_rx, _cmd_rx) = make_test_config_full();
+            let handle = spawn_notification_bridge(config);
+            handle.send(ToolNotification::BashExecutionBackgrounded(
+                xai_grok_tools::notification::types::BashExecutionBackgrounded {
+                    base: xai_grok_tools::notification::types::BashNotificationBase {
+                        tool_call_id: "call-delayed".into(),
+                        command: "sleep 100".into(),
+                        output: Vec::new(),
+                        total_bytes: 0,
+                        truncated: false,
+                        cwd: PathBuf::from("/tmp"),
+                    },
+                    output_file: PathBuf::from("/tmp/delayed-output"),
+                    task_id: "task-delayed".into(),
+                    monitor_description: None,
+                    description: None,
+                },
+            ));
+            let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_local(async move {
+                let result = handle.wait_for_bridge().await;
+                let _ = response_tx.send(result);
+            });
+
+            let xai_acp_lib::AcpClientMessage::ExtNotification(delivery) =
+                gateway_rx.recv().await.expect("background notification")
+            else {
+                panic!("expected background notification")
+            };
+            assert_eq!(delivery.request.method.as_ref(), "x.ai/task_backgrounded");
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                response_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            delivery.response_tx.send(Ok(())).unwrap();
+            response_rx.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn reparented_background_start_is_delivered_before_child_completion() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (config, mut gateway_rx, _persistence_rx, _cmd_rx) = make_test_config_full();
+            let handle = spawn_notification_bridge(config);
+            let scope = xai_grok_tools::notification::BackgroundDeliveryScope::new();
+            let reparented = handle.with_delivery_scope(Some(scope.clone()));
+            reparented.send(ToolNotification::BashExecutionBackgrounded(
+                xai_grok_tools::notification::BashExecutionBackgrounded {
+                    base: xai_grok_tools::notification::BashNotificationBase {
+                        tool_call_id: "child-call".into(),
+                        command: "sleep 100".into(),
+                        output: Vec::new(),
+                        total_bytes: 0,
+                        truncated: false,
+                        cwd: PathBuf::from("/tmp"),
+                    },
+                    output_file: PathBuf::from("/tmp/reparented-output"),
+                    task_id: "reparented-task".into(),
+                    monitor_description: None,
+                    description: None,
+                },
+            ));
+            let mut child_completion = tokio::task::spawn_local(async move { scope.wait().await });
+            let xai_acp_lib::AcpClientMessage::ExtNotification(start) =
+                gateway_rx.recv().await.unwrap()
+            else {
+                panic!("expected task start");
+            };
+            assert_eq!(start.request.method.as_ref(), "x.ai/task_backgrounded");
+            tokio::task::yield_now().await;
+            assert!(!child_completion.is_finished());
+            start.response_tx.send(Ok(())).unwrap();
+            (&mut child_completion).await.unwrap().unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn reserved_detached_start_blocks_turn_until_delivery_is_observed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (config, _gateway_rx, _persistence_rx, _cmd_rx) = make_test_config_full();
+            let handle = spawn_notification_bridge(config);
+            handle.reserve_background_start("child").unwrap();
+            let waiter_handle = handle.clone();
+            let mut waiter =
+                tokio::task::spawn_local(async move { waiter_handle.wait_for_bridge().await });
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished());
+            handle.resolve_background_start("child", Ok(()));
+            (&mut waiter).await.unwrap().unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn cancelled_barrier_does_not_block_later_notifications_or_barriers() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (config, mut gateway_rx, _persistence_rx, _cmd_rx) = make_test_config_full();
+            let handle = spawn_notification_bridge(config);
+            handle.send(ToolNotification::BashExecutionBackgrounded(
+                xai_grok_tools::notification::types::BashExecutionBackgrounded {
+                    base: xai_grok_tools::notification::types::BashNotificationBase {
+                        tool_call_id: "call-hung".into(),
+                        command: "sleep 100".into(),
+                        output: Vec::new(),
+                        total_bytes: 0,
+                        truncated: false,
+                        cwd: PathBuf::from("/tmp"),
+                    },
+                    output_file: PathBuf::from("/tmp/hung-output"),
+                    task_id: "task-hung".into(),
+                    monitor_description: None,
+                    description: None,
+                },
+            ));
+            let waiter_handle = handle.clone();
+            let waiter =
+                tokio::task::spawn_local(async move { waiter_handle.wait_for_bridge().await });
+            let delivery = gateway_rx.recv().await.expect("background notification");
+            tokio::task::yield_now().await;
+            waiter.abort();
+            let _ = waiter.await;
+            handle.send(ToolNotification::ScheduledTaskCreated(
+                xai_grok_tools::notification::ScheduledTaskCreated {
+                    task_id: "later".into(),
+                    prompt: "later".into(),
+                    human_schedule: "once".into(),
+                    next_fire_at: None,
+                    generation: String::new(),
+                    revision: 0,
+                },
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                handle.wait_for_bridge().await.unwrap();
+                let xai_acp_lib::AcpClientMessage::ExtNotification(later) =
+                    gateway_rx.recv().await.unwrap()
+                else {
+                    panic!("expected later notification")
+                };
+                assert_eq!(later.request.method.as_ref(), "x.ai/scheduled_task_created");
+            })
+            .await
+            .expect("bridge must continue after cancellation");
+            drop(delivery);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn removed_task_wake_emits_exact_resolution() {
+    let (config, mut gateway_rx, _persistence_rx, mut cmd_rx) = make_test_config_full();
+    handle_notification_with_admission(
+        &config,
+        ToolNotification::TaskCompleted(make_task_snapshot("removed", TaskKind::Bash)),
+        &mut HashMap::new(),
+        &mut cmd_rx,
+        true,
+    )
+    .await;
+    let mut found_prompt = false;
+    while let Ok(command) = cmd_rx.try_recv() {
+        if let SessionCommand::Prompt { respond_to, .. } = command {
+            found_prompt = true;
+            drop(respond_to);
+        }
+    }
+    assert!(found_prompt);
+    loop {
+        let xai_acp_lib::AcpClientMessage::ExtNotification(event) =
+            gateway_rx.recv().await.unwrap()
+        else {
+            continue;
+        };
+        if event.request.method.as_ref() == "x.ai/background_wake_resolved" {
+            let body: serde_json::Value = serde_json::from_str(event.request.params.get()).unwrap();
+            assert_eq!(body["prompt_id"], "task-completed-removed");
+            break;
+        }
+    }
+}
+
+#[tokio::test]
 async fn async_user_message_is_persisted_and_forwarded_without_a_blocking_request() {
     use xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY;
     let (config, mut gateway_rx, mut persistence_rx, mut command_rx) = make_test_config_full();
@@ -1958,4 +2148,40 @@ async fn task_completed_notification_is_frame_bounded() {
         persisted.expect("the completion must be persisted"),
         serde_json::from_str::<serde_json::Value>(&params).unwrap(),
     );
+}
+
+#[tokio::test]
+async fn admission_queued_after_barrier_can_settle_it() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (config, mut gateway_rx, _persistence_rx, _cmd_rx) = make_test_config_full();
+            let handle = spawn_notification_bridge(config);
+            let mut reservation = handle.reserve_subagent_admission().unwrap();
+            reservation.mark_enqueued();
+            let waiter_handle = handle.clone();
+            let waiter =
+                tokio::task::spawn_local(async move { waiter_handle.wait_for_bridge().await });
+            tokio::task::yield_now().await;
+            let admitted = reservation.admit("queued");
+            let xai_acp_lib::AcpClientMessage::ExtNotification(frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), gateway_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected admission")
+            };
+            assert_eq!(
+                frame.request.method.as_ref(),
+                "x.ai/background_subagent_admitted"
+            );
+            frame.response_tx.send(Ok(())).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            admitted.completed();
+        })
+        .await;
 }

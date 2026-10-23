@@ -37,7 +37,10 @@ pub struct FixArgs {
 
 pub fn run(args: DoctorArgs) -> Result<()> {
     match args.command {
-        None => run_report(args.json, &mut std::io::stdout().lock()),
+        None => run_report(
+            args.json,
+            &mut xai_tty_utils::cli_output::PipeTolerant(std::io::stdout().lock()),
+        ),
         Some(DoctorCommand::Fix(fix)) => run_fix(
             fix,
             std::io::stdin().is_terminal(),

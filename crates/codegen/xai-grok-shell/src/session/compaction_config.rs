@@ -194,6 +194,7 @@ pub(crate) struct CompactionConfig {
     pub auto_compact_suppressed: AtomicU8,
     /// Locks the context window when `GROK_DEBUG_CONTEXT_WINDOW` is set.
     pub context_window_override: Option<std::num::NonZeroU64>,
+    pub context_window_selection: Arc<AtomicU64>,
     pub count: AtomicU64,
     /// Set at turn end; consumed at next turn start for model-switch compaction.
     /// `Cell` because `SessionActor` is `!Send`.
@@ -210,6 +211,12 @@ pub(crate) struct CompactionConfig {
     pub prefix_released: AtomicBool,
     /// User/stop cancel for the current compact generation.
     pub cancel: CompactCancelGate,
+}
+
+impl CompactionConfig {
+    pub(crate) fn is_suppressed(&self) -> bool {
+        self.auto_compact_suppressed.load(Ordering::Relaxed) != SUPPRESS_NONE
+    }
 }
 
 #[cfg(test)]

@@ -7,11 +7,13 @@ use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::coordinator::active_message::{ActiveChildGeneration, ActiveMessageLifecycle};
+use super::types::ActiveAgentMessageDelivery;
 use super::types::{
-    ActiveSubagentSummary, AgentMailboxMessage, AgentMessageDeliveryStatus,
+    ActiveSubagentSummary, AgentMailboxDelivery, AgentMailboxMessage, AgentMessageDeliveryStatus,
     SubagentCompletionSummary, SubagentDescribeOutcome, SubagentInspection, SubagentRequest,
     SubagentResult, SubagentResumeLookup, SubagentSnapshot, SubagentSnapshotStatus,
-    SubagentValidateTypeOutcome, WaitAgentMessagesOutput,
+    SubagentValidateTypeOutcome,
 };
 
 /// Cap on retained completed-subagent entries before the oldest are evicted.
@@ -33,11 +35,25 @@ pub struct SubagentProgress {
     pub error_count: u32,
 }
 
+pub use super::active_message::ActiveMessageAdmission;
+
+pub const MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD: usize = 8;
+pub const MAX_ACTIVE_MESSAGE_ADMISSIONS: usize = 64;
+pub const ACTIVE_MESSAGE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const ACTIVE_MESSAGE_FINALIZATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(6);
+
 /// Runtime handle retained while a child is active.
 pub trait ChildControl: 'static {
     type ProgressFuture: Future<Output = SubagentProgress> + 'static;
 
     fn progress(&self) -> Self::ProgressFuture;
+    fn send_active_message(
+        &self,
+        _delivery: ActiveAgentMessageDelivery,
+    ) -> SendBoxFuture<ActiveMessageAdmission> {
+        Box::pin(std::future::ready(ActiveMessageAdmission::Unsupported))
+    }
     fn cancel(&self);
     fn interrupt(&self) -> bool {
         false
@@ -69,11 +85,35 @@ pub struct StartedChild<C> {
     pub control: C,
 }
 
+/// Provenance for a completed-child wake that continues the same identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeOrigin {
+    pub agent_id: String,
+    pub message_id: String,
+    pub source: WakeSource,
+}
+
+/// The actual sender of a message that resumes a completed child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeSource {
+    Parent {
+        session_id: String,
+    },
+    Agent {
+        agent_id: String,
+        kind: super::types::AgentMailboxMessageKind,
+    },
+}
+
 /// Input to one runtime-specific child run.
 pub struct ChildRunRequest<C> {
     pub request: SubagentRequest,
+    /// Opaque identity for a model-task admission, if lifecycle tracking is active.
+    pub admission_generation: Option<String>,
     pub cancellation: CancellationToken,
     pub reporter: ChildReporter<C>,
+    /// Set when this run continues a finished non-workflow child in place.
+    pub wake_origin: Option<WakeOrigin>,
     /// Time parked in the admission queue; `None` if admitted immediately.
     pub queued_for: Option<std::time::Duration>,
     /// The session's running non-workflow children when this spawn started,
@@ -101,6 +141,7 @@ pub struct CompletionDisposition {
 /// Terminal event delivered to the runtime adapter after state is committed.
 pub struct ChildCompletion<D> {
     pub request: SubagentRequest,
+    pub admission_generation: Option<String>,
     pub result: SubagentResult,
     pub completion_data: D,
     pub disposition: CompletionDisposition,
@@ -134,6 +175,17 @@ pub trait ChildRunner: 'static {
     ) -> Self::DescribeFuture;
 
     fn on_completed(&self, completion: ChildCompletion<Self::CompletionData>);
+
+    /// Whether `run` can continue a finished child's persisted session in place.
+    /// Default false so hosts without durable resume keep `NotActiveOrFinalizing`.
+    fn supports_wake(&self) -> bool {
+        false
+    }
+
+    /// Type of a resume source that is only on disk. Default is none.
+    fn durable_resume_type(&self, _resume_id: &str, _parent_session_id: &str) -> Option<String> {
+        None
+    }
 
     fn load_native_agents(
         &self,
@@ -290,6 +342,59 @@ impl<C: 'static> ChildReporter<C> {
         response_rx.await.unwrap_or(false)
     }
 
+    pub async fn finalizing(&self) -> bool {
+        let Some(response_rx) = self.request_finalizing() else {
+            return false;
+        };
+        tokio::time::timeout(ACTIVE_MESSAGE_FINALIZATION_TIMEOUT, response_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn request_finalizing(&self) -> Option<oneshot::Receiver<bool>> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.tx
+            .send(InternalEvent::Finalizing {
+                subagent_id: self.subagent_id.clone(),
+                respond_to,
+            })
+            .ok()
+            .map(|_| response_rx)
+    }
+
+    pub async fn set_resolved_subagent_type(&self, subagent_type: String) -> bool {
+        self.resolve_type(self.subagent_id.clone(), subagent_type)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn set_resolved_subagent_type_for(
+        &self,
+        subagent_id: &str,
+        subagent_type: String,
+    ) -> bool {
+        self.resolve_type(subagent_id.to_owned(), subagent_type)
+            .await
+    }
+
+    async fn resolve_type(&self, subagent_id: String, subagent_type: String) -> bool {
+        let (respond_to, response_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(InternalEvent::ResolvedSubagentType {
+                subagent_id,
+                subagent_type,
+                respond_to,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        response_rx.await.unwrap_or(false)
+    }
+
     /// Resolve an in-memory resume source without sharing coordinator state.
     pub async fn resume_source(
         &self,
@@ -318,10 +423,19 @@ pub(super) enum InternalEvent<C> {
         child: StartedChild<C>,
         respond_to: oneshot::Sender<bool>,
     },
+    Finalizing {
+        subagent_id: String,
+        respond_to: oneshot::Sender<bool>,
+    },
     ResumeSource {
         source_id: String,
         parent_session_id: String,
         respond_to: oneshot::Sender<SubagentResumeLookup>,
+    },
+    ResolvedSubagentType {
+        subagent_id: String,
+        subagent_type: String,
+        respond_to: oneshot::Sender<bool>,
     },
 }
 
@@ -352,6 +466,8 @@ pub(super) struct ActiveChild<C> {
     pub(super) child_cwd: String,
     pub(super) worktree_path: Option<String>,
     pub(super) effective_model_id: String,
+    pub(super) generation: ActiveChildGeneration,
+    pub(super) active_messages: ActiveMessageLifecycle,
     pub(super) control: C,
 }
 
@@ -376,7 +492,7 @@ pub(super) struct BlockingWaiter {
 
 pub(super) struct AgentMailboxWaiter {
     pub(super) deadline: tokio::time::Instant,
-    pub(super) respond_to: oneshot::Sender<WaitAgentMessagesOutput>,
+    pub(super) respond_to: oneshot::Sender<AgentMailboxDelivery>,
 }
 
 pub(super) struct BufferedCompletion {
@@ -501,6 +617,7 @@ impl<C> ChildRecord<C> {
 
 pub(super) trait ForegroundChild {
     fn id(&self) -> &str;
+    fn request(&self) -> &SubagentRequest;
     fn child_session_id(&self) -> &str;
     fn deadline(&self) -> Option<tokio::time::Instant>;
     /// True when the spawn caller dropped its result receiver while this
@@ -516,6 +633,10 @@ pub(super) trait ForegroundChild {
 impl ForegroundChild for PendingChild {
     fn id(&self) -> &str {
         &self.request.id
+    }
+
+    fn request(&self) -> &SubagentRequest {
+        &self.request
     }
 
     fn child_session_id(&self) -> &str {
@@ -551,6 +672,10 @@ impl ForegroundChild for PendingChild {
 impl<C: ChildControl> ForegroundChild for ActiveChild<C> {
     fn id(&self) -> &str {
         &self.request.id
+    }
+
+    fn request(&self) -> &SubagentRequest {
+        &self.request
     }
 
     fn child_session_id(&self) -> &str {
@@ -636,6 +761,13 @@ pub(super) fn background_if_caller_gone(child: &mut impl ForegroundChild) {
         "foreground subagent caller gone; auto-backgrounding (child keeps running)",
     );
     child.mark_backgrounded();
+}
+
+// `background_if_caller_gone` minus its gate: deterministic before the aborted caller drops.
+pub(super) fn hand_off_to_background(child: &mut impl ForegroundChild) {
+    if child.take_reply().is_some() {
+        child.mark_backgrounded();
+    }
 }
 
 pub(super) async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -847,6 +979,7 @@ pub fn completion_summary(
         subagent_id: request.id.clone(),
         subagent_type: request.subagent_type.clone(),
         description: request.description.clone(),
+        loop_task_id: request.runtime_overrides.loop_task_id.clone(),
         success: result.success && !result.cancelled,
         duration_ms: result.duration_ms,
         tool_calls: result.tool_calls,

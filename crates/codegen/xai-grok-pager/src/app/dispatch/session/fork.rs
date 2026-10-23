@@ -14,6 +14,28 @@ use crate::scrollback::blocks::SessionEvent;
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
 use std::time::Instant;
+
+/// Forking while an interaction is outstanding can detach its response from
+/// the original session. Wait until that session's cards have been resolved.
+fn fork_has_pending_interaction(agent: &AgentView) -> bool {
+    !agent.permission_queue.is_empty()
+        || agent.question_view.is_some()
+        || agent.plan_approval_view.is_some()
+        || agent.elicitation_view.is_some()
+        || !agent.pending_elicitation.is_empty()
+}
+
+fn refuse_pending_fork(app: &mut AppView, parent_id: AgentId) -> bool {
+    if app
+        .agents
+        .get(&parent_id)
+        .is_some_and(fork_has_pending_interaction)
+    {
+        app.show_toast("Finish the current approval or question before forking");
+        return true;
+    }
+    false
+}
 /// Top-level `/fork` dispatcher. Resolves the worktree decision: an
 /// explicit `--worktree` / `--no-worktree` flag short-circuits to
 /// [`dispatch_fork_resolved`]. When no flag is given and a persisted
@@ -48,6 +70,9 @@ pub(in crate::app::dispatch) fn dispatch_fork(
         app.show_toast("/fork only works inside a session");
         return vec![];
     };
+    if refuse_pending_fork(app, parent_id) {
+        return vec![];
+    }
     let (has_session, in_git_repo) = app
         .agents
         .get(&parent_id)
@@ -178,6 +203,9 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     let ActiveView::Agent(parent_id) = app.active_view else {
         return vec![];
     };
+    if refuse_pending_fork(app, parent_id) {
+        return vec![];
+    }
     let Some(parent) = app.agents.get(&parent_id) else {
         return vec![];
     };
@@ -247,12 +275,14 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     if worktree {
         vec![Effect::CreateWorktreeSession {
             agent_id: new_id,
+            permission_mode_override: None,
             load_session_id: Some(parent_session_id.0.to_string()),
             label: None,
             git_ref: None,
             // Fork resumes the parent session, which carries its own model.
             model_id: None,
             preferred_session_id: None,
+            minted_session_id: None,
             chat_kind: parent_chat_kind,
         }]
     } else {
@@ -304,6 +334,9 @@ fn build_fork_placeholder(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
@@ -361,6 +394,18 @@ pub(in crate::app::dispatch) fn dispatch_startup_fork_session(
     parent_cwd: Option<std::path::PathBuf>,
     new_session_id: Option<String>,
 ) -> Vec<Effect> {
+    let blocked = app.agents.values().any(|agent| {
+        agent
+            .session
+            .session_id
+            .as_ref()
+            .is_some_and(|sid| sid.0.as_ref() == parent_session_id)
+            && fork_has_pending_interaction(agent)
+    });
+    if blocked {
+        app.show_toast("Finish the current approval or question before forking");
+        return vec![];
+    }
     if !app.session_startup_allowed() {
         app.deferred_startup.session =
             Some(crate::app::session_startup::DeferredSessionStartup::Fork {
@@ -422,7 +467,7 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
         agent.session.finish_command();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.bind_session_id(session_id);
         agent.scrollback.begin_batch();
         agent.begin_replay_window();
@@ -500,7 +545,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_ready(
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "ForkSessionReady");
         agent.session.finish_command();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.bind_session_id(new_session_id);
         agent.scrollback.begin_batch();
         agent.begin_replay_window();
@@ -531,9 +576,10 @@ pub(in crate::app::dispatch) fn handle_fork_session_failed(
     tracing::error!(agent = ?agent_id, error = %error, "Fork session failed");
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
+        agent.session_starting_since = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
         agent

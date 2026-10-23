@@ -433,6 +433,7 @@ pub struct WorkspaceHandle {
 }
 /// Client-fs resolution base: request paths resolve against `base`,
 /// `canonical` is the matching canonicalization-containment boundary.
+#[derive(Debug)]
 pub(crate) struct ClientFsBase {
     pub(crate) base: PathBuf,
     pub(crate) canonical: PathBuf,
@@ -644,6 +645,9 @@ impl WorkspaceHandle {
                         .status_config
                         .effective_presence_activity_window()
                         .as_millis() as u64,
+                )
+                .with_scheduled_task_keep_awake_window_ms(
+                    config.status_config.scheduled_task_keep_awake.as_millis() as u64,
                 ),
             );
         activity_tracker.set_event_writers(session_event_writers.clone());
@@ -660,6 +664,11 @@ impl WorkspaceHandle {
             require_explicit_toolset: config.require_explicit_toolset,
             confine_fs_to_workspace_root: config.confine_fs_to_workspace_root,
             root_cwd: config.root_cwd.clone(),
+            sandbox: tokio::sync::OnceCell::new(),
+            #[cfg(test)]
+            test_hub_approval_gate: std::sync::atomic::AtomicU8::new(2),
+            #[cfg(test)]
+            test_after_hub_approval: parking_lot::Mutex::new(None),
             sessions: parking_lot::RwLock::new(sessions),
             session_factory: config.session_factory,
             mcp_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
@@ -671,6 +680,7 @@ impl WorkspaceHandle {
             skills_config: config.skills_config,
             plugin_discovery_config: config.plugin_discovery_config,
             hub_handle: tokio::sync::Mutex::new(None),
+            queue_stats_sampler: parking_lot::Mutex::new(None),
             hub_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
             hub_config: config.hub_config,
             auth_provider: config.auth_provider,
@@ -678,6 +688,7 @@ impl WorkspaceHandle {
             client_ext_sink: arc_swap::ArcSwap::new(Arc::new(None)),
             local_registry,
             activity_tracker,
+            scheduler_poll_started: std::sync::atomic::AtomicBool::new(false),
             status_config: config.status_config,
             server_metadata: config.server_metadata,
             identity,
@@ -698,6 +709,9 @@ impl WorkspaceHandle {
             session_event_writers,
             inflight_enqueues: dashmap::DashMap::new(),
             producer_tasks,
+            bind_mount_hook: arc_swap::ArcSwap::from_pointee(
+                crate::path_virtualization::BindMountHook::noop(),
+            ),
             #[cfg(test)]
             post_resolve_test_hook: parking_lot::Mutex::new(None),
             client_fs_hash_memo: Default::default(),
@@ -858,12 +872,14 @@ impl WorkspaceHandle {
         if session_id.is_empty() {
             return Err(WorkspaceError::EmptyAgentId);
         }
-        let mut sessions = self.shared.sessions.write();
-        if self.shared.activity_tracker.is_draining() {
-            return Err(WorkspaceError::ShuttingDown);
-        }
-        if sessions.contains_key(&session_id) {
-            return Err(WorkspaceError::SessionAlreadyExists(session_id));
+        {
+            let sessions = self.shared.sessions.read();
+            if self.shared.activity_tracker.is_draining() {
+                return Err(WorkspaceError::ShuttingDown);
+            }
+            if sessions.contains_key(&session_id) {
+                return Err(WorkspaceError::SessionAlreadyExists(session_id));
+            }
         }
         let session_env = Arc::new(std::collections::HashMap::new());
         let config = tool_config.unwrap_or_else(|| self.shared.default_tool_config.clone());
@@ -907,14 +923,35 @@ impl WorkspaceHandle {
             system_notifications,
             system_notify_channel,
         ));
-        tracing::info!(session_id = %session_id, "create_session: new session created");
-        sessions.insert(session_id, session.clone());
+        self.insert_session_guarded(&session)?;
+        tracing::info!(session_id = %session.session_id(), "create_session: new session created");
         record_toolset_swap(
             &self.shared.activity_tracker,
             "create",
             session.session_id(),
         );
         Ok(session)
+    }
+    fn insert_session_guarded(&self, session: &Arc<WorkspaceSession>) -> WorkspaceResult<()> {
+        let rejection = {
+            let mut sessions = self.shared.sessions.write();
+            if self.shared.activity_tracker.is_draining() {
+                Some(WorkspaceError::ShuttingDown)
+            } else if sessions.contains_key(session.session_id()) {
+                Some(WorkspaceError::SessionAlreadyExists(
+                    session.session_id().to_owned(),
+                ))
+            } else {
+                sessions.insert(session.session_id().to_owned(), Arc::clone(session));
+                None
+            }
+        };
+        if let Some(err) = rejection {
+            session.cancel_hunk_tracker();
+            session.shutdown_terminal_backend();
+            return Err(err);
+        }
+        Ok(())
     }
     /// Update a session's tool config with auth and serialization; the RPC
     /// handler derives `caller_session_id` from the server-bound envelope.
@@ -1800,22 +1837,31 @@ impl WorkspaceHandle {
         &self,
         session_id: Option<&str>,
     ) -> WorkspaceResult<ClientFsBase> {
+        let session = session_id.and_then(|id| self.session(id));
+        self.client_fs_base_for_session(session_id, session.as_ref())
+            .await
+    }
+    /// [`Self::client_fs_base`] for a session the caller already holds.
+    /// The cwd comes from that `Arc`, not from a map lookup after the await, so a session evicted mid-call cannot silently rebase the op onto the root.
+    pub(crate) async fn client_fs_base_for_session(
+        &self,
+        session_id: Option<&str>,
+        session: Option<&Arc<WorkspaceSession>>,
+    ) -> WorkspaceResult<ClientFsBase> {
         let root = self.root_cwd()?;
         let canonical_root = self.canonical_root().await?;
-        let suffix = session_id
-            .and_then(|id| self.session(id))
-            .and_then(|session| {
-                let cwd = session.cwd();
-                cwd.strip_prefix(&root)
-                    .or_else(|_| cwd.strip_prefix(&canonical_root))
-                    .ok()
-                    .filter(|s| {
-                        !s.as_os_str().is_empty()
-                            && s.components()
-                                .all(|c| matches!(c, std::path::Component::Normal(_)))
-                    })
-                    .map(std::path::Path::to_path_buf)
-            });
+        let suffix = session.and_then(|session| {
+            let cwd = session.cwd();
+            cwd.strip_prefix(&root)
+                .or_else(|_| cwd.strip_prefix(&canonical_root))
+                .ok()
+                .filter(|s| {
+                    !s.as_os_str().is_empty()
+                        && s.components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_)))
+                })
+                .map(std::path::Path::to_path_buf)
+        });
         let root_base = || ClientFsBase {
             base: root.clone(),
             canonical: canonical_root.clone(),
@@ -2444,9 +2490,6 @@ impl WorkspaceHandle {
     ) -> Option<Arc<xai_codebase_graph::IndexManagerHandle>> {
         self.shared.codebase_indexes.lock().get_covering(path)
     }
-    pub fn ensure_codebase_indexes(&self, roots: &[std::path::PathBuf]) {
-        self.shared.codebase_indexes.lock().ensure_all(roots);
-    }
     fn spawn_codebase_index_event_forwarder(&self) -> tokio::task::JoinHandle<()> {
         let shared = self.shared.clone();
         let root_cwd = self.shared.root_cwd.clone();
@@ -2928,14 +2971,22 @@ impl WorkspaceHandle {
         }
         let new_depth = parent.depth.saturating_add(1);
         let new_fork_budget = parent.fork_budget.saturating_sub(1).min(config.max_depth);
-        let baseline = config
+        let mut baseline = config
             .tool_config
             .clone()
             .unwrap_or_else(|| (*parent.effective_tool_config()).clone());
+        let active_agent_message_id = xai_grok_tools::registry::types::ToolConfig::for_tool::<
+            xai_grok_tools::implementations::grok_build::SendSubagentMessageTool,
+        >()
+        .id;
+        baseline.tools.retain(|tool| {
+            tool.kind != Some(xai_grok_tools::types::tool::ToolKind::ActiveAgentMessage)
+                && tool.id != active_agent_message_id
+        });
         let cwd = config
             .cwd_override
             .clone()
-            .unwrap_or_else(|| parent.cwd.clone());
+            .unwrap_or_else(|| parent.cwd().to_path_buf());
         let mut env: std::collections::HashMap<String, String> = (**parent.session_env()).clone();
         env.extend(config.extra_env.clone());
         let session_env = Arc::new(env);
@@ -2981,21 +3032,68 @@ impl WorkspaceHandle {
             false,
             None,
         ));
-        {
-            let mut sessions = self.shared.sessions.write();
-            if self.shared.activity_tracker.is_draining() {
-                session.cancel_hunk_tracker();
-                return Err(WorkspaceError::ShuttingDown);
-            }
-            if sessions.contains_key(&config.agent_id) {
-                session.cancel_hunk_tracker();
-                return Err(WorkspaceError::SessionAlreadyExists(config.agent_id));
-            }
-            sessions.insert(config.agent_id.clone(), session.clone());
+        if let Some(mapping) = parent.path_virtualization() {
+            session.set_path_virtualization(mapping.clone());
         }
+        self.insert_session_guarded(&session)?;
         record_toolset_swap(&self.shared.activity_tracker, "fork", session.session_id());
         self.finalize_session_setup(&session).await;
         Ok(session)
+    }
+    pub fn set_bind_mount_hook(&self, hook: crate::path_virtualization::BindMountHook) {
+        self.shared.bind_mount_hook.store(Arc::new(hook));
+    }
+    fn bind_lifecycle_ctx<'a>(
+        session: &'a crate::session::WorkspaceSession,
+        real_root: &'a std::path::Path,
+    ) -> crate::path_virtualization::BindLifecycleCtx<'a> {
+        crate::path_virtualization::BindLifecycleCtx {
+            session_id: session.session_id(),
+            real_root,
+        }
+    }
+    async fn invoke_bind_mount_hook(
+        &self,
+        session: &crate::session::WorkspaceSession,
+    ) -> Result<(), crate::path_virtualization::BindMountError> {
+        let Some(mapping) = session.path_virtualization() else {
+            return Ok(());
+        };
+        let hook = self.shared.bind_mount_hook.load_full();
+        let session_id = session.session_id().to_owned();
+        let real_root = mapping.real_root_path();
+        const BIND_MOUNT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        match tokio::time::timeout(
+            BIND_MOUNT_HOOK_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                hook.on_bind(crate::path_virtualization::BindLifecycleCtx {
+                    session_id: &session_id,
+                    real_root: &real_root,
+                })
+            }),
+        )
+        .await
+        {
+            Ok(join) => join.unwrap_or_else(|e| {
+                Err(crate::path_virtualization::BindMountError(format!(
+                    "bind mount hook join: {e}"
+                )))
+            }),
+            Err(_) => Err(crate::path_virtualization::BindMountError(format!(
+                "bind mount hook timed out after {}s",
+                BIND_MOUNT_HOOK_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+    pub(crate) fn invoke_unbind_hook(&self, session: &crate::session::WorkspaceSession) {
+        let Some(mapping) = session.path_virtualization() else {
+            return;
+        };
+        let real_root = mapping.real_root_path();
+        self.shared
+            .bind_mount_hook
+            .load()
+            .on_unbind(Self::bind_lifecycle_ctx(session, &real_root));
     }
     /// Remove a session.
     pub fn drop_session(&self, caller_session_id: &str, session_id: &str) -> WorkspaceResult<()> {
@@ -3010,10 +3108,12 @@ impl WorkspaceHandle {
             return Err(WorkspaceError::SessionNotFound(session_id.to_owned()));
         };
         drop(sessions);
+        self.invoke_unbind_hook(&session);
         session.abort_system_notify_producers();
         session.shutdown_terminal_backend();
         session.shutdown_browser_service();
         session.cancel_hunk_tracker();
+        session.staged_uploads().abandon_all();
         self.shared.tool_defs_last_emit.remove(session_id);
         Ok(())
     }
@@ -3097,6 +3197,30 @@ impl WorkspaceHandle {
                         .pointer("/metadata")
                         .map(crate::config::WorkspaceBindConfig::from_metadata)
                         .unwrap_or_default();
+                    let path_virt = bind_config
+                        .session_root
+                        .as_deref()
+                        .and_then(
+                            crate::path_virtualization::PathVirtualization::try_from_session_root,
+                        );
+                    if bind_config.session_root.is_some() && path_virt.is_none() {
+                        tracing::warn!(
+                            session_id = %sid_str,
+                            session_root = ?bind_config.session_root,
+                            "session.bind: ignoring malformed session_root"
+                        );
+                    }
+                    let bind_cwd = match (bind_cwd, &path_virt) {
+                        (Some(cwd), Some(v)) => {
+                            Some(
+                                std::path::PathBuf::from(
+                                    v.to_guest(&cwd.to_string_lossy()).into_owned(),
+                                ),
+                            )
+                        }
+                        (None, Some(v)) => Some(v.real_root_path()),
+                        (cwd, None) => cwd,
+                    };
                     let empty_toolset = || xai_grok_tools::registry::types::ToolServerConfig {
                         tools: vec![],
                         behavior_preset: None,
@@ -3177,6 +3301,7 @@ impl WorkspaceHandle {
                         yolo_mode,
                         "session.bind: resolving workspace session toolset"
                     );
+                    let bind_cwd_for_rebind = bind_cwd.clone();
                     let created = {
                         let _span = LocalSpan::enter_with_local_parent(
                                 "tool_server.session_bind.create_session",
@@ -3194,10 +3319,17 @@ impl WorkspaceHandle {
                     let session = match created {
                         Ok(session) => {
                             session.set_yolo_mode(yolo_mode);
+                            session.approval.set_policy(bind_config.tool_approval_policy);
                             session
                                 .set_bind_tool_config_fingerprint_if_unset(
                                     bind_fingerprint.clone(),
                                 );
+                            if let Some(mapping) = path_virt.clone() {
+                                session
+                                    .apply_path_virtualization(mapping, bind_cwd_for_rebind.clone())
+                                    .await
+                                    .map_err(xai_tool_runtime::ToolError::service_unavailable)?;
+                            }
                             ws.finalize_session_setup(&session)
                                 .in_span(
                                     fastrace::Span::enter_with_local_parent(
@@ -3213,6 +3345,22 @@ impl WorkspaceHandle {
                             session
                         }
                         Err(crate::error::WorkspaceError::SessionAlreadyExists(_)) => {
+                            if let Some(existing) = ws.session(&sid_str)
+                                && let Some(mapping) = path_virt.clone()
+                            {
+                                if let Err(error) = existing
+                                        .apply_path_virtualization(mapping, bind_cwd_for_rebind.clone())
+                                        .await
+                                {
+                                    return Err(
+                                        xai_tool_runtime::ToolError::service_unavailable(
+                                            format!(
+                                            "path-virt remount failed for `{sid_str}`: {error}"
+                                        ),
+                                        ),
+                                    );
+                                }
+                            }
                             match ws
                                 .rebind_existing_hub_session(
                                     &sid_str,
@@ -3261,6 +3409,36 @@ impl WorkspaceHandle {
                             );
                         }
                     };
+                    if let Some(mapping) = path_virt {
+                        if let Err(error) = session.apply_path_virtualization(mapping, bind_cwd_for_rebind).await
+                        {
+                            return Err(
+                                xai_tool_runtime::ToolError::service_unavailable(
+                                    format!(
+                                "path-virt remount failed for `{sid_str}`: {error}"
+                            ),
+                                ),
+                            );
+                        }
+                    }
+                    if let Err(e) = ws.invoke_bind_mount_hook(&session).await {
+                        tracing::error!(
+                            session_id = %sid_str,
+                            error = %e,
+                            "session.bind: bind mount hook failed"
+                        );
+                        WORKSPACE_BIND_FAILED_TOTAL
+                            .with_label_values(&["bind_mount_failed"])
+                            .inc();
+                        let _ = ws.drop_session(&sid_str, &sid_str);
+                        return Err(
+                            xai_tool_runtime::ToolError::service_unavailable(
+                                format!(
+                            "bind mount hook failed: {e}"
+                        ),
+                            ),
+                        );
+                    }
                     let mut handlers = {
                         let _span = LocalSpan::enter_with_local_parent(
                                 "tool_server.session_bind.handlers",
@@ -3338,7 +3516,7 @@ impl WorkspaceHandle {
     /// re-resolves every session's toolset whenever the server announces
     /// tool changes.
     pub async fn connect_hub(&self) -> WorkspaceResult<()> {
-        use crate::hub::{HubHandle, apply_tools_changed, hub_result};
+        use crate::hub::{HubHandle, HubWsTiming, apply_tools_changed, hub_result};
         tracing::info!("WorkspaceHandle::connect_hub — starting");
         let connect_hub_started = std::time::Instant::now();
         let hub_config = match &self.shared.hub_config {
@@ -3413,8 +3591,7 @@ impl WorkspaceHandle {
         let hub_ws_started = std::time::Instant::now();
         let connect_result = HubHandle::connect(
             &hub_config,
-            self.shared.status_config.ws_ping,
-            self.shared.status_config.ws_reconnect_backoff.clone(),
+            HubWsTiming::from_status(&self.shared.status_config),
             template_handlers,
             self.shared.server_metadata.clone(),
             Some(resolver),
@@ -3450,6 +3627,7 @@ impl WorkspaceHandle {
         self.shared
             .activity_notify_handle
             .store(Arc::new(Some(activity_notify_handle)));
+        crate::scheduler_liveness::spawn_scheduler_liveness_poll(&self.shared);
         let server = handle.server.clone();
         let server_task = tokio::spawn(async move {
             if let Err(e) = server.run().await {
@@ -3695,14 +3873,6 @@ impl WorkspaceHandle {
             }));
         }
         handle.set_codebase_index_forwarder_task(self.spawn_codebase_index_event_forwarder());
-        {
-            let ws = self.clone();
-            tokio::spawn(async move {
-                if let Ok(roots) = crate::workspace_ops::materialized_git_roots(&ws).await {
-                    ws.ensure_codebase_indexes(&roots);
-                }
-            });
-        }
         if let Some(task) = self.spawn_tool_definitions_event_forwarder() {
             handle.set_tool_defs_forwarder_task(task);
         }
@@ -3711,6 +3881,9 @@ impl WorkspaceHandle {
     }
     /// Shutdown the server connection, if active.
     pub async fn shutdown_hub(&self) {
+        if let Some(sampler) = self.shared.queue_stats_sampler.lock().take() {
+            sampler.abort();
+        }
         let handle = self.shared.hub_handle.lock().await.take();
         if let Some(h) = handle {
             h.shutdown().await;
@@ -3730,7 +3903,7 @@ fn build_session_routed_handlers(
     toolset: &xai_grok_tools::registry::types::FinalizedToolset,
     ws: &WorkspaceHandle,
 ) -> Vec<Arc<dyn xai_computer_hub_sdk::ToolServerHandler>> {
-    let tool_kinds = toolset.tool_kinds();
+    let tool_kinds = toolset.tool_kind_map();
     let mut seen = std::collections::HashSet::new();
     let mut handlers = Vec::new();
     for def in toolset.tool_definitions() {
@@ -3741,15 +3914,17 @@ fn build_session_routed_handlers(
             );
             continue;
         }
+        let semantic_kind = tool_kinds.get(&def.function.name).copied();
         let mut desc = xai_tool_types::ToolDescription::new(
             def.function.name.clone(),
             def.function.description.clone().unwrap_or_default(),
         );
         desc.arguments_schema = Some(def.function.parameters.clone());
-        desc.kind = tool_kinds.get(&def.function.name).cloned();
+        desc.kind = semantic_kind.map(|kind| kind.as_key().to_owned());
         match crate::hub::SessionRoutedToolHandler::new(
             def.function.name.clone(),
             desc,
+            semantic_kind,
             Some(def.function.parameters.clone()),
             ws.clone(),
         ) {
@@ -4024,7 +4199,13 @@ pub async fn connect_local_workspace(
         .unwrap_or_else(|_| "https://cli-chat-proxy.grok.com/v1".to_string());
     let data_collection_disabled =
         std::env::var("GROK_WORKSPACE_DATA_COLLECTION_DISABLED").as_deref() != Ok("false");
-    let mut factory = WorkspaceSessionContextFactory::with_auth(auth.clone(), api_base_url.clone());
+    let sandbox = crate::sandbox::WorkspaceSandbox::serve(
+        crate::sandbox::WorkspaceSandboxConfig::for_root(cwd.clone(), workspace_home.clone()),
+    )
+    .await;
+    let hook = xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(sandbox.clone());
+    let mut factory = WorkspaceSessionContextFactory::with_auth(auth.clone(), api_base_url.clone())
+        .with_sandbox_launch(hook);
     if crate::session::tool_config::tool_state_enabled() {
         factory = factory.with_tool_state_home(workspace_home.clone());
     }
@@ -4094,10 +4275,6 @@ pub async fn connect_local_workspace(
         );
     }
     upload_queue.cleanup_orphans(xai_file_utils::queue::DEFAULT_MAX_AGE);
-    crate::upload::spawn_queue_stats_sampler(
-        upload_queue.clone(),
-        std::time::Duration::from_secs(15),
-    );
     if crate::session::tool_config::tool_state_enabled() {
         let home = workspace_home.clone();
         tokio::spawn(async move {
@@ -4120,7 +4297,12 @@ pub async fn connect_local_workspace(
         identity,
     )
     .map_err(|e| WorkspaceError::HubError(format!("failed to create workspace: {e}")))?;
-    let connect_result = ws_handle.connect_hub().await;
+    // Install the same instance used by the factory before accepting any sessions.
+    ws_handle.shared.sandbox.set(sandbox).map_err(|_| {
+        WorkspaceError::HubError("workspace sandbox was already initialized".to_owned())
+    })?;
+    let _maintenance = crate::file_system::client_fs::spawn_staged_upload_maintenance(&ws_handle);
+    let connect_result = Box::pin(ws_handle.connect_hub()).await;
     observe_startup_stage(
         STARTUP_STAGE_TIME_TO_READY,
         if connect_result.is_ok() {
@@ -4131,6 +4313,13 @@ pub async fn connect_local_workspace(
         time_to_ready_started.elapsed().as_secs_f64(),
     );
     connect_result?;
+    if let Some(upload_queue) = &ws_handle.shared.upload_queue {
+        *ws_handle.shared.queue_stats_sampler.lock() =
+            Some(crate::upload::spawn_queue_stats_sampler(
+                upload_queue.clone(),
+                std::time::Duration::from_secs(15),
+            ));
+    }
     Ok(ws_handle)
 }
 /// Resolve `$GROK_WORKSPACE_HOME` — the workspace-owned on-disk state root.
@@ -4138,7 +4327,7 @@ pub async fn connect_local_workspace(
 /// Precedence:
 /// 1. `$GROK_WORKSPACE_HOME` (operator override).
 /// 2. `<grok_home>/workspace`, where `<grok_home>` honours `$GROK_HOME` and
-///    otherwise falls back to `~/.grok` (see [`xai_grok_config::grok_home`]).
+///    otherwise falls back to `~/.opengrok` (see [`xai_grok_config::grok_home`]).
 pub fn resolve_workspace_home() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("GROK_WORKSPACE_HOME")
         && !p.trim().is_empty()
@@ -4513,6 +4702,11 @@ impl xai_tool_runtime::ToolDyn for SessionToolHandle {
             session = %self.session_id,
             "local harness: dispatching tool call"
         );
+        let virt = session.path_virtualization().cloned();
+        let args = match &virt {
+            Some(v) => v.rewrite_json_inbound(args),
+            None => args,
+        };
         let inner = toolset.call_streaming(self.name(), args, &call_id, None);
         Box::pin(async_stream::stream! {
             use futures::StreamExt;
@@ -4521,12 +4715,19 @@ impl xai_tool_runtime::ToolDyn for SessionToolHandle {
                 match item {
                     // Rollout gate lives downstream in the sampler.
                     ToolStreamItem::Progress(p) => {
+                        let p = match &virt {
+                            Some(v) => v.rewrite_progress(p),
+                            None => p,
+                        };
                         yield ToolStreamItem::Progress(p);
                     }
                     ToolStreamItem::Terminal(Ok(run_result)) => {
-                        yield ToolStreamItem::Terminal(Ok(
-                            run_result.into_typed_tool_output(tool_id),
-                        ));
+                        let output = run_result.into_typed_tool_output(tool_id);
+                        let output = match &virt {
+                            Some(v) => v.rewrite_typed_output(output),
+                            None => output,
+                        };
+                        yield ToolStreamItem::Terminal(Ok(output));
                         return;
                     }
                     ToolStreamItem::Terminal(Err(e)) => {
@@ -4536,9 +4737,13 @@ impl xai_tool_runtime::ToolDyn for SessionToolHandle {
                             error = %e,
                             "local harness tool call failed"
                         );
+                        let detail = match &virt {
+                            Some(v) => v.rewrite_error(e).to_string(),
+                            None => e.to_string(),
+                        };
                         yield ToolStreamItem::Terminal(Err(ToolError::new(
                             ToolErrorKind::TerminalError,
-                            e.to_string(),
+                            detail,
                         )));
                         return;
                     }
@@ -4693,6 +4898,29 @@ impl WorkspaceHandle {
         let factory = std::sync::Arc::new(TestSessionContextFactory::new());
         Self::new(Self::test_config(root.to_path_buf(), factory))
             .expect("test workspace handle construction must succeed")
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test_in_with_sandbox(
+        root: &std::path::Path,
+        sandbox: Arc<crate::sandbox::WorkspaceSandbox>,
+        gate: crate::permission::ToolApprovalGate,
+    ) -> Self {
+        use crate::session::tool_config::test_support::TestSessionContextFactory;
+        let hook = xai_grok_tools::sandbox_launch::SandboxLaunchHook::new(sandbox.clone());
+        let factory = Arc::new(TestSessionContextFactory::new().with_sandbox_launch(hook));
+        let handle = Self::new(Self::test_config(root.to_path_buf(), factory))
+            .expect("test workspace handle construction must succeed");
+        handle
+            .shared
+            .sandbox
+            .set(sandbox)
+            .ok()
+            .expect("sandbox installed once");
+        handle.shared.test_hub_approval_gate.store(
+            u8::from(gate == crate::permission::ToolApprovalGate::Enforced),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        handle
     }
 }
 #[cfg(test)]

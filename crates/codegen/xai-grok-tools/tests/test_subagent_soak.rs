@@ -321,6 +321,7 @@ impl ChildRunner for SoakRunner {
                 request,
                 cancellation,
                 reporter,
+                wake_origin: _,
                 queued_for: _,
                 session_running: _,
             } = run;
@@ -406,6 +407,7 @@ fn soak_request(id: String, background: bool) -> SubagentRequest {
         swarm: None,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
+        tool_call_id: None,
     }
 }
 

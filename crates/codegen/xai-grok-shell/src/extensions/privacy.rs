@@ -77,13 +77,12 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         return Err(acp::Error::internal_error().data(friendly));
     }
 
-    // Update local auth state to reflect the change.
-    // Use save_without_enrichment to avoid a race: update() spawns a
-    // background GET /user enrichment that may read stale ACL state
-    // and overwrite the opt-out flag back to its previous value.
-    let mut updated = auth.clone();
-    updated.coding_data_retention_opt_out = params.coding_data_retention_opt_out;
-    let _ = agent.auth_manager.save_without_enrichment(updated).await;
+    // Update only the account that made the request, under the same lock as
+    // refresh and enrichment. A concurrent account switch must not be undone.
+    let _ = agent
+        .auth_manager
+        .save_privacy_if_current(&auth, params.coding_data_retention_opt_out)
+        .await;
 
     to_raw_response(&serde_json::json!({
         "codingDataRetentionOptOut": params.coding_data_retention_opt_out,

@@ -16,6 +16,16 @@ fn provider_session_models(model: &str, provider: &str) -> acp::SessionModelStat
 fn simulate_release_build() {
     unsafe { std::env::set_var(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim") };
 }
+fn pending_trust_workspace() -> (tempfile::TempDir, std::path::PathBuf, AppView) {
+    use xai_grok_workspace::trust::workspace_key;
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let workspace = workspace_key(repo.path());
+    let mut app = test_app();
+    app.trust_state = TrustState::Pending {
+        workspace: workspace.clone(),
+    };
+    (repo, workspace, app)
+}
 #[test]
 fn voice_on_welcome_creates_session_and_records() {
     if !xai_grok_voice::AUDIO_SUPPORTED {
@@ -34,7 +44,7 @@ fn voice_on_welcome_creates_session_and_records() {
     assert_eq!(app.voice_recording_target(), Some(VoiceTarget::Agent(id)));
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 }
 #[test]
@@ -48,7 +58,8 @@ fn voice_final_routes_to_recording_session_not_active_view() {
     app.active_view = ActiveView::Agent(other);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(rec),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -121,7 +132,8 @@ fn voice_auto_stops_when_leaving_recording_session() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.active_view = ActiveView::Agent(id);
     app.enforce_voice_session_bound();
@@ -137,7 +149,7 @@ fn voice_auto_stops_when_leaving_recording_session() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
 }
 #[test]
@@ -524,6 +536,8 @@ fn worktree_session_failed_without_session_returns_to_welcome() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -555,6 +569,8 @@ fn worktree_session_failed_with_fork_parent_keeps_agent() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -735,6 +751,7 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -746,6 +763,43 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         agent.toast.as_ref().map(|(m, _)| m.as_str()),
         Some("Session creation failed: No space left on device"),
     );
+}
+#[test]
+fn session_failed_names_step_only_on_timeout() {
+    for (timed_out, error, expected) in [
+        (
+            true,
+            "raw wire timeout text",
+            "Couldn't start the session: it timed out while loading your plugins. It may still \
+             finish in the background, so give it a moment before trying again.",
+        ),
+        (
+            false,
+            "No space left on device",
+            "Session creation failed: No space left on device",
+        ),
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let a = app.agents.get_mut(&id).unwrap();
+            a.session.session_id = Some(acp::SessionId::new("existing"));
+            a.session_starting_since = Some(std::time::Instant::now());
+            a.session_new_phase = Some(xai_grok_shell::agent::SessionSetupPhase::PluginRegistry);
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionFailed {
+                agent_id: id,
+                error: error.to_string(),
+                timed_out,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            Some(expected),
+            app.agents[&id].toast.as_ref().map(|(m, _)| m.as_str()),
+        );
+    }
 }
 #[test]
 fn session_failed_orphan_returns_to_welcome_with_warning() {
@@ -765,6 +819,7 @@ fn session_failed_orphan_returns_to_welcome_with_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -791,6 +846,7 @@ fn session_failed_orphan_with_fallback_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -816,6 +872,7 @@ fn session_failed_orphan_does_not_steal_other_active_agent() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -841,6 +898,7 @@ fn session_failed_orphan_on_welcome_with_survivor_uses_startup_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -1350,16 +1408,11 @@ fn finish_trust_resolves_and_replays_startup() {
 #[serial_test::serial(OPENGROK_HOME)]
 #[test]
 fn trust_folder_grants_and_resolves() {
-    use xai_grok_workspace::trust::{TrustStore, workspace_key};
+    use xai_grok_workspace::trust::TrustStore;
     let home = tempfile::tempdir().expect("home tempdir");
     unsafe { std::env::set_var("OPENGROK_HOME", home.path()) };
     simulate_release_build();
-    let repo = tempfile::tempdir().expect("repo tempdir");
-    let workspace = workspace_key(repo.path());
-    let mut app = test_app();
-    app.trust_state = TrustState::Pending {
-        workspace: workspace.clone(),
-    };
+    let (_repo, workspace, mut app) = pending_trust_workspace();
     let _ = dispatch(Action::TrustFolder, &mut app);
     assert!(matches!(app.trust_state, TrustState::Done));
     assert!(
@@ -1932,6 +1985,7 @@ fn session_failed_orphan_restores_dashboard_attach_to_survivor() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -1968,6 +2022,7 @@ fn session_failed_last_orphan_clears_dashboard_attach() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: AgentId(0),
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -2740,7 +2795,10 @@ fn dashboard_stop_with_peek_open_moves_selection_and_peek_down_one() {
             &reg,
             None,
             &[],
-            false,
+            app.workspace_dashboard_enabled,
+            app.workspace_snapshot.as_ref(),
+            app.dashboard_sessions_loading,
+            None,
             None,
         );
     };
@@ -3229,6 +3287,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::LocalWorkspace;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-1".into(),
             summary: "hello".into(),
             updated_at: chrono::Utc::now(),
@@ -3275,6 +3335,8 @@ mod welcome_workspace_mode {
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-1");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-1".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3334,6 +3396,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3371,6 +3435,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::LocalWorkspace;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3415,6 +3481,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = false;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3458,6 +3526,8 @@ mod welcome_workspace_mode {
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-lock");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-lock".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3503,6 +3573,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "missing-build".into(),
             summary: "gone".into(),
             updated_at: chrono::Utc::now(),
@@ -3576,6 +3648,8 @@ mod welcome_workspace_mode {
         app.local_workspace_startup_locked = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-lock".into(),
             summary: "hello".into(),
             updated_at: chrono::Utc::now(),
@@ -3649,6 +3723,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "remote-1".into(),
             summary: "remote row".into(),
             updated_at: chrono::Utc::now(),
@@ -3689,6 +3765,10 @@ mod welcome_workspace_mode {
         assert!(!welcome_history_build_bypass_applies(&[], true));
         assert!(!welcome_history_build_bypass_applies(
             &[Effect::FetchSessionList {
+                host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+                cwd_override: None,
+                generation: 0,
+                headless_policy: Default::default(),
                 query: None,
                 seq: 0,
                 kind_filter: None,
@@ -3715,11 +3795,13 @@ mod welcome_workspace_mode {
         assert!(welcome_history_build_bypass_applies(
             &[Effect::CreateWorktreeSession {
                 agent_id: AgentId(0),
+                permission_mode_override: None,
                 load_session_id: Some("s".into()),
                 label: None,
                 git_ref: None,
                 model_id: None,
                 preferred_session_id: None,
+                minted_session_id: None,
                 chat_kind: false,
             }],
             true
@@ -3728,11 +3810,13 @@ mod welcome_workspace_mode {
             crate::app::event_loop::welcome_history_build_bypass_consume(
                 &[Effect::CreateWorktreeSession {
                     agent_id: AgentId(0),
+                    permission_mode_override: None,
                     load_session_id: Some("s".into()),
                     label: None,
                     git_ref: None,
                     model_id: None,
                     preferred_session_id: None,
+                    minted_session_id: None,
                     chat_kind: false,
                 }],
                 true

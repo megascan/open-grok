@@ -14,9 +14,18 @@ Every command below lists its aliases where it has them. A few commands only app
 
 Start a fresh session and clear the current conversation. Alias: `/clear`.
 
-### `/resume`
+### `/resume [id or name]`
 
-Open the session picker to reload a previous session from disk.
+Open the session picker to reload a previous session. Add an ID or title to
+filter the picker; a unique exact match opens directly when the available
+session list is complete. Otherwise, choose from the filtered results.
+Search matches every word you type, in any order, ignoring punctuation and
+case. For example, `/resume fix-login-bug` matches "Fix login bug".
+
+From the CLI, `open-grok --resume "Fix login bug"` also accepts a local title.
+A missing title reports the miss and suggests similar local titles without
+starting remote sign-in. Ambiguous titles list candidates newest first;
+use a session ID to choose one.
 
 ### `/dashboard`
 
@@ -37,7 +46,8 @@ Grok also auto-compacts once the context window hits 85% (tune it with `[session
 
 ### `/context`
 
-Show how the context window is being used: a category breakdown (system prompt, messages, reasoning and overhead, free space) plus informational rows for tool definitions, the skills listing, and MCP server announcements with their estimated token cost.
+Show the context window split into System prompt, Messages, Reasoning/overhead, and Free.
+Rows for Tool definitions, Skills, and MCP servers are already counted in those totals.
 
 ### `/session-info`
 
@@ -120,14 +130,24 @@ These differ from `/cd`, which only changes where **new** dashboard sessions spa
 
 ## Model and Mode
 
-### `/model <name>`
+### `/context-window <size>`
 
-Switch models. Accepts a model ID or display name (case-insensitive), and for reasoning models you can add an effort level as a second argument. Alias: `/m`.
+Select a context window for the current model when it advertises multiple sizes. Use the short label (such as `500k`) or the full token count. The selection applies after the session accepts the change.
+
+```
+/context-window 500k
+/context-window 256000
+```
+
+### `/model <name> [window] [effort]`
+
+Switch models using an ID, provider-qualified selector, or unambiguous display name (case-insensitive). For models that offer multiple context windows or reasoning effort levels, the picker guides you through those choices. Alias: `/m`.
 
 ```
 /model grok-build
 /model Grok Build
 /model Reasoning X high
+/model codex:example 500k high
 ```
 
 ### `/effort <level>`
@@ -136,6 +156,22 @@ Set reasoning effort on the **current** model without reselecting it. Levels are
 
 ```
 /effort high
+```
+
+### `/provider [add]`
+
+Open the guided custom-provider wizard: type a server address, optionally a key
+for that server, choose the wire format (OpenAI Chat Completions, OpenAI
+Responses, or Anthropic Messages), then pick which of that server's models to
+keep. Aliases: `/providers`, `/custom-provider`; `add` and `new` are accepted so
+`/provider add` reads naturally. Nothing is written until you confirm the model
+list, and `Esc` at any step cancels without touching config. The saved rows are
+ordinary `[model.*]` tables with `provider = "custom"` -- see
+[Custom Models](11-custom-models.md#custom-endpoint-wizard-provider).
+
+```
+/provider
+/provider add
 ```
 
 ### `/always-approve`, `/yolo-2`, and `/auto`
@@ -152,7 +188,7 @@ Running one while another is active switches modes — for example, `/auto` whil
 
 ### `/multiline`
 
-Toggle multiline input. When it's on, `Enter` inserts a newline and `Shift+Enter` (or `Alt+Enter`) sends the message. Mid-turn, a bare `Enter` on an empty composer still force-sends the top queued follow-up. Alias: `/ml`.
+Toggle multiline input. When it's on, `Enter` inserts a newline and `Shift+Enter` (or `Alt+Enter`) sends the message. Mid-turn, a bare `Enter` on an empty composer still force-sends the top queued follow-up. Alias: `/ml`. With multiline off, the composer footer shows the newline chord once the draft is non-empty.
 
 ### `/history`
 
@@ -171,6 +207,8 @@ Toggle vim-style scrollback keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, and so on)
 ### `/minimal` and `/fullscreen`
 
 Reopen the current session in the other render mode. `/minimal` (offered while you're in fullscreen) switches to the experimental scrollback-native mode; `/fullscreen` (offered while you're in minimal; alias `/full`) switches back to standard fullscreen mode. Both relaunch the pager on the same conversation for this session only — they don't touch `config.toml`, and the relaunch banner reminds you how to switch back. The `--minimal` / `--fullscreen` CLI flags are session-scoped the same way. To make plain `open-grok` open in a given mode by default, use `/settings` → **Default screen mode** or set `[ui] screen_mode`.
+
+In minimal mode, a terminal resize can reprint the current session at the new width after a short pause. Reprinting clears the terminal screen and scrollback, including output from before Open Grok and previous `/new` sessions. It restores up to the newest 4,000 rows of this session; use `/transcript` for older conversation blocks.
 
 A handful of commands only work in one of the two modes, because the surface they drive doesn't exist in the other: `/find`, `/jump`, `/timeline`, `/theme`, `/tutorial`, `/workflows`, and `/dashboard` are fullscreen-only, while `/expand` and `/edit-prompt` are minimal-only. Those are hidden from the command menu and the palette in the mode they can't run in. If you type one out anyway, Grok says why — and points you at whichever is actually useful. When the other mode is the only way to get it, that's the mode switch: `/theme isn't available in minimal mode (minimal renders with your terminal's own palette). Run /fullscreen to switch this session.` When this mode already does the job another way, it names that instead: `/expand isn't available in fullscreen mode — press Tab to focus the scrollback, then → on the block.` Everything else works in both. Note that `--no-alt-screen` still counts as fullscreen here, so it keeps the fullscreen-only commands.
 
@@ -203,24 +241,28 @@ Open a preview of the current saved plan. Aliases: `/show-plan`, `/plan-view`.
 
 ## Memory
 
-`/flush`, `/dream`, and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available.
+`/flush` and `/dream` require memory enabled through `GROK_MEMORY=1`, `[memory] enabled = true`, or managed remote settings. `/memory` is available whenever a memory store is configured for the session, including when `[memory] enabled = false` turned memory off, so you can browse saved notes and turn memory on for the session from inside the modal. It is hidden only when no memory store is configured, or when `--no-memory` / `GROK_MEMORY=0` turned memory off for the whole process. `/remember` is always available.
 
 ### `/memory`
 
-Browse, view, and manage saved memories. Pass `on` or `off` to enable or disable memory. Alias: `/mem`.
+Browse, view, and manage saved memories. Alias: `/mem`. Inside the modal, `t`
+turns memory on or off for the session, `x` deletes the selected note, and `s`
+shows content-free queue, lease, retention, and pinned-rollout diagnostics.
+The `t` toggle is session-scoped: it does not edit `config.toml`, and new
+sessions follow the config again. It cannot override `--no-memory` or
+`GROK_MEMORY=0`.
 
 ```
 /memory
-/memory off
 ```
 
 ### `/flush`
 
-Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context.
+Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context. The status line shows "Flushing memory…" while it runs, and a scrollback line reports the outcome (for example "Memory flushed through turn 12").
 
 ### `/dream`
 
-Run memory consolidation — merge session logs into organized topics.
+Run memory consolidation — merge session logs into organized topics. The status line shows "Consolidating memory…" while it runs, and a scrollback line reports what happened: how many observations were merged into how many topics, that there was nothing to consolidate, or that another session is already consolidating.
 
 ### `/remember`
 
@@ -360,6 +402,10 @@ Launch a saved workflow, or manage a running one by the session-unique display n
 /workflow save review-changes
 ```
 
+Pause and stop require the exact display name or full run ID. A shortened
+prefix such as `review` does not select `review-changes`; ambiguous names
+are refused.
+
 Project workflows live in `.opengrok/workflows/*.rhai`; user workflows live in `~/.opengrok/workflows/*.rhai`. A same-process pause/resume continues the original immutable script, args, and `agent_budget` cap from committed host-call results — to iterate, edit the returned script copy and launch it as a new run.
 
 A run shown as **blocked** paused itself because it needs outside help. When it asked via `escalate()`, the session agent is told the blocking issue and usually fixes and resumes it on its own; a bare `/workflow resume <name>` pushes such a run past its question with an empty answer — to actually answer it, ask the agent to resume with a `resume_note`. A run blocked by a plain `pause` (for example a launch without the input it needs) cannot be satisfied by resuming, because the script and its launch args are immutable — start a new run with the corrected input instead.
@@ -390,6 +436,8 @@ Report an issue or send feedback. A message sends immediately. With none, a pane
 ### `/btw`
 
 Send an aside to the agent without interrupting the current task. In minimal mode (`--minimal`), the answer shows up in a dismissible panel above the prompt: `Esc` dismisses it, a finished answer is saved into native scrollback, and a late reply to an already-dismissed panel is dropped. The side question and its answer aren't part of the main turn.
+
+`/btw` can also appear mid-message: the whole message (minus the token) becomes the side question and nothing goes to the main turn. Only `/btw` works this way; other commands must start the message. For a multi-line side question, use `Alt+Enter` (over SSH) or `Shift+Enter`, a trailing `\`, or `/ml`. Do not rely on `Cmd+Enter`: Apple Terminal inserts a newline locally via CoreGraphics; a delivered `SUPER+Enter` (Kitty) also inserts a newline rather than sending; over SSH Cmd never arrives and the chord sends.
 
 ```
 /btw also check the error handling
@@ -505,6 +553,13 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
 ### `/settings`
 
 Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
+
+### `/sandbox`
+
+Open Settings on **OS sandbox**. Sandboxing is off by default; opening this command
+does not enable it. Turn the setting on to select the `workspace` profile, then
+restart Open Grok and start a new session. Turn it off to save `off` for future
+sessions. Existing sessions retain their saved profile. See [Sandbox Mode](18-sandbox.md).
 
 ### `/timestamps`
 

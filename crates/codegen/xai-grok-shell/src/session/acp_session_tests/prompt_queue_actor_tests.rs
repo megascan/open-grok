@@ -50,6 +50,21 @@ fn ids(wire: &[crate::session::prompt_queue::QueueEntryWire]) -> Vec<String> {
     wire.iter().map(|e| e.id.clone()).collect()
 }
 
+/// `set_follow_up_steer_cache` only validates against an existing
+/// `config.toml` (mtime-keyed); seed one so the Steer tests behave the same
+/// in a fresh, empty `OPENGROK_HOME`.
+fn seed_config_for_steer_cache() {
+    let config = crate::util::grok_home::grok_home().join("config.toml");
+    if !config.exists() {
+        std::fs::write(&config, b"").expect("seed config.toml");
+    }
+}
+
+/// The Steer cache is process-global, so the two `drain_at_safe_point_*`
+/// tests must not interleave (each sets the cache and immediately asserts
+/// behavior derived from it).
+static STEER_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A queued user bash item (`!cmd`), mirroring `queue_input`'s derivation.
 fn bash_item(id: &str, owner: &str, command: &str) -> InputItem {
     let mut item = user_item(id, owner);
@@ -445,7 +460,9 @@ async fn edit_queued_prompt_clears_combine_hold() {
             {
                 let mut state = actor.state.lock().await;
                 state.pending_inputs.push_back(user_item("p1", "alice"));
-                state.combine_edit_holds.insert("p1".to_string());
+                state
+                    .edit_holds
+                    .insert("p1".to_string(), std::time::Instant::now());
             }
 
             actor
@@ -454,7 +471,7 @@ async fn edit_queued_prompt_clears_combine_hold() {
 
             let state = actor.state.lock().await;
             assert!(
-                !state.combine_edit_holds.contains("p1"),
+                !state.edit_holds.contains_key("p1"),
                 "applying the edit must clear the combine hold for that row"
             );
             let item = state
@@ -486,7 +503,9 @@ async fn edit_then_combine_uses_edited_text() {
                 state.pending_inputs.push_back(p1);
                 state.pending_inputs.push_back(p2);
                 // Follower under edit: skip_ids only gate followers.
-                state.combine_edit_holds.insert("p2".to_string());
+                state
+                    .edit_holds
+                    .insert("p2".to_string(), std::time::Instant::now());
             }
 
             // While held, combine must not absorb the follower.
@@ -510,7 +529,7 @@ async fn edit_then_combine_uses_edited_text() {
             {
                 let mut state = actor.state.lock().await;
                 assert!(
-                    !state.combine_edit_holds.contains("p2"),
+                    !state.edit_holds.contains_key("p2"),
                     "edit must clear the hold before combine can absorb the row"
                 );
                 // Row still present with edited text before combine runs.
@@ -812,13 +831,14 @@ async fn interject_after_cancel_does_nothing_and_keeps_prompt_queued() {
                 state.pending_inputs.push_back(user_item("running", "A"));
                 state.running_task = Some(running_task_stub("running"));
                 state.pending_inputs.push_back(user_item("p1", "A"));
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
             }
             *actor
                 .current_prompt_id
@@ -1108,7 +1128,9 @@ async fn promote_queued_as_interjections_stops_at_edit_hold() {
                 state.pending_inputs.push_back(user_item("m1", "A"));
                 state.pending_inputs.push_back(user_item("m2", "A"));
                 state.pending_inputs.push_back(user_item("m3", "A"));
-                state.combine_edit_holds.insert("m2".into());
+                state
+                    .edit_holds
+                    .insert("m2".into(), std::time::Instant::now());
                 state.running_task = Some(running_task_stub("running"));
             }
 
@@ -1121,7 +1143,7 @@ async fn promote_queued_as_interjections_stops_at_edit_hold() {
                 .map(|i| i.prompt_id.as_str())
                 .collect();
             assert_eq!(order, vec!["running", "m2", "m3"]);
-            assert!(state.combine_edit_holds.contains("m2"));
+            assert!(state.edit_holds.contains_key("m2"));
             drop(state);
             let interjections: Vec<String> = actor
                 .pending_interjections
@@ -1173,9 +1195,11 @@ async fn promote_queued_as_interjections_stops_at_send_now() {
 /// safe point (queue stays; no interjection in conversation).
 #[tokio::test]
 async fn drain_at_safe_point_with_steer_off_does_not_promote_held_row() {
+    let _steer = STEER_CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            seed_config_for_steer_cache();
             crate::util::config::set_follow_up_steer_cache(false);
             let (actor, _rx) = build_actor().await;
             {
@@ -1206,9 +1230,11 @@ async fn drain_at_safe_point_with_steer_off_does_not_promote_held_row() {
 /// synthetic interjection user item.
 #[tokio::test]
 async fn drain_at_safe_point_with_steer_on_promotes_and_drains_held_row() {
+    let _steer = STEER_CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            seed_config_for_steer_cache();
             crate::util::config::set_follow_up_steer_cache(true);
             let (actor, _rx) = build_actor().await;
             {
@@ -2059,6 +2085,8 @@ async fn stale_completion_does_not_clear_promoted_turns_running_task() {
     local
         .run_until(async {
             let (actor, _rx) = build_actor().await;
+            let stale_task = running_task_stub("cancelled-old");
+            stale_task.abort();
             {
                 let mut state = actor.state.lock().await;
                 state.pending_inputs.push_back(user_item("promoted", "A"));
@@ -2072,6 +2100,8 @@ async fn stale_completion_does_not_clear_promoted_turns_running_task() {
             actor
                 .handle_completion(
                     "cancelled-old".to_string(),
+                    stale_task.epoch,
+                    &stale_task.identity,
                     Ok(crate::session::commands::PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
                         total_tokens: 0,
@@ -2081,6 +2111,7 @@ async fn stale_completion_does_not_clear_promoted_turns_running_task() {
                         usage: None,
                         tool_overrides: None,
                     }),
+                    None,
                 )
                 .await;
 
@@ -2598,6 +2629,7 @@ async fn send_now_cancel_flushes_buffered_interjections_as_prompts() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("wait-turn".into());
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "buffered steer".to_string(),
                 attachments: vec![],
             });
@@ -2850,7 +2882,9 @@ async fn rewind_if_pristine_never_pops_an_interjection_fallback_front() {
 
             let _ = actor
                 .cancel_running_task(crate::session::CancelOptions {
-                    rewind_if_no_output: true,
+                    history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput {
+                        prompt_id: None,
+                    },
                     trigger: Some(crate::session::CancelTrigger::Esc),
                     user_initiated: true,
                     ..Default::default()

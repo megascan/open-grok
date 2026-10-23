@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -18,6 +19,9 @@ use crate::version::{
 };
 use xai_grok_shell::util::config;
 use xai_grok_shell::util::grok_home::{grok_application, grok_home};
+
+#[path = "release_artifact.rs"]
+mod release_artifact;
 
 #[derive(Clone, Copy, Debug)]
 pub enum UpdateRunMode {
@@ -917,6 +921,7 @@ pub async fn run_install_script(
 
 const OPEN_GROK_MACOS_AARCH64_ASSET: &str = "open-grok-macos-aarch64";
 const OPEN_GROK_LINUX_X86_64_ASSET: &str = "open-grok-linux-x86_64";
+const OPEN_GROK_LINUX_AARCH64_ASSET: &str = "open-grok-linux-aarch64";
 const OPEN_GROK_WINDOWS_X86_64_ASSET: &str = "open-grok-windows-x86_64.exe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -929,9 +934,12 @@ struct OpenGrokReleasePlatform {
 }
 
 fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
-    if cfg!(target_os = "macos")
-        && (cfg!(target_arch = "aarch64") || running_under_rosetta_on_apple_silicon())
-    {
+    let (os, arch) = detect_platform()?;
+    open_grok_release_platform_for(os, arch)
+}
+
+fn open_grok_release_platform_for(os: &str, arch: &str) -> Result<OpenGrokReleasePlatform> {
+    if (os, arch) == ("macos", "aarch64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_MACOS_AARCH64_ASSET,
             versioned_platform: "macos-aarch64",
@@ -939,7 +947,7 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
             display_name: "macOS Apple Silicon",
             managed_command: "open-grok",
         })
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    } else if (os, arch) == ("linux", "x86_64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_LINUX_X86_64_ASSET,
             versioned_platform: "linux-x86_64",
@@ -947,7 +955,15 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
             display_name: "Linux x86_64",
             managed_command: "open-grok",
         })
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+    } else if (os, arch) == ("linux", "aarch64") {
+        Ok(OpenGrokReleasePlatform {
+            asset: OPEN_GROK_LINUX_AARCH64_ASSET,
+            versioned_platform: "linux-aarch64",
+            binary_extension: "",
+            display_name: "Linux arm64",
+            managed_command: "open-grok",
+        })
+    } else if (os, arch) == ("windows", "x86_64") {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_WINDOWS_X86_64_ASSET,
             versioned_platform: "windows-x86_64",
@@ -957,7 +973,7 @@ fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
         })
     } else {
         anyhow::bail!(
-            "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64, and Windows x86_64"
+            "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64 and arm64, and Windows x86_64"
         )
     }
 }
@@ -1136,8 +1152,6 @@ pub async fn install_open_grok_release_from_base(
     let asset = platform.asset;
     let base = release_base_url.trim_end_matches('/');
     let tag = format!("v{version}");
-    let asset_url = format!("{base}/download/{tag}/{asset}");
-    let checksum_url = format!("{asset_url}.sha256");
 
     let home = grok_home();
     let download_dir = home.join("downloads");
@@ -1162,28 +1176,11 @@ pub async fn install_open_grok_release_from_base(
     } else {
         canonical_binary_path
     };
-    let checksum_path = unique_temp_sibling(&download_dir.join(&versioned_name), "sha256");
-
     eprintln!(
         "  Downloading Open Grok v{version} ({})...",
         platform.display_name
     );
-    download_with_progress(&asset_url, &binary_path).await?;
-    if let Err(error) = download_silent(&checksum_url, &checksum_path).await {
-        let _ = tokio::fs::remove_file(&binary_path).await;
-        return Err(error).context("downloading published Open Grok SHA-256");
-    }
-
-    let checksum_contents = tokio::fs::read_to_string(&checksum_path).await?;
-    let _ = tokio::fs::remove_file(&checksum_path).await;
-    let expected = parse_published_checksum(&checksum_contents, asset)?;
-    let actual = sha256_file(&binary_path).await?;
-    if actual != expected {
-        let _ = tokio::fs::remove_file(&binary_path).await;
-        anyhow::bail!(
-            "Open Grok SHA-256 verification failed (expected {expected}, got {actual}); current version was not changed"
-        );
-    }
+    release_artifact::download_verified(base, &tag, asset, &binary_path, true).await?;
 
     let reported_version = match smoke_test_open_grok_binary(&binary_path, &version).await {
         Ok(reported_version) => reported_version,
@@ -1450,6 +1447,8 @@ pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result
     let resp = client.get(url).send().await?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()
+            .with_context(|| format!("Download failed: HTTP {}", resp.status()))?;
         anyhow::bail!("Download failed: HTTP {}", resp.status());
     }
 
@@ -1510,6 +1509,8 @@ pub async fn download_silent(url: &str, dest: &std::path::Path) -> Result<()> {
     let resp = client.get(url).send().await?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()
+            .with_context(|| format!("Download failed: HTTP {}", resp.status()))?;
         anyhow::bail!("Download failed: HTTP {}", resp.status());
     }
 
@@ -3902,6 +3903,21 @@ mod tests {
                 managed_command: "open-grok",
             }
         );
+    }
+
+    #[test]
+    fn test_open_grok_release_platform_selects_linux_arm64() {
+        assert_eq!(
+            open_grok_release_platform_for("linux", "aarch64").unwrap(),
+            OpenGrokReleasePlatform {
+                asset: "open-grok-linux-aarch64",
+                versioned_platform: "linux-aarch64",
+                binary_extension: "",
+                display_name: "Linux arm64",
+                managed_command: "open-grok",
+            }
+        );
+        assert!(open_grok_release_platform_for("linux", "arm").is_err());
     }
 
     #[test]

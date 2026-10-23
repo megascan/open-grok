@@ -24,7 +24,7 @@ use crate::scrollback::layout::HorizontalLayout;
 use crate::syntax::get_syntect;
 use crate::theme::{Theme, ThemeKind};
 use crate::util::format_duration;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use super::list_pane::{
     ListItem, ListPane, ListPaneConfig, ListPaneState, ListPaneStyle, WrapMode,
@@ -233,8 +233,8 @@ pub enum TaskEntry {
         styled: Line<'static>,
         running: bool,
         started_at: Instant,
-        /// Capitalized agent-type / persona label (e.g. `Explore`, `Plan`,
-        /// `General`). Used to order subagents by type within their group.
+        /// Capitalized persona / role / tag label (e.g. `Reviewer`, `Subagent`).
+        /// Used to order subagents by display label within their group.
         type_label: String,
     },
     Scheduled {
@@ -428,7 +428,7 @@ impl TaskEntry {
         ];
         if let Some(activity) = activity {
             spans.push(Span::styled(
-                format!(" \u{2014} {activity}"),
+                format!(" \u{00b7} {activity}"),
                 Style::default().fg(theme.gray),
             ));
         }
@@ -511,7 +511,7 @@ impl TaskEntry {
         ];
         if !suffix.is_empty() {
             spans.push(Span::styled(
-                format!(" \u{2014} {suffix}"),
+                format!(" \u{00b7} {suffix}"),
                 Style::default().fg(theme.gray),
             ));
         }
@@ -548,19 +548,6 @@ impl TaskEntry {
         } else {
             info.prompt.clone()
         };
-        let countdown = |schedule: &str, created: std::time::Instant| -> String {
-            if let Some(secs) = crate::util::parse_schedule_interval_secs(schedule) {
-                let approx = created + std::time::Duration::from_secs(secs);
-                let now = std::time::Instant::now();
-                if approx > now {
-                    format!(" (next in {})", format_duration(approx.duration_since(now)))
-                } else {
-                    " (due now)".to_string()
-                }
-            } else {
-                String::new()
-            }
-        };
         let is_provisional = info.task_id.starts_with("provisional-");
         let suffix = if current_cron == Some(&info.task_id) || linked_running {
             " (running)".to_string()
@@ -568,21 +555,8 @@ impl TaskEntry {
             " (queued)".to_string()
         } else if is_provisional {
             " (starting)".to_string()
-        } else if let Some(n) = &info.next_fire_at {
-            if let Ok(dt) = DateTime::<chrono::FixedOffset>::parse_from_rfc3339(n) {
-                let dt = dt.with_timezone(&Utc);
-                let now = Utc::now();
-                if dt > now {
-                    let dur = (dt - now).to_std().unwrap_or_default();
-                    format!(" (next in {})", format_duration(dur))
-                } else {
-                    " (due now)".to_string()
-                }
-            } else {
-                countdown(&info.human_schedule, info.created_at)
-            }
         } else {
-            countdown(&info.human_schedule, info.created_at)
+            crate::views::scheduled_next::next_suffix(info, Utc::now())
         };
         // Capitalize the tag for display (`loop` → `Loop`) so it reads as a
         // proper label, matching the monitor row's `Monitor` tag.
@@ -767,6 +741,12 @@ enum OverlayEntryData {
 
 const MAX_TASKS_HEIGHT: u16 = 8;
 const MAX_TASKS_FRACTION: f32 = 0.15;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TaskStatusCounts {
+    pub(crate) running: usize,
+    pub(crate) paused_workflows: usize,
+}
 
 pub struct TasksPane {
     /// Display list: sorted `items` with group headers inserted and
@@ -973,10 +953,8 @@ impl TasksPane {
                 .cmp(&b.type_order())
                 // 2. Running before done *within* each group.
                 .then_with(|| b.is_running().cmp(&a.is_running()))
-                // 3. Within a (group, run-state): subagents order by agent
-                //    type (alphabetical) then newest-first; tasks/monitors/
-                //    loops order newest-first. Avoids mixing SystemTime and
-                //    Instant across types.
+                // 3. Within a (group, run-state): subagents order by display label (alphabetical) then newest-first.
+                //    Tasks/monitors/loops order newest-first. The per-variant match avoids mixing SystemTime and Instant across types.
                 .then_with(|| match (a, b) {
                     (
                         TaskEntry::Agent {
@@ -1030,16 +1008,13 @@ impl TasksPane {
         // reconcile them away within the same `session/load`; on warm
         // reconnects they are ambient, not new activity), so they must not
         // flash the overlay open on every resume.
-        let running_count = bg_tasks
-            .values()
-            .filter(|t| t.status == BgTaskStatus::Running && !t.restored_from_replay)
-            .count()
-            + subagents
+        let counts = Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs);
+        let running_count = counts.running.saturating_sub(
+            bg_tasks
                 .values()
-                .filter(|s| s.is_running() && s.workflow_run_id.is_none())
-                .count()
-            + scheduled.len()
-            + workflow_runs.iter().filter(|run| run.is_active()).count();
+                .filter(|task| task.status == BgTaskStatus::Running && task.restored_from_replay)
+                .count(),
+        );
 
         // Auto-show: running went from 0 to N
         if running_count > 0 && self.prev_running_count == 0 {
@@ -1049,7 +1024,7 @@ impl TasksPane {
 
         // Auto-close: running went from N to 0, auto-shown, not focused
         if running_count == 0
-            && self.prev_running_count > 0
+            && counts.paused_workflows == 0
             && self.overlay.visible
             && !self.overlay.focused
             && self.opened_by_auto
@@ -1136,16 +1111,41 @@ impl TasksPane {
         scheduled: &HashMap<String, ScheduledTaskInfo>,
         workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
     ) -> usize {
-        bg_tasks
-            .values()
-            .filter(|t| t.status == BgTaskStatus::Running)
-            .count()
-            + subagents
+        Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs).running
+    }
+
+    pub(crate) fn status_counts(
+        &self,
+        bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
+        subagents: &HashMap<String, SubagentInfo>,
+        scheduled: &HashMap<String, ScheduledTaskInfo>,
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
+    ) -> TaskStatusCounts {
+        Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs)
+    }
+
+    fn status_counts_from(
+        bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
+        subagents: &HashMap<String, SubagentInfo>,
+        scheduled: &HashMap<String, ScheduledTaskInfo>,
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
+    ) -> TaskStatusCounts {
+        TaskStatusCounts {
+            running: bg_tasks
                 .values()
-                .filter(|s| s.is_running() && s.workflow_run_id.is_none())
+                .filter(|task| task.status == BgTaskStatus::Running)
                 .count()
-            + scheduled.len()
-            + workflow_runs.iter().filter(|run| run.is_active()).count()
+                + subagents
+                    .values()
+                    .filter(|subagent| subagent.is_running() && subagent.workflow_run_id.is_none())
+                    .count()
+                + scheduled.len()
+                + workflow_runs.iter().filter(|run| run.is_active()).count(),
+            paused_workflows: workflow_runs
+                .iter()
+                .filter(|run| !run.is_active() && !run.is_terminal())
+                .count(),
+        }
     }
 
     // -- Visibility ----------------------------------------------------------
@@ -1930,6 +1930,10 @@ impl TasksPane {
 }
 
 #[cfg(test)]
+#[path = "tasks_pane_status_tests.rs"]
+mod status_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1975,7 +1979,7 @@ mod tests {
             prompt: None,
             child_cwd: None,
             worktree_path: None,
-            child_updates_replayed: false,
+            transcript: Default::default(),
         }
     }
 
@@ -3008,7 +3012,7 @@ mod tests {
     }
 
     #[test]
-    fn subagents_ordered_by_agent_type() {
+    fn nameless_explore_and_plan_type_labels_are_subagent() {
         let mut pane = TasksPane::new();
         let mut subagents = HashMap::new();
         // Two running subagents of different types; both running so the
@@ -3031,7 +3035,6 @@ mod tests {
             &[],
         );
 
-        // Ordered by agent type alphabetically: Explore before Plan.
         let types: Vec<&str> = pane
             .items
             .iter()
@@ -3040,7 +3043,44 @@ mod tests {
                 _ => panic!("expected Agent"),
             })
             .collect();
-        assert_eq!(types, vec!["Explore", "Plan"]);
+        assert_eq!(types, vec!["Subagent", "Subagent"]);
+    }
+
+    #[test]
+    fn display_label_sort_orders_reviewer_before_subagent() {
+        // Type-based clustering is gone; Agent rows order by type_label then newest-first.
+        let mut pane = TasksPane::new();
+        let mut subagents = HashMap::new();
+        let mut reviewer = make_info();
+        reviewer.child_session_id = "cs-reviewer".into();
+        reviewer.subagent_id = "sa-reviewer".into();
+        reviewer.persona = Some("reviewer".into());
+        let mut nameless = make_info();
+        nameless.child_session_id = "cs-nameless".into();
+        nameless.subagent_id = "sa-nameless".into();
+        // Nameless is newer so newest-first must not beat Reviewer < Subagent.
+        nameless.started_at += std::time::Duration::from_secs(1);
+        subagents.insert("cs-nameless".into(), nameless);
+        subagents.insert("cs-reviewer".into(), reviewer);
+
+        pane.sync(
+            &std::collections::BTreeMap::new(),
+            &subagents,
+            &HashMap::new(),
+            None,
+            &std::collections::HashSet::new(),
+            &[],
+        );
+
+        let types: Vec<&str> = pane
+            .items
+            .iter()
+            .map(|e| match e {
+                TaskEntry::Agent { type_label, .. } => type_label.as_str(),
+                _ => panic!("expected Agent"),
+            })
+            .collect();
+        assert_eq!(vec!["Reviewer", "Subagent"], types);
     }
 
     #[test]
@@ -3052,8 +3092,8 @@ mod tests {
             _ => panic!("expected Agent variant"),
         };
         assert!(
-            label.starts_with("Explore "),
-            "label should start with capitalized type badge: {label}",
+            label.starts_with("Subagent "),
+            "label should start with capitalized display label: {label}",
         );
     }
 
@@ -3085,7 +3125,7 @@ mod tests {
             TaskEntry::Agent { label, .. } => label.as_str(),
             _ => panic!("expected Agent variant"),
         };
-        assert_eq!(label, "Explore Find API endpoints");
+        assert_eq!(label, "Subagent Find API endpoints");
     }
 
     #[test]
@@ -3098,7 +3138,7 @@ mod tests {
             _ => panic!("expected Agent variant"),
         };
         let suffix = styled.spans.last().unwrap();
-        assert_eq!(suffix.content.as_ref(), " \u{2014} Running: cargo build");
+        assert_eq!(suffix.content.as_ref(), " \u{00b7} Running: cargo build");
         assert_eq!(suffix.style.fg, Some(Theme::current().gray));
         assert!(
             !label.contains("cargo build"),

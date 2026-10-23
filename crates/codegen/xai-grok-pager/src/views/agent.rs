@@ -25,6 +25,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Padding, Widget};
+
+pub(crate) const SCROLLBACK_MIN_ROWS: u16 = 5;
+
 /// Which pane is currently active in the agent view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivePane {
@@ -35,6 +38,7 @@ pub enum ActivePane {
     Prompt,
     Tasks,
     Catalog,
+    Dock,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum InputMode {
@@ -51,6 +55,7 @@ pub struct PaneAreas {
     pub prompt: Rect,
     pub tasks: Rect,
     pub catalog: Rect,
+    pub dock: Rect,
 }
 impl PaneAreas {
     /// Determine which pane a screen position falls in, if any.
@@ -67,6 +72,9 @@ impl PaneAreas {
         }
         if self.queue.area() > 0 && self.queue.contains(pos) {
             return Some(ActivePane::Queue);
+        }
+        if self.dock.area() > 0 && self.dock.contains(pos) {
+            return Some(ActivePane::Dock);
         }
         if self.scrollback.contains(pos) {
             return Some(ActivePane::Scrollback);
@@ -109,6 +117,7 @@ pub struct AgentViewLayout {
     pub scrollback: Rect,
     pub todo: Rect,
     pub queue: Rect,
+    pub dock: Rect,
     /// Inline /btw side question panel (above queue / turn status / prompt).
     pub btw: Rect,
     pub turn_status: Rect,
@@ -120,9 +129,11 @@ pub struct AgentViewLayout {
     pub follow_ups: Rect,
     /// Single-row record indicator ("◉ Recording") directly above the prompt,
     /// shown only while voice capture is active.
+    pub model_notice: Rect,
     pub voice_recording: Rect,
     pub prompt: Rect,
     pub shortcuts: Rect,
+    pub status_line: Rect,
     /// Scrollback area narrowed for scrollbar (content rendering uses this).
     pub scrollback_content: Rect,
     /// Scrollbar track position (x coordinate).
@@ -172,8 +183,11 @@ impl AgentViewLayout {
         follow_ups_height: u16,
         startup_warning_height: u16,
         prompt_gap: u16,
+        model_notice_height: u16,
         voice_recording_height: u16,
         shortcuts_height: u16,
+        dock_height: u16,
+        status_line_height: u16,
         compact: bool,
     ) -> Self {
         let outer_vpad = layout_cfg.eff_outer_vpad(compact);
@@ -221,7 +235,7 @@ impl AgentViewLayout {
         }
         let status_gap = if top_vpad == 0 { 0u16 } else { 1 };
         constraints.push(Constraint::Length(status_gap));
-        constraints.push(Constraint::Min(5));
+        constraints.push(Constraint::Min(SCROLLBACK_MIN_ROWS));
         if btw_height > 0 {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(btw_height));
@@ -246,16 +260,36 @@ impl AgentViewLayout {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(follow_ups_height));
         }
+        if dock_height > 0 {
+            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Length(dock_height));
+        }
         if prompt_gap > 0 {
             constraints.push(Constraint::Length(prompt_gap));
+        }
+        if model_notice_height > 0 {
+            constraints.push(Constraint::Length(model_notice_height));
         }
         if voice_recording_height > 0 {
             constraints.push(Constraint::Length(voice_recording_height));
         }
         constraints.push(Constraint::Length(prompt_height));
-        let shortcuts_gap = if bottom_vpad == 0 { 0u16 } else { 1 };
+        let reserved = constraints
+            .iter()
+            .map(|constraint| match constraint {
+                Constraint::Length(length) | Constraint::Min(length) | Constraint::Max(length) => {
+                    *length
+                }
+                _ => 0,
+            })
+            .fold(shortcuts_height, u16::saturating_add);
+        let status_line_height = status_line_height.min(inner_area.height.saturating_sub(reserved));
+        let shortcuts_gap = u16::from(bottom_vpad > 0 && status_line_height == 0);
         if shortcuts_gap > 0 {
             constraints.push(Constraint::Length(shortcuts_gap));
+        }
+        if status_line_height > 0 {
+            constraints.push(Constraint::Length(status_line_height));
         }
         constraints.push(Constraint::Length(shortcuts_height));
         let chunks = Layout::vertical(constraints).split(inner_area);
@@ -344,9 +378,24 @@ impl AgentViewLayout {
         } else {
             Rect::default()
         };
+        let dock = if dock_height > 0 {
+            i += 1;
+            let dock_area = chunks[i];
+            i += 1;
+            dock_area
+        } else {
+            Rect::default()
+        };
         if prompt_gap > 0 {
             i += 1;
         }
+        let model_notice = if model_notice_height > 0 {
+            let r = chunks[i];
+            i += 1;
+            r
+        } else {
+            Rect::default()
+        };
         let voice_recording = if voice_recording_height > 0 {
             let r = chunks[i];
             i += 1;
@@ -359,6 +408,13 @@ impl AgentViewLayout {
         if shortcuts_gap > 0 {
             i += 1;
         }
+        let status_line = if status_line_height > 0 {
+            let status_area = chunks[i];
+            i += 1;
+            status_area
+        } else {
+            Rect::default()
+        };
         let shortcuts = chunks[i];
         let scrollbar_x = area.right().saturating_sub(scrollbar_cfg.gap_right + 1);
         let timeline_width = if scrollbar_cfg.enabled {
@@ -389,14 +445,17 @@ impl AgentViewLayout {
             scrollback,
             todo,
             queue,
+            dock,
             btw,
             turn_status,
             banner,
             plugin_cta,
             follow_ups,
+            model_notice,
             voice_recording,
             prompt,
             shortcuts,
+            status_line,
             scrollback_content,
             scrollbar_x,
             timeline_x,
@@ -426,6 +485,7 @@ impl AgentViewLayout {
             prompt: self.prompt,
             tasks: self.tasks,
             catalog: self.catalog,
+            dock: self.dock,
         }
     }
 }
@@ -680,7 +740,7 @@ pub fn render_hook_hover_popup(
         if y >= inner.y + inner.height {
             break;
         }
-        buf.set_line_safe(inner.x, y, &line.content, inner.width);
+        buf.set_line_safe_bidi(inner.x, y, &line.content, inner.width);
     }
 }
 /// Selection/hover chrome for a side pane (todo / queue / tasks). Focused panes get a dismiss control.
@@ -954,7 +1014,7 @@ pub fn build_hints(
     selected_is_user_prompt: bool,
     selected_is_agent_message: bool,
     selected_is_credit_limit: bool,
-    shift_enter_unavailable: bool,
+    prefer_alt_enter_newline: bool,
     scrollback_search: Option<&ScrollbackSearchState>,
 ) -> Vec<HintItem> {
     let mut hints = match active_pane {
@@ -1006,7 +1066,7 @@ pub fn build_hints(
         }
         ActivePane::Prompt => {
             let mut hints = Vec::new();
-            let newline_key = if shift_enter_unavailable {
+            let newline_key = if prefer_alt_enter_newline {
                 crate::key!(Enter, ALT)
             } else {
                 crate::key!(Enter, SHIFT)
@@ -1023,8 +1083,12 @@ pub fn build_hints(
                     hints.push(HintItem::new(key, "send now"));
                 }
             }
-            if shift_enter_unavailable && !multiline_mode && prompt.can_send() {
-                hints.push(HintItem::new(crate::key!(Enter, ALT), "newline"));
+            if !multiline_mode && prompt.can_send() {
+                hints.push(if prefer_alt_enter_newline {
+                    HintItem::new(newline_key, "newline")
+                } else {
+                    HintItem::paired(newline_key, crate::key!(Enter, ALT), "newline")
+                });
             }
             if prompt.file_ref_near_cursor() {
                 hints.push(HintItem::new(crate::key!(':'), "lines"));
@@ -1068,6 +1132,11 @@ pub fn build_hints(
             hints
         }
         ActivePane::Catalog => vec![],
+        ActivePane::Dock => vec![
+            HintItem::paired(crate::key!('j'), crate::key!('k'), "navigate"),
+            HintItem::new(crate::key!(Enter), "open"),
+            HintItem::new(crate::key!('x'), "kill"),
+        ],
         ActivePane::Scrollback if scrollback_search.is_some() => {
             let mut hints = Vec::new();
             if vim_mode {
@@ -1757,17 +1826,18 @@ mod tests {
     }
     fn prompt_hints_with_text(
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
     ) -> Vec<HintItem> {
-        prompt_hints_with_text_and_turn(multiline_mode, shift_enter_unavailable, false)
+        prompt_hints_with_text_and_turn("hello", multiline_mode, prefer_alt_enter_newline, false)
     }
     fn prompt_hints_with_text_and_turn(
+        text: &str,
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
         is_turn_running: bool,
     ) -> Vec<HintItem> {
         let mut prompt = PromptWidget::default();
-        prompt.textarea.insert_str("hello");
+        prompt.textarea.insert_str(text);
         let registry = ActionRegistry::defaults();
         build_hints(
             ActivePane::Prompt,
@@ -1793,13 +1863,13 @@ mod tests {
             false,
             false,
             false,
-            shift_enter_unavailable,
+            prefer_alt_enter_newline,
             None,
         )
     }
     #[test]
     fn prompt_idle_submit_hint_is_send() {
-        let hints = prompt_hints_with_text_and_turn(false, false, false);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"send") && !labels.contains(&"queue"),
@@ -1808,7 +1878,7 @@ mod tests {
     }
     #[test]
     fn prompt_running_submit_hint_is_queue_and_send_now() {
-        let hints = prompt_hints_with_text_and_turn(false, false, true);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, true);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"queue"),
@@ -1865,21 +1935,20 @@ mod tests {
             );
         }
     }
-    /// Running-turn cancel hint key tracks `esc_would_cancel_turn` — the
-    /// input-routing predicate computed by the caller: Esc when a bare press
-    /// would reach the policy's mid-turn cancel, the registry Ctrl+C binding
-    /// otherwise. (The predicate itself — gate, panes, and higher-priority
-    /// Esc consumers — is pinned by `esc_would_cancel_turn_tests` in
-    /// `agent_view::input`.)
+    /// The running-turn cancel hint always names the registry Ctrl+C binding:
+    /// Esc never cancels a turn (it only hints at this key), in every mode
+    /// and pane.
     #[test]
-    fn running_turn_cancel_hint_key_tracks_esc_predicate() {
+    fn running_turn_cancel_hint_is_always_ctrl_c() {
         let prompt = PromptWidget::default();
         let registry = ActionRegistry::defaults();
-        for (esc_would_cancel_turn, expected) in
-            [(true, crate::key!(Esc)), (false, crate::key!('c', CONTROL))]
-        {
+        for (vim_mode, pane) in [
+            (false, ActivePane::Prompt),
+            (true, ActivePane::Prompt),
+            (false, ActivePane::Scrollback),
+        ] {
             let hints = build_hints(
-                ActivePane::Prompt,
+                pane,
                 prompt_focus_hint(),
                 &prompt,
                 &registry,
@@ -1894,10 +1963,10 @@ mod tests {
                 false,
                 false,
                 false,
-                true,
+                vim_mode,
                 false,
                 true,
-                esc_would_cancel_turn,
+                false,
                 false,
                 false,
                 false,
@@ -1910,9 +1979,15 @@ mod tests {
                 .find(|h| h.label == "cancel")
                 .expect("running turn must surface the cancel hint");
             assert_eq!(
+                vec![crate::key!('c', CONTROL)],
                 cancel.keys,
-                vec![expected],
-                "cancel hint key for esc_would_cancel_turn={esc_would_cancel_turn}"
+                "cancel hint key for vim_mode={vim_mode} pane={pane:?}"
+            );
+            assert!(
+                !hints
+                    .iter()
+                    .any(|h| h.label == "cancel" && h.keys == vec![crate::key!(Esc)]),
+                "no hint may advertise Esc as the turn cancel (vim_mode={vim_mode} pane={pane:?})"
             );
         }
     }
@@ -2023,22 +2098,66 @@ mod tests {
     }
     #[test]
     fn prompt_legacy_vte_adds_alt_enter_newline_hint() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, true);
-        let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("legacy VTE must surface an explicit Alt+Enter newline hint");
+        let [key] = newline.keys.as_slice() else {
+            panic!(
+                "prefer-Alt newline must be a single key, got {:?}",
+                newline.keys
+            );
+        };
         assert!(
-            labels.contains(&"newline"),
-            "legacy VTE must surface an explicit Alt+Enter newline hint; \
-             got {labels:?}"
+            key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SHIFT),
+            "legacy VTE newline must be Alt+Enter, got {:?}",
+            key.modifiers
         );
     }
     #[test]
-    fn prompt_modern_terminal_no_newline_hint() {
+    fn prompt_modern_terminal_pairs_shift_and_alt_newline() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, false);
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("sendable draft must surface a newline hint");
+        let [shift, alt] = newline.keys.as_slice() else {
+            panic!(
+                "local modern newline must pair Shift+Enter / Alt+Enter, got {:?}",
+                newline.keys
+            );
+        };
+        assert!(
+            shift.modifiers.contains(KeyModifiers::SHIFT),
+            "first chord must be Shift+Enter, got {:?}",
+            shift.modifiers
+        );
+        assert!(
+            alt.modifiers.contains(KeyModifiers::ALT),
+            "second chord must be Alt+Enter, got {:?}",
+            alt.modifiers
+        );
+    }
+    #[test]
+    fn prompt_empty_draft_no_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "modern terminals must not show the legacy-VTE newline hint \
-             (Shift+Enter works natively); got {labels:?}"
+            "empty composer must not show newline; got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_btw_draft_shows_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("/btw what about retries", false, true, false);
+        assert!(
+            hints.iter().any(|h| h.label == "newline"),
+            "/btw draft must show newline; got {:?}",
+            hints.iter().map(|h| h.label.as_ref()).collect::<Vec<_>>()
         );
     }
     #[test]
@@ -2047,8 +2166,39 @@ mod tests {
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "multiline mode must not show the legacy-VTE newline hint \
+            "multiline mode must not show the extra newline hint \
              (Enter already inserts a newline); got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_newline_footer_renders_alt_enter_when_prefer_alt() {
+        use crate::views::shortcuts_bar::ShortcutsBar;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        let hints = prompt_hints_with_text(false, true);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        ShortcutsBar::new(&hints)
+            .compact(5, None)
+            .render(area, &mut buf);
+        let text: String = (0..80)
+            .map(|x| buf.cell((x, 0)).expect("cell").symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+        let alt = if cfg!(target_os = "macos") {
+            "Opt+Enter"
+        } else {
+            "Alt+Enter"
+        };
+        assert!(
+            text.contains("Enter:send") && text.contains(&format!("{alt}:newline")),
+            "SSH/prefer-Alt footer must show Enter send and {alt} newline, got {text:?}"
+        );
+        assert!(
+            !text.contains("Shift+Enter:newline"),
+            "prefer-Alt footer must not advertise Shift+Enter as newline, got {text:?}"
         );
     }
     #[test]
@@ -2121,12 +2271,60 @@ mod tests {
             0,
             0,
             0,
+            0,
             1,
+            0,
+            0,
             false,
         )
     }
     fn layout_with_cta(area: Rect, cta_height: u16) -> AgentViewLayout {
         layout_with_rows(area, 0, cta_height, 0)
+    }
+
+    #[test]
+    fn dock_layout_preserves_prompt_and_status_line_rows() {
+        let layout = AgentViewLayout::compute(
+            Rect::new(0, 0, 100, 40),
+            &LayoutConfig::default(),
+            &ScrollbarConfig::default(),
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            4,
+            1,
+            false,
+        );
+        assert_eq!(layout.dock.height, 4);
+        assert_eq!(layout.status_line.height, 1);
+        assert_eq!(layout.prompt.height, 2);
+        assert!(layout.dock.bottom() <= layout.prompt.y);
+        assert!(layout.prompt.bottom() <= layout.status_line.y);
+        assert_eq!(layout.pane_areas().dock, layout.dock);
+    }
+
+    #[test]
+    fn dock_embedded_queue_takes_hit_test_precedence() {
+        let areas = PaneAreas {
+            dock: Rect::new(2, 10, 50, 8),
+            queue: Rect::new(2, 14, 50, 4),
+            ..Default::default()
+        };
+        assert_eq!(areas.hit_test(5, 12), Some(ActivePane::Dock));
+        assert_eq!(areas.hit_test(5, 15), Some(ActivePane::Queue));
     }
     /// Minimal layout with a timeline rail request — hides the cfg-dependent
     /// arity of `compute` like `layout_with_rows` does.
@@ -2154,7 +2352,10 @@ mod tests {
             0,
             0,
             0,
+            0,
             1,
+            0,
+            0,
             false,
         )
     }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// (`<user_grok_home>/trusted-hook-projects`), or `None` when no user grok home
 /// resolves. Retained only for the one-time migration into folder-trust.
 pub fn legacy_trust_file_path() -> Option<PathBuf> {
-    Some(xai_grok_config::user_grok_home()?.join("trusted-hook-projects"))
+    Some(xai_grok_config::user_grok_home()?.join(xai_grok_config::TRUSTED_HOOK_PROJECTS_FILENAME))
 }
 
 /// Parse the legacy trusted-projects file into a list of project paths.
@@ -36,13 +36,92 @@ pub fn list_trusted_projects_with_file(trust_file: &Path) -> std::io::Result<Vec
 
 // ── Hook enable/disable ─────────────────────────────────────────────────
 
-/// Check whether a hook is disabled by name.
-///
-/// Disabled hooks are listed in , one hook name per line.
-pub fn is_hook_disabled(hook_name: &str) -> bool {
-    match disabled_hooks_file_path() {
-        Some(file) => is_hook_disabled_with_file(hook_name, &file),
-        None => false,
+/// Why a hook is skipped at dispatch and shown disabled in the modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSkipReason {
+    /// Its `enabled` flag is off or its name is in `$OPENGROK_HOME/disabled-hooks`.
+    UserDisabled,
+    /// `allow_managed_hooks_only` is pinned and the hook is not managed policy.
+    ManagedOnly,
+}
+
+/// One-shot snapshot of the per-spec skip inputs: the disabled-hooks file and the `allow_managed_hooks_only` pin.
+/// An unreadable file disables non-managed hooks because their saved state is unknown.
+/// [`Self::skip_reason`] is the one rule the dispatcher, the stop-gate guard, and the modal apply, so they cannot disagree about what runs.
+#[derive(Debug, Default)]
+pub struct DisabledHooks {
+    names: std::collections::HashSet<String>,
+    managed_only: bool,
+    read_failed: bool,
+}
+
+impl DisabledHooks {
+    pub fn new<I: IntoIterator<Item = String>>(names: I, managed_only: bool) -> Self {
+        Self {
+            names: names.into_iter().collect(),
+            managed_only,
+            read_failed: false,
+        }
+    }
+
+    /// Read the disabled-hooks file. A missing file is empty; other read failures
+    /// disable non-managed hooks. Managed policy hooks still run.
+    pub fn load(managed_only: bool) -> Self {
+        match disabled_hooks_file_path() {
+            Some(file) => Self::load_file(&file, managed_only),
+            None => {
+                tracing::warn!("cannot resolve disabled-hooks file; skipping non-managed hooks");
+                Self {
+                    read_failed: true,
+                    ..Self::new([], managed_only)
+                }
+            }
+        }
+    }
+
+    fn load_file(file: &Path, managed_only: bool) -> Self {
+        match std::fs::read_to_string(file) {
+            Ok(content) => Self::new(
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(str::to_string),
+                managed_only,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::new([], managed_only),
+            Err(err) => {
+                tracing::warn!(path = %file.display(), error = %err, "cannot read disabled-hooks file; skipping non-managed hooks");
+                Self {
+                    read_failed: true,
+                    ..Self::new([], managed_only)
+                }
+            }
+        }
+    }
+
+    pub fn contains(&self, hook_name: &str) -> bool {
+        self.read_failed || self.names.contains(hook_name)
+    }
+
+    pub fn managed_only(&self) -> bool {
+        self.managed_only
+    }
+
+    /// Managed-policy hooks are never skipped; the lockdown outranks a user disable as the reported reason.
+    pub fn skip_reason(&self, spec: &crate::config::HookSpec) -> Option<HookSkipReason> {
+        if spec.is_managed_policy() {
+            return None;
+        }
+        if self.managed_only {
+            return Some(HookSkipReason::ManagedOnly);
+        }
+        (!spec.enabled || self.contains(&spec.name)).then_some(HookSkipReason::UserDisabled)
+    }
+
+    /// Whether dispatch skips `spec`; also what the modal shows as disabled.
+    pub fn blocks(&self, spec: &crate::config::HookSpec) -> bool {
+        self.skip_reason(spec).is_some()
     }
 }
 
@@ -65,7 +144,7 @@ pub fn disable_hook(hook_name: &str) -> Result<(), String> {
 
 fn disable_hook_with_file(hook_name: &str, file: &Path) -> Result<(), String> {
     if is_hook_disabled_with_file(hook_name, file) {
-        return Ok(()); // Already disabled.
+        return Ok(());
     }
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -167,5 +246,52 @@ mod tests {
             list_trusted_projects_with_file(Path::new("/nonexistent/trusted-hook-projects"))
                 .expect("missing file resolves to Ok(empty)");
         assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn disabled_hooks_unreadable_file_fails_closed_but_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("disabled-hooks");
+        let missing = DisabledHooks::load_file(&file, false);
+        assert!(!missing.contains("global/disabled"));
+
+        std::fs::write(&file, "# comment\n global/disabled \n").unwrap();
+        let loaded = DisabledHooks::load_file(&file, false);
+        assert!(loaded.contains("global/disabled"));
+        assert!(!loaded.contains("global/other"));
+
+        // Invalid UTF-8 reliably exercises a read failure without depending on
+        // permissions or the privileges of the test runner.
+        std::fs::write(&file, [0xff]).unwrap();
+        let unreadable = DisabledHooks::load_file(&file, false);
+        assert!(unreadable.contains("global/disabled"));
+        assert!(unreadable.contains("global/other"));
+
+        let mut spec = crate::config::HookSpec {
+            name: "global/disabled".into(),
+            event: crate::event::HookEventName::PreToolUse,
+            handler_type: crate::config::HandlerType::Command,
+            configured_matcher: None,
+            matcher: None,
+            enabled: true,
+            command: None,
+            command_raw: None,
+            url: None,
+            url_raw: None,
+            timeout_ms: 1000,
+            source_dir: dir.path().to_owned(),
+            extra_env: Default::default(),
+            layer: crate::config::HookProvenance::File,
+        };
+        assert_eq!(
+            unreadable.skip_reason(&spec),
+            Some(HookSkipReason::UserDisabled)
+        );
+        spec.layer = crate::config::HookProvenance::Requirements;
+        assert_eq!(unreadable.skip_reason(&spec), None);
+        std::fs::write(&file, "").unwrap();
+        assert!(!DisabledHooks::load_file(&file, false).blocks(&spec));
+        spec.layer = crate::config::HookProvenance::File;
+        assert!(!DisabledHooks::load_file(&file, false).blocks(&spec));
     }
 }

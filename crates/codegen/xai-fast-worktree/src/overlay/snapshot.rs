@@ -386,18 +386,13 @@ pub fn try_remove_from_metadata(
     Ok(None)
 }
 
-/// Scan known overlay roots under `/local/repo-fuse-*/worktrees/` for orphaned
-/// overlay snapshots.
-///
-/// An overlay snapshot is orphaned if:
-/// - Its metadata file exists but the `mount_target` doesn't exist or isn't mounted
-/// - Or the worktrees/ dir contains snapshot dirs without metadata (crashed mid-create)
-///
-/// For each orphan: delete the btrfs snapshot, remove the work dir,
-/// remove the metadata file, clean up the parent dir.
-///
-/// Intended for host startup / periodic cleanup of leftovers left behind when
-/// a previous session exited uncleanly.
+fn orphan_overlay_snapshot_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Remove empty overlay remnants with matching metadata and no target. Existing
+/// snapshot data is retained because an absent mount cannot prove it is unused
+/// or clean.
 pub fn cleanup_orphaned_overlay_snapshots() -> crate::api::CleanupReport {
     let mut report = crate::api::CleanupReport::default();
 
@@ -456,42 +451,44 @@ pub fn cleanup_orphaned_overlay_snapshots() -> crate::api::CleanupReport {
                 continue;
             }
 
+            // An unmounted upperdir can still contain the only copy of an
+            // agent's changes. The mount table alone cannot prove its owner,
+            // session liveness, or cleanliness, so leave data-bearing orphan
+            // candidates for explicit recovery.
+            if !orphan_overlay_snapshot_absent(&snapshot_path) {
+                tracing::warn!(snapshot = %snapshot_path.display(), "retaining unverified overlay snapshot");
+                continue;
+            }
+
             // Try to read metadata for additional cleanup (unmount stale target).
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<OverlayMetadata>(&content)
             {
+                // Metadata alone cannot authorize unmounting or deleting a
+                // replacement at the old target path.
+                if !matches!(std::fs::symlink_metadata(&meta.mount_target), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+                    || meta.snapshot_root != snapshot_path
+                    || meta.work_dir != work_dir
+                {
+                    continue;
+                }
                 tracing::info!(
                     target = %meta.mount_target.display(),
                     snapshot = %meta.snapshot_root.display(),
                     "cleaning up orphaned overlay snapshot"
                 );
-
-                // Unmount target if it's somehow still a mountpoint (stale).
-                let _ = unmount_overlay(&meta.mount_target);
-                let _ = std::fs::remove_dir(&meta.mount_target);
             } else {
-                tracing::info!(
-                    snapshot = %snapshot_path.display(),
-                    "cleaning up orphaned snapshot (no or corrupt metadata)"
-                );
+                continue;
             }
 
-            // Clean up btrfs subvolume + work dir + metadata.
-            if snapshot_path.exists() {
-                if let Err(e) = delete_btrfs_snapshot(&snapshot_path) {
-                    tracing::warn!(
-                        path = %snapshot_path.display(),
-                        error = %e,
-                        "failed to delete orphaned btrfs snapshot"
-                    );
-                    report.errors += 1;
-                    // Still clean up metadata + work dir below
-                } else {
-                    report.btrfs_deleted += 1;
-                }
+            // Recheck: a snapshot may have appeared while metadata was read.
+            if !orphan_overlay_snapshot_absent(&snapshot_path) {
+                continue;
             }
 
-            let _ = std::fs::remove_dir_all(&work_dir);
+            if work_dir.exists() && std::fs::remove_dir(&work_dir).is_err() {
+                continue;
+            }
             let _ = std::fs::remove_file(&meta_path);
             let _ = std::fs::remove_dir(&wt_path);
             report.removed += 1;
@@ -614,6 +611,19 @@ fn write_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_overlay_snapshot_preserves_existing_data_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("upper");
+        assert!(orphan_overlay_snapshot_absent(&path));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("changes"), "uncommitted").unwrap();
+        assert!(!orphan_overlay_snapshot_absent(&path));
+        std::fs::remove_dir_all(&path).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), &path).unwrap();
+        assert!(!orphan_overlay_snapshot_absent(&path));
+    }
 
     #[test]
     fn test_metadata_serialization() {

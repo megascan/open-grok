@@ -26,6 +26,19 @@ async fn build_gate_actor() -> SessionActor {
         ToolConfig::for_tool::<ExitPlanModeTool>(),
     ])
     .await;
+    let plan_dir = tempfile::tempdir().expect("plan directory").keep();
+    let plan_dir = dunce::canonicalize(plan_dir).expect("canonical plan directory");
+    *actor.plan_mode.lock() = crate::session::plan_mode::PlanModeTracker::new(plan_dir);
+    actor
+        .workspace_ops
+        .bind_local_session(
+            &actor.session_id_string(),
+            actor.tool_context.cwd.as_path().to_path_buf(),
+            actor.tool_context.hunk_tracker_handle.clone(),
+            actor.agent.borrow().tool_bridge().toolset(),
+            None,
+        )
+        .unwrap();
     tokio::task::spawn_local(async move {
         while let Some(msg) = gateway_rx.recv().await {
             if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = msg {
@@ -35,7 +48,7 @@ async fn build_gate_actor() -> SessionActor {
     });
     actor
 }
-/// Flip the fixture's tracker to Active (plan file: `/tmp/test-session/plan.md`).
+/// Flip the fixture's tracker to Active.
 fn activate_plan_mode(actor: &SessionActor) {
     let mut tracker = actor.plan_mode.lock();
     assert!(tracker.enter_pending());
@@ -78,7 +91,7 @@ async fn prepare(
     let mut deferred = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        actor.prepare_tool_call(call, &mut deferred),
+        actor.prepare_tool_call(call, &mut deferred, None),
     )
     .await
     .expect("prepare_tool_call must not hang (a hang means a permission prompt was issued)")
@@ -121,7 +134,7 @@ async fn plan_mode_rejects_grok_edit_outside_plan_file_despite_allow_all_permiss
                 "rejection text: {text}"
             );
             assert!(
-                text.contains("/tmp/test-session/plan.md"),
+                text.contains(actor.plan_mode.lock().plan_file_path().to_str().unwrap()),
                 "must name the plan file so the model knows the one editable path: {text}"
             );
             assert!(
@@ -133,6 +146,7 @@ async fn plan_mode_rejects_grok_edit_outside_plan_file_despite_allow_all_permiss
 }
 /// The carve-out: the plan file itself prepares cleanly (the gate defers to
 /// `should_auto_approve_edit`, the same predicate as the permission bypass).
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn plan_mode_allows_plan_file_edit() {
     let local = tokio::task::LocalSet::new();
@@ -140,11 +154,13 @@ async fn plan_mode_allows_plan_file_edit() {
         .run_until(async {
             let actor = build_gate_actor().await;
             activate_plan_mode(&actor);
-            let result = prepare(
-                &actor,
-                search_replace_call("call_plan_file", "/tmp/test-session/plan.md"),
-            )
-            .await;
+            let plan = actor
+                .plan_mode
+                .lock()
+                .plan_file_path()
+                .to_string_lossy()
+                .into_owned();
+            let result = prepare(&actor, search_replace_call("call_plan_file", &plan)).await;
             assert!(
                 result.is_ok(),
                 "plan-file edit must pass the gate and prepare; got {:?}",
@@ -192,9 +208,10 @@ async fn plan_gate_sees_hook_rewritten_path() {
                 ),
             );
             activate_plan_mode(&actor);
+            let plan = actor.plan_mode.lock().plan_file_path().to_string_lossy().into_owned();
             let result = prepare(
                     &actor,
-                    search_replace_call("call_hook_gate", "/tmp/test-session/plan.md"),
+                    search_replace_call("call_hook_gate", &plan),
                 )
                 .await;
             assert!(

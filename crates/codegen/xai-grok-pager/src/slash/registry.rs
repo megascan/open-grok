@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::acp_command::AcpSlashCommand;
-use super::command::{CommandProvenance, SlashCommand};
+use super::command::{CommandProvenance, SlashCommand, WorkflowChoice};
 use super::mode_support::ModeSupport;
 
 /// Shell ACP names the pager never offers (unified `/hooks` / `/plugins` UI,
@@ -107,6 +107,11 @@ impl CommandTrigger {
     }
 }
 
+/// Pager builtins that shadow a shell builtin of the same name and stay hidden until the shell's
+/// catalog advertises it. Any backend advertising one must implement the matching `x.ai/memory/*`
+/// extension method.
+const SHELL_GATED_COMMANDS: &[&str] = &["memory", "flush", "dream"];
+
 /// Registry of all known slash commands.
 ///
 /// Owns the command objects and provides lookup by name/alias.
@@ -152,6 +157,7 @@ pub struct CommandRegistry {
     ///   Commands whose `required_tools()` are not all present in the
     ///   set are hidden, the same way `hidden` hides commands by name.
     available_tools: Option<HashSet<String>>,
+    saved_workflows: Vec<WorkflowChoice>,
 }
 
 impl CommandRegistry {
@@ -172,6 +178,8 @@ impl CommandRegistry {
         hidden.insert("voice".to_string());
         // `/auto` is fail-closed: hidden until `set_auto_mode_available(true)`.
         hidden.insert("auto".to_string());
+        // Memory commands follow the shell's own gate: shown once the ACP catalog advertises them.
+        hidden.extend(SHELL_GATED_COMMANDS.iter().map(|name| name.to_string()));
         let mut reg = Self {
             commands: builtins,
             sources,
@@ -181,6 +189,7 @@ impl CommandRegistry {
             menu_hidden: HashSet::new(),
             restricted: HashSet::new(),
             available_tools: None,
+            saved_workflows: Vec::new(),
         };
         reg.rebuild_triggers();
         reg
@@ -410,6 +419,12 @@ impl CommandRegistry {
         self.set_command_visible("dashboard", visible);
     }
 
+    /// Whether `/dashboard` would run if typed, so header affordances follow
+    /// the same gate as the command.
+    pub fn dashboard_dispatchable(&self) -> bool {
+        self.get_for_dispatch("dashboard").is_some()
+    }
+
     /// Show or hide the `/recap` command (shell `sessionRecap` gate).
     /// Hidden by default in [`Self::new`]; revealed from initialize meta.
     pub fn set_recap_visible(&mut self, visible: bool) {
@@ -494,7 +509,25 @@ impl CommandRegistry {
         self.rebuild_triggers();
     }
 
+    pub fn saved_workflows(&self) -> &[WorkflowChoice] {
+        &self.saved_workflows
+    }
     fn apply_acp_commands(&mut self, commands: &[agent_client_protocol::AvailableCommand]) {
+        let mut saved_workflows: Vec<WorkflowChoice> = commands
+            .iter()
+            .filter_map(WorkflowChoice::from_acp)
+            .collect();
+        saved_workflows.sort_by(|left, right| left.name.cmp(&right.name));
+        self.saved_workflows = saved_workflows;
+
+        for name in SHELL_GATED_COMMANDS {
+            if commands.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                self.hidden.remove(*name);
+            } else {
+                self.hidden.insert(name.to_string());
+            }
+        }
+
         // Remove old ACP-sourced commands.
         let mut i = 0;
         while i < self.commands.len() {
@@ -735,6 +768,63 @@ mod tests {
         assert!(registry.get("flush").is_none());
     }
 
+    fn acp_workflow(
+        name: &str,
+        description: &str,
+        source: &str,
+    ) -> agent_client_protocol::AvailableCommand {
+        agent_client_protocol::AvailableCommand::new(name.to_string(), description.to_string())
+            .meta(
+                serde_json::json!({ "workflowSource": source })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            )
+    }
+
+    #[test]
+    fn set_acp_commands_extracts_saved_workflows_sorted() {
+        let mut registry = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "exit",
+            aliases: &[],
+        })]);
+        registry.set_acp_commands(&[
+            agent_client_protocol::AvailableCommand::new(
+                "flush".to_string(),
+                "Flush memory".to_string(),
+            ),
+            acp_workflow("zeta-wf", "Workflow: Zeta", "user"),
+            acp_workflow("alpha-wf", "Workflow: Alpha", "project"),
+        ]);
+        let names: Vec<&str> = registry
+            .saved_workflows()
+            .iter()
+            .map(|workflow| workflow.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha-wf", "zeta-wf"]);
+        assert_eq!(registry.saved_workflows()[0].description, "Alpha");
+        assert_eq!(registry.saved_workflows()[1].description, "Zeta");
+
+        registry.set_acp_commands(&[]);
+        assert!(registry.saved_workflows().is_empty());
+    }
+
+    #[test]
+    fn saved_workflows_include_names_skipped_as_reserved() {
+        let mut registry = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "theme",
+            aliases: &[],
+        })]);
+        registry.set_acp_commands(&[acp_workflow("theme", "Workflow: colliding name", "user")]);
+        assert!(
+            registry.get("theme").is_some(),
+            "pager builtin keeps the name"
+        );
+        assert_eq!(registry.saved_workflows().len(), 1);
+        assert_eq!(registry.saved_workflows()[0].name, "theme");
+        assert_eq!(registry.saved_workflows()[0].description, "colliding name");
+    }
+
     #[test]
     fn set_share_visible_hides_and_restores_share_command() {
         let share: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
@@ -884,6 +974,33 @@ mod tests {
             "Flush memory".to_string(),
         )]);
         assert!(registry.get("flush").is_none());
+    }
+
+    #[test]
+    fn memory_commands_follow_shell_catalog() {
+        for name in SHELL_GATED_COMMANDS {
+            let builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand { name, aliases: &[] });
+            let mut registry = CommandRegistry::new(vec![builtin]);
+            assert!(
+                registry.get(name).is_none(),
+                "/{name} is hidden until the shell advertises it"
+            );
+
+            registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+                name.to_string(),
+                String::new(),
+            )]);
+            let cmd = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("/{name} shown once the shell advertises it"));
+            assert!(
+                registry.is_builtin(cmd.name()),
+                "the pager builtin shadows the shell entry"
+            );
+
+            registry.set_acp_commands(&[]);
+            assert!(registry.get(name).is_none());
+        }
     }
 
     #[test]

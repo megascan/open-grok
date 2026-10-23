@@ -1,17 +1,14 @@
 //! Per-agent first-user-message rendering.
 //!
-//! Mirrors `prompt::context::PromptContext` but for the first user message
-//! (the prefix that contains `<user_info>`, `<git_status>`, optional
-//! workspace overview, optional rules / skills / MCP listings).
+//! Mirrors `prompt::context::PromptContext` but for the first user message.
+//! That prefix contains `<user_info>`, an optional workspace overview, and optional rules / skills / MCP listings.
 //!
 //! `UserMessageTemplate` selects the rendering strategy:
 //! - `Default`: the legacy Grok Build prefix (built by the shell layer).
-//! - `Custom`: caller-supplied MiniJinja template string (same delimiters as
-//!   the system prompt templates).
+//! - `Custom`: caller-supplied MiniJinja template string (same delimiters as the system prompt templates).
 //!
-//! The shell layer gathers session-scoped inputs (cwd, vcs status, rule
-//! files, skill registry, MCP servers) and hands them to
-//! `UserMessageContext::render`, which dispatches on `template`.
+//! The shell layer gathers session-scoped inputs (cwd, VCS root, rule files, skill registry, MCP servers).
+//! It hands them to `UserMessageContext::render`, which dispatches on `template`.
 use crate::prompt::agents_md::AgentConfigFile;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -38,6 +35,15 @@ fn neutralize_file_rule_content(content: &str) -> String {
         .replace("</system_reminder>", "&lt;/system_reminder>")
         .replace("<system_reminder>", "&lt;system_reminder>")
 }
+fn push_rule_body(output: &mut String, content: &str) {
+    if !content.starts_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(content);
+    if !content.ends_with('\n') {
+        output.push('\n');
+    }
+}
 pub fn format_rules_section(
     workspace_rules: &[RuleEntry],
     user_rules: &[RuleEntry],
@@ -59,7 +65,7 @@ pub fn format_rules_section(
             out.push_str("<always_applied_workspace_rule name=\"");
             out.push_str(&rule.path);
             out.push_str("\">");
-            out.push_str(&neutralize_file_rule_content(rule.content.trim()));
+            push_rule_body(&mut out, &neutralize_file_rule_content(rule.content.trim()));
             out.push_str("</always_applied_workspace_rule>\n");
         }
         out.push_str("</always_applied_workspace_rules>");
@@ -79,9 +85,9 @@ pub fn format_rules_section(
             }
             out.push_str("<user_rule>");
             if rule.path.is_empty() {
-                out.push_str(&rule.content);
+                push_rule_body(&mut out, &rule.content);
             } else {
-                out.push_str(&neutralize_file_rule_content(&rule.content));
+                push_rule_body(&mut out, &neutralize_file_rule_content(&rule.content));
             }
             out.push_str("</user_rule>\n");
         }
@@ -139,8 +145,8 @@ pub fn normalize_git_status(status: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UserMessageTemplate {
-    /// Legacy Grok Build prefix (`<user_info>` + optional `<git_status>`), built directly by the
-    /// shell layer; the renderer returns `None` and the caller uses its own legacy path.
+    /// Legacy Grok Build prefix (`<user_info>`), built directly by the shell layer.
+    /// The renderer returns `None` and the caller uses its own legacy path.
     #[default]
     Default,
     /// Caller-supplied MiniJinja template string.
@@ -209,6 +215,14 @@ pub struct RuleEntry {
     /// Raw file body.
     pub content: String,
 }
+const AVOID_CONTRASTIVE_NEGATION_PROSE_RULE: &str = "State points directly in affirmative language. Avoid unnecessary contrastive negation such as “X, not Y,” especially clarifications about alternatives the user did not mention.";
+/// Product-authored rules injected ahead of discovered user rules.
+pub fn built_in_user_rules() -> Vec<RuleEntry> {
+    vec![RuleEntry {
+        path: String::new(),
+        content: AVOID_CONTRASTIVE_NEGATION_PROSE_RULE.to_owned(),
+    }]
+}
 impl From<AgentConfigFile> for RuleEntry {
     fn from(f: AgentConfigFile) -> Self {
         Self {
@@ -253,8 +267,6 @@ pub struct UserMessageContext {
     pub shell: String,
     /// Git/jj working-tree root, if any.
     pub vcs_root: Option<PathBuf>,
-    /// Pre-fetched VCS status output (caller handles timeouts).
-    pub vcs_status: Option<String>,
     /// Local date captured at session start (or compaction). Formatted
     /// inside the renderer using [`USER_MESSAGE_DATE_FORMAT`] so the producer
     /// cannot accidentally drift the model-facing date shape.
@@ -307,10 +319,6 @@ struct UserMessagePlaceholders<'a> {
     shell: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     vcs_root: Option<String>,
-    /// Owned because the renderer caps/normalizes the raw status via
-    /// [`normalize_git_status`] before handing it to MiniJinja.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vcs_status: Option<String>,
     /// Pre-formatted using [`USER_MESSAGE_DATE_FORMAT`]; `None` is rendered as
     /// `null` so the `${% if today_local %}` guard in the template drops
     /// the line entirely.
@@ -344,7 +352,6 @@ impl UserMessageContext {
                 .vcs_root
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            vcs_status: self.vcs_status.as_deref().and_then(normalize_git_status),
             today_local: self
                 .today_local
                 .map(|d| d.format(USER_MESSAGE_DATE_FORMAT).to_string()),
@@ -410,7 +417,6 @@ mod tests {
             os_family: "macos",
             shell: "zsh",
             vcs_root: None,
-            vcs_status: None,
             today_local: Some("Friday Apr 24, 2026".into()),
             terminals_folder: None,
             has_rules: false,
@@ -444,45 +450,6 @@ mod tests {
             assert_eq!(original, loaded);
         }
     }
-    /// A status under the cap passes through unchanged (trim is a no-op for
-    /// real `git status --short --branch` output, which starts with `##`).
-    #[test]
-    fn normalize_git_status_passthrough_under_limit() {
-        let status = "## main...origin/main\n M src/app.rs";
-        assert_eq!(normalize_git_status(status).as_deref(), Some(status));
-    }
-    /// Empty / whitespace-only status -> `None` so the section is dropped and
-    /// no empty fence is emitted.
-    #[test]
-    fn normalize_git_status_drops_whitespace_only() {
-        assert_eq!(normalize_git_status(""), None);
-        assert_eq!(normalize_git_status("   \n\t  "), None);
-    }
-    /// A status over the cap is truncated at the last newline before the limit
-    /// and carries the spec's truncation marker.
-    #[test]
-    fn normalize_git_status_truncates_over_limit() {
-        let mut status = String::from("## main...origin/main\n");
-        while status.len() <= GIT_STATUS_CHARACTER_LIMIT {
-            status.push_str(" M src/some/long/path/to/file.rs\n");
-        }
-        assert!(status.len() > GIT_STATUS_CHARACTER_LIMIT);
-        let out = normalize_git_status(&status).expect("non-empty status");
-        assert!(
-            out.ends_with("\n\n... (git status truncated)"),
-            "missing truncation marker: {out}"
-        );
-        let body = out
-            .strip_suffix("\n\n... (git status truncated)")
-            .expect("marker suffix");
-        assert!(
-            body.len() <= GIT_STATUS_CHARACTER_LIMIT,
-            "body {} exceeds cap {GIT_STATUS_CHARACTER_LIMIT}",
-            body.len()
-        );
-        assert!(status.starts_with(body), "body is not a clean prefix");
-        assert!(!body.ends_with('\n'), "body should be snapped to last line");
-    }
     #[test]
     fn format_rules_section_workspace_then_user() {
         let workspace = [RuleEntry {
@@ -505,15 +472,23 @@ mod tests {
             "{RULES_SECTION_INTRO}\n\n\n<always_applied_workspace_rules "
         )));
         assert!(block.contains(
-            "<always_applied_workspace_rule name=\"/repo/AGENTS.md\">Use python3.</always_applied_workspace_rule>"
+            "<always_applied_workspace_rule name=\"/repo/AGENTS.md\">\nUse python3.\n</always_applied_workspace_rule>"
         ));
         assert!(block.contains("</always_applied_workspace_rules>\n\n<user_rules "));
-        assert!(
-            block.contains(
-                "<user_rule>Verify UI.</user_rule>\n\n<user_rule>User prefs.</user_rule>"
-            )
-        );
+        assert!(block.contains(
+            "<user_rule>\nVerify UI.\n</user_rule>\n\n<user_rule>\nUser prefs.\n</user_rule>"
+        ));
         assert!(block.ends_with("</rules>"));
+    }
+    #[test]
+    fn built_in_user_rules_use_the_standard_user_rule_renderer() {
+        let block = format_rules_section(&[], &built_in_user_rules()).unwrap();
+        assert_eq!(block.matches("<user_rule>").count(), 1);
+        assert_eq!(block.matches("</user_rule>").count(), 1);
+        assert!(!block.contains("<user_rule name="));
+        assert!(block.contains(&format!(
+            "<user_rule>\n{AVOID_CONTRASTIVE_NEGATION_PROSE_RULE}\n</user_rule>"
+        )));
     }
     #[test]
     fn format_rules_section_neutralizes_file_backed_wrappers() {
@@ -536,6 +511,24 @@ mod tests {
         assert!(!block.contains("keep </rules>"));
         assert_eq!(block.matches("</rules>").count(), 1);
         let synthetic_block = format_rules_section(&[], &synthetic).unwrap();
-        assert!(synthetic_block.contains("<user_rule>raw </rules> stays</user_rule>"));
+        assert!(synthetic_block.contains("<user_rule>\nraw </rules> stays\n</user_rule>"));
+    }
+    #[test]
+    fn format_rules_section_keeps_markdown_headings_on_separate_lines() {
+        for content in [
+            "# Personal Rules\n\n- Be concise.",
+            "\n# Personal Rules\n\n- Be concise.\n",
+        ] {
+            let user = [RuleEntry {
+                path: "/home/dev/.opengrok/rules/personal.md".into(),
+                content: content.into(),
+            }];
+            let block = format_rules_section(&[], &user).unwrap();
+            assert!(block.contains("<user_rule>\n# Personal Rules\n\n- Be concise.\n</user_rule>"));
+            let block = format_rules_section(&user, &[]).unwrap();
+            assert!(block.contains(
+                "\">\n# Personal Rules\n\n- Be concise.\n</always_applied_workspace_rule>"
+            ));
+        }
     }
 }

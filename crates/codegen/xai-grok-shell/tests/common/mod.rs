@@ -323,6 +323,7 @@ pub fn test_sampler_config(
     // Shell `Client` is `xai_grok_sampler::SamplingClient`, which takes a
     // `SamplerConfig` directly. Construct one inline here.
     SamplerConfig {
+        max_request_bytes: None,
         api_key: Some("test-api-key".to_string()),
         base_url: base_url.to_string(),
         model: "test-model".to_string(),
@@ -356,6 +357,7 @@ pub fn test_sampler_config(
         supports_backend_search: false,
         supports_standalone_web_search: false,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         codex_permissions: None,

@@ -1,14 +1,30 @@
 use std::time::Duration;
 
+use crate::event::{MAX_HOOK_OUTPUT_REPLACEMENT_CHARS, clip_text};
+
 /// The outcome of a blocking (`pre_tool_use`) hook dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookDecision {
     Allow,
-    Deny { reason: String, hook_name: String },
+    Ask {
+        hook_name: String,
+        reason: Option<String>,
+    },
+    Defer {
+        hook_name: String,
+    },
+    Deny {
+        hook_name: String,
+        reason: String,
+    },
 }
 
-/// Parsed output of one `Stop`/`SubagentStop` gate hook. The dispatcher
-/// aggregates these across hooks; `force_stop` overrides blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptDecision {
+    Allow,
+    Block { reason: String, hook_name: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StopHookOutcome {
     pub block_reason: Option<String>,
@@ -22,6 +38,74 @@ pub struct StopOverride {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementKind {
+    Builtin,
+    Mcp,
+}
+
+impl ReplacementKind {
+    pub fn wire_field(self) -> &'static str {
+        match self {
+            Self::Builtin => "updatedToolOutput",
+            Self::Mcp => "updatedMCPToolOutput",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputReplacement {
+    pub kind: ReplacementKind,
+    pub hook_name: String,
+    pub value: serde_json::Value,
+}
+
+impl OutputReplacement {
+    pub fn wire_field(&self) -> &'static str {
+        self.kind.wire_field()
+    }
+
+    /// Preserve small structured MCP replacements and cap oversized output.
+    pub fn mcp_output(self) -> serde_json::Value {
+        let text = match self.value {
+            serde_json::Value::String(text) => text,
+            structured => {
+                let text = structured.to_string();
+                if text.chars().count() <= MAX_HOOK_OUTPUT_REPLACEMENT_CHARS {
+                    return structured;
+                }
+                text
+            }
+        };
+        serde_json::Value::String(clip_text(&text, MAX_HOOK_OUTPUT_REPLACEMENT_CHARS))
+    }
+
+    pub fn mcp_output_text(self) -> String {
+        let text = match self.value {
+            serde_json::Value::String(text) => text,
+            structured => structured.to_string(),
+        };
+        clip_text(&text, MAX_HOOK_OUTPUT_REPLACEMENT_CHARS)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PostToolUseHookOutcome {
+    pub block_reason: Option<String>,
+    pub force_stop: Option<StopOverride>,
+    pub additional_context: Option<String>,
+    pub output_replacement: Option<OutputReplacement>,
+}
+
+impl PostToolUseHookOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.block_reason.is_none()
+            && self.force_stop.is_none()
+            && self.additional_context.is_none()
+            && self.output_replacement.is_none()
+    }
+}
+
 impl StopHookOutcome {
     pub fn is_empty(&self) -> bool {
         self.block_reason.is_none()
@@ -33,12 +117,7 @@ impl StopHookOutcome {
 /// HTTP execution details for `"http"` hooks, for scrollback enrichment.
 #[derive(Debug, Clone)]
 pub struct HttpInfo {
-    /// Post-expansion target (for SSRF debugging). May contain secrets from
-    /// resolved `${VAR}` substitutions, so user-facing display MUST prefer
-    /// `raw_url` when present.
     pub url: String,
-    /// Pre-expansion source URL as written in the file, safe for display.
-    /// `None` when the spec was built without it (fall back to `url`).
     pub raw_url: Option<String>,
     pub status: Option<u16>,
     pub response_preview: Option<String>,
@@ -51,6 +130,7 @@ pub enum HookRunResult {
         hook_name: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
     Skipped {
         hook_name: String,
@@ -61,6 +141,7 @@ pub enum HookRunResult {
         detail: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
     /// Hook failed (timeout, crash, bad output): fail-open.
     Failed {
@@ -68,5 +149,29 @@ pub enum HookRunResult {
         error: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    fn replacement(value: serde_json::Value) -> OutputReplacement {
+        OutputReplacement {
+            kind: ReplacementKind::Mcp,
+            hook_name: "test".into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn mcp_replacements_preserve_small_objects_and_clip_large_output() {
+        let object = serde_json::json!({"id": "example"});
+        assert_eq!(replacement(object.clone()).mcp_output(), object);
+        let large = "x".repeat(MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+        let out = replacement(serde_json::Value::String(large)).mcp_output_text();
+        assert!(out.chars().count() <= MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+        assert!(out.len() < MAX_HOOK_OUTPUT_REPLACEMENT_CHARS + 50);
+    }
 }

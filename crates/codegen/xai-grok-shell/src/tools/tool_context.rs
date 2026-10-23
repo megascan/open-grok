@@ -11,6 +11,7 @@ use crate::terminal::AsyncTerminalRunner;
 use agent_client_protocol as acp;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_paths::AbsPathBuf;
 use xai_grok_tools::implementations::grok_build::task::types::ForegroundWaitKind;
@@ -73,12 +74,31 @@ impl TaskOutputTokenBudget {
         (state.spent, state.incomplete)
     }
 }
+/// Dedicated wait-abort flag for a parent Interject. The message itself stays
+/// on `pending_inputs` so it is not also drained through
+/// `pending_interjections` (that would double-deliver).
+#[derive(Default)]
+pub(crate) struct ParentInterjectSignal {
+    has_pending: AtomicBool,
+}
+
+impl ParentInterjectSignal {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.has_pending.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_pending(&self, has_pending: bool) {
+        self.has_pending.store(has_pending, Ordering::Relaxed);
+    }
+}
+
 pub struct BlockingWaitState(std::sync::Mutex<BlockingWaitInner>);
 #[derive(Default)]
 struct BlockingWaitInner {
     depth: usize,
     orchestration_depth: usize,
     generation: u64,
+    interrupted_wait: Option<Vec<String>>,
 }
 impl BlockingWaitState {
     pub(crate) fn new() -> Self {
@@ -113,6 +133,43 @@ impl BlockingWaitState {
         state.generation = state.generation.wrapping_add(1);
         state.depth = 0;
         state.orchestration_depth = 0;
+        state.interrupted_wait = None;
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.0
+            .lock()
+            .expect("blocking wait state mutex poisoned")
+            .generation
+    }
+    pub(crate) fn update_interrupted_wait<Result>(
+        &self,
+        generation: u64,
+        update: impl FnOnce(&mut Option<Vec<String>>) -> Result,
+    ) -> Option<Result> {
+        let mut state = self.0.lock().expect("blocking wait state mutex poisoned");
+        (state.generation == generation).then(|| update(&mut state.interrupted_wait))
+    }
+    #[cfg(test)]
+    pub(crate) fn note_interrupted_wait(&self, ids: Vec<String>) {
+        self.update_interrupted_wait(self.generation(), |remembered| {
+            if ids.is_empty() {
+                return;
+            }
+            let existing = remembered.get_or_insert_with(Vec::new);
+            for id in ids {
+                if !existing.contains(&id) {
+                    existing.push(id);
+                }
+            }
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn interrupted_wait_ids(&self) -> Option<Vec<String>> {
+        self.0
+            .lock()
+            .expect("blocking wait state mutex poisoned")
+            .interrupted_wait
+            .clone()
     }
 }
 pub(crate) struct BlockingWaitGuard {
@@ -121,6 +178,9 @@ pub(crate) struct BlockingWaitGuard {
     generation: u64,
 }
 impl BlockingWaitGuard {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
     pub(crate) fn enter(state: Arc<BlockingWaitState>) -> Self {
         Self::enter_kind(state, ForegroundWaitKind::Interruptible)
     }
@@ -164,6 +224,69 @@ pub(crate) fn subagent_foreground_wait(
         move |kind| Box::new(BlockingWaitGuard::enter_kind(Arc::clone(&state), kind)),
     )
 }
+/// Session-wide path locks. Weak entries are discarded once no call holds or
+/// waits for a path, so a long-running session does not retain every filename.
+#[derive(Default)]
+pub(crate) struct FileDispatchLocks {
+    barrier: Arc<tokio::sync::RwLock<()>>,
+    paths: parking_lot::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>,
+    >,
+}
+
+enum PathGuard {
+    Read(#[allow(dead_code)] tokio::sync::OwnedRwLockReadGuard<()>),
+    Write(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>),
+}
+
+pub(crate) struct FileDispatchGuard {
+    _barrier: PathGuard,
+    _path: Option<PathGuard>,
+}
+
+impl FileDispatchLocks {
+    pub(crate) async fn lock(
+        &self,
+        path: Option<String>,
+        read_only: bool,
+        is_edit: bool,
+    ) -> Option<FileDispatchGuard> {
+        let Some(path) = path else {
+            return if is_edit {
+                Some(FileDispatchGuard {
+                    _barrier: PathGuard::Write(self.barrier.clone().write_owned().await),
+                    _path: None,
+                })
+            } else {
+                None
+            };
+        };
+        // Every caller takes the barrier before its path lock, avoiding lock
+        // order inversions while pathless edits exclude all file operations.
+        let barrier = self.barrier.clone().read_owned().await;
+        let lock = {
+            let mut paths = self.paths.lock();
+            paths.retain(|_, value| value.strong_count() != 0);
+            if let Some(lock) = paths.get(&path).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::RwLock::new(()));
+                paths.insert(path, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let path = if read_only {
+            PathGuard::Read(lock.read_owned().await)
+        } else {
+            PathGuard::Write(lock.write_owned().await)
+        };
+        Some(FileDispatchGuard {
+            _barrier: PathGuard::Read(barrier),
+            _path: Some(path),
+        })
+    }
+}
+
 /// Session-level context. NOT used for tool execution (bridge handles that).
 /// Holds ACP gateway, cwd, hunk tracker, etc. for session infrastructure.
 #[derive(Clone)]
@@ -173,6 +296,8 @@ pub struct ToolContext {
     pub fs: AsyncFsWrapper,
     pub terminal: Arc<dyn AsyncTerminalRunner>,
     pub cwd: AbsPathBuf,
+    /// Shared by ordinary and Code Mode dispatches for this session.
+    pub(crate) file_dispatch_locks: Arc<FileDispatchLocks>,
     pub file_state_handle: Option<FileStateHandle>,
     pub session_env: Arc<HashMap<String, String>>,
     pub hunk_tracker_handle: HunkTrackerHandle,
@@ -181,6 +306,7 @@ pub struct ToolContext {
     /// `noop()` and the fs-notify loop skips forwarding to avoid per-event cost.
     pub hunk_tracking_enabled: bool,
     pub prompt_index: Arc<tokio::sync::Mutex<usize>>,
+    pub(crate) active_message_parent_prompt_index: Arc<std::sync::atomic::AtomicUsize>,
     /// Current subagent nesting depth for this session.
     /// Top-level sessions start at 0; child sessions are parent_depth + 1.
     pub subagent_depth: u32,
@@ -191,6 +317,9 @@ pub struct ToolContext {
         tokio::sync::mpsc::UnboundedSender<
             xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
         >,
+    >,
+    pub subagent_coordinator_sender: Option<
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     >,
     /// Shared LSP runtime — cloned cheaply (Arc) from parent to child.
     /// Same pattern as `fs` and `terminal`.
@@ -242,6 +371,9 @@ pub struct ToolContext {
     /// [`BlockingWaitGuard`]). `queue_input` reads it: a prompt arriving while
     /// non-zero takes the send-now path.
     pub blocking_wait_depth: Arc<BlockingWaitState>,
+    /// Parent Interject wait-abort flag. Separate from `pending_interjections`
+    /// so the follow-up is not drained twice.
+    pub(crate) parent_interject: Arc<ParentInterjectSignal>,
     /// Fired when a user message arrives during an orchestration wait so
     /// `agent_swarm` / `swarm_wait` can detach without cancelling members.
     pub orchestration_steer:
@@ -314,13 +446,16 @@ impl ToolContext {
             fs: AsyncFsWrapper::new(fs),
             terminal,
             cwd,
+            file_dispatch_locks: Arc::new(FileDispatchLocks::default()),
             file_state_handle: None,
             session_env: Arc::new(session_env),
             hunk_tracker_handle,
             hunk_tracking_enabled: true,
             prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
+            active_message_parent_prompt_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             subagent_depth: 0,
             subagent_event_tx: None,
+            subagent_coordinator_sender: None,
             lsp: None,
             lsp_server_names: Vec::new(),
             is_turn_active: None,
@@ -335,6 +470,7 @@ impl ToolContext {
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
+            parent_interject: Arc::new(ParentInterjectSignal::default()),
             orchestration_steer: xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
             swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
             task_output_token_budget: None,
@@ -387,13 +523,92 @@ mod output_budget_tests {
 }
 #[cfg(test)]
 mod tests {
-    use super::BlockingWaitState;
+    use super::{BlockingWaitState, FileDispatchLocks};
     use crate::{terminal::AsyncTerminalRunner, tools::ToolContext};
     use std::collections::HashMap;
     use std::sync::Arc;
     use xai_grok_paths::AbsPathBuf;
     use xai_grok_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
     use xai_hunk_tracker::HunkTrackerHandle;
+
+    #[tokio::test]
+    async fn shared_file_dispatch_locks_serialize_writes_and_release_on_cancel() {
+        let locks = Arc::new(FileDispatchLocks::default());
+        let normal = locks.lock(Some("/work/a".into()), false, true).await;
+        let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let nested_locks = locks.clone();
+        let nested = tokio::spawn(async move {
+            let _ = attempt_tx.send(());
+            let _guard = nested_locks.lock(Some("/work/a".into()), false, true).await;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        attempt_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            entered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            locks.lock(Some("/work/b".into()), false, true),
+        )
+        .await
+        .expect("different files do not block one another");
+        drop(other);
+        drop(normal);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut entered_rx)
+            .await
+            .expect("nested call follows the normal call")
+            .unwrap();
+        let waiting_locks = locks.clone();
+        let reader = tokio::spawn(async move {
+            waiting_locks
+                .lock(Some("/work/a".into()), true, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished());
+        nested.abort();
+        let _ = nested.await;
+        let read_guard = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("cancelling the holder releases the lock")
+            .unwrap();
+        let second_reader = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            locks.lock(Some("/work/a".into()), true, false),
+        )
+        .await
+        .expect("readers may run together");
+        drop((read_guard, second_reader));
+    }
+
+    #[tokio::test]
+    async fn pathless_edit_barrier_excludes_path_dispatch_in_both_directions() {
+        let locks = Arc::new(FileDispatchLocks::default());
+        let path = locks.lock(Some("/work/a".into()), false, true).await;
+        let waiting = locks.clone();
+        let patch = tokio::spawn(async move { waiting.lock(None, false, true).await });
+        tokio::task::yield_now().await;
+        assert!(!patch.is_finished());
+        drop(path);
+        let patch_guard = tokio::time::timeout(std::time::Duration::from_secs(1), patch)
+            .await
+            .unwrap()
+            .unwrap();
+        let waiting = locks.clone();
+        let file =
+            tokio::spawn(async move { waiting.lock(Some("/work/b".into()), false, true).await });
+        tokio::task::yield_now().await;
+        assert!(!file.is_finished());
+        drop(patch_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), file)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     impl ToolContext {
         pub(crate) fn new_local_context(
             cwd: AbsPathBuf,
@@ -406,13 +621,16 @@ mod tests {
                 fs: AsyncFsWrapper::new(fs),
                 terminal,
                 cwd,
+                file_dispatch_locks: Arc::new(FileDispatchLocks::default()),
                 file_state_handle: None,
                 session_env: Arc::new(HashMap::new()),
                 hunk_tracker_handle: HunkTrackerHandle::noop(),
                 hunk_tracking_enabled: true,
                 prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
+                active_message_parent_prompt_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subagent_depth: 0,
                 subagent_event_tx: None,
+                subagent_coordinator_sender: None,
                 lsp: None,
                 lsp_server_names: Vec::new(),
                 is_turn_active: None,
@@ -427,6 +645,7 @@ mod tests {
                 auto_wake_enabled: true,
                 goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
+                parent_interject: Arc::new(super::ParentInterjectSignal::default()),
                 orchestration_steer: xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
                 swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
                 task_output_token_budget: None,

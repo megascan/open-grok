@@ -8,13 +8,15 @@
 //! State is transported via extra file descriptors (fd 3 for input, fd 4 for output)
 //! so that dump traffic never pollutes stdout/stderr.
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use base64::Engine as _;
 use command_fds::FdMapping;
 use nix::libc;
 use tokio::io::AsyncReadExt;
@@ -38,7 +40,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum time to wait for the dump reader task after the child process exits.
 /// Uses a 5s close timeout. If a background process inherits fd 4,
 /// the reader would hang forever without this.
-const DUMP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const DUMP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound memory even if a command writes arbitrary data to its inherited fd 4.
+const MAX_DUMP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Environment overrides applied to every agent terminal / persistent shell spawn.
 /// Prevents color/pager noise in captured output and marks the process as agent-driven.
@@ -279,6 +283,7 @@ impl ShellState {
         shell: ShellKind,
         cwd: &Path,
         shell_env_policy: Option<&crate::util::ShellEnvironmentPolicy>,
+        sandbox_hook: Option<&dyn crate::sandbox_launch::SandboxLaunch>,
     ) -> Result<Self, crate::computer::types::ComputerError> {
         let dump_script = shell.dump_script();
         let dump_fn = shell.dump_function_name();
@@ -297,13 +302,7 @@ impl ShellState {
         // to stderr (fills the pipe buffer, child blocks on write, parent blocks
         // on stdout read).
         let mut cmd = tokio::process::Command::new(shell.binary_path());
-        cmd.args(&args)
-            .current_dir(cwd)
-            .stdin(xai_tty_utils::null_stdio())
-            .stdout(Stdio::piped())
-            .stderr(xai_tty_utils::null_stdio())
-            .kill_on_drop(true);
-        crate::util::detach_command(&mut cmd);
+        cmd.args(&args).current_dir(cwd);
         // Apply the policy before the `export -p` snapshot so the replayed state
         // is already filtered; otherwise the restore would undo it. No-op unless set.
         //
@@ -320,6 +319,9 @@ impl ShellState {
         }
         crate::util::apply_shell_environment_policy(&mut cmd, shell_env_policy);
         cmd.envs(crate::util::pager_env());
+        let call = crate::sandbox_launch::CallId::shell_init("shell-state");
+        crate::sandbox_launch::prepare(sandbox_hook, &mut cmd, &call)?;
+        crate::sandbox_launch::wire_prepared(&mut cmd, xai_tty_utils::null_stdio());
         #[allow(clippy::disallowed_methods)] // one-shot init run, waited on here
         let mut child = cmd.spawn().map_err(|e| {
             crate::computer::types::ComputerError::io(format!(
@@ -412,73 +414,94 @@ impl ShellState {
         // which clears CLOEXEC on the target fd (3/4), so the child keeps
         // them across exec. The originals are closed on exec by CLOEXEC.
 
-        // The wrapper command:
-        // 1. Read prior snapshot from fd 3, eval it (restores env/funcs/aliases/opts)
-        // 2. Run the user's command (passed as $1)
-        // 3. Dump new state to fd 4
-        // 4. Exit with the user command's exit code
-        let wrapper = match self.shell {
+        // Save the original process environment, arguments and cwd before
+        // replay. On failure an EXIT trap replaces this process with a fresh
+        // shell, preserving its PID and process group. Signal traps suppress
+        // fallback when cancellation interrupts restore.
+        let user_body = match self.shell {
             ShellKind::Bash => format!(
-                // Merge the user command's stderr into its
-                // stdout via `2>&1` so the captured byte stream preserves
-                // chronological write order. Without this, the bash tool's
-                // separate stdout/stderr pipes (each read in lockstep)
-                // emit all-of-stdout-then-all-of-stderr in a single poll
-                // tick, so a command like `echo X 1>&2 && echo Y` shows
-                // up as `Y\nX\n` instead of the chronological `X\nY\n`.
-                // Shell-level diagnostics (eval syntax errors, etc.) still
-                // land on the outer shell's stderr — those are unaffected.
-                // Re-export GROK_AGENT=1 after snapshot eval so agent-definition
-                // selectors (or other values) from prior shells cannot clear the
-                // agent sentinel (process env alone is insufficient).
-                //
-                // Copy $1/$2 into plain variables and clear the positional
-                // parameters (`builtin set --`) BEFORE eval'ing the user
-                // command: `source <script>` with no arguments makes the
-                // sourced script inherit the caller's positional parameters,
-                // so e.g. conda's `bin/activate` (which forwards "$@" to
-                // `conda activate`) would receive the entire wrapped command
-                // string as an environment name. Clearing them matches the
-                // plain `bash -c "<command>"` execution path, where $# is 0.
-                //
-                // The snapshot can restore `allexport` (set -a), which would
-                // auto-export the temp variable — so strip the export
-                // attribute post-assignment (`declare +x`; inline `declare +x
-                // var=value` does NOT beat allexport) and unset it after the
-                // eval so it can never reach child processes or the state
-                // dump (`export -p`).
-                "{dump_script} \
-                 snap=$(command cat <&3) && builtin shopt -s extglob && builtin eval -- \"$snap\" && \
-                 {{ builtin set +u 2>/dev/null || true; \
+                "builtin set +u 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
                  builtin shopt -s expand_aliases 2>/dev/null; {sudo_inject}{search_inject}\
                  builtin printf '%s' \"${{2:-}}\"; \
                  __grok_user_cmd=\"$1\"; builtin declare +x __grok_user_cmd 2>/dev/null; builtin set --; \
-                 builtin eval \"$__grok_user_cmd\" 2>&1; }}; \
+                 builtin eval \"$__grok_user_cmd\" 2>&1; \
                  COMMAND_EXIT_CODE=$?; builtin unset __grok_user_cmd 2>/dev/null; {dump_fn} >&4; builtin exit $COMMAND_EXIT_CODE"
             ),
-            // After snapshot restore: force nonomatch so login dumps cannot re-arm NOMATCH for model globs.
-            // See the bash wrapper comment for why positional parameters are
-            // cleared before the user-command eval (zsh's `source`/`.` inherits
-            // them identically).
             ShellKind::Zsh => format!(
-                "{dump_script} \
-                 snap=$(command cat <&3); \
-                 builtin unsetopt aliases 2>/dev/null; \
-                 builtin unalias -m '*' 2>/dev/null || true; \
-                 builtin eval \"$snap\" && \
-                 {{ builtin unsetopt nounset 2>/dev/null || true; \
+                "builtin unsetopt nounset 2>/dev/null || true; \
                  builtin setopt nonomatch 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
                  builtin setopt aliases 2>/dev/null; {sudo_inject}{search_inject}\
                  builtin printf '%s' \"${{2:-}}\"; \
                  __grok_user_cmd=\"$1\"; builtin typeset +x __grok_user_cmd 2>/dev/null; builtin set --; \
-                 builtin eval \"$__grok_user_cmd\" 2>&1; }}; \
+                 builtin eval \"$__grok_user_cmd\" 2>&1; \
                  COMMAND_EXIT_CODE=$?; builtin unset __grok_user_cmd 2>/dev/null; {dump_fn} >&4; builtin exit $COMMAND_EXIT_CODE"
             ),
         };
+
+        // Bash's BASH_ENV and zsh's per-user zshenv already ran at startup.
+        // Skip them on recovery, then restore BASH_ENV before user code.
+        let fallback_prefix = match self.shell {
+            ShellKind::Bash => {
+                "if [ \"$1\" = 1 ]; then builtin export \"BASH_ENV=$2\"; else builtin unset BASH_ENV; fi; builtin shift 2;"
+            }
+            ShellKind::Zsh => "builtin setopt rcs 2>/dev/null || true;",
+        };
+        let fallback_script = format!("{fallback_prefix} {dump_script} {user_body}");
+        let shell_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let fallback_quoted = shell_quote(&fallback_script);
+        let shell_quoted = shell_quote(self.shell.binary_path());
+        let (fallback_args, filter_env, restore) = match self.shell {
+            ShellKind::Bash => (
+                format!(
+                    "{shell_quoted} -O extglob -c {fallback_quoted} -- \"$__grok_bash_env_set\" \"$__grok_bash_env\""
+                ),
+                "case \"$__grok_original_entry\" in BASH_ENV=*) __grok_bash_env_set=1; __grok_bash_env=${__grok_original_entry#*=}; continue;; esac;",
+                "builtin set -e; builtin shopt -s extglob; builtin eval -- \"$snap\"; builtin set +e; \
+                 builtin declare +x snap grok_snap_ENV_VARS_B64 grok_snap_POSIX_OPTS_B64 grok_snap_BASH_OPTS_B64 grok_snap_FUNCTIONS_B64 grok_snap_ALIASES_B64 2>/dev/null",
+            ),
+            ShellKind::Zsh => (
+                format!("{shell_quoted} -f -c {fallback_quoted} --"),
+                "",
+                // Local errreturn aborts even nested eval failures without
+                // terminating zsh, whose fatal eval errors skip EXIT traps.
+                // Disable localoptions on success to retain restored options.
+                "builtin unsetopt aliases 2>/dev/null; builtin unalias -m '*' 2>/dev/null || true; \
+                 __grok_restore() {{ builtin setopt localoptions errreturn; builtin eval \"$snap\"; builtin unsetopt localoptions errreturn; }}; \
+                 __grok_restore; __grok_restore_status=$?; \
+                 if [ \"$__grok_restore_status\" -ne 0 ]; then __grok_fallback; fi; \
+                 builtin typeset +x snap grok_snap_ENV_VARS_B64 grok_snap_ZSH_OPTS_B64 grok_snap_FUNCTIONS_B64 grok_snap_ALIASES_B64 2>/dev/null",
+            ),
+        };
+        // `restore` is inserted as a literal, not formatted itself.
+        let restore = restore.replace("{{", "{").replace("}}", "}");
+        let wrapper = format!(
+            "{dump_script} \
+             __grok_original_cwd=$(builtin pwd); __grok_original_args=(\"$@\"); \
+             __grok_original_env=(); __grok_bash_env_set=0; __grok_bash_env=''; \
+             while IFS= builtin read -r -d '' __grok_original_entry; do \
+                 {filter_env} __grok_original_env+=(\"$__grok_original_entry\"); \
+             done < <(/usr/bin/env -0); \
+             __grok_fallback() {{ \
+                 builtin trap - EXIT TERM INT HUP QUIT; \
+                 builtin printf '%s\\n' 'Warning: failed to restore shell state; running command in a fresh shell.' >&2; \
+                 builtin exec /usr/bin/env -i -- \"${{__grok_original_env[@]}}\" /bin/sh -c 'cd \"$1\" || exit 1; shift; exec \"$@\"' -- \"$__grok_original_cwd\" {fallback_args} \"${{__grok_original_args[@]}}\"; \
+             }}; \
+             builtin trap '__grok_fallback' EXIT; \
+             builtin trap 'builtin trap - EXIT TERM; builtin kill -TERM $$' TERM; \
+             builtin trap 'builtin trap - EXIT INT; builtin kill -INT $$' INT; \
+             builtin trap 'builtin trap - EXIT HUP; builtin kill -HUP $$' HUP; \
+             builtin trap 'builtin trap - EXIT QUIT; builtin kill -QUIT $$' QUIT; \
+             snap=$(command cat <&3) || __grok_fallback; \
+             {restore}; \
+             builtin trap - EXIT TERM INT HUP QUIT; \
+             builtin unset __grok_original_cwd __grok_original_args __grok_original_env __grok_original_entry __grok_bash_env_set __grok_bash_env __grok_restore_status; \
+             builtin unset -f __grok_fallback __grok_restore 2>/dev/null || true; \
+             {user_body}"
+        );
 
         let effective_cwd = cwd_override.unwrap_or(&self.cwd);
 
@@ -642,6 +665,208 @@ fn parse_after_marker<'a>(output: &'a str, marker: &str) -> &'a str {
     }
 }
 
+/// The variables `snapshot` exports when it is replayed: its `export -p` (bash) or `typeset -xp`
+/// (zsh) block, decoded and read back. A name exported without a value is left out, and so is
+/// every command this does not read in full: nothing is guessed.
+pub fn snapshot_exports(snapshot: &str) -> Vec<(OsString, OsString)> {
+    let header = "grok_snap_ENV_VARS_B64=$(command base64 -d <<'GROK_SNAP_EOF_ENV_VARS_B64'";
+    let Some(payload) = snapshot.lines().skip_while(|line| *line != header).nth(1) else {
+        return Vec::new();
+    };
+    let Ok(script) = base64::engine::general_purpose::STANDARD.decode(payload.trim()) else {
+        return Vec::new();
+    };
+    shell_commands(&script)
+        .into_iter()
+        .flatten()
+        .flat_map(exported_assignments)
+        .collect()
+}
+
+/// `declare`/`typeset`/`export` assignments among a command's words. Arrays and tied parameters
+/// (`-a`, `-A`, `-T`) are not environment variables.
+fn exported_assignments(words: Vec<Vec<u8>>) -> Vec<(OsString, OsString)> {
+    let Some((verb, args)) = words.split_first() else {
+        return Vec::new();
+    };
+    if !matches!(verb.as_slice(), b"declare" | b"typeset" | b"export") {
+        return Vec::new();
+    }
+    let mut assignments = Vec::new();
+    for arg in args {
+        if arg.first() == Some(&b'-') {
+            if arg.iter().any(|b| matches!(b, b'a' | b'A' | b'T')) {
+                return Vec::new();
+            }
+            continue;
+        }
+        let Some(eq) = arg.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        let (name, value) = arg.split_at(eq);
+        let is_name = name.split_first().is_some_and(|(first, rest)| {
+            (first.is_ascii_alphabetic() || *first == b'_')
+                && rest.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        });
+        if is_name {
+            assignments.push((
+                OsString::from_vec(name.to_vec()),
+                OsString::from_vec(value.get(1..).unwrap_or_default().to_vec()),
+            ));
+        }
+    }
+    assignments
+}
+
+/// `script` as shell commands (split at unquoted newlines and `;`), each a list of words with
+/// their quoting removed: `'…'`, `"…"`, `$'…'` and a backslash outside quotes. `None` for a
+/// command that needs more than quote removal (an expansion, a subshell, a redirection); an
+/// unterminated quote ends the read.
+fn shell_commands(script: &[u8]) -> Vec<Option<Vec<Vec<u8>>>> {
+    let mut rest = script;
+    let mut commands = Vec::new();
+    let mut words = Some(Vec::new());
+    let mut word: Option<Vec<u8>> = None;
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        match byte {
+            b' ' | b'\t' => end_word(&mut word, &mut words),
+            b'\n' | b';' => {
+                end_word(&mut word, &mut words);
+                if words.as_ref().is_none_or(|words| !words.is_empty()) {
+                    commands.push(words.replace(Vec::new()));
+                }
+            }
+            b'\\' => {
+                if let Some((&escaped, tail)) = rest.split_first() {
+                    rest = tail;
+                    if escaped != b'\n' {
+                        word.get_or_insert_with(Vec::new).push(escaped);
+                    }
+                }
+            }
+            b'\'' => {
+                let Some(end) = rest.iter().position(|&b| b == b'\'') else {
+                    return commands;
+                };
+                let (quoted, tail) = rest.split_at(end);
+                word.get_or_insert_with(Vec::new).extend_from_slice(quoted);
+                rest = tail.get(1..).unwrap_or_default();
+            }
+            b'"' | b'$' if byte == b'"' || rest.first() == Some(&b'\'') => {
+                let quoted = word.get_or_insert_with(Vec::new);
+                let read = if byte == b'"' {
+                    double_quoted(rest, quoted)
+                } else {
+                    ansi_c_quoted(rest.get(1..).unwrap_or_default(), quoted)
+                };
+                let Some((tail, readable)) = read else {
+                    return commands;
+                };
+                rest = tail;
+                if !readable {
+                    words = None;
+                }
+            }
+            b'$' | b'`' | b'(' | b')' | b'|' | b'&' | b'<' | b'>' => words = None,
+            other => word.get_or_insert_with(Vec::new).push(other),
+        }
+    }
+    end_word(&mut word, &mut words);
+    if words.as_ref().is_none_or(|words| !words.is_empty()) {
+        commands.push(words);
+    }
+    commands
+}
+
+fn end_word(word: &mut Option<Vec<u8>>, words: &mut Option<Vec<Vec<u8>>>) {
+    if let (Some(word), Some(words)) = (word.take(), words.as_mut()) {
+        words.push(word);
+    }
+}
+
+/// The rest of a `"…"` word into `word`: what follows the closing quote (`None` when there is
+/// none) and whether the word is its text alone. A backslash escapes only `$`, `` ` ``, `"`, `\`
+/// and a newline, as in the shell; an unescaped `$` or `` ` `` is an expansion, not text.
+fn double_quoted<'a>(mut rest: &'a [u8], word: &mut Vec<u8>) -> Option<(&'a [u8], bool)> {
+    let mut readable = true;
+    loop {
+        let (&byte, tail) = rest.split_first()?;
+        rest = tail;
+        match byte {
+            b'"' => return Some((rest, readable)),
+            b'\\' => {
+                let (&escaped, tail) = rest.split_first()?;
+                rest = tail;
+                match escaped {
+                    b'$' | b'`' | b'"' | b'\\' => word.push(escaped),
+                    b'\n' => {}
+                    other => word.extend_from_slice(&[b'\\', other]),
+                }
+            }
+            b'$' | b'`' => readable = false,
+            other => word.push(other),
+        }
+    }
+}
+
+/// The rest of a `$'…'` word into `word` with its escapes decoded: what follows the closing quote
+/// (`None` when there is none) and whether every escape was one this decodes. `\u`, `\c` and the
+/// like are not, and leave the command unread rather than wrong.
+fn ansi_c_quoted<'a>(mut rest: &'a [u8], word: &mut Vec<u8>) -> Option<(&'a [u8], bool)> {
+    let mut readable = true;
+    loop {
+        let (&byte, tail) = rest.split_first()?;
+        rest = tail;
+        if byte == b'\'' {
+            return Some((rest, readable));
+        }
+        if byte != b'\\' {
+            word.push(byte);
+            continue;
+        }
+        let (&escaped, tail) = rest.split_first()?;
+        rest = tail;
+        let decoded = match escaped {
+            b'n' => Some(b'\n'),
+            b't' => Some(b'\t'),
+            b'r' => Some(b'\r'),
+            b'a' => Some(0x07),
+            b'b' => Some(0x08),
+            b'e' | b'E' => Some(0x1b),
+            b'f' => Some(0x0c),
+            b'v' => Some(0x0b),
+            b'\\' | b'\'' | b'"' | b'?' => Some(escaped),
+            b'0'..=b'7' | b'x' => {
+                let (radix, lead) = if escaped == b'x' {
+                    (16, String::new())
+                } else {
+                    (8, char::from(escaped).to_string())
+                };
+                let digits = rest
+                    .iter()
+                    .take_while(|b| char::from(**b).is_digit(radix))
+                    .take(2)
+                    .count();
+                let (more, tail) = rest.split_at(digits);
+                rest = tail;
+                let text: String = lead
+                    .chars()
+                    .chain(more.iter().map(|b| char::from(*b)))
+                    .collect();
+                u32::from_str_radix(&text, radix)
+                    .ok()
+                    .and_then(|value| u8::try_from(value).ok())
+            }
+            _ => None,
+        };
+        match decoded {
+            Some(decoded) => word.push(decoded),
+            None => readable = false,
+        }
+    }
+}
+
 /// Write the snapshot to the state-in pipe, then close the fd.
 /// Uses blocking I/O on a dedicated thread (pipes are not regular files).
 pub async fn write_snapshot_to_pipe(snapshot: &str, fd: OwnedFd) -> std::io::Result<()> {
@@ -660,75 +885,126 @@ pub async fn write_snapshot_to_pipe(snapshot: &str, fd: OwnedFd) -> std::io::Res
     .map_err(std::io::Error::other)?
 }
 
-/// Read the full dump output from the state-out pipe with a timeout.
+/// Read the dump while the command runs, stopping at the end marker or EOF.
 ///
-/// If a background process inherits fd 4, the pipe never closes and the reader
-/// hangs. The timeout (5s close timeout) prevents this from
-/// blocking the actor loop forever. On timeout, returns whatever was read so far
-/// (which is typically empty, so marker validation will fail and prior state is kept).
+/// The caller bounds the wait *after* the shell exits. The descriptor is
+/// nonblocking so aborting this future closes it even if another process has
+/// inherited the write end; no blocking worker is left behind.
 pub async fn read_dump_from_pipe(fd: OwnedFd) -> std::io::Result<String> {
-    // Read until either of the END markers appears, *not* until EOF.
-    //
-    // When the user's command backgrounds a subprocess (`cmd &`), the bg
-    // shell inherits fd 4 (the dump pipe's write-end) and keeps it open
-    // until *it* exits. The parent shell finishes its dump and exits, but
-    // the kernel doesn't close the read-end's EOF until every write-end
-    // holder closes theirs. Without marker-driven termination we'd block
-    // on `read_to_string` for the entire bg lifetime, hit the 5s safety
-    // timeout, and discard the (perfectly complete) dump — which manifests
-    // as `cd` / function / alias state silently failing to persist after
-    // any command that backgrounds something. (See harness scenarios
-    // "State persistence after backgrounded command" and the cd-roundtrip
-    // tests for shell state persistence parity.)
-    //
-    // We additionally cap on `DUMP_READ_TIMEOUT` so a shell that crashed
-    // before emitting the END marker doesn't wedge the actor.
-    match tokio::time::timeout(
-        DUMP_READ_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
-            std::mem::forget(fd);
-            let mut buf = String::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let n = file.read(&mut chunk)?;
-                if n == 0 {
-                    // EOF: every write-end holder closed fd 4 (the
-                    // expected path when no bg subprocess was spawned).
-                    break;
-                }
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                // Either marker suffices; we accept whichever shell the
-                // child happens to be (bash vs zsh).
-                if buf.contains(BASH_STATE_END_MARKER) || buf.contains(ZSH_STATE_END_MARKER) {
-                    break;
-                }
-            }
-            drop(file);
-            Ok(buf)
-        }),
+    read_dump_with_limit(fd, MAX_DUMP_BYTES).await
+}
+
+async fn read_dump_with_limit(fd: OwnedFd, limit: usize) -> std::io::Result<String> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use tokio::io::unix::AsyncFd;
+
+    let flags = fcntl(&fd, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    fcntl(
+        &fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
     )
-    .await
-    {
-        Ok(join_result) => join_result.map_err(std::io::Error::other)?,
-        Err(_timeout) => {
-            tracing::warn!(
-                "shell state dump read timed out after {}s (END marker never arrived)",
-                DUMP_READ_TIMEOUT.as_secs()
-            );
-            Ok(String::new())
+    .map_err(std::io::Error::from)?;
+    let fd = AsyncFd::new(fd)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut trailing = Vec::new();
+    let mut exceeded = false;
+    let mut since_yield = 0;
+    loop {
+        let mut ready = fd.readable().await?;
+        let n = match ready.try_io(|inner| {
+            nix::unistd::read(inner.get_ref(), &mut chunk).map_err(std::io::Error::from)
+        }) {
+            Ok(result) => result?,
+            Err(_) => continue,
+        };
+        if n == 0 {
+            break;
+        }
+        if !exceeded {
+            if n > limit.saturating_sub(bytes.len()) {
+                exceeded = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+        }
+        // Keep only a marker-sized overlap after an oversized dump. We keep
+        // draining without storing it so the shell can finish and retain its
+        // command exit status instead of receiving SIGPIPE while dumping.
+        trailing.extend_from_slice(&chunk[..n]);
+        let found = trailing
+            .windows(BASH_STATE_END_MARKER.len())
+            .any(|w| w == BASH_STATE_END_MARKER.as_bytes())
+            || trailing
+                .windows(ZSH_STATE_END_MARKER.len())
+                .any(|w| w == ZSH_STATE_END_MARKER.as_bytes());
+        if found {
+            break;
+        }
+        let overlap = BASH_STATE_END_MARKER.len().max(ZSH_STATE_END_MARKER.len()) - 1;
+        if trailing.len() > overlap {
+            trailing.drain(..trailing.len() - overlap);
+        }
+        since_yield += n;
+        if since_yield >= 64 * 1024 {
+            since_yield = 0;
+            tokio::task::yield_now().await;
         }
     }
+    if exceeded {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("shell state dump exceeded {limit} bytes"),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "shell_state_cli_facing_unchanged_tests.rs"]
+mod cli_facing_unchanged_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn oversized_dump_is_discarded_without_closing_live_writer() {
+        let (read, write) = os_pipe().unwrap();
+        let reader = tokio::spawn(read_dump_with_limit(read, 64));
+        nix::unistd::write(&write, &[b'x'; 80]).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reader.is_finished(),
+            "reader must keep draining while shell runs"
+        );
+        nix::unistd::write(&write, BASH_STATE_END_MARKER.as_bytes()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn cancelling_dump_reader_closes_open_pipe() {
+        let (read, write) = os_pipe().unwrap();
+        let reader = tokio::spawn(read_dump_from_pipe(read));
+        tokio::task::yield_now().await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            nix::unistd::write(&write, b"x"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
 
     #[test]
     fn shell_env_overrides_marks_agent_terminal() {
@@ -875,6 +1151,87 @@ mod tests {
         assert_eq!(state.snapshot, "old stuff");
     }
 
+    /// A snapshot as the dump script writes one, with `script` as its `export -p` block.
+    fn snapshot_with_exports(script: &str) -> String {
+        let payload = base64::engine::general_purpose::STANDARD.encode(script);
+        format!(
+            "\ngrok_snap_ENV_VARS_B64=$(command base64 -d <<'GROK_SNAP_EOF_ENV_VARS_B64'\n\
+             {payload}\nGROK_SNAP_EOF_ENV_VARS_B64\n)\neval \"$grok_snap_ENV_VARS_B64\"\n"
+        )
+    }
+
+    fn utf8_exports(snapshot: &str) -> Vec<(String, String)> {
+        snapshot_exports(snapshot)
+            .into_iter()
+            .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
+            .collect()
+    }
+
+    /// The exports a snapshot replays read back through the quoting both shells print: bash's
+    /// `declare -x NAME="…"` with its backslash escapes and a multi-line value, zsh's bare,
+    /// `'…'` and `$'…'` words. A name with no value, a tied parameter and a word needing an
+    /// expansion are left out rather than guessed.
+    #[test]
+    fn snapshot_exports_read_back_both_shells_quoting() {
+        let bash = "declare -x PYTHONUSERBASE=\"/opt/py user\"\n\
+                    declare -x ESCAPED=\"a\\\"b\\$c\\\\d\\`e\"\n\
+                    declare -x MULTI=\"one\ntwo\"\n\
+                    declare -x OLDPWD\n\
+                    declare -rx READONLY=\"r\"\n";
+        let zsh = "export XDG_DATA_HOME=/opt/share\n\
+                   export QUOTED='it'\\''s'\n\
+                   export ANSI=$'tab\\there\\041'\n\
+                   typeset -x EMPTY=''\n\
+                   export -T PATHLIKE pathlike=( /a /b )\n\
+                   export EXPANDS=\"$HOME\"\n";
+        let expected: Vec<(String, String)> = [
+            ("PYTHONUSERBASE", "/opt/py user"),
+            ("ESCAPED", "a\"b$c\\d`e"),
+            ("MULTI", "one\ntwo"),
+            ("READONLY", "r"),
+            ("XDG_DATA_HOME", "/opt/share"),
+            ("QUOTED", "it's"),
+            ("ANSI", "tab\there!"),
+            ("EMPTY", ""),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        assert_eq!(
+            expected,
+            utf8_exports(&snapshot_with_exports(&format!("{bash}{zsh}")))
+        );
+        assert!(snapshot_exports("# no exports block\n").is_empty());
+    }
+
+    /// A real dump from each shell reads back to the value the shell exported, whatever quoting
+    /// the value needs.
+    #[tokio::test]
+    async fn snapshot_exports_read_back_a_real_dump() {
+        let value = "/opt/py user/it's \"q\" $HOME `x` \\ tab\there";
+        let policy = crate::util::ShellEnvironmentPolicy {
+            set: HashMap::from([("PYTHONUSERBASE".to_owned(), value.to_owned())]),
+            ..Default::default()
+        };
+        let cwd = std::env::current_dir().unwrap();
+        for (shell, available) in [
+            (ShellKind::Bash, bash_available()),
+            (ShellKind::Zsh, zsh_available()),
+        ] {
+            if !available {
+                continue;
+            }
+            let state = ShellState::init(shell, &cwd, Some(&policy), None)
+                .await
+                .unwrap();
+            let exports = utf8_exports(&state.snapshot);
+            assert!(
+                exports.contains(&("PYTHONUSERBASE".to_owned(), value.to_owned())),
+                "{shell:?}: {exports:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_init_bash() {
         // Integration test: actually runs bash and captures state.
@@ -883,7 +1240,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
         assert!(state.cwd.is_absolute());
         // The snapshot should contain at least some env var exports
         assert!(
@@ -902,7 +1261,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Run "export GROK_TEST_VAR=hello" and capture the new state
         let prep = state
@@ -964,19 +1325,31 @@ mod tests {
 
     /// Helper: run a command against a ShellState, update state, return (exit_code, stdout).
     async fn run_command(state: &mut ShellState, command: &str) -> (i32, String) {
+        let (code, stdout, _, _) = run_command_with_options(state, command, None, &[], None).await;
+        (code, stdout)
+    }
+
+    async fn run_command_with_options(
+        state: &mut ShellState,
+        command: &str,
+        cwd_override: Option<&Path>,
+        env: &[(&str, &str)],
+        notice: Option<&str>,
+    ) -> (i32, String, String, bool) {
         use command_fds::CommandFdExt;
 
         let prep = state
             .prepare_command(
                 command,
-                None,
+                cwd_override,
                 crate::computer::local::SearchShadowConfig::default(),
-                None,
+                notice,
             )
             .unwrap();
         let mut cmd = tokio::process::Command::new(&prep.binary);
         cmd.args(&prep.args)
             .current_dir(&prep.cwd)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -997,11 +1370,451 @@ mod tests {
         let output = child.wait_with_output().await.unwrap();
         write_handle.await.unwrap().unwrap();
         let dump = read_handle.await.unwrap().unwrap();
-        state.update_from_dump(&dump);
+        let updated = state.update_from_dump(&dump);
 
-        let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        (code, stdout)
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            updated,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_restore_runs_once_in_fresh_shell_and_recovers() {
+        let snapshots = [
+            "export GROK_TEST_PARTIAL=bad; cd /; false; export GROK_TEST_AFTER=bad",
+            "export GROK_TEST_PARTIAL=bad; eval 'if'; export GROK_TEST_AFTER=bad",
+            "export GROK_TEST_PARTIAL=bad; readonly GROK_TEST_LOCK=old; export GROK_TEST_LOCK=new; export GROK_TEST_AFTER=bad",
+            "export GROK_TEST_PARTIAL=bad; eval 'readonly GROK_TEST_LOCK=old; export GROK_TEST_LOCK=new; export GROK_TEST_AFTER=bad'; export GROK_TEST_AFTER=bad",
+            "export GROK_TEST_PARTIAL=bad; readonly PWD; false",
+            "export GROK_TEST_PARTIAL=bad; exit 0",
+            "if",
+        ];
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            for snapshot in snapshots {
+                let dir = tempfile::tempdir().unwrap();
+                let cwd = dir.path().canonicalize().unwrap();
+                let count_file = dir.path().join("count");
+                let count_path = count_file.to_str().unwrap();
+                let mut state = ShellState {
+                    cwd: std::env::current_dir().unwrap(),
+                    snapshot: snapshot.into(),
+                    shell,
+                };
+                let command = "printf 'run\\n' >> \"$GROK_TEST_COUNT\"; \
+                    printf '%s|%s|%s|%s|%s|%s\\n' \
+                    \"${GROK_TEST_PARTIAL-unset}\" \"${GROK_TEST_AFTER-unset}\" \
+                    \"$GROK_TEST_REQUEST\" \"$GROK_AGENT\" \"$PWD\" \"$#\"; \
+                    export GROK_TEST_RECOVERED=ok; false";
+                let (code, stdout, stderr, updated) = run_command_with_options(
+                    &mut state,
+                    command,
+                    Some(&cwd),
+                    &[
+                        ("GROK_TEST_COUNT", count_path),
+                        ("GROK_TEST_REQUEST", "request"),
+                        ("GROK_TEST_PARTIAL", "fresh"),
+                        ("GROK_TEST_AFTER", "initial"),
+                        ("GROK_AGENT", "wrong"),
+                    ],
+                    Some("notice\n"),
+                )
+                .await;
+                assert_eq!(code, 1, "{shell:?}: {snapshot}: {stderr}");
+                assert_eq!(
+                    stdout,
+                    format!("notice\nfresh|initial|request|1|{}|0\n", cwd.display()),
+                    "{shell:?}: {snapshot}"
+                );
+                assert!(
+                    stderr.contains("failed to restore shell state"),
+                    "{shell:?}: {snapshot}: {stderr}"
+                );
+                assert_eq!(std::fs::read_to_string(&count_file).unwrap(), "run\n");
+                assert!(
+                    updated,
+                    "fallback must produce a valid dump for {shell:?}: {snapshot}"
+                );
+                assert_eq!(state.cwd, cwd);
+                let (code, stdout, stderr, updated) = run_command_with_options(
+                    &mut state,
+                    "printf '%s|%s' \"$GROK_TEST_RECOVERED\" \"${GROK_TEST_PARTIAL-unset}\"",
+                    None,
+                    &[],
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    (code, stdout.as_str()),
+                    (0, "ok|fresh"),
+                    "{shell:?}: {snapshot}: {stderr}"
+                );
+                assert!(
+                    updated && !stderr.contains("failed to restore shell state"),
+                    "{shell:?}: {snapshot}: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_success_or_failure_never_repeats_user_exit() {
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            for snapshot in [
+                "export GROK_TEST_OK=yes",
+                "export GROK_TEST_PARTIAL=bad; false",
+            ] {
+                for command in [
+                    "printf 'run\\n' >> \"$GROK_TEST_COUNT\"; exit 23",
+                    "printf 'run\\n' >> \"$GROK_TEST_COUNT\"; exec /bin/sh -c 'exit 23'",
+                ] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let count_file = dir.path().join("count");
+                    let mut state = ShellState {
+                        cwd: dir.path().into(),
+                        snapshot: snapshot.into(),
+                        shell,
+                    };
+                    let (code, _, stderr, updated) = run_command_with_options(
+                        &mut state,
+                        command,
+                        None,
+                        &[("GROK_TEST_COUNT", count_file.to_str().unwrap())],
+                        None,
+                    )
+                    .await;
+                    assert_eq!(code, 23, "{shell:?}: {snapshot}: {stderr}");
+                    assert_eq!(std::fs::read_to_string(&count_file).unwrap(), "run\n");
+                    assert_eq!(
+                        stderr.contains("failed to restore shell state"),
+                        snapshot.contains("false")
+                    );
+                    assert!(!updated, "an explicit exit or exec bypasses the state dump");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_fallback_does_not_repeat_user_startup_files() {
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let startup = dir.path().join(if shell == ShellKind::Bash {
+                "bash_env"
+            } else {
+                ".zshenv"
+            });
+            let count = dir.path().join("startup_count");
+            std::fs::write(
+                &startup,
+                "printf 'startup\\n' >> \"$GROK_TEST_STARTUP_COUNT\"\n",
+            )
+            .unwrap();
+            let startup_key = if shell == ShellKind::Bash {
+                "BASH_ENV"
+            } else {
+                "ZDOTDIR"
+            };
+            let startup_value = if shell == ShellKind::Bash {
+                startup.as_path()
+            } else {
+                dir.path()
+            };
+            let mut state = ShellState {
+                cwd: dir.path().into(),
+                snapshot: format!("export {startup_key}=/invalid; false"),
+                shell,
+            };
+            let (code, stdout, stderr, updated) = run_command_with_options(
+                &mut state,
+                &format!("printf '%s' \"{}{}\"", '$', startup_key),
+                None,
+                &[
+                    (startup_key, startup_value.to_str().unwrap()),
+                    ("GROK_TEST_STARTUP_COUNT", count.to_str().unwrap()),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(code, 0, "{shell:?}: {stderr}");
+            assert_eq!(stdout, startup_value.to_str().unwrap());
+            assert_eq!(std::fs::read_to_string(count).unwrap(), "startup\n");
+            assert!(updated && stderr.contains("failed to restore shell state"));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_fallback_retains_bash_extended_globs() {
+        if !bash_available() {
+            return;
+        }
+        let mut state = ShellState {
+            cwd: std::env::current_dir().unwrap(),
+            snapshot: "false".into(),
+            shell: ShellKind::Bash,
+        };
+        let (code, stdout, stderr, updated) = run_command_with_options(
+            &mut state,
+            "case abc in @(abc|def)) printf matched;; esac",
+            None,
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!((code, stdout.as_str()), (0, "matched"), "{stderr}");
+        assert!(updated && stderr.contains("failed to restore shell state"));
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_shell_signal_status_and_exit_codes() {
+        use command_fds::CommandFdExt;
+        use std::os::unix::process::ExitStatusExt;
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            for snapshot in ["", "export GROK_TEST_PARTIAL=bad; false"] {
+                for (command, expected_signal, expected_code) in [
+                    ("kill -TERM $$; printf survived", Some(libc::SIGTERM), None),
+                    ("exec /bin/sh -c 'kill -TERM $$'", Some(libc::SIGTERM), None),
+                    ("exit 143", None, Some(143)),
+                ] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let state = ShellState {
+                        cwd: dir.path().into(),
+                        snapshot: snapshot.into(),
+                        shell,
+                    };
+                    let prep = state
+                        .prepare_command(
+                            command,
+                            None,
+                            crate::computer::local::SearchShadowConfig::default(),
+                            None,
+                        )
+                        .unwrap();
+                    let mut cmd = tokio::process::Command::new(&prep.binary);
+                    cmd.args(&prep.args)
+                        .current_dir(&prep.cwd)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true);
+                    cmd.fd_mappings(prep.fd_mappings).unwrap();
+                    #[allow(clippy::disallowed_methods)] // test fixture; the test reaps it
+                    let child = cmd.spawn().unwrap();
+                    drop(cmd);
+                    let write = tokio::spawn(async move {
+                        write_snapshot_to_pipe(&state.snapshot, prep.state_in_write).await
+                    });
+                    let read_dump =
+                        tokio::spawn(async move { read_dump_from_pipe(prep.state_out_read).await });
+                    let output = child.wait_with_output().await.unwrap();
+                    write.await.unwrap().unwrap();
+                    read_dump.await.unwrap().unwrap();
+                    assert_eq!(
+                        output.status.signal(),
+                        expected_signal,
+                        "{shell:?}: {snapshot}: {command}"
+                    );
+                    assert_eq!(
+                        output.status.code(),
+                        expected_code,
+                        "{shell:?}: {snapshot}: {command}"
+                    );
+                    assert!(output.stdout.is_empty(), "{shell:?}: {snapshot}: {command}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_restore_never_dispatches_user_command() {
+        use command_fds::CommandFdExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let ran = dir.path().join("ran");
+            let state = ShellState {
+                cwd: dir.path().into(),
+                snapshot: "sh -c 'printf \"restore-ready\\n\"; exec sleep 30' & wait $!; false"
+                    .into(),
+                shell,
+            };
+            let prep = state
+                .prepare_command(
+                    "printf run > \"$GROK_TEST_RAN\"",
+                    None,
+                    crate::computer::local::SearchShadowConfig::default(),
+                    None,
+                )
+                .unwrap();
+            let mut cmd = tokio::process::Command::new(&prep.binary);
+            cmd.args(&prep.args)
+                .current_dir(&prep.cwd)
+                .env("GROK_TEST_RAN", &ran)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            crate::util::new_process_group(&mut cmd);
+            cmd.fd_mappings(prep.fd_mappings).unwrap();
+            #[allow(clippy::disallowed_methods)] // attached to a process group below
+            let mut child = cmd.spawn().unwrap();
+            drop(cmd);
+            let mut group = crate::util::ProcessGroup::new().unwrap();
+            group.attach(&child).unwrap();
+            let write = tokio::spawn(async move {
+                write_snapshot_to_pipe(&state.snapshot, prep.state_in_write).await
+            });
+            let read_dump =
+                tokio::spawn(async move { read_dump_from_pipe(prep.state_out_read).await });
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            let ready =
+                tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line)).await;
+            group.terminate().unwrap();
+            let waited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            if waited.is_err() {
+                let _ = group.kill();
+            }
+            let status = waited
+                .expect("restore did not stop after cancellation")
+                .unwrap();
+            let mut rest = String::new();
+            let eof =
+                tokio::time::timeout(Duration::from_secs(5), output.read_to_string(&mut rest))
+                    .await;
+            if eof.is_err() {
+                let _ = group.kill();
+            }
+            eof.expect("restore descendant survived cancellation")
+                .unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .await
+                .unwrap();
+            write.await.unwrap().unwrap();
+            read_dump.await.unwrap().unwrap();
+            assert!(ready.is_ok(), "restore did not start for {shell:?}");
+            assert_eq!(line, "restore-ready\n");
+            assert!(!status.success());
+            assert!(rest.is_empty());
+            assert!(!ran.exists(), "cancelled restore dispatched user command");
+            assert!(
+                !stderr.contains("failed to restore shell state"),
+                "{stderr}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_command_streams_and_process_group_cancellation_reaches_children() {
+        use command_fds::CommandFdExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            if (shell == ShellKind::Bash && !bash_available())
+                || (shell == ShellKind::Zsh && !zsh_available())
+            {
+                continue;
+            }
+            for snapshot in [
+                "export GROK_TEST_OK=yes",
+                "export GROK_TEST_PARTIAL=bad; false",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let state = ShellState {
+                    cwd: dir.path().into(),
+                    snapshot: snapshot.into(),
+                    shell,
+                };
+                let prep = state
+                    .prepare_command(
+                        "sleep 30 & printf 'ready\\n'; wait $!; printf late",
+                        None,
+                        crate::computer::local::SearchShadowConfig::default(),
+                        None,
+                    )
+                    .unwrap();
+                let mut cmd = tokio::process::Command::new(&prep.binary);
+                cmd.args(&prep.args)
+                    .current_dir(&prep.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                crate::util::new_process_group(&mut cmd);
+                cmd.fd_mappings(prep.fd_mappings).unwrap();
+                #[allow(clippy::disallowed_methods)] // attached to a process group below
+                let mut child = cmd.spawn().unwrap();
+                drop(cmd);
+                let mut group = crate::util::ProcessGroup::new().unwrap();
+                group.attach(&child).unwrap();
+                let write = tokio::spawn(async move {
+                    write_snapshot_to_pipe(&state.snapshot, prep.state_in_write).await
+                });
+                let read_dump =
+                    tokio::spawn(async move { read_dump_from_pipe(prep.state_out_read).await });
+                let mut output = BufReader::new(child.stdout.take().unwrap());
+                let mut first_line = String::new();
+                let ready =
+                    tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut first_line))
+                        .await;
+                // Kill before asserting, so a broken streaming test cannot
+                // leave a long-running child behind on failure.
+                group.kill().unwrap();
+                let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut rest = String::new();
+                tokio::time::timeout(Duration::from_secs(5), output.read_to_string(&mut rest))
+                    .await
+                    .expect("descendant kept stdout open after process-group cancellation")
+                    .unwrap();
+                write.await.unwrap().unwrap();
+                read_dump.await.unwrap().unwrap();
+                assert!(
+                    ready.is_ok(),
+                    "output did not stream for {shell:?}: {snapshot}"
+                );
+                assert_eq!(first_line, "ready\n");
+                assert!(!status.success());
+                assert!(
+                    rest.is_empty(),
+                    "command continued after cancellation: {rest:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1010,7 +1823,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // cd to /tmp (macOS resolves to /private/tmp via symlink)
         let (code, _) = run_command(&mut state, "cd /tmp").await;
@@ -1033,7 +1848,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Export a variable
         let (code, _) = run_command(&mut state, "export MY_TEST_VAR=persistent_value").await;
@@ -1052,7 +1869,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         let (code, _) = run_command(&mut state, "export GPG_TTY=/grok-sentinel-tty").await;
         assert_eq!(code, 0);
@@ -1072,7 +1891,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None, None)
+            .await
+            .unwrap();
 
         let (code, _) = run_command(&mut state, "export GPG_TTY=/grok-sentinel-tty").await;
         assert_eq!(code, 0);
@@ -1092,7 +1913,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None, None)
+            .await
+            .unwrap();
 
         let prep = state
             .prepare_command(
@@ -1111,7 +1934,7 @@ mod tests {
             .find("eval \"$snap\"")
             .expect("wrapper must restore snapshot via eval \"$snap\"");
         let nonomatch_pos = wrapper
-            .find("setopt nonomatch")
+            .rfind("setopt nonomatch")
             .expect("wrapper must force nonomatch after snapshot restore");
         assert!(
             nonomatch_pos > snap_pos,
@@ -1137,7 +1960,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Define a function
         let (code, _) = run_command(&mut state, "greet() { echo \"hello $1\"; }").await;
@@ -1165,7 +1990,9 @@ mod tests {
         std::fs::write(&probe, "echo \"SOURCED_ARGC=$#\"\n").unwrap();
 
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         let (code, stdout) = run_command(
             &mut state,
@@ -1190,7 +2017,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Turn on allexport; the option is captured by the dump and replayed
         // into every subsequent command's shell.
@@ -1225,7 +2054,9 @@ mod tests {
         std::fs::write(&probe, "echo \"SOURCED_ARGC=$#\"\n").unwrap();
 
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None, None)
+            .await
+            .unwrap();
 
         let (code, stdout) = run_command(
             &mut state,
@@ -1246,7 +2077,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Define an alias
         let (code, _) = run_command(&mut state, "alias ll='ls -la'").await;
@@ -1273,7 +2106,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         let prep = state.prepare_command("true", None, shadows, None).unwrap();
         // Shadows enabled → the self-resolving find/grep functions are always
@@ -1312,7 +2147,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None, None)
+            .await
+            .unwrap();
 
         // Set up some state
         let (_, _) = run_command(&mut state, "export SURVIVE_TEST=yes").await;
