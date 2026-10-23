@@ -289,6 +289,7 @@ mod tests {
 
     fn config(base_url: String) -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: Some("codex-token".to_string()),
             base_url,
             model: "gpt-test".to_string(),
@@ -319,6 +320,7 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: true,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,

@@ -19,6 +19,9 @@ use crate::types::RequestId;
 pub enum SamplingChannel {
     Text,
     Reasoning,
+    /// A progress update the model wrote for the user between tool calls.
+    /// The deltas stream on `Reasoning`. The finished block is re-emitted whole on this channel.
+    Narration,
 }
 
 /// Why the in-flight request was stripped. What to do about it (e.g. persist
@@ -92,9 +95,10 @@ pub enum SamplingEvent {
     /// Responses: fired on `function_call_arguments.done` /
     /// `custom_tool_call_input.done`, with `output_item.done` and terminal
     /// response backstops when per-call done events are absent. Messages: fired on
-    /// `content_block_stop` for `tool_use` blocks. Chat Completions has no
+    /// `content_block_stop` for complete JSON input; ambiguous empty placeholders
+    /// wait for a known non-truncated stop. Chat Completions has no
     /// per-call completion signal and calls may interleave, so it completes
-    /// calls only at `finish_reason` or stream end.
+    /// calls only at `finish_reason`.
     ///
     /// Never emitted after `Completed`/`Failed` for that call. `id`/`name`
     /// repeat the identity only when this event is the first to carry it;
@@ -142,7 +146,15 @@ pub enum SamplingEvent {
         metrics: InferenceLatencyStats,
     },
 
-    /// In-flight strip before retry. Persist on `ServerRejected`.
+    /// All server-reported doom-loop labels observed on an attempt that is being discarded before `Completed` can carry its response.
+    /// Labels only; recovery policy remains encoded separately on `Retrying`.
+    DoomLoopSignals {
+        request_id: RequestId,
+        triggers: Vec<String>,
+    },
+
+    /// Images were stripped from the in-flight request before a retry.
+    /// Persist the strip on `ServerRejected`.
     ImagesStripped {
         request_id: RequestId,
         /// URLs actually stripped from this request.
@@ -198,6 +210,29 @@ pub enum SamplingEvent {
     },
 }
 
+impl SamplingEvent {
+    /// Sampler request that owns this event.
+    pub fn request_id(&self) -> &RequestId {
+        match self {
+            Self::StreamStarted { request_id, .. }
+            | Self::FirstToken { request_id }
+            | Self::ChannelToken { request_id, .. }
+            | Self::ToolCallDelta { request_id, .. }
+            | Self::ToolCallArgumentsComplete { request_id, .. }
+            | Self::ResponseStarted { request_id, .. }
+            | Self::ReasoningCompleted { request_id, .. }
+            | Self::Completed { request_id, .. }
+            | Self::DoomLoopSignals { request_id, .. }
+            | Self::ImagesStripped { request_id, .. }
+            | Self::Retrying { request_id, .. }
+            | Self::Failed { request_id, .. }
+            | Self::ModelMetadata { request_id, .. }
+            | Self::BackendToolCallStarted { request_id, .. }
+            | Self::BackendToolCallCompleted { request_id, .. } => request_id,
+        }
+    }
+}
+
 /// Serializable mirror of [`SamplingError`].
 ///
 /// The rich `SamplingError` carries non-serializable inner values
@@ -245,11 +280,9 @@ pub struct SamplingErrorInfo {
 
 /// Coarse-grained classification of a sampling failure.
 ///
-/// Intentionally narrow — context-window-exceeded does NOT have its own
-/// variant because the sampler cannot reliably detect it (it lacks
-/// tracked token counts). Context-window errors arrive as
-/// `Api { status: 400, .. }` with model metadata; the session inspects
-/// the metadata and decides whether to compact.
+/// Intentionally narrow — context-window-exceeded does not have its own
+/// variant. The session uses a provider error code or message, and any
+/// available model metadata and token estimate, to decide whether to compact.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SamplingErrorKind {
     Auth,
@@ -281,6 +314,30 @@ impl SamplingErrorKind {
             SamplingErrorKind::MaxTokensTruncation => "max_tokens_truncation",
             SamplingErrorKind::DoomLoopDetected => "doom_loop_detected",
         }
+    }
+}
+
+/// [`SamplingErrorKind::from_str`] error: the wire string matched no known kind (a newer peer's kind); callers degrade to untyped via `.ok()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownSamplingErrorKind;
+
+/// Inverse of [`SamplingErrorKind::as_str`]; the round-trip test exercises both maps for every listed variant.
+impl std::str::FromStr for SamplingErrorKind {
+    type Err = UnknownSamplingErrorKind;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "auth" => Self::Auth,
+            "http" => Self::Http,
+            "api" => Self::Api,
+            "serialization" => Self::Serialization,
+            "idle_timeout" => Self::IdleTimeout,
+            "rate_limited" => Self::RateLimited,
+            "empty_response" => Self::EmptyResponse,
+            "max_tokens_truncation" => Self::MaxTokensTruncation,
+            "doom_loop_detected" => Self::DoomLoopDetected,
+            _ => return Err(UnknownSamplingErrorKind),
+        })
     }
 }
 
@@ -369,6 +426,19 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
     use xai_grok_sampling_types::ApiErrorCode;
+
+    #[test]
+    fn arguments_complete_retains_request_ownership() {
+        let request_id = RequestId::from("request-tool-complete");
+        let event = SamplingEvent::ToolCallArgumentsComplete {
+            request_id: request_id.clone(),
+            tool_index: 0,
+            id: Some("call-1".into()),
+            name: Some("exec".into()),
+        };
+
+        assert_eq!(event.request_id(), &request_id);
+    }
 
     #[test]
     fn from_sampling_error_carries_should_retry_header() {
@@ -548,5 +618,32 @@ mod tests {
         assert_eq!(info.kind, SamplingErrorKind::IdleTimeout);
         assert!(!info.is_retryable);
         assert!(info.message.contains("300s"));
+    }
+
+    #[test]
+    fn error_kind_wire_string_round_trips_for_every_variant() {
+        use SamplingErrorKind::*;
+        let all = [
+            Auth,
+            Http,
+            Api,
+            Serialization,
+            IdleTimeout,
+            RateLimited,
+            EmptyResponse,
+            MaxTokensTruncation,
+            DoomLoopDetected,
+        ];
+        for kind in all {
+            match kind {
+                Auth | Http | Api | Serialization | IdleTimeout | RateLimited | EmptyResponse
+                | MaxTokensTruncation | DoomLoopDetected => {}
+            }
+            assert_eq!(kind.as_str().parse(), Ok(kind));
+        }
+        assert_eq!(
+            "nope".parse::<SamplingErrorKind>(),
+            Err(UnknownSamplingErrorKind)
+        );
     }
 }

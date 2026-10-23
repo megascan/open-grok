@@ -2,6 +2,91 @@
 use super::support::*;
 use super::*;
 
+#[tokio::test]
+async fn native_agent_carrier_closes_pristine_rewind_window_before_commit() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for through_setup in [false, true] {
+                let (actor, _) = build_actor().await;
+                actor.state.lock().await.rewindable = true;
+                actor
+                    .pending_native_agent_messages
+                    .lock()
+                    .push(ConversationItem::system_reminder("native mail"));
+                if through_setup {
+                    actor.flush_pending_skill_reminders().await;
+                } else {
+                    assert!(actor.drain_pending_interjections().await);
+                }
+                assert!(!actor.state.lock().await.rewindable);
+                assert!(actor.pending_native_agent_messages.lock().is_empty());
+                assert!(
+                    actor
+                        .chat_state_handle
+                        .get_conversation()
+                        .await
+                        .iter()
+                        .any(|item| item.text_content().contains("native mail"))
+                );
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn model_authored_interjections_keep_agent_message_classification() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (actor, _) = build_actor().await;
+            actor.state.lock().await.rewindable = true;
+            for (origin, text) in [
+                (
+                    crate::session::PromptOrigin::AgentMessage {
+                        message_id: "team-1".into(),
+                    },
+                    "<agent_message sender=\"worker\">team mail</agent_message>",
+                ),
+                (
+                    crate::session::PromptOrigin::PeerSessionMessage {
+                        message_id: "peer-1".into(),
+                    },
+                    "<agent_message sender=\"session\">peer mail</agent_message>",
+                ),
+            ] {
+                actor.pending_interjections.push(PendingInterjection {
+                    text: text.into(),
+                    attachments: vec![],
+                    origin,
+                });
+            }
+            assert!(actor.drain_pending_interjections().await);
+            assert!(
+                !actor.state.lock().await.rewindable,
+                "accepted model mail must survive a later cancel"
+            );
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let messages: Vec<_> = conversation
+                .iter()
+                .filter_map(|item| match item {
+                    ConversationItem::User(user)
+                        if user.synthetic_reason == Some(SyntheticReason::AgentMessage) =>
+                    {
+                        Some(item.text_content())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                [
+                    "<agent_message sender=\"worker\">team mail</agent_message>",
+                    "<agent_message sender=\"session\">peer mail</agent_message>"
+                ]
+            );
+        })
+        .await;
+}
+
 /// Draining a mid-turn interjection pushes a standalone synthetic user
 /// message tagged [`SyntheticReason::Interjection`] — even when the
 /// conversation tail is a `ToolResult`. The tool result content must be
@@ -18,6 +103,7 @@ async fn drain_interjections_pushes_synthetic_user_message_after_tool_result() {
                 .chat_state_handle
                 .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "please also add tests".to_string(),
                 attachments: vec![],
             });
@@ -85,14 +171,17 @@ async fn drain_multiple_interjections_pushes_one_user_message_each_in_order() {
                 .chat_state_handle
                 .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "first steer".to_string(),
                 attachments: vec![],
             });
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "second steer".to_string(),
                 attachments: vec![],
             });
             actor.pending_interjections.push(PendingInterjection {
+                origin: crate::session::PromptOrigin::User,
                 text: "third steer".to_string(),
                 attachments: vec![],
             });
@@ -175,17 +264,11 @@ mod interjection_format_tests {
     }
 
     #[test]
-    fn interjection_reminds_to_finish_previous_work() {
+    fn interjection_does_not_defer_the_user() {
         let wrapped = format_interjection("please also add tests".to_string());
         assert!(
             !wrapped.contains("After completing your current task"),
             "interjection must not defer the user's message, got: {wrapped}"
-        );
-        assert!(
-            wrapped.trim_end().ends_with(
-                "</user_query>\nMake sure to complete any unfinished tasks from previous turns."
-            ),
-            "unfinished-task reminder must follow the wrapped query, got: {wrapped}"
         );
     }
 }

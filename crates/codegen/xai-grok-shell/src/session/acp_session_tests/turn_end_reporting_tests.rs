@@ -102,9 +102,21 @@ impl Harness {
         tokio::sync::mpsc::UnboundedSender<SessionCommand>,
         std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>,
     ) {
+        let (cmd, fired, _) = self.spawn_loop_with_completion().await;
+        (cmd, fired)
+    }
+
+    async fn spawn_loop_with_completion(
+        &mut self,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+        std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>,
+        tokio::sync::mpsc::UnboundedSender<TurnCompletionMsg>,
+    ) {
         if let Some(queue) = self.queue.take() {
             queue.drain().await;
         }
+        let (completion_tx, completion_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
         self.chat = Some(chat_tx);
@@ -128,7 +140,7 @@ impl Harness {
                 }
             }
         });
-        tokio::task::spawn_local(super::run_session(
+        tokio::task::spawn_local(super::run_session_with_completion(
             self.actor.clone(),
             cmd_rx,
             chat_rx,
@@ -139,8 +151,10 @@ impl Harness {
             )),
             std::path::PathBuf::from("/tmp"),
             crate::session::fs_watch::FsWatchCapabilities::none(),
+            completion_tx.clone(),
+            completion_rx,
         ));
-        (cmd_tx, fired)
+        (cmd_tx, fired, completion_tx)
     }
 
     fn listen(&self, events: &[HookEventName]) {
@@ -164,9 +178,9 @@ impl Harness {
         &self,
         prompt_id: &str,
     ) -> tokio::sync::oneshot::Receiver<PromptTurnResult> {
-        self.start_turn(prompt_id).await;
         let (item, rx) = super::turn_completion_emit_tests::pending_input(prompt_id);
         self.actor.state.lock().await.pending_inputs.push_back(item);
+        self.start_turn(prompt_id).await;
         rx
     }
 
@@ -184,10 +198,18 @@ impl Harness {
             .current_prompt_id
             .lock()
             .expect("current_prompt_id mutex poisoned") = Some(prompt_id.to_string());
-        self.actor.state.lock().await.running_task = Some(AgentTask {
-            prompt_id: prompt_id.into(),
+        let mut state = self.actor.state.lock().await;
+        if state.pending_inputs.is_empty() {
+            state
+                .pending_inputs
+                .push_back(super::turn_completion_emit_tests::pending_input(prompt_id).0);
+        }
+        assert_eq!(state.pending_inputs.front().unwrap().prompt_id, prompt_id);
+        state.running_task = Some(AgentTask::new_at_epoch(
+            prompt_id,
+            self.actor.turn_report.epoch(),
             handle,
-        });
+        ));
     }
 
     async fn cancel(&self, trigger: CancelTrigger) -> super::tasks_cancel::CancelOutcome {
@@ -394,7 +416,9 @@ async fn a_rewind_reports_nothing_but_still_settles_the_session() {
         let outcome = h
             .actor
             .cancel_running_task(crate::session::CancelOptions {
-                rewind_if_no_output: true,
+                history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput {
+                    prompt_id: Some("p1".to_string()),
+                },
                 trigger: Some(CancelTrigger::Esc),
                 user_initiated: true,
                 ..Default::default()
@@ -497,7 +521,11 @@ async fn only_a_settled_main_session_offers_an_idle_ping() {
             "a running turn is not idle"
         );
 
-        parent.actor.state.lock().await.running_task = None;
+        {
+            let mut state = parent.actor.state.lock().await;
+            state.running_task.take().unwrap().abort();
+            state.pending_inputs.pop_front();
+        }
         // Suppressed by the interrupt that ended the turn, which must not swallow the ping.
         parent.actor.state.lock().await.notifications_suppressed = true;
         parent.actor.emit_session_idle_if_idle().await;
@@ -601,6 +629,83 @@ async fn the_loop_reports_and_settles_a_cancelled_turn() {
         assert_eq!(h.lifecycle.idles.get(), 1, "the loop must settle the host");
     })
     .await;
+}
+
+#[test]
+fn closed_rewind_window_runs_post_cancel_loop_work() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            for (requested_id, queued) in [
+                (Some("p1".to_owned()), true),
+                (None, true),
+                (Some("p1".to_owned()), false),
+                (None, false),
+            ] {
+                let mut h = Harness::new().await;
+                let temp = tempfile::TempDir::new().unwrap();
+                {
+                    let mut tracker = h.actor.goal_tracker.lock();
+                    *tracker =
+                        crate::session::goal_tracker::GoalTracker::new(temp.path().to_owned());
+                    tracker.create_goal(
+                        "g-test".into(),
+                        "test goal".into(),
+                        None,
+                        0,
+                        "2026-01-01T00:00:00Z".into(),
+                        None,
+                    );
+                }
+                let response = h.queue_turn("p1").await;
+                let promoted = if queued {
+                    let (mut input, _) = user_item_with_rx("p2", "alice");
+                    let (ready, rx) = tokio::sync::oneshot::channel();
+                    input.initial_child_prompt_ready = Some(ready);
+                    h.actor.state.lock().await.pending_inputs.push_back(input);
+                    Some(rx)
+                } else {
+                    None
+                };
+                h.actor.state.lock().await.rewindable = false;
+                let (cmd, _) = h.spawn_loop().await;
+                cmd.send(SessionCommand::Cancel(crate::session::CancelOptions {
+                    history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                        prompt_id: requested_id,
+                    },
+                    trigger: Some(CancelTrigger::Esc),
+                    user_initiated: true,
+                    ..Default::default()
+                }))
+                .unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(5), response)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .completion_kind,
+                    PromptCompletionKind::Cancelled { .. }
+                ));
+                if let Some(promoted) = promoted {
+                    tokio::time::timeout(Duration::from_secs(5), promoted)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while h.lifecycle.idles.get() == 0
+                            || !h.actor.goal_tracker.lock().status().unwrap().is_paused()
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                assert!(h.actor.goal_tracker.lock().status().unwrap().is_paused());
+            }
+        })
+    });
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -788,10 +893,13 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
         h.listen(&[HookEventName::StopCancelled]);
         let _p1 = h.queue_turn("p1").await;
 
+        let (epoch, task_identity) = completion_binding(&h.actor, "p1").await;
         let _ = h.cancel(CancelTrigger::CtrlC).await;
         h.actor
             .handle_completion(
                 "p1".into(),
+                epoch,
+                &task_identity,
                 Ok(PromptTurnOk {
                     stop_reason: acp::StopReason::Cancelled,
                     total_tokens: 0,
@@ -804,11 +912,99 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
                     usage: None,
                     tool_overrides: None,
                 }),
+                None,
             )
             .await;
         h.drain_turn_ends().await;
 
         assert_eq!(h.fired(), ["stop_cancelled"], "one turn, one report");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_completions_cannot_mutate_a_running_successor() {
+    run(async {
+        let mut h = Harness::new().await;
+        let _old = h.queue_turn("old").await;
+        let (old_epoch, old_identity) = completion_binding(&h.actor, "old").await;
+        let _ = h.cancel(CancelTrigger::CtrlC).await;
+        let _new = h.queue_turn("new").await;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        {
+            let mut tracker = h.actor.goal_tracker.lock();
+            *tracker = crate::session::goal_tracker::GoalTracker::new(temp.path().to_owned());
+            tracker.create_goal(
+                "successor-goal".into(),
+                "keep running".into(),
+                None,
+                0,
+                "2026-01-01T00:00:00Z".into(),
+                None,
+            );
+        }
+        set_goal_harness_for_tests(&h.actor);
+        h.actor
+            .goal_continuation_streak
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        h.actor.pending_interjections.push(PendingInterjection {
+            text: "new turn mail".into(),
+            attachments: Vec::new(),
+            origin: PromptOrigin::AgentMessage {
+                message_id: "successor-mail".into(),
+            },
+        });
+        let (cmd, _, completions) = h.spawn_loop_with_completion().await;
+        let results = [
+            Ok(PromptTurnOk {
+                stop_reason: acp::StopReason::EndTurn,
+                total_tokens: 0,
+                turn_snapshot: None,
+                completion_kind: PromptCompletionKind::Completed,
+                structured_output: None,
+                usage: None,
+                tool_overrides: None,
+            }),
+            Err(acp::Error::internal_error().data("old infrastructure error")),
+        ];
+        for result in results {
+            let (processed, done) = tokio::sync::oneshot::channel();
+            assert!(
+                completions
+                    .send(TurnCompletionMsg {
+                        prompt_id: "old".into(),
+                        epoch: old_epoch,
+                        task_identity: old_identity.clone(),
+                        result,
+                        elapsed_ms: None,
+                        processed: Some(processed),
+                    })
+                    .is_ok()
+            );
+            tokio::time::timeout(Duration::from_secs(5), done)
+                .await
+                .unwrap()
+                .unwrap();
+            // A command acknowledgement places this assertion after the entire
+            // completion arm, not merely after its test-only processed signal.
+            let (responds_to, response) = tokio::sync::oneshot::channel();
+            cmd.send(SessionCommand::GetActiveAgent { responds_to })
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(h.actor.state.lock().await.running_prompt_id(), Some("new"));
+            assert!(!h.actor.goal_tracker.lock().status().unwrap().is_paused());
+            assert_eq!(
+                h.actor
+                    .goal_continuation_streak
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+            assert_eq!(h.actor.pending_interjections.snapshot().len(), 1);
+        }
     })
     .await;
 }
@@ -831,18 +1027,25 @@ async fn a_completion_reports_its_own_cancel_reason() {
         };
 
         let _p1 = h.queue_turn("p1").await;
+        let (epoch, task_identity) = completion_binding(&h.actor, "p1").await;
         h.actor
             .handle_completion(
                 "p1".into(),
+                epoch,
+                &task_identity,
                 ok(PromptCompletionKind::MaxTurnsReached { limit: 1 }),
+                None,
             )
             .await;
 
         h.actor.turn_report.start_next_turn();
         let _p2 = h.queue_turn("p2").await;
+        let (epoch, task_identity) = completion_binding(&h.actor, "p2").await;
         h.actor
             .handle_completion(
                 "p2".into(),
+                epoch,
+                &task_identity,
                 ok(PromptCompletionKind::Cancelled {
                     category: Some(
                         crate::session::events::CancellationCategory::PermissionRejected,
@@ -854,6 +1057,7 @@ async fn a_completion_reports_its_own_cancel_reason() {
                         trigger: Some(format!("ctrl_c{}", "y".repeat(2000))),
                     }),
                 }),
+                None,
             )
             .await;
         h.drain_turn_ends().await;
@@ -892,8 +1096,8 @@ async fn a_flush_leaves_the_queue_open() {
         let mut h = Harness::new().await;
         h.listen(&[HookEventName::StopCancelled]);
         for prompt_id in ["p1", "p2"] {
-            h.start_turn(prompt_id).await;
             h.actor.turn_report.start_next_turn();
+            h.start_turn(prompt_id).await;
             let _ = h.cancel(CancelTrigger::CtrlC).await;
             h.queue.as_mut().expect("a live queue").flush().await;
         }

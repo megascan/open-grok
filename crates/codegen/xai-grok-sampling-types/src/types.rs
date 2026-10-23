@@ -1,6 +1,13 @@
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::num::NonZeroU64;
+
+mod model_notice;
+
+pub use self::model_notice::{
+    MODEL_NOTICE_META_KEY, ModelNotice, ModelNoticeSeverity, parse_model_notice_meta,
+};
 
 // ============================================================================
 // TraceContext — cloneable, type-erased context for request tracing
@@ -107,6 +114,8 @@ pub struct ChatCompletionRequest {
     #[serde(skip)]
     pub x_grok_turn_idx: Option<String>,
     #[serde(skip)]
+    pub x_grok_transient_retry: Option<String>,
+    #[serde(skip)]
     pub x_grok_agent_id: Option<String>,
     #[serde(skip)]
     pub x_grok_deployment_id: Option<String>,
@@ -143,6 +152,7 @@ impl ChatCompletionRequest {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -402,6 +412,7 @@ pub enum FinishReason {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(from = "ChatResponseMessageWire")]
 pub struct ChatResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +425,38 @@ pub struct ChatResponseMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citations: Option<Vec<String>>,
+}
+
+// Gateways can emit both names, including `reasoning_content: null` beside
+// `reasoning`. A serde alias treats that as a duplicate field and rejects the
+// entire response. Decode independently and apply the same nonempty-field
+// precedence used by ChatChunkDelta::reasoning_text.
+#[derive(Deserialize)]
+struct ChatResponseMessageWire {
+    role: Role,
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallResponse>,
+    tool_call_id: Option<String>,
+    citations: Option<Vec<String>>,
+}
+
+impl From<ChatResponseMessageWire> for ChatResponseMessage {
+    fn from(message: ChatResponseMessageWire) -> Self {
+        Self {
+            role: message.role,
+            content: message.content,
+            reasoning_content: message
+                .reasoning_content
+                .filter(|text| !text.is_empty())
+                .or(message.reasoning),
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            citations: message.citations,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -548,9 +591,9 @@ pub struct ChatChunkDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// DeepSeek/Kimi thinking tokens. OpenRouter sends the same payload as
-    /// `reasoning`; the alias keeps one accumulator for both wire names.
-    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    /// DeepSeek/Kimi thinking tokens. Kept separate from OpenRouter's
+    /// `reasoning` so responses containing both fields remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// OpenRouter's normalized reasoning delta field. OpenRouter streams
     /// thinking text as `delta.reasoning` (a plain string); `reasoning_content`
@@ -738,7 +781,7 @@ impl CompactionsRemaining {
 }
 
 /// Reasoning effort level. `None`/`Minimal` are omitted on the Anthropic Messages API.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -908,6 +951,16 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Canonical effort parse only; remapped menu ids need a model catalog.
 pub fn parse_canonical_effort_token(token: &str) -> Option<ReasoningEffort> {
     token.parse().ok()
@@ -979,8 +1032,22 @@ enum RawReasoningEffortOption {
     },
 }
 
-/// Uppercase the first character of an id for a default label; `"xhigh"` becomes
-/// `"Xhigh"`, `"deep"` becomes `"Deep"`.
+/// Display label for a known level; the bare-string menu shorthand and the shell's built-in effort picker share it.
+pub fn effort_label(effort: ReasoningEffort) -> String {
+    match effort {
+        ReasoningEffort::None => "None",
+        ReasoningEffort::Minimal => "Minimal",
+        ReasoningEffort::Low => "Low",
+        ReasoningEffort::Medium => "Medium",
+        ReasoningEffort::High => "High",
+        ReasoningEffort::Xhigh => "X-High",
+        ReasoningEffort::Max => "Max",
+        ReasoningEffort::Ultra => "Ultra",
+    }
+    .to_string()
+}
+
+/// Uppercase the first character of a custom id for a default label; `"deep"` becomes `"Deep"`.
 fn humanize_effort_id(id: &str) -> String {
     let mut chars = id.chars();
     match chars.next() {
@@ -999,12 +1066,10 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffortOption {
                 let value = s
                     .parse::<ReasoningEffort>()
                     .map_err(serde::de::Error::custom)?;
-                let id = value.as_str().to_string();
-                let label = humanize_effort_id(&id);
                 ReasoningEffortOption {
-                    id,
+                    id: value.as_str().to_string(),
                     value,
-                    label,
+                    label: effort_label(value),
                     description: None,
                     default: false,
                 }
@@ -1016,8 +1081,11 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffortOption {
                 description,
                 default,
             } => {
+                let label = label.unwrap_or_else(|| match &id {
+                    Some(id) => humanize_effort_id(id),
+                    None => effort_label(value),
+                });
                 let id = id.unwrap_or_else(|| value.as_str().to_string());
-                let label = label.unwrap_or_else(|| humanize_effort_id(&id));
                 ReasoningEffortOption {
                     id,
                     value,
@@ -1033,14 +1101,17 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffortOption {
 /// Parse a JSON array of reasoning-effort options element-by-element, skipping
 /// (and warning on) any entry whose `value` fails to parse (forward-compat for
 /// tiers a newer server introduces). The single home for the skip-invalid rule,
-/// shared by the meta reader and the remote `/models` parser.
-pub fn parse_reasoning_effort_options(arr: &[serde_json::Value]) -> Vec<ReasoningEffortOption> {
+/// shared by the meta reader and the remote `/models` parser; `field` names the source key in the warn.
+pub fn parse_reasoning_effort_options(
+    arr: &[serde_json::Value],
+    field: &str,
+) -> Vec<ReasoningEffortOption> {
     arr.iter()
         .filter_map(
             |el| match serde_json::from_value::<ReasoningEffortOption>(el.clone()) {
                 Ok(opt) => Some(opt),
                 Err(err) => {
-                    tracing::warn!(value = %el, error = %err, "reasoningEfforts: skipping invalid entry");
+                    tracing::warn!(value = %el, error = %err, "{field}: skipping invalid entry");
                     None
                 }
             },
@@ -1063,12 +1134,116 @@ pub fn parse_reasoning_efforts_meta(
             return None;
         }
     };
-    let options = parse_reasoning_effort_options(arr);
+    let options = parse_reasoning_effort_options(arr, REASONING_EFFORTS_META_KEY);
     (!options.is_empty()).then_some(options)
 }
 
 pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_json::Value {
     serde_json::to_value(opts).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+/// The `session/set_model` `_meta` key for the context window size, in tokens, that the client selected.
+pub const CONTEXT_WINDOW_META_KEY: &str = "contextWindow";
+/// The model `meta` key that lists the context window sizes a client can select.
+pub const CONTEXT_WINDOWS_META_KEY: &str = "contextWindows";
+
+/// Returns the selected context window, or `None` with a warning when the value is not a positive integer.
+pub fn parse_context_window_meta(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<NonZeroU64> {
+    let raw = meta?.get(CONTEXT_WINDOW_META_KEY)?;
+    match parse_context_window_value(raw) {
+        Some(window) => Some(window),
+        None => {
+            tracing::warn!(value = %raw, "meta.contextWindow: expected a positive integer, ignoring");
+            None
+        }
+    }
+}
+
+/// Returns the context windows a client can select from a model's ACP `meta`, or `None` when there are none.
+pub fn parse_context_windows_meta(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<Vec<NonZeroU64>> {
+    let raw = meta?.get(CONTEXT_WINDOWS_META_KEY)?;
+    let arr = match raw.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(value = %raw, "meta.contextWindows: expected array, ignoring");
+            return None;
+        }
+    };
+    let windows: Vec<NonZeroU64> = arr.iter().filter_map(parse_context_window_value).collect();
+    (!windows.is_empty()).then_some(windows)
+}
+
+fn parse_context_window_value(value: &Value) -> Option<NonZeroU64> {
+    value.as_u64().and_then(NonZeroU64::new)
+}
+
+pub fn context_windows_meta_value(windows: &[NonZeroU64]) -> Value {
+    Value::Array(
+        windows
+            .iter()
+            .map(|w| context_window_meta_value(*w))
+            .collect(),
+    )
+}
+
+pub fn context_window_meta_value(window: NonZeroU64) -> Value {
+    Value::Number(window.get().into())
+}
+
+#[cfg(test)]
+mod context_window_meta_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selected_window_requires_a_positive_integer() {
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1024"),
+            json!(null),
+            json!(true),
+        ] {
+            let meta = serde_json::Map::from_iter([(CONTEXT_WINDOW_META_KEY.into(), invalid)]);
+            assert_eq!(parse_context_window_meta(Some(&meta)), None);
+        }
+        let selected = NonZeroU64::new(128_000).unwrap();
+        let meta = serde_json::Map::from_iter([(
+            CONTEXT_WINDOW_META_KEY.into(),
+            context_window_meta_value(selected),
+        )]);
+        assert_eq!(parse_context_window_meta(Some(&meta)), Some(selected));
+        assert_eq!(parse_context_window_meta(None), None);
+    }
+
+    #[test]
+    fn available_windows_ignore_invalid_entries_and_empty_lists() {
+        let meta = serde_json::Map::from_iter([(
+            CONTEXT_WINDOWS_META_KEY.into(),
+            json!([0, 128000, null, -1, "256000", 256000]),
+        )]);
+        let windows = [
+            NonZeroU64::new(128_000).unwrap(),
+            NonZeroU64::new(256_000).unwrap(),
+        ];
+        assert_eq!(
+            parse_context_windows_meta(Some(&meta)),
+            Some(windows.to_vec())
+        );
+        assert_eq!(
+            context_windows_meta_value(&windows),
+            json!([128000, 256000])
+        );
+        for invalid in [json!([]), json!([0, null]), json!({}), json!(100)] {
+            let meta = serde_json::Map::from_iter([(CONTEXT_WINDOWS_META_KEY.into(), invalid)]);
+            assert_eq!(parse_context_windows_meta(Some(&meta)), None);
+        }
+    }
 }
 
 // ============================================================================
@@ -1208,6 +1383,9 @@ pub enum ApiBackend {
     Responses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
+    /// Use Google's AI Studio API (models/{model}:generateContent and :streamGenerateContent)
+    #[serde(alias = "ai_studio", alias = "gemini", alias = "google")]
+    GoogleAiStudio,
 }
 
 /// First-party provider contract selected by a model catalog entry.
@@ -1254,6 +1432,13 @@ pub enum ModelProvider {
     /// catalog; an empty enabled list keeps every discovered text model.
     #[serde(alias = "open_router", alias = "open-router")]
     OpenRouter,
+    /// A user-supplied server address speaking one of the three supported wire
+    /// protocols (OpenAI Responses, OpenAI Chat Completions, or Anthropic
+    /// Messages). Selected by the custom-provider wizard, never inferred from
+    /// a model slug or host: the model entry carries the endpoint, so the
+    /// policy below is the only thing that can attach to the wire.
+    #[serde(alias = "custom_endpoint", alias = "byok", alias = "byo")]
+    Custom,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1270,6 +1455,12 @@ pub enum ResponsesDialect {
     DeepSeek,
     /// Meta Model API's OpenAI-compatible, stateless Responses contract.
     Meta,
+    /// Vanilla OpenAI Responses contract, used by user-supplied endpoints that
+    /// speak it (`https://api.openai.com/v1` and OpenAI-compatible gateways).
+    /// Stateless like DeepSeek/Meta: the full input is replayed every turn, no
+    /// provider-side continuity or cache-routing metadata is sent, and no
+    /// opaque provider-native history carriers are replayed.
+    OpenAi,
 }
 
 /// Wire representation used for Code Mode's client-executed `exec` tool.
@@ -1297,6 +1488,8 @@ pub struct ProviderBackends {
     pub chat_completions: bool,
     pub responses: Option<ResponsesDialect>,
     pub messages: bool,
+    #[serde(default)]
+    pub google_ai_studio: bool,
 }
 
 impl ProviderBackends {
@@ -1305,6 +1498,7 @@ impl ProviderBackends {
             ApiBackend::ChatCompletions => self.chat_completions,
             ApiBackend::Responses => self.responses.is_some(),
             ApiBackend::Messages => self.messages,
+            ApiBackend::GoogleAiStudio => self.google_ai_studio,
         }
     }
 }
@@ -1420,6 +1614,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: Some(ResponsesDialect::Xai),
             messages: true,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::Xai),
@@ -1435,6 +1630,7 @@ impl ProviderProfile {
             chat_completions: false,
             responses: Some(ResponsesDialect::Codex),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::NativeCustomGrammar,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1453,6 +1649,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1472,6 +1669,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1491,6 +1689,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: Some(ResponsesDialect::DeepSeek),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1509,6 +1708,7 @@ impl ProviderProfile {
             chat_completions: false,
             responses: Some(ResponsesDialect::Meta),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1526,6 +1726,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: true,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1544,6 +1745,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1563,6 +1765,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1583,6 +1786,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1592,17 +1796,17 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
-    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions.
-    /// Gemini 3 models reason by default and accept ordinary client-side
-    /// function tools. This profile stays Chat-only: the official OpenAI
-    /// compatibility surface is `chat/completions`, not a first-class
-    /// Responses dialect. No hosted tools, native web search, or OAuth.
+    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions and
+    /// native Google AI Studio API. Gemini 3 models reason by default and
+    /// accept ordinary client-side function tools. No hosted tools, native
+    /// web search, or OAuth.
     pub const GEMINI: Self = Self {
         provider: ModelProvider::Gemini,
         backends: ProviderBackends {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: true,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1622,6 +1826,30 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
+    /// A user-supplied server address reached with the model's own API key.
+    ///
+    /// This is the only profile whose endpoint comes from the user rather than
+    /// from a first-party catalog, so it is deliberately fail-closed: every
+    /// hosted-tool dialect, native web search, Code Mode transport, built-in
+    /// session credential, and xAI service path is off. A BYO endpoint gets
+    /// the plain wire protocol it asked for and nothing else.
+    pub const CUSTOM: Self = Self {
+        provider: ModelProvider::Custom,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: Some(ResponsesDialect::OpenAi),
+            messages: true,
+            google_ai_studio: true,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1687,6 +1915,10 @@ impl ProviderProfile {
         self.provider.is_open_router()
     }
 
+    pub const fn is_custom(self) -> bool {
+        self.provider.is_custom()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1720,6 +1952,7 @@ impl ModelProvider {
             Self::Runinfra => "runinfra",
             Self::Gemini => "gemini",
             Self::OpenRouter => "openrouter",
+            Self::Custom => "custom",
         }
     }
 
@@ -1738,6 +1971,7 @@ impl ModelProvider {
             Self::Runinfra => "RunInfra",
             Self::Gemini => "Google Gemini",
             Self::OpenRouter => "OpenRouter",
+            Self::Custom => "Custom endpoint",
         }
     }
 
@@ -1800,6 +2034,13 @@ impl ModelProvider {
         matches!(self, Self::OpenRouter)
     }
 
+    /// Whether this provider is a user-supplied server address with
+    /// user-supplied credentials, and therefore must never receive
+    /// first-party credentials, hosted tools, or xAI request metadata.
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1815,6 +2056,7 @@ impl ModelProvider {
             Self::Runinfra => ProviderProfile::RUNINFRA,
             Self::Gemini => ProviderProfile::GEMINI,
             Self::OpenRouter => ProviderProfile::OPENROUTER,
+            Self::Custom => ProviderProfile::CUSTOM,
         }
     }
 }
@@ -1842,7 +2084,6 @@ impl ApiBackend {
         matches!(self, Self::ChatCompletions | Self::Responses)
     }
 
-    /// Whether replayed reasoning must be stripped. Only the Messages API rejects thinking blocks sent without a top-level `thinking` config.
     pub fn requires_reasoning_strip(&self) -> bool {
         matches!(self, Self::Messages)
     }
@@ -1852,6 +2093,17 @@ impl ApiBackend {
     /// [`ConversationRequest::prompt_cache_key`]: crate::conversation::ConversationRequest::prompt_cache_key
     pub fn forwards_prompt_cache_key(&self) -> bool {
         matches!(self, Self::Responses)
+    }
+
+    /// Request-body cap the hosts speaking this protocol enforce; the budget when a model sets no `max_request_bytes`.
+    /// The xAI inference proxy rejects bodies over 50 MiB (nginx `proxy-body-size`); Messages API hosts reject bodies over 30 MB.
+    pub const fn default_max_request_bytes(&self) -> NonZeroU64 {
+        match self {
+            Self::ChatCompletions | Self::Responses | Self::GoogleAiStudio => {
+                NonZeroU64::new(50 * 1024 * 1024).unwrap()
+            }
+            Self::Messages => NonZeroU64::new(30_000_000).unwrap(),
+        }
     }
 }
 
@@ -1881,6 +2133,9 @@ pub struct SamplingConfig {
     pub env_http_headers: indexmap::IndexMap<String, String>,
     /// Total context window size in tokens. Used for auto-compact thresholds.
     pub context_window: NonZeroU64,
+    /// Provider request-body cap, already defaulted from `api_backend` by model resolution; `None` budgets to 50 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<NonZeroU64>,
     /// Reasoning effort level for reasoning models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -1928,6 +2183,7 @@ pub struct CreateResponseWrapper {
 
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -1973,6 +2229,7 @@ impl CreateResponseWrapper {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -2009,6 +2266,7 @@ pub struct MessagesRequestWrapper {
 
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -2026,6 +2284,7 @@ impl MessagesRequestWrapper {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -2069,6 +2328,7 @@ mod tests {
                     chat_completions: true,
                     responses: Some(ResponsesDialect::Xai),
                     messages: true,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::Xai),
@@ -2085,6 +2345,7 @@ mod tests {
                     chat_completions: false,
                     responses: Some(ResponsesDialect::Codex),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::NativeCustomGrammar,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2101,6 +2362,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2117,6 +2379,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2133,6 +2396,7 @@ mod tests {
                     chat_completions: true,
                     responses: Some(ResponsesDialect::DeepSeek),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2149,6 +2413,7 @@ mod tests {
                     chat_completions: false,
                     responses: Some(ResponsesDialect::Meta),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2165,6 +2430,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: true,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2181,6 +2447,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2197,6 +2464,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2213,6 +2481,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2229,6 +2498,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: true,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2245,6 +2515,27 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
+            // The BYO endpoint profile: every supported wire protocol, and
+            // nothing first-party. Adding a capability here means sending it to
+            // infrastructure the user, not Open Grok, operates.
+            Case {
+                provider: ModelProvider::Custom,
+                id: "custom",
+                name: "Custom endpoint",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: Some(ResponsesDialect::OpenAi),
+                    messages: true,
+                    google_ai_studio: true,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2279,11 +2570,13 @@ mod tests {
             assert_eq!(profile.is_runinfra(), case.provider.is_runinfra());
             assert_eq!(profile.is_gemini(), case.provider.is_gemini());
             assert_eq!(profile.is_open_router(), case.provider.is_open_router());
+            assert_eq!(profile.is_custom(), case.provider.is_custom());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,
                 ApiBackend::Responses,
                 ApiBackend::Messages,
+                ApiBackend::GoogleAiStudio,
             ] {
                 assert_eq!(
                     profile.supports_backend(&backend),
@@ -2313,11 +2606,13 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Custom,
         ] {
             for backend in [
                 ApiBackend::ChatCompletions,
                 ApiBackend::Responses,
                 ApiBackend::Messages,
+                ApiBackend::GoogleAiStudio,
             ] {
                 let supported = provider == ModelProvider::Xai && backend == ApiBackend::Responses;
                 assert_eq!(
@@ -2366,18 +2661,26 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_reasoning_alias_deserializes_into_reasoning_content() {
+    fn openrouter_reasoning_fields_deserialize_without_alias_collisions() {
         let delta: ChatChunkDelta = serde_json::from_value(json!({
             "role": "assistant",
             "reasoning": "gateway thoughts"
         }))
         .expect("OpenRouter delta.reasoning deserializes");
-        assert_eq!(delta.reasoning_content.as_deref(), Some("gateway thoughts"));
+        assert!(delta.reasoning_content.is_none());
+        assert_eq!(delta.reasoning.as_deref(), Some("gateway thoughts"));
+        assert_eq!(delta.reasoning_text(), "gateway thoughts");
 
         let message: ChatResponseMessage = serde_json::from_value(json!({
             "role": "assistant",
             "content": "answer",
-            "reasoning": "non-stream thoughts"
+            "reasoning": "non-stream thoughts",
+            "tool_calls": [{
+                "id": "call_lookup",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }],
+            "citations": ["https://example.test/reference"]
         }))
         .expect("OpenRouter message.reasoning deserializes");
         assert_eq!(message.content.as_deref(), Some("answer"));
@@ -2385,6 +2688,29 @@ mod tests {
             message.reasoning_content.as_deref(),
             Some("non-stream thoughts")
         );
+        assert_eq!(message.tool_calls[0].function.name, "lookup");
+        assert_eq!(
+            message.citations.as_ref().unwrap()[0],
+            "https://example.test/reference"
+        );
+
+        for (content, expected) in [
+            (Some("preferred thoughts"), "preferred thoughts"),
+            (Some(""), "gateway thoughts"),
+            (None, "gateway thoughts"),
+        ] {
+            let wire = json!({
+                "role": "assistant",
+                "reasoning_content": content,
+                "reasoning": "gateway thoughts"
+            });
+            let delta: ChatChunkDelta = serde_json::from_value(wire.clone())
+                .expect("both delta reasoning fields deserialize");
+            assert_eq!(delta.reasoning_text(), expected);
+            let message: ChatResponseMessage =
+                serde_json::from_value(wire).expect("both message reasoning fields deserialize");
+            assert_eq!(message.reasoning_content.as_deref(), Some(expected));
+        }
     }
 
     #[test]
@@ -2436,7 +2762,7 @@ mod tests {
             ReasoningEffortOption {
                 id: "xhigh".to_string(),
                 value: ReasoningEffort::Xhigh,
-                label: "Xhigh".to_string(),
+                label: "X-High".to_string(),
                 description: None,
                 default: false,
             }

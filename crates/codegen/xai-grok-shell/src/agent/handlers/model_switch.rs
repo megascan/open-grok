@@ -17,24 +17,26 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_resolved_tool_policy(agent, args, None).await
+    apply_with_resolved_tool_policy(agent, args, None, None).await
 }
 
 /// Restore a persisted session model while retaining the session's pinned tool
-/// presentation. The actor revalidates the policy against the selected route,
-/// and current catalog model requirements still take precedence.
+/// presentation and saved window. The actor only applies the saved window when
+/// the selected model advertises it; otherwise it retains it for a later catalog.
 pub(crate) async fn apply_restored(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
-    policy: crate::session::tool_surface::ResolvedToolPolicy,
+    policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    context_window: Option<std::num::NonZeroU64>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_resolved_tool_policy(agent, args, Some(policy)).await
+    apply_with_resolved_tool_policy(agent, args, policy, Some(context_window)).await
 }
 
 async fn apply_with_resolved_tool_policy(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
     resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    restored_window: Option<Option<std::num::NonZeroU64>>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     xai_grok_telemetry::unified_log::info(
@@ -44,6 +46,11 @@ async fn apply_with_resolved_tool_policy(
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
+    let window_meta = args
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(xai_grok_sampling_types::CONTEXT_WINDOW_META_KEY))
+        .cloned();
     // `None` = meta key absent (preserve prior session tier when still valid).
     // `Some(None)` = explicit standard routing (`default`).
     // `Some(Some(id))` = concrete tier id such as `priority`.
@@ -63,6 +70,13 @@ async fn apply_with_resolved_tool_policy(
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let model = agent.resolve_model_id(&model_id)?;
+    let context_window_selection = match restored_window {
+        Some(selection) => Some(selection),
+        None => resolve_switch_window(window_meta.as_ref(), model.info(), &model_id)?,
+    };
+    let supported_context_windows = std::iter::once(model.info().context_window)
+        .chain(model.info().context_windows.iter().copied())
+        .collect();
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile
@@ -262,6 +276,8 @@ async fn apply_with_resolved_tool_policy(
     };
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
+        context_window_selection,
+        supported_context_windows,
         model_id: model_id.clone(),
         sampling_config: model_sampling,
         use_concise,
@@ -286,6 +302,12 @@ async fn apply_with_resolved_tool_policy(
         &session_id,
         model_id.0.as_ref(),
         applied_effort.map(|eff| eff.to_string()),
+        std::num::NonZeroU64::new(
+            handle
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .map(std::num::NonZeroU64::get),
     );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
         session_id: session_id.0.to_string(),
@@ -318,12 +340,14 @@ fn broadcast_model_changed(
     session_id: &acp::SessionId,
     model_id: &str,
     reasoning_effort: Option<String>,
+    context_window_selection: Option<u64>,
 ) {
     let notification = crate::extensions::notification::SessionNotification {
         session_id: session_id.clone(),
         update: crate::extensions::notification::SessionUpdate::ModelChanged {
             model_id: model_id.to_owned(),
             reasoning_effort,
+            context_window_selection,
         },
         meta: None,
     };
@@ -334,5 +358,49 @@ fn broadcast_model_changed(
                 "x.ai/session_notification",
                 params.into(),
             ));
+    }
+}
+
+fn resolve_switch_window(
+    raw: Option<&serde_json::Value>,
+    info: &config::ModelInfo,
+    model_id: &acp::ModelId,
+) -> Result<Option<Option<std::num::NonZeroU64>>, acp::Error> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let window = raw
+        .as_u64()
+        .and_then(std::num::NonZeroU64::new)
+        .filter(|window| info.supports_context_window(*window))
+        .ok_or_else(|| {
+            acp::Error::invalid_params().data(format!(
+                "model '{}' does not support context window {raw}",
+                model_id.0
+            ))
+        })?;
+    Ok(Some(Some(window)))
+}
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+    #[test]
+    fn validates_requested_window_against_selected_model() {
+        let mut info = config::ModelInfo::fallback("test");
+        info.context_windows = vec![std::num::NonZeroU64::new(500_000).unwrap()];
+        let id = acp::ModelId::new("test");
+        assert_eq!(resolve_switch_window(None, &info, &id).unwrap(), None);
+        assert_eq!(
+            resolve_switch_window(Some(&serde_json::json!(500_000)), &info, &id).unwrap(),
+            Some(std::num::NonZeroU64::new(500_000))
+        );
+        for raw in [
+            serde_json::json!(0),
+            serde_json::json!(300_000),
+            serde_json::json!("500000"),
+            serde_json::Value::Null,
+        ] {
+            assert!(resolve_switch_window(Some(&raw), &info, &id).is_err());
+        }
     }
 }

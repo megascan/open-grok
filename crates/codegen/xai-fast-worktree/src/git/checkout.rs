@@ -437,6 +437,44 @@ pub fn rehydrate_worktree_from_ref(
     )
 }
 
+fn rehydrate_marker_path(dest: &Path) -> Result<PathBuf> {
+    let mut name = dest
+        .file_name()
+        .context("restore destination has no filename")?
+        .to_os_string();
+    name.push(".opengrok-rehydrating");
+    Ok(dest.with_file_name(name))
+}
+
+#[cfg(unix)]
+fn sync_rehydrate_marker_parent(marker: &Path) -> Result<()> {
+    let parent = marker
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?
+        .sync_all()
+        .context("cannot persist restore marker")
+}
+
+#[cfg(not(unix))]
+fn sync_rehydrate_marker_parent(_marker: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Reject a restore that may have stopped before its working tree was populated.
+/// The sibling marker survives a crash and is removed only after successful restore.
+pub fn ensure_rehydrate_complete(dest: &Path) -> Result<()> {
+    let marker = rehydrate_marker_path(dest)?;
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => anyhow::bail!("worktree restore is incomplete: {}", marker.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("cannot inspect restore marker {}", marker.display()))
+        }
+    }
+}
+
 fn rehydrate_worktree_from_ref_inner(
     dest: &Path,
     source_repo: &Path,
@@ -471,17 +509,28 @@ fn rehydrate_worktree_from_ref_inner(
             snapshot_commit
         }
     };
-    // A prior rehydrate may have failed after `worktree add` and left a partial dir; remove it so this attempt starts clean (worktree add fails on an existing path).
-    if dest.exists() {
-        let _ = crate::remove_worktree(dest);
-        if dest.exists() {
-            let _ = std::fs::remove_dir_all(dest);
-        }
+    // Git accepts a pre-existing *empty* directory, so checking for absence
+    // before invoking it is not enough: another actor could create the path
+    // between the check and the add. Claim it atomically instead, including
+    // refusing files and dangling symlinks. Do not scrub a stale registration:
+    // an absent path can belong to a live worktree in another mount namespace.
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create restore parent {}", parent.display()))?;
     }
-    // `git worktree add` refuses a path another registration still claims,
-    // so scrub `dest`'s stale registration (previously-disposed worktree, or
-    // the raw `remove_dir_all` fallback above) before adding.
-    crate::git::remove_stale_worktree_registration(source_repo, dest);
+    // The marker precedes the destination claim so an interrupted restore can
+    // never be mistaken for a completed one, even with an old matching DB row.
+    let marker = rehydrate_marker_path(dest)?;
+    std::fs::create_dir(&marker)
+        .with_context(|| format!("cannot claim restore marker {}", marker.display()))?;
+    sync_rehydrate_marker_parent(&marker)?;
+    if let Err(error) = std::fs::create_dir(dest) {
+        // Nothing was restored. Only remove our empty marker; never remove the
+        // occupied destination or a marker another actor has filled.
+        let _ = std::fs::remove_dir(&marker);
+        return Err(error)
+            .with_context(|| format!("restore destination is unavailable: {}", dest.display()));
+    }
     snapshot_git(
         source_repo,
         &[
@@ -497,21 +546,14 @@ fn rehydrate_worktree_from_ref_inner(
 
     // Past this point the dest dir + its registration exist. Populate the index
     // and working tree from the snapshot tree without moving HEAD, so restored
-    // content appears as changes against the base. If any step fails, tear down
-    // the partial worktree so a later resume can't reuse a corrupt directory.
+    // content appears as changes against the base. If population fails, retain
+    // the directory: it may have been replaced or adopted since the add, and
+    // a later restore must not silently reuse or delete a partial worktree.
     let populate = || -> Result<String> {
         snapshot_git(dest, &["read-tree", "--reset", "-u", snapshot_commit], &[])?;
         snapshot_git(dest, &["rev-parse", "HEAD"], &[])
     };
-    let commit = match populate() {
-        Ok(commit) => commit,
-        Err(e) => {
-            // Best-effort cleanup; preserve the original error.
-            let _ = crate::remove_worktree(dest);
-            crate::git::remove_stale_worktree_registration(source_repo, dest);
-            return Err(e);
-        }
-    };
+    let commit = populate()?;
 
     // Mirror `WorktreeBuilder::create()` registration so the rehydrated worktree
     // is tracked again after its directory was disposed of. `session_id` is only
@@ -520,6 +562,7 @@ fn rehydrate_worktree_from_ref_inner(
     let _ = session_id;
     #[cfg(feature = "metadata")]
     crate::api::register_worktree(
+        None,
         dest,
         source_repo,
         crate::db::WorktreeKind::Subagent,
@@ -530,6 +573,10 @@ fn rehydrate_worktree_from_ref_inner(
         None,
         None,
     );
+
+    std::fs::remove_dir(&marker)
+        .with_context(|| format!("cannot clear restore marker {}", marker.display()))?;
+    sync_rehydrate_marker_parent(&marker)?;
 
     tracing::debug!(
         dest = %dest.display(),
@@ -544,6 +591,9 @@ fn rehydrate_worktree_from_ref_inner(
         commit,
         unignored_copy: CopyReport::default(),
         ignored_copy: None,
+        resolved_strategy: crate::worktree::STRATEGY_GIT,
+        strategy_metadata: None,
+        skipped: Vec::new(),
     })
 }
 
@@ -1002,6 +1052,7 @@ mod tests {
         let report = rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).unwrap();
         assert_eq!(report.worktree_path, wt);
         assert!(wt.exists());
+        ensure_rehydrate_complete(&wt).unwrap();
 
         // Tracked edit present.
         assert_eq!(
@@ -1094,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rehydrate_self_heals_over_leftover_dest_dir() {
+    fn test_rehydrate_refuses_an_existing_worktree() {
         xai_test_utils::require_git!();
         let temp = TempDir::new().unwrap();
         let (repo_path, wt) = repo_with_worktree(&temp);
@@ -1108,26 +1159,111 @@ mod tests {
         rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).unwrap();
         assert!(wt.exists());
 
-        // Re-rehydrating at the SAME dest (a leftover dir, as a failed prior
-        // attempt would leave) must self-heal and succeed rather than erroring.
-        let report = rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).unwrap();
-        assert_eq!(report.worktree_path, wt);
+        // The existing worktree could be active or contain later edits. A
+        // second restore must refuse it without touching any of its data.
+        std::fs::write(wt.join("untracked.txt"), "later edit").unwrap();
+        assert!(rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).is_err());
         assert_eq!(
             std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
             "edited"
         );
         assert_eq!(
             std::fs::read_to_string(wt.join("untracked.txt")).unwrap(),
-            "brand new"
+            "later edit"
         );
     }
 
-    /// Rehydrate must clear its own stale registration (so re-adding the
-    /// same path succeeds) while leaving every other entry alone — its
-    /// cleanup once pruned repo-wide and destroyed user registrations whose
-    /// paths were not visible from the container mount namespace.
     #[test]
-    fn test_rehydrate_clears_only_its_own_stale_registration() {
+    fn test_rehydrate_refuses_occupied_destination_entries() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let (repo_path, wt) = repo_with_worktree(&temp);
+        let snap =
+            snapshot_worktree_to_ref(&wt, "refs/open-grok/snapshots/occupied", "occupied").unwrap();
+
+        let occupied = temp.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("keep"), "user data").unwrap();
+        assert!(rehydrate_worktree_from_ref(&occupied, &repo_path, &snap, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("keep")).unwrap(),
+            "user data"
+        );
+
+        let empty = temp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(rehydrate_worktree_from_ref(&empty, &repo_path, &snap, None).is_err());
+        assert!(std::fs::read_dir(&empty).unwrap().next().is_none());
+        ensure_rehydrate_complete(&empty).unwrap();
+
+        let file = temp.path().join("file");
+        std::fs::write(&file, "user file").unwrap();
+        assert!(rehydrate_worktree_from_ref(&file, &repo_path, &snap, None).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "user file");
+
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("dangling");
+            std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
+            assert!(rehydrate_worktree_from_ref(&link, &repo_path, &snap, None).is_err());
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn test_rehydrate_population_failure_retains_partial_and_marker() {
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let (repo_path, _) = repo_with_worktree(&temp);
+        let base = git_capture_in(&repo_path, &["rev-parse", "HEAD"], &[]).unwrap();
+        // The commit's parent is valid, allowing worktree add, but its tree is
+        // absent, so read-tree fails after the new linked worktree exists.
+        let broken_commit = temp.path().join("broken-commit");
+        std::fs::write(
+            &broken_commit,
+            format!(
+                "tree {}\nparent {base}\nauthor T <t@example.com> 1 +0000\ncommitter T <t@example.com> 1 +0000\n\nmissing tree\n",
+                "0".repeat(base.len())
+            ),
+        )
+        .unwrap();
+        let broken = git_capture_in(
+            &repo_path,
+            &[
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                broken_commit.to_str().unwrap(),
+            ],
+            &[],
+        )
+        .unwrap();
+        let dest = temp.path().join("partial");
+        assert!(rehydrate_worktree_from_ref(&dest, &repo_path, &broken, Some("child")).is_err());
+        assert!(
+            dest.join(".git").is_file(),
+            "worktree add must have completed"
+        );
+        assert!(ensure_rehydrate_complete(&dest).is_err());
+
+        std::fs::write(dest.join("keep"), "partial data").unwrap();
+        assert!(rehydrate_worktree_from_ref(&dest, &repo_path, &broken, Some("child")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("keep")).unwrap(),
+            "partial data"
+        );
+    }
+
+    /// A missing directory does not prove its registration is stale: the
+    /// worktree may be live in a different mount namespace.
+    #[test]
+    fn test_rehydrate_preserves_unproven_stale_registrations() {
         xai_test_utils::require_git!();
         let temp = TempDir::new().unwrap();
         let (repo_path, wt) = repo_with_worktree(&temp);
@@ -1155,11 +1291,11 @@ mod tests {
 
         std::fs::remove_dir_all(&wt).unwrap();
 
-        let report = rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).unwrap();
-        assert_eq!(report.worktree_path, wt);
-        assert_eq!(
-            std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
-            "edited"
+        assert!(rehydrate_worktree_from_ref(&wt, &repo_path, &snap, None).is_err());
+        assert!(registration.is_dir(), "unproven registration must survive");
+        assert!(
+            ensure_rehydrate_complete(&wt).is_err(),
+            "failed restore must leave its marker"
         );
         assert!(
             repo_path.join(".git/worktrees/user-wt").exists(),

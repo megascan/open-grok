@@ -68,6 +68,8 @@ impl AgentView {
             has_session_announcements: slash_controller.has_session_announcements(),
             billing_surface_visible: slash_controller.billing_surface_visible(),
             workflows_available: slash_controller.workflows_available(),
+            saved_workflows: slash_controller.registry().saved_workflows(),
+            workflow_runs: slash_controller.workflow_runs(),
             screen_mode: slash_controller.screen_mode(),
             current_title: slash_controller.current_title(),
         };
@@ -371,11 +373,12 @@ impl AgentView {
 
         // MemoryBrowser: route through ModalWindow chrome, then delegate.
         if let ActiveModal::MemoryBrowser { state } = modal {
-            // When the filter input is focused, Esc exits filter mode
-            // instead of closing the modal. Handle before modal chrome.
+            // While the filter or the preview has focus, Esc leaves that mode instead of closing
+            // the modal. Handle before modal chrome
             if matches!(
                 state.mode,
                 crate::views::memory_modal::MemoryModalMode::FilterFocused
+                    | crate::views::memory_modal::MemoryModalMode::PreviewFocused
             ) {
                 return crate::views::memory_modal::handle_memory_key(state, key);
             }
@@ -452,8 +455,16 @@ impl AgentView {
                 ModalWindowOutcome::Unhandled => {
                     use crate::views::usage_modal::{self, UsageModalOutcome};
                     return match usage_modal::handle_usage_modal_key(state, key) {
+                        UsageModalOutcome::Close => {
+                            self.active_modal = None;
+                            InputOutcome::Changed
+                        }
                         UsageModalOutcome::CopySessionId => {
                             self.copy_usage_modal_session_id();
+                            InputOutcome::Changed
+                        }
+                        UsageModalOutcome::CopyText(text) => {
+                            self.copy_usage_modal_text(&text);
                             InputOutcome::Changed
                         }
                         UsageModalOutcome::Changed => InputOutcome::Changed,
@@ -700,6 +711,14 @@ impl AgentView {
                         if let Some(effort_items) = cmd.suggest_args(&ctx, &next_query)
                             && Self::arg_items_look_like_effort_phase(&effort_items)
                         {
+                            let selected = cmd
+                                .preselected_arg(&ctx, &next_query)
+                                .and_then(|target| {
+                                    effort_items
+                                        .iter()
+                                        .position(|row| row.insert_text == target)
+                                })
+                                .unwrap_or(0);
                             if let Some(ActiveModal::ArgPicker {
                                 args_query,
                                 items,
@@ -713,6 +732,7 @@ impl AgentView {
                                 *original_items = effort_items;
                                 // Effort sub-step is part of the type-to-find /model picker: open input-focused (cursor + type-to-filter), matching the rest of the flow.
                                 *state = crate::views::picker::PickerState::input_active();
+                                state.selected = selected;
                             }
                             return InputOutcome::Changed;
                         }
@@ -903,6 +923,8 @@ impl AgentView {
                                         })
                                     };
                                     self.active_modal = Some(ActiveModal::SessionPicker {
+                                        generation: 0,
+                                        detail_seq: 0,
                                         state: crate::views::picker::PickerState::default(),
                                         entries: None,
                                         loading: true,
@@ -1644,8 +1666,16 @@ impl AgentView {
                         mouse.column,
                         mouse.row,
                     ) {
+                        UsageModalOutcome::Close => {
+                            self.active_modal = None;
+                            InputOutcome::Changed
+                        }
                         UsageModalOutcome::CopySessionId => {
                             self.copy_usage_modal_session_id();
+                            InputOutcome::Changed
+                        }
+                        UsageModalOutcome::CopyText(text) => {
+                            self.copy_usage_modal_text(&text);
                             InputOutcome::Changed
                         }
                         UsageModalOutcome::Changed => InputOutcome::Changed,
@@ -1730,6 +1760,11 @@ impl AgentView {
             return;
         };
         let delivery = crate::clipboard::copy_text_or_file(&id);
+        self.show_toast(delivery.toast_message().as_ref());
+    }
+
+    fn copy_usage_modal_text(&mut self, text: &str) {
+        let delivery = crate::clipboard::copy_text_or_file(text);
         self.show_toast(delivery.toast_message().as_ref());
     }
 
@@ -1863,8 +1898,10 @@ impl AgentView {
             {
                 // Arg picker: ModalWindow chrome + picker content.
                 let title = match command.as_str() {
-                    "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
-                    "model" | "m" => "Pick model",
+                    "model" | "m" => crate::slash::commands::model::picker_title(
+                        &self.session.models,
+                        args_query,
+                    ),
                     "theme" | "t" => "Pick theme",
                     "login" => "Connect provider",
                     _ => "Pick option",
@@ -2477,6 +2514,10 @@ impl AgentView {
 }
 
 #[cfg(test)]
+#[path = "modals_tests.rs"]
+mod tests;
+
+#[cfg(test)]
 mod session_picker_delete_tests {
     use crate::app::actions::Action;
     use crate::app::agent_view::AgentView;
@@ -2487,6 +2528,8 @@ mod session_picker_delete_tests {
 
     fn entry(id: &str) -> SessionPickerEntry {
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: chrono::Utc::now(),
@@ -2507,6 +2550,8 @@ mod session_picker_delete_tests {
 
     fn open_picker(agent: &mut AgentView, entries: Vec<SessionPickerEntry>) {
         agent.active_modal = Some(ActiveModal::SessionPicker {
+            generation: 0,
+            detail_seq: 0,
             state: crate::views::picker::PickerState::default(),
             entries: Some(entries),
             loading: false,

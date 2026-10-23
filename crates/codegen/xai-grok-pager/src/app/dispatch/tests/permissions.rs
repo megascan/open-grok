@@ -99,6 +99,7 @@ fn set_yolo_mode_on_drains_permission_queue_with_allow_once() {
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });
@@ -591,6 +592,7 @@ fn push_bash_allow_always(
         args_expanded: false,
         desc_scroll: 0,
         subagent_label: None,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });
@@ -746,5 +748,90 @@ fn retyped_same_text_is_still_glob() {
     assert!(
         terms.is_glob,
         "dirty editor is a glob even when text matches pre-fill"
+    );
+}
+
+fn enqueue_sandbox_test(
+    app: &mut AppView,
+) -> tokio::sync::oneshot::Receiver<acp::Result<acp::RequestPermissionResponse>> {
+    let rx = enqueue_permission_with_enable_always_approve(app);
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let perm = agent.permission_queue.front_mut().unwrap();
+    perm.request.request = crate::app::sandbox_permission::tests::request();
+    perm.options = crate::app::sandbox_permission::options(&perm.request.request);
+    (perm.title, perm.description) = crate::app::sandbox_permission::display(&perm.request.request);
+    perm.args_expanded = true;
+    rx
+}
+
+#[test]
+fn sandbox_yolo_toggle_does_not_resolve_pending_card() {
+    let mut app = test_app_with_agent();
+    let mut rx = enqueue_sandbox_test(&mut app);
+    let _ = dispatch(Action::SetYoloMode(true), &mut app);
+    assert_eq!(app.agents[&AgentId(0)].permission_queue.len(), 1);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn sandbox_approval_requires_a_complete_render_and_sends_typed_decision() {
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
+    let mut app = test_app_with_agent();
+    let mut rx = enqueue_sandbox_test(&mut app);
+    let option = acp::PermissionOptionId::new(Arc::from("sandbox:workspace"));
+    let area = Rect::new(0, 0, 100, 30);
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.pane_areas.prompt = area;
+        agent.terminal_size_stale = false;
+    }
+    let _ = dispatch(Action::PermissionSelect(option.clone()), &mut app);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let perm = agent.permission_queue.front_mut().unwrap();
+    assert!(crate::views::permission_view::sandbox_card_fits(perm, area));
+    perm.sandbox_visible_area = Some(area);
+    let _ = dispatch(Action::PermissionSelect(option), &mut app);
+    let response = rx.try_recv().unwrap().unwrap();
+    let decision = &response.meta.unwrap()["sandbox_decision"];
+    assert_eq!(decision["scope"]["value"], "/tmp/cache");
+    assert_eq!(decision["duration"]["kind"], "workspace");
+    assert_eq!(decision["expires"]["seconds"], 3600);
+}
+
+#[test]
+fn sandbox_dashboard_refuses_approval_but_can_deny() {
+    use std::sync::Arc;
+    let mut app = test_app_with_agent();
+    let mut rx = enqueue_sandbox_test(&mut app);
+    let row = crate::views::dashboard::DashboardRowId::TopLevel(AgentId(0));
+    let id = app.agents[&AgentId(0)].permission_queue.front().unwrap().id;
+    let _ = dispatch_dashboard_permission_select(
+        &mut app,
+        row.clone(),
+        id,
+        acp::PermissionOptionId::new(Arc::from("sandbox:call")),
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let _ = dispatch_dashboard_permission_select(
+        &mut app,
+        row,
+        id,
+        acp::PermissionOptionId::new(Arc::from("sandbox:deny")),
+    );
+    let response = rx.try_recv().unwrap().unwrap();
+    assert_eq!(
+        response.meta.unwrap()["sandbox_decision"]["outcome"],
+        "reject"
     );
 }

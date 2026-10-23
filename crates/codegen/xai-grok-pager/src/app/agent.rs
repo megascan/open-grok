@@ -124,10 +124,13 @@ impl QueuedPrompt {
 /// - Type safety (can't misspell command names)
 /// - Variant-specific data (e.g., `/model` would carry target model)
 /// - Proper rendering per command type
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCommand {
     /// `/compact` — compact conversation history.
     Compact,
+    /// Cross-family model switch compact (lossy summary while the `/model` RPC is in flight).
+    /// Idle, so it would otherwise have no turn-status loader; this command owns the spinner.
+    SwitchModelCompact,
     /// Creating a git worktree (from the welcome screen `w` action).
     CreateWorktree,
     /// Resuming a session in a worktree (worktree + code restore).
@@ -138,17 +141,28 @@ pub enum AgentCommand {
     /// Drives the spinner shown on the placeholder agent while the
     /// `x.ai/session/fork` request is in flight.
     ForkSession,
+    /// `/flush`: capture this session's memory now.
+    MemoryFlush,
+    /// `/dream`: consolidate memory now.
+    MemoryDream,
 }
 impl AgentCommand {
     /// Human-readable label for the status line (e.g., "Compacting").
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Compact => "Compacting",
+            Self::SwitchModelCompact => "Switching model",
             Self::CreateWorktree => "Creating worktree",
             Self::RestoreWorktree => "Restoring session in worktree",
             Self::RestoreCode => "Restoring code",
             Self::ForkSession => "Forking session",
+            Self::MemoryFlush => "Flushing memory",
+            Self::MemoryDream => "Consolidating memory",
         }
+    }
+    /// Manual `/compact` or the idle family-switch compact that reuses the same cancel/status path.
+    pub fn is_compact(&self) -> bool {
+        matches!(self, Self::Compact | Self::SwitchModelCompact)
     }
 }
 /// Maximum in-memory stdout per background task (10 MB).
@@ -650,13 +664,22 @@ impl AgentState {
     pub fn is_turn_running(&self) -> bool {
         matches!(self, Self::TurnRunning)
     }
-    /// Manual `/compact` is in flight (stoppable via session/cancel).
+    /// Manual `/compact` or family-switch compact is in flight (stoppable via session/cancel).
     pub fn is_compact_running(&self) -> bool {
         matches!(
             self,
+            Self::CommandRunning { command, .. } if command.is_compact()
+        )
+    }
+    /// Family-switch compact (started from `AutoCompactStarted`, finished from its completed/failed/cancelled follow-up).
+    pub fn is_switch_model_compact(&self) -> bool {
+        matches!(
+            self,
             Self::CommandRunning {
-                command: AgentCommand::Compact,
+                command: AgentCommand::SwitchModelCompact,
                 ..
+            } | Self::CommandCancelling {
+                command: AgentCommand::SwitchModelCompact,
             }
         )
     }
@@ -687,6 +710,25 @@ pub struct DeferredModelSwitch {
     /// Displayed model at stash time — the rollback target
     /// (`Effect::SwitchModel.prev_model_id`) if the switch fails.
     pub prev_model_id: Option<acp::ModelId>,
+}
+pub const PROMPT_HISTORY_CAP: usize = 200;
+#[derive(Debug, Clone)]
+pub struct BlockedPromptContext {
+    pub row_id: u64,
+    pub hook_name: Option<String>,
+    pub reason: Option<String>,
+    pub was_combined: bool,
+}
+pub fn remember_prompt(list: &mut Vec<String>, text: &str) {
+    let key = text.trim();
+    if key.is_empty() {
+        return;
+    }
+    if list.first().is_some_and(|p| p.trim() == key) {
+        return;
+    }
+    list.insert(0, text.to_owned());
+    list.truncate(PROMPT_HISTORY_CAP);
 }
 /// Per-agent business logic (ACP session, models, state).
 ///
@@ -781,6 +823,11 @@ pub struct AgentSession {
     /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
     /// drops the in-flight RPC — else a lost completion jams the queue forever.
     pub model_switch_pending: bool,
+    /// The context-window RPC currently holding this session's sends.
+    pub(crate) pending_context_switch:
+        Option<(acp::SessionId, acp::ModelId, std::num::NonZeroU64, u64)>,
+    pub hook_block_hold: bool,
+    pub blocked_prompt: Option<BlockedPromptContext>,
     /// A provider settings/key change requires this session's sampler to be
     /// rebuilt before another queued prompt may start. Unlike the RPC-local
     /// `model_switch_pending`, this spans endpoint/key refresh work.
@@ -872,6 +919,28 @@ impl AgentSession {
     pub(crate) fn set_auto_mode_for_test(&mut self, on: bool) {
         self.auto_mode = on;
     }
+    /// The shell's own session directory derivation from the bound session id and this session's cwd.
+    /// `None` until a session id is bound; never touches the filesystem or scans other sessions.
+    pub fn local_session_dir(&self) -> Option<PathBuf> {
+        Some(xai_grok_shell::session::persistence::session_dir(
+            &self.local_session_info()?,
+        ))
+    }
+    /// Create `local_session_dir` with owner-only permissions when it is missing, then return it.
+    /// Not every backend writes to it before the first feedback draft.
+    pub fn ensure_local_session_dir(&self) -> Option<std::io::Result<PathBuf>> {
+        Some(
+            xai_grok_shell::session::persistence::ensure_owner_only_session_dir(
+                &self.local_session_info()?,
+            ),
+        )
+    }
+    fn local_session_info(&self) -> Option<xai_grok_shell::session::info::Info> {
+        Some(xai_grok_shell::session::info::Info {
+            id: self.session_id.clone()?,
+            cwd: self.cwd.to_string_lossy().to_string(),
+        })
+    }
     /// Process an ACP session update. Returns true if scrollback was modified.
     pub fn handle_update(
         &mut self,
@@ -892,6 +961,7 @@ impl AgentSession {
         self.tracker.expect_user_echo();
         self.state = AgentState::TurnRunning;
         self.in_flight_prompt = None;
+        self.models.set_served_model_name(None);
     }
     /// Finish the current turn: cleanup tracker, set state to Idle.
     ///
@@ -967,16 +1037,12 @@ impl AgentSession {
     pub fn finish_command(&mut self) {
         self.state = AgentState::Idle;
     }
-    /// Mark an in-flight `/compact` as cancelling (waiting for CompactComplete).
+    /// Mark an in-flight compact as cancelling (waiting for CompactComplete / AutoCompactCancelled).
     pub fn cancel_compact_command(&mut self) {
-        if let AgentState::CommandRunning {
-            command: AgentCommand::Compact,
-            ..
-        } = &self.state
+        if let AgentState::CommandRunning { command, .. } = &self.state
+            && command.is_compact()
         {
-            self.state = AgentState::CommandCancelling {
-                command: AgentCommand::Compact,
-            };
+            self.state = AgentState::CommandCancelling { command: *command };
         }
     }
     /// Push a prompt onto the back of the queue. Returns the assigned ID.
@@ -1183,6 +1249,9 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,

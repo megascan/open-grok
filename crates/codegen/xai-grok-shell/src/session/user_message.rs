@@ -27,7 +27,8 @@ pub(crate) struct UserInfoOverride {
 
 /// Minimal user message prefix for fast-start / headless contexts.
 ///
-/// Intentionally excludes workspace snapshot and git status.
+/// Intentionally excludes workspace snapshot and git status — training/actors
+/// never put `<git_status>` on the first-message prefix, and the harness matches that.
 /// When `override_info` is provided, uses remote workspace info instead
 /// of local machine introspection.
 pub(crate) fn construct_user_message_minimal(
@@ -53,7 +54,6 @@ OS Version: {os}
 Shell: {shell}
 Workspace Path: {cwd}
 {USER_INFO_DATE_MARKER} {today}
-Note: Prefer using relative paths over absolute paths as tool call args when possible.
 </user_info>"#,
     )
 }
@@ -104,7 +104,9 @@ pub(crate) async fn compute_vcs_status_block(
     working_directory: &Path,
     vcs_kind: VcsKind,
 ) -> Option<String> {
-    use xai_grok_workspace::file_system::{git_status_short, jj_status};
+    use xai_grok_workspace::file_system::{
+        git_status_short_pinned, jj_status, probe_fsmonitor_override,
+    };
 
     if matches!(vcs_kind, VcsKind::None) {
         return None;
@@ -124,7 +126,11 @@ pub(crate) async fn compute_vcs_status_block(
     let result = if vcs_kind.is_jj() {
         tokio::time::timeout(timeout, jj_status(working_directory)).await
     } else {
-        tokio::time::timeout(timeout, git_status_short(working_directory)).await
+        tokio::time::timeout(timeout, async {
+            let fsmonitor = probe_fsmonitor_override(working_directory).await;
+            git_status_short_pinned(working_directory, fsmonitor).await
+        })
+        .await
     };
     match result {
         Ok(Ok(status)) => {

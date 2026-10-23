@@ -9,8 +9,15 @@ default = []
 dhat-heap = ["dep:dhat"]
 # Session synthesis + in-process e2e harness (`session::testkit`) for soak,
 # load, and bench tests. Off by default; the tests/benches that use it declare
-# it via `required-features`.
-test-support = []
+# it via `required-features`. Forwards sampler and workspace `test-support`
+# so downstream test builds see those crates' test seams
+# (`isolated_spawn_e2e` uses `WorkspaceOps::for_test`).
+# (Upstream also forwards `xai-grok-login/test-support`; the fork omits the
+# login crate and maps its auth surface onto fork auth instead.)
+test-support = [
+    "xai-grok-sampler/test-support",
+    "xai-grok-workspace/test-support",
+]
 # Local Computer Hub workspace_server (own/attach + crash-restart). Requires
 local-workspace = []
 default-bazel = [
@@ -41,7 +48,7 @@ glob = { workspace = true }
 globset = { workspace = true }
 kanal = "0.1"
 regex = { workspace = true }
-# rmcp 2.1 + reqwest 0.13 are quarantined inside `xai-grok-mcp`. The remaining
+# rmcp 3.2 + reqwest 0.13 are quarantined inside `xai-grok-mcp`. The remaining
 # MCP code in this crate (extensions/mcp.rs, mcp_doctor.rs) reaches rmcp model
 # types via `xai_grok_mcp::rmcp::model::*`. reqwest 0.13 is a private impl
 # detail of xai-grok-mcp::servers; shell never sees it. Every HTTP call site
@@ -81,7 +88,7 @@ tracing-subscriber = { workspace = true, features = [
     "time",
 ] }
 obfstr = { workspace = true }
-tokio-util = { workspace = true, features = ["compat"] }
+tokio-util = { workspace = true, features = ["compat", "rt"] }
 tokio-retry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "v7"] }
 xai-acp-lib = { workspace = true }
@@ -118,6 +125,7 @@ moka = { workspace = true, features = ["future"] }
 dhat = { version = "0.3", optional = true }
 base64 = { workspace = true }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+hmac = "0.12"
 sha2 = { workspace = true }
 rand = { workspace = true }
 shlex = { workspace = true }
@@ -130,6 +138,7 @@ xai-grok-paths = { path = "../xai-grok-paths" }
 xai-grok-shell-base = { workspace = true }
 xai-grok-shell-session-support = { workspace = true }
 xai-grok-shared = { workspace = true }
+xai-grok-status-line = { path = "../xai-grok-status-line" }
 xai-tracing-macros = { path = "../xai-tracing-macros" }
 xai-fsnotify = { path = "../xai-fsnotify" }
 xai-codebase-graph = { path = "../xai-codebase-graph" }
@@ -141,6 +150,8 @@ xai-chat-state = { path = "../xai-chat-state" }
 xai-compaction-transcript = { workspace = true }
 xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
 xai-grok-extra-ca = { workspace = true }
+# Leader lock: bounded flock polling behind the machine-local acquire slot.
+xai-grok-file-lock = { workspace = true }
 xai-grok-sampler = { path = "../xai-grok-sampler" }
 xai-grok-session-search = { workspace = true }
 xai-sqlite-journal = { workspace = true }
@@ -160,6 +171,7 @@ xai-grok-config-types = { workspace = true }
 xai-grok-code-mode = { workspace = true }
 xai-grok-code-mode-protocol = { workspace = true }
 xai-grok-memory = { workspace = true }
+xai-grok-feedback = { workspace = true }
 xai-grok-hooks = { path = "../xai-grok-hooks" }
 xai-hooks-plugins-types = { path = "../xai-hooks-plugins-types" }
 xai-grok-plugin-marketplace = { path = "../xai-grok-plugin-marketplace" }
@@ -221,6 +233,8 @@ serial_test = { workspace = true }
 # Test-only builds expose `env::EnvVarGuard` and the cpu_profile test seams to
 # this crate's test targets.
 xai-grok-shell-base = { workspace = true, features = ["test-support"] }
+# Exposes sampler's `notify_on_submit` mock to lib tests via feature unification.
+xai-grok-sampler = { path = "../xai-grok-sampler", features = ["test-support"] }
 xai-grok-test-support = { workspace = true, features = [] }
 xai-test-utils = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` (paused virtual
@@ -267,6 +281,11 @@ required-features = ["test-support"]
 [[test]]
 name = "testkit_synth_roundtrip"
 required-features = ["test-support"]
+
+# NOTE(1.0.41-replay): upstream adds `tool_call_trace` + `tool_call_trace_off`
+# test targets, but those tests exercise the OTLP diagnostic-upload stack
+# (MockOtelServer, otel_layer config) that the fork omits, so their files
+# are not ported and no targets are declared.
 
 [lints]
 workspace = true

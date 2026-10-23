@@ -1,6 +1,6 @@
 //! Handle to communicate with ChatStateActor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
@@ -20,6 +20,17 @@ pub struct ChatStateHandle {
     cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatStateMailboxClosed;
+
+impl std::fmt::Display for ChatStateMailboxClosed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("chat-state actor mailbox is closed")
+    }
+}
+
+impl std::error::Error for ChatStateMailboxClosed {}
+
 impl ChatStateHandle {
     /// Create a new handle with the given command sender.
     pub(crate) fn new(cmd_tx: mpsc::UnboundedSender<ChatStateCommand>) -> Self {
@@ -38,6 +49,15 @@ impl ChatStateHandle {
     /// Push a user message into the conversation.
     pub fn push_user_message(&self, item: ConversationItem) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushUserMessage { item });
+    }
+
+    pub fn try_push_user_messages_batch(
+        &self,
+        items: Vec<ConversationItem>,
+    ) -> Result<(), ChatStateMailboxClosed> {
+        self.cmd_tx
+            .send(ChatStateCommand::PushUserMessagesBatch { items })
+            .map_err(|_| ChatStateMailboxClosed)
     }
 
     /// Push a user message and await acknowledgement that the chat-state actor
@@ -82,6 +102,28 @@ impl ChatStateHandle {
     /// Record a tool result.
     pub fn push_tool_result(&self, item: ConversationItem) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult { item });
+    }
+
+    /// Append a tool result and run its commit only after actor acceptance.
+    /// Dropping an undelivered callback releases its owned resources.
+    pub fn push_tool_result_with_commit(
+        &self,
+        item: ConversationItem,
+        commit: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), ChatStateMailboxClosed> {
+        self.cmd_tx
+            .send(ChatStateCommand::PushToolResultWithCommit { item, commit })
+            .map_err(|_| ChatStateMailboxClosed)
+    }
+
+    pub fn push_model_output(&self, item: ConversationItem) {
+        let _ = self.cmd_tx.send(ChatStateCommand::PushModelOutput { item });
+    }
+
+    pub fn push_unreported_model_output(&self, item: ConversationItem) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::PushUnreportedModelOutput { item });
     }
 
     /// Record accumulated token usage.
@@ -144,6 +186,18 @@ impl ChatStateHandle {
         })
         .await
         .is_some()
+    }
+
+    pub fn mark_usage_incomplete_nowait(&self, prompt: bool, session: bool) {
+        let (reply, _rx) = oneshot::channel();
+        let cmd = ChatStateCommand::MarkUsageIncomplete {
+            prompt,
+            session,
+            reply,
+        };
+        if self.cmd_tx.send(cmd).is_err() {
+            tracing::warn!("ChatStateActor dead: MarkUsageIncomplete dropped");
+        }
     }
 
     /// Increment prompt index (called at start of each user turn).
@@ -321,11 +375,22 @@ impl ChatStateHandle {
         let _ = self.cmd_tx.send(ChatStateCommand::FlushHarnessTraceTurn);
     }
 
-    /// Repair dangling tool calls after a harness-initiated halt.
-    pub fn repair_dangling_after_harness_halt(&self, class: &'static str) {
+    /// Repair dangling tool calls after a harness-initiated halt. `answers` are
+    /// written only for ids still dangling; the rest are dropped.
+    pub fn repair_dangling_after_harness_halt(
+        &self,
+        class: &'static str,
+        answers: HashMap<String, String>,
+    ) {
         let _ = self
             .cmd_tx
-            .send(ChatStateCommand::RepairDanglingAfterHarnessHalt { class });
+            .send(ChatStateCommand::RepairDanglingAfterHarnessHalt { class, answers });
+    }
+
+    pub fn pop_stranded_continue_reminder(&self) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::PopStrandedContinueReminder);
     }
 
     // ═══ Async queries (via oneshot) ═══
@@ -462,11 +527,14 @@ impl ChatStateHandle {
     /// `total_tokens` plus bytes/4 estimate of tool results pushed since the
     /// last model response. Used by `check_preflight_overflow`.
     pub async fn get_estimated_total_tokens(&self) -> u64 {
+        self.try_get_estimated_total_tokens().await.unwrap_or(0)
+    }
+
+    pub async fn try_get_estimated_total_tokens(&self) -> Option<u64> {
         self.query("GetEstimatedTotalTokens", |reply| {
             ChatStateCommand::GetEstimatedTotalTokens { reply }
         })
         .await
-        .unwrap_or(0)
     }
 
     /// Bytes/4 estimate of all non-system conversation items.
@@ -610,6 +678,14 @@ impl ChatStateHandle {
     pub async fn get_last_assistant_text(&self) -> Option<String> {
         self.query("GetLastAssistantText", |reply| {
             ChatStateCommand::GetLastAssistantText { reply }
+        })
+        .await
+        .flatten()
+    }
+
+    pub async fn get_trailing_assistant_report(&self) -> Option<String> {
+        self.query("GetTrailingAssistantReport", |reply| {
+            ChatStateCommand::GetTrailingAssistantReport { reply }
         })
         .await
         .flatten()

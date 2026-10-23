@@ -13,6 +13,7 @@ mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub mod pre_tui;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 pub(crate) mod single_flight;
@@ -45,10 +46,10 @@ pub use flow::{
     run_cli_runinfra_login, run_cli_runinfra_logout, run_cli_wafer_login, run_cli_wafer_logout,
     run_cli_zai_login, run_cli_zai_logout, try_ensure_fresh_auth,
 };
-pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
+pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration, parse_jwt_subject};
 mod meta;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
-pub use manager::{AuthManager, shared_api_key_provider};
+pub use manager::{AuthManager, Login, LoginChanges, LoginSnapshot, shared_api_key_provider};
 pub(crate) use manager::{AuthRemedy, SilentRefresh};
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};

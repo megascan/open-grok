@@ -254,6 +254,25 @@ impl AgentView {
                         xai_grok_telemetry::events::AnnouncementCtaSurface::Header,
                     ));
                 }
+                if self.hit_dashboard.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(if self.in_dashboard_overlay {
+                        Action::DashboardOverlayExit
+                    } else {
+                        Action::OpenDashboard
+                    });
+                }
+                if self.hit_overlay_prev.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::DashboardOverlayPrev);
+                }
+                if self.hit_overlay_next.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::DashboardOverlayNext);
+                }
                 if self.hit_cwd.contains(mouse.column, mouse.row) {
                     let path = self.session.cwd.display().to_string();
                     self.copy_to_clipboard(&path);
@@ -451,6 +470,15 @@ impl AgentView {
                     return InputOutcome::Unchanged;
                 }
                 match self.pane_areas.hit_test(mouse.column, mouse.row) {
+                    Some(AgentPane::Dock) => {
+                        let row = mouse.row.saturating_sub(self.pane_areas.dock.y);
+                        if let Some(item) = crate::views::dock::item_at(&self.dock_counts(), row) {
+                            self.handle_dock_click(item)
+                        } else {
+                            self.set_active_pane(AgentPane::Dock, false);
+                            InputOutcome::Changed
+                        }
+                    }
                     Some(AgentPane::Todo) => {
                         self.set_active_pane(AgentPane::Todo, false);
                         self.todo.handle_mouse(
@@ -1033,7 +1061,8 @@ impl AgentView {
                         | AgentPane::Queue
                         | AgentPane::Prompt
                         | AgentPane::Tasks
-                        | AgentPane::Catalog => None,
+                        | AgentPane::Catalog
+                        | AgentPane::Dock => None,
                     })
                 };
                 let new_prompt_hover = hit == Some(AgentPane::Prompt)
@@ -1139,6 +1168,9 @@ impl AgentView {
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_dashboard.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_overlay_prev.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_overlay_next.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_upgrade_cta.update_hover(mouse.column, mouse.row);
                 {
                     let new_kill = self
@@ -1354,7 +1386,7 @@ mod tests {
         let ids = agent.queue.entry_ids();
         let outcome = click_send_now(&mut agent, ids[1]);
         match outcome {
-            InputOutcome::Action(Action::SendPromptNow { text, images }) => {
+            InputOutcome::Action(Action::SendPromptNow { text, images, .. }) => {
                 assert_eq!(text, "local one");
                 assert_eq!(images.len(), 1, "row image must ride the send-now");
             }

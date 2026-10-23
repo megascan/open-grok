@@ -319,6 +319,9 @@ fn lost_cancel_is_resent_while_still_cancelling() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -390,6 +393,9 @@ fn cancel_retry_reuses_recorded_subagent_choice() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -434,6 +440,9 @@ fn confirmed_stop_retry_does_not_rearm_auto_resend() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -637,7 +646,11 @@ fn do_cancel_turn_cancels_running_wake_turn() {
         });
     }
 
-    let effects = super::super::turn::do_cancel_turn(&mut app, true);
+    let effects = super::super::turn::do_cancel_turn(
+        &mut app,
+        true,
+        crate::app::cancel_latency::CancelOrigin::Programmatic,
+    );
     assert!(
         matches!(
             effects.as_slice(),
@@ -1043,6 +1056,62 @@ fn reconcile_finishes_cancelling_turn_after_grace() {
     );
 }
 
+/// The tick-arm reconcile drains the queue outside any dispatched action; the flush that follows it in
+/// the event loop must deliver a queued image's read failure on the active view and request a redraw.
+#[test]
+fn reconcile_drain_notice_is_flushed_from_the_tick_arm() {
+    use crate::app::dispatch::tests::enqueue_local;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.session.current_prompt_id = Some("pid-stuck".into());
+    }
+    enqueue_local(&mut app, id, "look at [Image #2]");
+    {
+        let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+        image.display_number = 2;
+        image.encoded_bytes = None;
+        image.session_image_path = Some(dir.path().join("gone.png"));
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .pending_prompts
+            .back_mut()
+            .unwrap()
+            .images = vec![image];
+    }
+    arm_reconcile(
+        &mut app,
+        id,
+        "pid-stuck",
+        "end_turn",
+        TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1),
+    );
+
+    let fired = reconcile_overdue_turn_ends(&mut app);
+    let shown = app.flush_image_notices_if_root();
+
+    assert!(
+        fired.is_some_and(|effects| effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPromptBlocks { .. }))),
+        "the reconcile must drain the queued prompt"
+    );
+    assert!(shown, "the flush must report the visible change");
+    assert_eq!(
+        app.agents[&id]
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str()),
+        Some("Image #2 couldn't be read — not sent")
+    );
+}
+
 /// A lost-RPC reconcile for a send-now cancel (`_meta.cancelTrigger: "send_now"`) pushes no marker.
 #[test]
 fn reconcile_suppresses_send_now_cancel_marker() {
@@ -1250,6 +1319,9 @@ fn reconcile_error_formats_marker_and_defers_to_banner() {
                 prompt_id: "pid-stuck".into(),
                 stop_reason: Some("error".into()),
                 agent_result: Some("boom".into()),
+                cancellation_category: None,
+                cancellation_context: None,
+                error_kind: None,
                 cancel_trigger: None,
                 received_at: std::time::Instant::now()
                     - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
@@ -1274,7 +1346,7 @@ fn reconcile_error_formats_marker_and_defers_to_banner() {
 
     assert_eq!(
         run(false).as_deref(),
-        Some("Request failed \u{2014} boom. Try sending again."),
+        Some("Request failed: boom. Try sending again."),
         "the raw agent_result must render as a formatted marker"
     );
     assert_eq!(
@@ -1478,7 +1550,15 @@ fn cancel_rewind_removes_all_combined_segment_blocks() {
         (first_id, last_id)
     };
 
-    let _ = dispatch(Action::CancelTurn, &mut app);
+    let effects = dispatch(Action::CancelTurn, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CancelTurn {
+            rewind_if_no_output: true,
+            rewind_prompt_id: Some(prompt_id),
+            ..
+        }] if prompt_id == "p-combo"
+    ));
 
     let agent = &app.agents[&id];
     assert!(
@@ -1494,6 +1574,35 @@ fn cancel_rewind_removes_all_combined_segment_blocks() {
         "first\n\nsecond",
         "the joined combined text is restored into the composer"
     );
+}
+
+/// An unidentifiable in-flight turn cannot safely be rewound on the server.
+#[test]
+fn cancel_without_prompt_identity_keeps_in_flight_prompt() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("sent prompt".into()), &mut app);
+    let entry = app.agents[&id]
+        .session
+        .in_flight_prompt
+        .as_ref()
+        .unwrap()
+        .scrollback_entry;
+    app.agents.get_mut(&id).unwrap().session.current_prompt_id = None;
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CancelTurn {
+            rewind_if_no_output: false,
+            rewind_prompt_id: None,
+            ..
+        }]
+    ));
+    let agent = &app.agents[&id];
+    assert!(agent.scrollback.index_of_id(entry).is_some());
+    assert!(agent.prompt.text().is_empty());
+    assert!(agent.session.state.is_cancelling());
 }
 
 /// A cancel landing before first server activity must NOT rewind the stashed
@@ -1721,6 +1830,85 @@ fn bg_task_killed_keeps_pending_kill_on_killed_outcome() {
 }
 
 #[test]
+fn kill_bg_task_in_subagent_view_names_the_childs_session() {
+    let mut app = test_app_with_agent();
+    let root_id = AgentId(0);
+    let child_sid = "child-1";
+    let mut child = AgentView::new(
+        make_test_agent_session(&app, AgentId(1), child_sid),
+        ScrollbackState::new(),
+    );
+    child
+        .session
+        .bg_tasks
+        .insert("bg-child".into(), super::make_bg_task("bg-child"));
+    {
+        let root = app.agents.get_mut(&root_id).expect("root agent must exist");
+        root.subagent_views
+            .insert(child_sid.to_string(), Box::new(child));
+        root.active_subagent = Some(child_sid.to_string());
+    }
+
+    let effects = dispatch(Action::KillBgTask("bg-child".into()), &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::KillBgTask { session_id, task_id, .. }]
+                if session_id.0.as_ref() == child_sid && task_id == "bg-child"
+        ),
+        "the kill must name the child's session, got {effects:?}"
+    );
+    assert!(
+        child_task_pending_kill(&app, root_id, child_sid, "bg-child"),
+        "the kill must mark the child's row"
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::BgTaskKillFailed {
+            session_id: child_sid.into(),
+            task_id: "bg-child".into(),
+            error: "connection lost".into(),
+        }),
+        &mut app,
+    );
+
+    assert!(
+        !child_task_pending_kill(&app, root_id, child_sid, "bg-child"),
+        "a failed kill must clear the child's row"
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::BgTaskKilled {
+            session_id: child_sid.into(),
+            task_id: "bg-child".into(),
+            outcome: Some(xai_grok_tools::types::KillOutcome::NotFound),
+        }),
+        &mut app,
+    );
+
+    let child_has_row = app.agents[&root_id]
+        .subagent_views
+        .get(child_sid)
+        .is_some_and(|view| view.session.bg_tasks.contains_key("bg-child"));
+    assert!(!child_has_row, "an unknown task must drop the child's row");
+}
+
+fn child_task_pending_kill(
+    app: &AppView,
+    root_id: AgentId,
+    child_sid: &str,
+    task_id: &str,
+) -> bool {
+    app.agents[&root_id]
+        .subagent_views
+        .get(child_sid)
+        .and_then(|view| view.session.bg_tasks.get(task_id))
+        .map(|task| task.pending_kill)
+        .unwrap_or_else(|| panic!("missing the child's task {task_id}"))
+}
+
+#[test]
 fn bg_task_kill_failed_clears_pending_kill_on_inactive_agent() {
     let mut app = two_agent_app_with_bg_task();
 
@@ -1755,7 +1943,6 @@ fn build_rows_collapses_many_subagents() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1784,7 +1971,6 @@ fn build_rows_seven_subagents_no_placeholder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1810,7 +1996,6 @@ fn build_rows_eight_subagents_no_placeholder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1837,7 +2022,6 @@ fn build_rows_sixteen_subagents_placeholder_counts_remainder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1867,7 +2051,6 @@ fn build_rows_with_roster_hides_subagent_rows() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1883,7 +2066,6 @@ fn build_rows_with_roster_hides_subagent_rows() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1910,7 +2092,6 @@ fn subagent_label_strips_control_characters() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,

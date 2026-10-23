@@ -15,7 +15,7 @@ use crate::scrollback::layout::HorizontalLayout;
 use crate::scrollback::render::{ScratchBuffer, render_scrolled_entries_with_selection_boundaries};
 use crate::scrollback::selection::{RenderOutput, ScrollInfo, SelectionBox};
 use crate::scrollback::state::{ScrollbackState, ViewMode};
-use crate::scrollback::sticky::{PromptDescriptor, StickyHeaderLayout, compute_sticky_layout};
+use crate::scrollback::sticky::StickyHeaderLayout;
 use crate::scrollback::text_selection::{
     ResolvedSelectableLine, ResolvedSelectionBoundaries, ResolvedSelectionModel,
     VisibleBlockGeometry,
@@ -379,24 +379,11 @@ impl ScrollbackPane {
         scratch: &mut ScratchBuffer,
     ) -> RenderOutputWithSelectionBoundaries {
         let layout_cfg = &state.appearance().scrollback.layout;
-        let layout = HorizontalLayout::new(area, layout_cfg);
-        let entry_content_width = layout.entry_content_area().width;
-
-        // Build prompt descriptors for the given entry range.
-        // For SingleTurn, this gives us relative y_virtual coordinates.
-        // For AllTurns, this is equivalent to the full range.
-        let prompts = self.build_prompt_descriptors_for_range(
-            state,
-            entry_content_width,
-            theme,
-            entry_range.clone(),
-        );
-
         // Compute sticky header layout (disabled in compact mode).
         let use_sticky = state.appearance().scrollback.display.sticky_headers
             && !state.appearance().prompt.compact;
         let sticky = if use_sticky {
-            compute_sticky_layout(state.scroll_offset(), area.height, &prompts)
+            state.sticky_layout_for_range(entry_range.clone(), state.scroll_offset(), area.height)
         } else {
             StickyHeaderLayout::default()
         };
@@ -605,53 +592,6 @@ impl ScrollbackPane {
         output
     }
 
-    /// Build prompt descriptors for a range of entries.
-    ///
-    /// The y_virtual coordinates are relative to the range start, not absolute.
-    /// This allows the same sticky layout logic to work for both:
-    /// - SingleTurn: range = visible_entry_range() (one turn's entries)
-    /// - AllTurns: range = 0..len() (all entries)
-    ///
-    /// NOTE: This method now uses cached data from prepare_layout().
-    /// Heights are NOT recomputed - they come from the LayoutCache.
-    fn build_prompt_descriptors_for_range(
-        &self,
-        state: &ScrollbackState,
-        _entry_content_width: u16, // Kept for API compat, but not used (heights from cache)
-        _theme: &Theme,            // Kept for API compat, but not used
-        entry_range: Range<usize>,
-    ) -> Vec<PromptDescriptor> {
-        // Get cached data - must be valid after prepare_layout()
-        let cached_descriptors = state
-            .get_cached_prompt_descriptors()
-            .expect("layout cache must be valid - was prepare_layout() called?");
-
-        let cached_virtual_y = state
-            .get_cached_virtual_y()
-            .expect("layout cache must be valid - was prepare_layout() called?");
-
-        // Get the y_offset of the first entry in the range
-        // All y_virtual values will be adjusted relative to this
-        let y_offset = cached_virtual_y
-            .get(entry_range.start)
-            .copied()
-            .unwrap_or(0);
-
-        // Filter descriptors to only those in the entry range,
-        // and adjust y_virtual to be relative to range start
-        cached_descriptors
-            .iter()
-            .filter(|p| entry_range.contains(&p.entry_idx))
-            .map(|p| PromptDescriptor {
-                entry_idx: p.entry_idx,
-                y_virtual: p.y_virtual.saturating_sub(y_offset),
-                full_height: p.full_height,
-                min_height: p.min_height,
-                sticky: p.sticky,
-            })
-            .collect()
-    }
-
     /// Render a sticky header (pushed or pinned).
     ///
     /// - `render_height`: Total height budget for the block (including vpads)
@@ -840,7 +780,6 @@ impl ScrollbackPane {
         let block_has_vpad = entry.block.has_vpad(ctx);
 
         // Get accent background preference and block background
-        let accent_has_bg = entry.block.accent_background(ctx);
         let block_bg = entry.block.background(ctx);
 
         // Resolve the background color from block_bg
@@ -900,7 +839,7 @@ impl ScrollbackPane {
                 break;
             }
             // Render line in the content area (not overlapping with accent)
-            buf.set_line_safe(content_area.x, y, &line.content, content_area.width);
+            buf.set_line_safe_bidi(content_area.x, y, &line.content, content_area.width);
             if let (Some(range_id), Some(cols)) = (
                 line.selection_range,
                 selectable_cols(&line.content, &line.selectable),
@@ -911,8 +850,10 @@ impl ScrollbackPane {
                     block_line_idx,
                     screen_y: y,
                     screen_x: content_area.x,
-                    selectable_cols: cols,
+                    selectable_cols: crate::scrollback::types::visual_selectable_cols(line)
+                        .unwrap_or(cols),
                     text: derive_selection_text(line),
+                    painted_region: Some(crate::scrollback::types::painted_selectable_region(line)),
                     joiner_to_previous: line.joiner.clone(),
                 });
             }
@@ -957,37 +898,14 @@ impl ScrollbackPane {
 
         // Draw accent line if entry has one, otherwise clear the accent column
         // so stale content from previous frames doesn't bleed through.
-        if let Some(accent) = entry.block.accent(ctx) {
-            let color = accent.color;
-            let accent_area = layout.accent;
+        let accent_area = layout.accent;
 
-            // Determine accent background color based on accent_has_bg and block_bg
-            let accent_bg = if accent_has_bg {
-                match block_bg {
-                    BlockBackground::None => theme.bg_base,
-                    BlockBackground::Light => theme.bg_light,
-                    BlockBackground::Dark => theme.bg_dark,
-                }
-            } else {
-                theme.bg_base
-            };
-
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char('┃');
-                    cell.set_style(ratatui::style::Style::default().fg(color).bg(accent_bg));
-                }
-            }
-        } else {
-            // No accent: clear the column with the block's bg so it matches.
-            let accent_area = layout.accent;
-            let clear_bg = bg_color.unwrap_or(theme.bg_base);
-            let clear_style = ratatui::style::Style::default().bg(clear_bg);
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char(' ');
-                    cell.set_style(clear_style);
-                }
+        // Determine accent background color based on accent_has_bg and block_bg
+        let clear_style = ratatui::style::Style::default().bg(bg_color.unwrap_or(theme.bg_base));
+        for row in accent_area.y..accent_area.y + total_height.min(area.height) {
+            if let Some(cell) = buf.cell_mut((accent_area.x, row)) {
+                cell.set_char(' ');
+                cell.set_style(clear_style);
             }
         }
 

@@ -13,7 +13,10 @@ use std::fmt;
 
 /// Input for the `task` tool — launches a subagent to handle a task
 /// autonomously.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// Field descriptions name parameters literally: prod chat derives its
+/// model-facing `arguments_schema` from this type with no template renderer.
+#[derive(Debug, Clone, JsonSchema)]
 pub struct TaskToolInput {
     /// The full task prompt for the subagent to execute.
     #[schemars(description = "The full task prompt for the subagent to execute.")]
@@ -23,13 +26,19 @@ pub struct TaskToolInput {
     #[schemars(description = "Short description of the task (3-5 words).")]
     pub description: String,
 
-    /// Name of the subagent type to launch. Built-in types: "general-purpose",
-    /// "explore", "plan". Additional user-defined types may also be available.
-    #[schemars(
-        description = "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\". Additional user-defined types may also be available."
-    )]
+    /// Not on the model-facing schema. Omitted JSON defaults to general-purpose
+    /// and is not written back. A present key is kept: hosts persist this struct
+    /// through ACP `raw_input`, and callers still select explore, plan, and
+    /// custom types by name.
+    #[schemars(skip)]
     #[serde(default = "default_subagent_type")]
     pub subagent_type: String,
+
+    /// True when the JSON key was present. In-process constructors leave this
+    /// false, so a default `general-purpose` string is still an omitted type.
+    #[schemars(skip)]
+    #[serde(default, skip_serializing)]
+    pub subagent_type_specified: bool,
 
     /// Whether to run the subagent in the background.
     ///
@@ -75,8 +84,8 @@ pub struct TaskToolInput {
         description = "Resume from a previously completed subagent's conversation. \
             Pass the subagent_id returned by a prior task call. The new subagent \
             continues the previous one's raw transcript with the new task prompt \
-            appended. The source must be completed (not running), belong to the \
-            current session, and use the same subagent_type."
+            appended. The source must be completed (not running) and belong to the \
+            current session."
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_from: Option<String>,
@@ -109,6 +118,13 @@ pub struct TaskToolInput {
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Optional id of the workspace the child runs in. Accepted on the wire
+    /// and ignored locally; omitted from the derived schema, so hosts that
+    /// support it advertise the property themselves.
+    #[schemars(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 
     /// Initial-context mode for the subagent.
     #[schemars(
@@ -143,6 +159,127 @@ pub struct TaskToolInput {
 /// Default `subagent_type` for [`TaskToolInput`] when the caller omits it.
 pub fn default_subagent_type() -> String {
     "general-purpose".to_string()
+}
+
+/// Wire shape for [`TaskToolInput`]. A missing `subagent_type` key is omitted;
+/// a present key, including `general-purpose`, is explicit.
+#[derive(Deserialize)]
+struct TaskToolInputDe {
+    prompt: String,
+    description: String,
+    #[serde(default)]
+    subagent_type: Option<String>,
+    #[serde(
+        default = "default_true",
+        deserialize_with = "crate::serde_lenient::deserialize_lenient_bool"
+    )]
+    run_in_background: bool,
+    #[serde(default)]
+    capability_mode: Option<SubagentCapabilityMode>,
+    #[serde(default)]
+    isolation: Option<SubagentIsolationMode>,
+    #[serde(default)]
+    resume_from: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    context: Option<SubagentContextMode>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+// Manual Serialize: an omitted type must not gain a subagent_type key.
+impl Serialize for TaskToolInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        TaskToolInputSer {
+            prompt: &self.prompt,
+            description: &self.description,
+            subagent_type: self
+                .subagent_type_specified
+                .then_some(self.subagent_type.as_str()),
+            run_in_background: self.run_in_background,
+            capability_mode: self.capability_mode.as_ref(),
+            isolation: self.isolation.as_ref(),
+            resume_from: self.resume_from.as_deref(),
+            cwd: self.cwd.as_deref(),
+            model: self.model.as_deref(),
+            workspace: self.workspace.as_deref(),
+            context: self.context.as_ref(),
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            task_id: self.task_id.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct TaskToolInputSer<'a> {
+    prompt: &'a str,
+    description: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_type: Option<&'a str>,
+    run_in_background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_mode: Option<&'a SubagentCapabilityMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolation: Option<&'a SubagentIsolationMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<&'a SubagentContextMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    task_id: Option<&'a str>,
+}
+
+// Manual Deserialize: #[serde(from)] makes schemars schema-generate TaskToolInputDe.
+impl<'de> Deserialize<'de> for TaskToolInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        TaskToolInputDe::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl From<TaskToolInputDe> for TaskToolInput {
+    fn from(raw: TaskToolInputDe) -> Self {
+        let specified = raw.subagent_type.as_deref().is_some_and(is_not_sentinel);
+        Self {
+            prompt: raw.prompt,
+            description: raw.description,
+            subagent_type: raw
+                .subagent_type
+                .filter(|value| is_not_sentinel(value))
+                .unwrap_or_else(default_subagent_type),
+            subagent_type_specified: specified,
+            run_in_background: raw.run_in_background,
+            capability_mode: raw.capability_mode,
+            isolation: raw.isolation,
+            resume_from: raw.resume_from,
+            cwd: raw.cwd,
+            model: raw.model,
+            workspace: raw.workspace,
+            context: raw.context,
+            reasoning_effort: raw.reasoning_effort,
+            task_id: raw.task_id,
+        }
+    }
 }
 
 /// Input for `agent_swarm`, which launches a bounded foreground cohort of
@@ -436,11 +573,7 @@ pub struct SubagentCompletedOutput {
 impl SubagentCompletedOutput {
     /// Render the resume footer showing the subagent ID and resume hint.
     pub fn resume_footer(&self) -> String {
-        format_resume_footer(
-            &self.subagent_id,
-            &self.subagent_type,
-            self.persona.as_deref(),
-        )
+        format_resume_footer(&self.subagent_id, self.persona.as_deref())
     }
 
     /// Render the full model-facing completion block: the answer text, the
@@ -449,7 +582,6 @@ impl SubagentCompletedOutput {
         format_subagent_completed(
             &self.output,
             &self.subagent_id,
-            &self.subagent_type,
             self.tool_calls,
             self.turns,
             self.duration_ms,
@@ -581,19 +713,69 @@ fn blob_is_delegate(text: &str) -> bool {
 /// background and is still running.
 ///
 /// When `continue_parent_work` is true, append the continue-parent CTA.
-pub fn format_subagent_started_background(
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackgroundNoticeNaming<'a> {
+    pub task_output_tool: &'a str,
+    pub task_ids_param: &'a str,
+    pub timeout_ms_param: &'a str,
+}
+impl BackgroundNoticeNaming<'static> {
+    pub const CANONICAL: Self = Self {
+        task_output_tool: "get_task_output",
+        task_ids_param: "task_ids",
+        timeout_ms_param: "timeout_ms",
+    };
+}
+fn background_result_line(subagent_id: &str, naming: &BackgroundNoticeNaming) -> String {
+    let BackgroundNoticeNaming {
+        task_output_tool,
+        task_ids_param,
+        timeout_ms_param,
+    } = *naming;
+    format!(
+        "When you need its result, use {task_output_tool} with {task_ids_param}=[\"{subagent_id}\"] and a positive {timeout_ms_param}."
+    )
+}
+pub fn format_subagent_started_background<'a>(
     subagent_id: &str,
-    subagent_type: &str,
     description: &str,
-    task_output_tool_name: &str,
+    naming: impl Into<BackgroundNoticeNaming<'a>>,
     continue_parent_work: bool,
 ) -> String {
+    let naming = naming.into();
+    let result_line = background_result_line(subagent_id, &naming);
     let mut text = format!(
         "Subagent started in background.\n\
          subagent_id: {subagent_id}\n\
-         type: {subagent_type}\n\
          description: {description}\n\n\
-         Use {task_output_tool_name} with task_ids=[\"{subagent_id}\"] and timeout_ms to wait for results."
+         {result_line}"
+    );
+    if continue_parent_work {
+        text.push_str("\n\n");
+        text.push_str(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK);
+    }
+    text
+}
+pub fn format_subagent_auto_backgrounded(
+    subagent_id: &str,
+    description: &str,
+    naming: &BackgroundNoticeNaming,
+    notified_on_completion: bool,
+    continue_parent_work: bool,
+) -> String {
+    let notify_clause = if notified_on_completion {
+        " — you will be notified when it completes"
+    } else {
+        ""
+    };
+    let result_line = background_result_line(subagent_id, naming);
+    let mut text = format!(
+        "Subagent took longer than the foreground budget and was moved to the \
+         background to keep the conversation responsive. It is still running{notify_clause}.\n\
+         subagent_id: {subagent_id}\n\
+         description: {description}\n\n\
+         {result_line}"
     );
     if continue_parent_work {
         text.push_str("\n\n");
@@ -602,21 +784,118 @@ pub fn format_subagent_started_background(
     text
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundSpawnInterrupt {
+    UserSentMessage,
+    UserStoppedTurn,
+}
+
+impl ForegroundSpawnInterrupt {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserSentMessage => "user_sent_message",
+            Self::UserStoppedTurn => "user_stopped_turn",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandedOffSubagentState {
+    Running,
+    Queued,
+    Finished,
+    Cancelled,
+}
+
+impl HandedOffSubagentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Queued => "queued",
+            Self::Finished => "finished",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+pub fn format_subagent_backgrounded_on_turn_end(
+    subagent_id: &str,
+    description: &str,
+    naming: &BackgroundNoticeNaming,
+    interrupt: ForegroundSpawnInterrupt,
+    state: HandedOffSubagentState,
+    notified_on_completion: bool,
+) -> String {
+    let cause = match interrupt {
+        ForegroundSpawnInterrupt::UserSentMessage => "the user's message ended this turn",
+        ForegroundSpawnInterrupt::UserStoppedTurn => "the user stopped this turn",
+    };
+    let notify_clause = if notified_on_completion {
+        " — you will be notified when it completes"
+    } else {
+        ""
+    };
+    let headline = match state {
+        HandedOffSubagentState::Running => format!(
+            "Subagent was moved to the background because {cause}. It was not cancelled and \
+             is still running{notify_clause} — do not spawn it again."
+        ),
+        HandedOffSubagentState::Queued => format!(
+            "Subagent was moved to the background because {cause}. It was not cancelled and \
+             is queued to start when a subagent slot frees{notify_clause} — do not spawn it \
+             again."
+        ),
+        HandedOffSubagentState::Finished => format!(
+            "Subagent finished, but {cause} before its result was delivered here — do not \
+             spawn it again."
+        ),
+        HandedOffSubagentState::Cancelled => {
+            "Subagent was cancelled before its result was delivered here.".to_owned()
+        }
+    };
+    let result_line = background_result_line(subagent_id, naming);
+    format!(
+        "{headline}\n\
+         subagent_id: {subagent_id}\n\
+         description: {description}\n\n\
+         {result_line}"
+    )
+}
+
+impl<'a> From<&'a str> for BackgroundNoticeNaming<'a> {
+    fn from(task_output_tool: &'a str) -> Self {
+        Self {
+            task_output_tool,
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+        }
+    }
+}
+impl<'a> From<&'a String> for BackgroundNoticeNaming<'a> {
+    fn from(task_output_tool: &'a String) -> Self {
+        Self::from(task_output_tool.as_str())
+    }
+}
+impl<'a> From<&BackgroundNoticeNaming<'a>> for BackgroundNoticeNaming<'a> {
+    fn from(naming: &BackgroundNoticeNaming<'a>) -> Self {
+        *naming
+    }
+}
+
 /// Render the full model-facing completion block for a finished subagent:
 /// the answer text, a `<subagent_meta>` line carrying run stats, and the
 /// `<subagent_result>` resume footer.
 pub fn format_subagent_completed(
     output: &str,
     subagent_id: &str,
-    subagent_type: &str,
     tool_calls: u32,
     turns: u32,
     duration_ms: u64,
     persona: Option<&str>,
 ) -> String {
-    let footer = format_resume_footer(subagent_id, subagent_type, persona);
+    let footer = format_resume_footer(subagent_id, persona);
     format!(
-        "{output}\n\n<subagent_meta>id={subagent_id}, type={subagent_type}, \
+        "{output}\n\n<subagent_meta>id={subagent_id}, \
          tool_calls={tool_calls}, turns={turns}, duration_ms={duration_ms}</subagent_meta>\n\n\
          {footer}"
     )
@@ -624,15 +903,10 @@ pub fn format_subagent_completed(
 
 /// Render a resume footer from bare fields (when [`SubagentCompletedOutput`] is
 /// not available, e.g. in the `get_task_output` path).
-pub fn format_resume_footer(
-    subagent_id: &str,
-    subagent_type: &str,
-    persona: Option<&str>,
-) -> String {
+pub fn format_resume_footer(subagent_id: &str, persona: Option<&str>) -> String {
     let mut footer = format!(
         "<subagent_result>\n\
          subagent_id: {subagent_id}\n\
-         subagent_type: {subagent_type}\n\
          To continue this subagent's conversation, use resume_from=\"{subagent_id}\"."
     );
     if let Some(persona) = persona {
@@ -718,9 +992,10 @@ pub fn task_output_waits(timeout_ms: Option<u64>) -> bool {
 }
 
 /// Default ceiling on a single blocking wait (`get_task_output` with a positive
-/// `timeout_ms`, `wait_tasks`). Capping is safe because a completed task pings
-/// the model, so a truncated wait costs one more poll, not the result.
-pub const MAX_WAIT_BLOCK_MS_DEFAULT: u64 = 600_000;
+/// `timeout_ms`, `wait_tasks`). One hour: above the p99 of timeouts the model
+/// actually requests, so the harness rarely hands back "still running" first.
+/// Hosts with a shorter transport deadline set `OPENGROK_MAX_WAIT_BLOCK_MS`.
+pub const MAX_WAIT_BLOCK_MS_DEFAULT: u64 = 3_600_000;
 
 /// The blocking-wait ceiling in effect, honoring `OPENGROK_MAX_WAIT_BLOCK_MS`.
 ///
@@ -735,16 +1010,18 @@ pub fn max_wait_block_ms() -> u64 {
         .unwrap_or(MAX_WAIT_BLOCK_MS_DEFAULT)
 }
 
-/// Render a wait ceiling for tool descriptions, e.g. `600000 (~10 min)`.
+/// Render a wait ceiling for tool descriptions, e.g. `3600000 (~1 h)`.
 ///
 /// The unit is derived from the value, so it cannot drift from the millisecond
-/// figure beside it. Both branches round *down*: a cap must never read as
+/// figure beside it. All branches round *down*: a cap must never read as
 /// longer than it is.
 pub fn format_wait_cap_ms(ms: u64) -> String {
     if ms < 60_000 {
         format!("{ms} (~{} s)", ms / 1_000)
-    } else {
+    } else if ms < 3_600_000 {
         format!("{ms} (~{} min)", ms / 60_000)
+    } else {
+        format!("{ms} (~{} h)", ms / 3_600_000)
     }
 }
 
@@ -1207,8 +1484,6 @@ pub fn builtin_subagent_by_name(name: &str) -> Option<&'static BuiltinSubagent> 
 pub struct TaskToolNaming<'a> {
     /// Name of the spawn tool (canonical: `task`).
     pub task_tool: &'a str,
-    /// Name of the `subagent_type` parameter.
-    pub subagent_type_param: &'a str,
     /// Name of the `run_in_background` parameter.
     pub run_in_background_param: &'a str,
     /// Name of the `resume_from` parameter.
@@ -1220,49 +1495,30 @@ pub struct TaskToolNaming<'a> {
     pub isolation_param: &'a str,
 }
 
-/// Build the `task` tool description from an effective subagent list.
+/// Build the `task` tool description.
 ///
-/// Assembles the canonical header, the agent roster, and the usage-notes
-/// footer, substituting the product-specific tool/parameter names from
-/// `naming`. Agent lines render as `- **{name}**: {description} {tools}` (the
-/// trailing tools fragment is omitted when [`SubagentDescriptor::tools`] is
-/// `None`, e.g. for user-defined agents).
-pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToolNaming) -> String {
-    let agent_lines = subagents
-        .iter()
-        .map(|s| match &s.tools {
-            Some(tools) => format!("- **{}**: {} {}", s.name, s.description, tools),
-            None => format!("- **{}**: {}", s.name, s.description),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+/// Substitutes the product-specific tool and parameter names from `naming`.
+pub fn build_task_description(naming: &TaskToolNaming) -> String {
     let TaskToolNaming {
         task_tool,
-        subagent_type_param,
         run_in_background_param,
         resume_from_param,
         background_retrieval_tool,
         isolation_param,
     } = *naming;
 
-    let out = format!(
+    format!(
         "Start a subagent that works on a task independently and reports back.\n\n\
-         Agent types:\n\n\
-         {agent_lines}\n\n\
          ## Usage notes\n\
          - When the agent is done, it returns a single message with its agent ID. Use that ID to resume the agent later for follow-up work.\n\
          - {run_in_background_param}: Returns immediately with a subagent_id. Use {background_retrieval_tool} to retrieve results. This is set to true by default.\n\
          - Subagents receive a compacted version of project instructions (AGENTS.md). If the task requires detailed conventions (e.g., build rules, testing patterns), include the relevant rules directly in the prompt.\n\
-         - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.\n\n\
-         Resuming a previous agent (resume_from):\n\
-         - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\
-         - The resumed agent must use the same subagent_type as the source.\n\n\
+         - When launching independent subagents, you MUST incorporate the results into the task based on requirements BEFORE concluding.\n\n\
+         Resuming a previous agent ({resume_from_param}):\n\
+         - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\n\
          Isolation mode:\n\
          - Use {isolation_param} to control the child's execution environment. With \"worktree\", the child runs in an isolated git worktree whose edits don't affect the parent workspace; the worktree is preserved after completion and its path is returned in the output."
-    );
-
-    out
+    )
 }
 
 /// Shared `background task or subagent`-style target suffix used by the
@@ -1356,8 +1612,11 @@ pub struct TaskOutputToolNaming<'a> {
     pub monitor_tool: Option<&'a str>,
     /// Read tool name for the "large output" hint, or `None`.
     pub read_tool: Option<&'a str>,
-    /// The bash `is_background` param name, when a bash/`execute` tool is present.
+    /// The bash `is_background` param name, when the bash/`execute` tool advertises one.
     pub bash_background_param: Option<&'a str>,
+    /// The bash `block_until_ms` param name, when the bash/`execute` tool advertises one.
+    /// Ignored when [`Self::bash_background_param`] is `Some`.
+    pub bash_block_param: Option<&'a str>,
     /// The subagent `run_in_background` param name, when a `task` tool is present.
     pub subagent_background_param: Option<&'a str>,
     /// Model-facing name of the `task_ids` input (tracks param renames).
@@ -1375,6 +1634,7 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
         monitor_tool,
         read_tool,
         bash_background_param,
+        bash_block_param,
         subagent_background_param,
         task_ids_param,
         timeout_ms_param,
@@ -1385,14 +1645,11 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
 
     let target_suffix = lifecycle_target_suffix(monitor_present, subagent_present);
 
-    let sources = match (bash_background_param, subagent_background_param) {
-        // Both params share one client-facing name: don't repeat it.
-        (Some(b), Some(s)) if b == s => format!("{b}=true commands or subagents"),
-        (Some(b), Some(s)) => format!("{b}=true commands or {s}=true subagents"),
-        (Some(b), None) => format!("{b}=true commands"),
-        (None, Some(s)) => format!("{s}=true subagents"),
-        (None, None) => "background tasks".to_string(),
-    };
+    let sources = background_sources(
+        bash_background_param,
+        bash_block_param,
+        subagent_background_param,
+    );
 
     let monitor_note = monitor_task_id_note(monitor_tool, task_id_param);
     let read_note = match read_tool {
@@ -1410,13 +1667,46 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
     )
 }
 
+/// Names how the model starts a background command or subagent, for the "ids from …" sentence.
+fn background_sources(
+    bash_background_param: Option<&str>,
+    bash_block_param: Option<&str>,
+    subagent_background_param: Option<&str>,
+) -> String {
+    let bash = bash_background_phrase(bash_background_param, bash_block_param);
+    match (bash, subagent_background_param) {
+        // Both params share one client-facing name
+        (Some(b), Some(s)) if b == format!("{s}=true") => format!("{b} commands or subagents"),
+        (Some(b), Some(s)) => format!("{b} commands or {s}=true subagents"),
+        (Some(b), None) => format!("{b} commands"),
+        (None, Some(s)) => format!("{s}=true subagents"),
+        (None, None) => "background tasks".to_string(),
+    }
+}
+
+/// The bash argument that starts a background command, or `None` when the bash tool advertises neither param.
+/// `is_background=true` wins over `block_until_ms=0`.
+fn bash_background_phrase(
+    bash_background_param: Option<&str>,
+    bash_block_param: Option<&str>,
+) -> Option<String> {
+    match (bash_background_param, bash_block_param) {
+        (Some(b), _) => Some(format!("{b}=true")),
+        (None, Some(p)) => Some(format!("{p}=0")),
+        (None, None) => None,
+    }
+}
+
 /// Naming/feature inputs for [`build_wait_tasks_description`].
 #[derive(Clone, Copy, Debug)]
 pub struct WaitTasksToolNaming<'a> {
     /// The preferred retrieval tool name shown in the "Prefer …" line.
     pub background_retrieval_tool: &'a str,
-    /// The bash `is_background` param name, when a bash/`execute` tool is present.
+    /// The bash `is_background` param name, when the bash/`execute` tool advertises one.
     pub bash_background_param: Option<&'a str>,
+    /// The bash `block_until_ms` param name, when the bash/`execute` tool advertises one.
+    /// Ignored when [`Self::bash_background_param`] is `Some`.
+    pub bash_block_param: Option<&'a str>,
     /// The subagent `run_in_background` param name, when a `task` tool is present.
     pub subagent_background_param: Option<&'a str>,
 }
@@ -1426,17 +1716,15 @@ pub fn build_wait_tasks_description(naming: &WaitTasksToolNaming) -> String {
     let WaitTasksToolNaming {
         background_retrieval_tool,
         bash_background_param,
+        bash_block_param,
         subagent_background_param,
     } = *naming;
 
-    let sources = match (bash_background_param, subagent_background_param) {
-        // Both params share one client-facing name: don't repeat it.
-        (Some(b), Some(s)) if b == s => format!("{b}=true commands or subagents"),
-        (Some(b), Some(s)) => format!("{b}=true commands or {s}=true subagents"),
-        (Some(b), None) => format!("{b}=true commands"),
-        (None, Some(s)) => format!("{s}=true subagents"),
-        (None, None) => "background tasks".to_string(),
-    };
+    let sources = background_sources(
+        bash_background_param,
+        bash_block_param,
+        subagent_background_param,
+    );
 
     let wait_cap = MAX_WAIT_MS_PLACEHOLDER;
 
@@ -1452,6 +1740,42 @@ pub fn build_wait_tasks_description(naming: &WaitTasksToolNaming) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_notices_track_renamed_tool_and_params() {
+        let naming = BackgroundNoticeNaming {
+            task_output_tool: "FetchJobResult",
+            task_ids_param: "job_ids",
+            timeout_ms_param: "max_wait",
+        };
+        let spawn = format_subagent_started_background("sa-9", "scan", &naming, false);
+        assert!(
+            spawn.contains("use FetchJobResult with job_ids=[\"sa-9\"]")
+                && spawn.contains("a positive max_wait"),
+            "renamed tool/params must appear: {spawn}"
+        );
+        assert!(
+            !spawn.contains("task_ids") && !spawn.contains("timeout_ms"),
+            "canonical param names must not remain after rename: {spawn}"
+        );
+        let auto = format_subagent_auto_backgrounded("sa-9", "scan", &naming, true, true);
+        assert!(
+            auto.contains("moved to the background")
+                && auto.contains("you will be notified when it completes")
+                && auto.contains("use FetchJobResult with job_ids=[\"sa-9\"]")
+                && auto.contains("a positive max_wait"),
+            "auto-bg notice must share the renamed retrieval line: {auto}"
+        );
+        assert!(
+            auto.contains(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK),
+            "auto-bg notice must carry the CTA when parent work remains: {auto}"
+        );
+        let quiet = format_subagent_auto_backgrounded("sa-9", "scan", &naming, false, false);
+        assert!(
+            !quiet.contains("you will be notified"),
+            "no notification promise without system reminders: {quiet}"
+        );
+    }
+
     use super::*;
 
     fn result_with_status(status: &str) -> TaskOutputOutput {
@@ -1490,7 +1814,6 @@ mod tests {
     fn literal_naming() -> TaskToolNaming<'static> {
         TaskToolNaming {
             task_tool: "task",
-            subagent_type_param: "subagent_type",
             run_in_background_param: "run_in_background",
             resume_from_param: "resume_from",
             background_retrieval_tool: "get_task_output",
@@ -1538,20 +1861,67 @@ mod tests {
         let input = TaskToolInput {
             prompt: "p".into(),
             description: "d".into(),
-            subagent_type: default_subagent_type(),
+            subagent_type: "explore".into(),
+            subagent_type_specified: true,
             run_in_background: false,
             capability_mode: None,
             isolation: None,
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             context: None,
             reasoning_effort: None,
             task_id: None,
         };
+        assert_eq!(input.subagent_type, "explore");
         let value = serde_json::to_value(&input).unwrap();
         assert!(value.get("model").is_none());
         assert!(value.get("reasoning_effort").is_none());
+        assert!(value.get("capability_mode").is_none());
+        assert_eq!(
+            value.get("subagent_type").and_then(|v| v.as_str()),
+            Some("explore")
+        );
+        assert!(value.get("workspace").is_none());
+    }
+
+    #[test]
+    fn task_tool_input_workspace_defaults_to_none() {
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description": "d", "prompt": "p"}"#).unwrap();
+        assert_eq!(None, input.workspace);
+        let input: TaskToolInput = serde_json::from_str(
+            r#"{"description": "d", "prompt": "p", "workspace": "computer-1a2b3c4d"}"#,
+        )
+        .unwrap();
+        assert_eq!(Some("computer-1a2b3c4d"), input.workspace.as_deref());
+    }
+
+    /// The argument is accepted on the wire but is not advertised by the
+    /// derived schema.
+    #[test]
+    fn task_tool_input_schema_hides_workspace() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("model"));
+        assert!(!properties.contains_key("workspace"));
+        assert!(!properties.contains_key("task_id"));
+    }
+
+    #[test]
+    fn task_family_input_schemas_carry_no_template_markers() {
+        for schema in [
+            serde_json::to_string(&schemars::schema_for!(TaskToolInput)).unwrap(),
+            serde_json::to_string(&schemars::schema_for!(TaskOutputToolInput)).unwrap(),
+            serde_json::to_string(&schemars::schema_for!(WaitTasksToolInput)).unwrap(),
+            serde_json::to_string(&schemars::schema_for!(KillTaskToolInput)).unwrap(),
+        ] {
+            assert!(
+                !schema.contains("${{") && !schema.contains("${%"),
+                "shared input schemas are consumed by hosts without a template renderer: {schema}"
+            );
+        }
     }
 
     #[test]
@@ -1569,6 +1939,62 @@ mod tests {
             None
         );
         assert!(normalize_subagent_reasoning_effort(Some("extreme".into())).is_err());
+    }
+
+    #[test]
+    fn task_tool_input_present_general_purpose_is_explicit() {
+        let omitted: TaskToolInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p"}"#).unwrap();
+        assert_eq!(omitted.subagent_type, "general-purpose");
+        assert!(!omitted.subagent_type_specified);
+
+        let explicit: TaskToolInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","subagent_type":"general-purpose"}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.subagent_type, "general-purpose");
+        assert!(explicit.subagent_type_specified);
+        let explicit_json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(
+            explicit_json.get("subagent_type").and_then(|v| v.as_str()),
+            Some("general-purpose")
+        );
+        let round_trip: TaskToolInput = serde_json::from_value(explicit_json).unwrap();
+        assert_eq!(round_trip.subagent_type, "general-purpose");
+        assert!(round_trip.subagent_type_specified);
+
+        let omitted_json = serde_json::to_value(&omitted).unwrap();
+        assert!(omitted_json.get("subagent_type").is_none());
+        let omitted_round_trip: TaskToolInput = serde_json::from_value(omitted_json).unwrap();
+        assert_eq!(omitted_round_trip.subagent_type, "general-purpose");
+        assert!(!omitted_round_trip.subagent_type_specified);
+
+        let json_null: TaskToolInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","subagent_type":null}"#)
+                .unwrap();
+        assert_eq!(json_null.subagent_type, "general-purpose");
+        assert!(!json_null.subagent_type_specified);
+        for sentinel in ["none", "null", "undefined", ""] {
+            let raw = format!(r#"{{"description":"d","prompt":"p","subagent_type":"{sentinel}"}}"#);
+            let input: TaskToolInput = serde_json::from_str(&raw).unwrap();
+            assert_eq!(input.subagent_type, "general-purpose", "{sentinel}");
+            assert!(!input.subagent_type_specified, "{sentinel}");
+        }
+    }
+
+    #[test]
+    fn task_tool_input_keeps_present_subagent_type_json() {
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","subagent_type":"explore"}"#)
+                .unwrap();
+        assert_eq!(input.subagent_type, "explore");
+        assert!(input.subagent_type_specified);
+    }
+
+    #[test]
+    fn task_tool_input_schema_omits_subagent_type() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        assert!(schema["properties"].get("subagent_type").is_none());
     }
 
     #[test]
@@ -1636,49 +2062,23 @@ mod tests {
 
     #[test]
     fn build_task_description_substitutes_names_and_lists_agents() {
-        let subagents = vec![
-            SubagentDescriptor {
-                name: "general-purpose".into(),
-                description: "General-purpose agent.".into(),
-                tools: Some("Has access to all tools.".into()),
-            },
-            SubagentDescriptor {
-                name: "code-reviewer".into(),
-                description: "Reviews code.".into(),
-                tools: None,
-            },
-        ];
-        let desc = build_task_description(&subagents, &literal_naming());
+        let desc = build_task_description(&literal_naming());
         assert!(desc.starts_with("Start a subagent that works on a task independently"));
-        assert!(desc.contains("Agent types:"));
-        assert!(
-            desc.contains("- **general-purpose**: General-purpose agent. Has access to all tools.")
-        );
-        // User-defined entries (tools = None) get no trailing fragment.
-        assert!(desc.contains("- **code-reviewer**: Reviews code."));
+        assert!(!desc.contains("Agent types:"));
+        assert!(!desc.contains("subagent_type"));
         assert!(desc.contains("## Usage notes"));
         assert!(desc.contains(
             "run_in_background: Returns immediately with a subagent_id. Use get_task_output to retrieve results. This is set to true by default."
         ));
-        assert!(desc.contains("you must specify a subagent_type parameter"));
         assert!(desc.contains("Use resume_from to continue"));
     }
 
     #[test]
     fn build_task_description_includes_isolation_paragraph() {
-        let subagents = vec![SubagentDescriptor {
-            name: "explore".into(),
-            description: "Explore.".into(),
-            tools: None,
-        }];
-
-        let desc = build_task_description(
-            &subagents,
-            &TaskToolNaming {
-                isolation_param: "isolation",
-                ..literal_naming()
-            },
-        );
+        let desc = build_task_description(&TaskToolNaming {
+            isolation_param: "isolation",
+            ..literal_naming()
+        });
         assert!(desc.contains("Isolation mode:"));
         assert!(desc.contains("Use isolation to control the child's execution environment."));
     }
@@ -1799,8 +2199,9 @@ mod tests {
     fn format_wait_cap_ms_derives_its_unit_and_rounds_down() {
         assert_eq!(
             format_wait_cap_ms(MAX_WAIT_BLOCK_MS_DEFAULT),
-            "600000 (~10 min)"
+            "3600000 (~1 h)"
         );
+        assert_eq!(format_wait_cap_ms(3_600_000), "3600000 (~1 h)");
         assert_eq!(format_wait_cap_ms(300_000), "300000 (~5 min)");
         // Rounds down: 1.5 min must not read as 2.
         assert_eq!(format_wait_cap_ms(90_000), "90000 (~1 min)");
@@ -1841,28 +2242,20 @@ mod tests {
     fn build_task_description_preserves_template_placeholders() {
         // The CLI passes `${{ ... }}` placeholders; the builder must emit them
         // verbatim for its downstream TemplateRenderer to resolve.
-        let subagents = vec![SubagentDescriptor {
-            name: "explore".into(),
-            description: "Explore.".into(),
-            tools: Some("Read-only — has access to: ${{ tools.by_kind.read }}.".into()),
-        }];
-        let desc = build_task_description(
-            &subagents,
-            &TaskToolNaming {
-                task_tool: "${{ tools.by_kind.task }}",
-                subagent_type_param: "${{ params.task.subagent_type }}",
-                run_in_background_param: "${{ params.task.run_in_background }}",
-                resume_from_param: "${{ params.task.resume_from }}",
-                background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
-                isolation_param: "${{ params.task.isolation }}",
-            },
-        );
-        assert!(desc.contains("When using the ${{ tools.by_kind.task }} tool"));
-        assert!(desc.contains("${{ tools.by_kind.read }}"));
+        let desc = build_task_description(&TaskToolNaming {
+            task_tool: "${{ tools.by_kind.task }}",
+            run_in_background_param: "${{ params.task.run_in_background }}",
+            resume_from_param: "${{ params.task.resume_from }}",
+            background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
+            isolation_param: "${{ params.task.isolation }}",
+        });
+        assert!(desc.contains("prior ${{ tools.by_kind.task }} call"));
+        assert!(desc.contains("Use ${{ params.task.resume_from }} to continue"));
         assert!(desc.contains(
             "${{ params.task.run_in_background }}: Returns immediately with a subagent_id. Use ${{ tools.by_kind.background_task_action }} to retrieve results. This is set to true by default."
         ));
         assert!(desc.contains("Use ${{ params.task.isolation }} to control"));
+        assert!(!desc.contains("subagent_type"));
     }
 
     // ── Lifecycle tool descriptions ──────────────────────────────────────
@@ -1949,6 +2342,7 @@ mod tests {
             monitor_tool: Some("monitor"),
             read_tool: None,
             bash_background_param: Some("is_background"),
+            bash_block_param: None,
             subagent_background_param: None,
             task_ids_param: "process_ids",
             timeout_ms_param: "max_wait",
@@ -1978,6 +2372,7 @@ mod tests {
             monitor_tool: Some("monitor"),
             read_tool: Some("read_file"),
             bash_background_param: Some("background"),
+            bash_block_param: None,
             subagent_background_param: Some("background"),
             task_ids_param: "task_ids",
             timeout_ms_param: "timeout_ms",
@@ -2000,6 +2395,7 @@ mod tests {
             monitor_tool: None,
             read_tool: Some("read_file"),
             bash_background_param: None,
+            bash_block_param: None,
             subagent_background_param: Some("run_in_background"),
             task_ids_param: "task_ids",
             timeout_ms_param: "timeout_ms",
@@ -2021,6 +2417,7 @@ mod tests {
         let desc = build_wait_tasks_description(&WaitTasksToolNaming {
             background_retrieval_tool: "get_command_or_subagent_output",
             bash_background_param: Some("background"),
+            bash_block_param: None,
             subagent_background_param: Some("background"),
         });
         assert_eq!(
@@ -2035,10 +2432,54 @@ mod tests {
     }
 
     #[test]
+    fn task_tools_name_block_until_ms_zero_when_bash_lacks_is_background() {
+        let desc = build_task_output_description(&TaskOutputToolNaming {
+            monitor_tool: None,
+            read_tool: None,
+            bash_background_param: None,
+            bash_block_param: Some("block_until_ms"),
+            subagent_background_param: Some("run_in_background"),
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+            task_id_param: "task_id",
+        });
+        assert!(
+            desc.contains(
+                "ids from block_until_ms=0 commands or run_in_background=true subagents;"
+            ),
+            "{desc}"
+        );
+
+        let desc = build_wait_tasks_description(&WaitTasksToolNaming {
+            background_retrieval_tool: "get_task_output",
+            bash_background_param: None,
+            bash_block_param: Some("wait_ms"),
+            subagent_background_param: None,
+        });
+        assert!(
+            desc.contains("- task_ids: list of task IDs from wait_ms=0 commands\n"),
+            "{desc}"
+        );
+
+        // `is_background` wins when the bash tool advertises both params
+        let desc = build_wait_tasks_description(&WaitTasksToolNaming {
+            background_retrieval_tool: "get_task_output",
+            bash_background_param: Some("is_background"),
+            bash_block_param: Some("block_until_ms"),
+            subagent_background_param: None,
+        });
+        assert!(
+            desc.contains("from is_background=true commands\n"),
+            "{desc}"
+        );
+    }
+
+    #[test]
     fn wait_tasks_subagent_only_toolbox() {
         let desc = build_wait_tasks_description(&WaitTasksToolNaming {
             background_retrieval_tool: "get_task_output",
             bash_background_param: None,
+            bash_block_param: None,
             subagent_background_param: Some("run_in_background"),
         });
         assert!(
@@ -2051,7 +2492,6 @@ mod tests {
     fn background_spawn_notice_keeps_poll_hint_and_open_parent_work() {
         let with_cta = format_subagent_started_background(
             "sa-1",
-            "general-purpose",
             "author board-setup skill",
             "get_command_or_subagent_output",
             true,
@@ -2075,7 +2515,6 @@ mod tests {
 
         let poll_only = format_subagent_started_background(
             "sa-1",
-            "general-purpose",
             "review pr",
             "get_command_or_subagent_output",
             false,

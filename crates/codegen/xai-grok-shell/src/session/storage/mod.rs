@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::io::{self, BufRead, BufReader, Seek};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
@@ -13,6 +13,7 @@ use agent_client_protocol as acp;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_workspace::session::file_state::RewindPoint;
 
+mod compression;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
@@ -34,6 +35,7 @@ pub(crate) const SUMMARY_FILE: &str = "summary.json";
 pub(crate) const PLAN_FILE: &str = "plan.json";
 pub(crate) const PLAN_MODE_FILE: &str = "plan_mode.json";
 pub(crate) const SIGNALS_FILE: &str = "signals.json";
+pub(crate) const USAGE_FILE: &str = "usage.json";
 pub(crate) const GOAL_STATE_FILE: &str = "goal/state.json";
 pub(crate) const ANNOUNCEMENT_STATE_FILE: &str = "announcement_state.json";
 pub(crate) const WORKING_DIRS_FILE: &str = "working_dirs.json";
@@ -44,9 +46,25 @@ pub(crate) const UPDATES_FILE: &str = "updates.jsonl";
 /// renaming it over the target, so a crash or a concurrent writer never leaves a
 /// torn file. The temp is removed on failure.
 pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes_atomic_with(path, bytes, sync_file_durable, || {
+        sync_parent_dir_durable(path)
+    })
+}
+
+fn write_bytes_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    sync_file: impl Fn(&std::fs::File) -> io::Result<()>,
+    sync_parent: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
     let tmp = temp_sibling(path);
-    match std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
-        Ok(()) => Ok(()),
+    let write_synced = || -> io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        sync_file(&file)
+    };
+    match write_synced().and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => sync_parent(),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -84,20 +102,114 @@ pub(crate) fn sync_file_durable(_file: &std::fs::File) -> io::Result<()> {
     ))
 }
 
-/// Async sibling of [`write_bytes_atomic`].
-pub(crate) async fn write_bytes_atomic_async(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
-    let tmp = temp_sibling(path);
-    let result = match tokio::fs::write(&tmp, bytes).await {
-        Ok(()) => tokio::fs::rename(&tmp, path).await,
-        Err(e) => Err(e),
-    };
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    result
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_dir_durable(dir: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(dir)?;
+    file.sync_all()?;
+    fullfsync_raw(file.as_raw_fd())
 }
 
-/// Serialize `items` to newline-delimited JSON bytes.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn sync_dir_durable(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_dir_durable(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_dir_durable(_dir: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable directory sync is unsupported on this platform",
+    ))
+}
+
+pub(crate) fn sync_cwd_marker_if_present(cwd_dir: &Path) -> io::Result<()> {
+    sync_cwd_marker_if_present_with(cwd_dir, sync_file_durable)
+}
+
+pub(crate) fn sync_cwd_marker_if_present_with(
+    cwd_dir: &Path,
+    sync_file: impl Fn(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let cwd_file = cwd_dir.join(".cwd");
+    match std::fs::OpenOptions::new().write(true).open(&cwd_file) {
+        Ok(file) => sync_file(&file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn sync_parent_dir_durable(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    sync_dir_durable(parent)
+}
+
+pub(crate) fn create_dir_all_durable(
+    dir: &Path,
+    create: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    create_dir_all_durable_with(dir, create, sync_dir_durable)
+}
+
+pub(crate) fn create_dir_all_durable_with(
+    dir: &Path,
+    create: impl FnOnce(&Path) -> io::Result<()>,
+    sync_dir: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut gaining_an_entry = Vec::new();
+    let mut cursor = dir;
+    while !cursor.exists() {
+        let Some(parent) = cursor.parent() else { break };
+        gaining_an_entry.push(parent);
+        cursor = parent;
+    }
+    create(dir)?;
+    let retry_ancestors;
+    let to_sync: &[&Path] = if !gaining_an_entry.is_empty() {
+        &gaining_an_entry
+    } else if std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        retry_ancestors = dir
+            .ancestors()
+            .skip(1)
+            .take(4)
+            .filter(|parent| !is_fs_root(parent))
+            .collect::<Vec<_>>();
+        &retry_ancestors
+    } else {
+        return Ok(());
+    };
+    for parent in to_sync {
+        if is_fs_root(parent) {
+            continue;
+        }
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn is_fs_root(path: &Path) -> bool {
+    path.parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty())
+}
+
+pub(crate) async fn write_bytes_atomic_async(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || write_bytes_atomic(&path, &bytes))
+        .await
+        .map_err(io::Error::other)?
+}
+
 fn to_jsonl_bytes<T: serde::Serialize>(items: &[T]) -> io::Result<Vec<u8>> {
     let mut content = Vec::new();
     for item in items {
@@ -111,7 +223,9 @@ fn to_jsonl_bytes<T: serde::Serialize>(items: &[T]) -> io::Result<Vec<u8>> {
 /// Write `items` as newline-delimited JSON to `path`, atomically (see
 /// [`write_bytes_atomic`]).
 pub(crate) fn write_jsonl_atomic<T: serde::Serialize>(path: &Path, items: &[T]) -> io::Result<()> {
-    write_bytes_atomic(path, &to_jsonl_bytes(items)?)
+    let _lock = compression::lock_history(path)?;
+    let bytes = compression::encode_snapshot(path, to_jsonl_bytes(items)?)?;
+    write_bytes_atomic(path, &bytes)
 }
 
 /// Async sibling of [`write_jsonl_atomic`].
@@ -119,7 +233,15 @@ pub(crate) async fn write_jsonl_atomic_async<T: serde::Serialize>(
     path: &Path,
     items: &[T],
 ) -> io::Result<()> {
-    write_bytes_atomic_async(path, to_jsonl_bytes(items)?).await
+    let path = path.to_owned();
+    let bytes = to_jsonl_bytes(items)?;
+    tokio::task::spawn_blocking(move || {
+        let _lock = compression::lock_history(&path)?;
+        let bytes = compression::encode_snapshot(&path, bytes)?;
+        write_bytes_atomic(&path, &bytes)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// A unique sibling temp path, e.g. `summary.json` -> `summary.json.<uuid>.tmp`.
@@ -148,17 +270,18 @@ pub(crate) mod chat_rebuild {
         use std::io::{Seek, Write};
 
         let updates_path = dir.join(UPDATES_FILE);
-        let Some(iter) = UpdatesIterator::open(&updates_path)? else {
+        let Some(mut iter) = UpdatesIterator::open(&updates_path)? else {
             return Ok(0);
         };
 
         let chat_path = dir.join(CHAT_HISTORY_FILE);
+        let _lock = super::compression::lock_history(&chat_path)?;
         let tmp_path = dir.join(format!("{CHAT_HISTORY_FILE}.{}.tmp", uuid::Uuid::now_v7()));
         let file = std::fs::File::create(&tmp_path)?;
         let mut writer = std::io::BufWriter::new(file);
         let mut reducer = ChatReducer::new();
 
-        for result in iter {
+        for result in iter.by_ref() {
             let update = match result {
                 Ok(u) => u,
                 Err(_) => continue,
@@ -179,6 +302,11 @@ pub(crate) mod chat_rebuild {
             }
         }
 
+        if let Err(error) = iter.finish() {
+            drop(writer);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
         for item in reducer.flush() {
             if let Ok(line) = serde_json::to_string(&item) {
                 let _ = writer.write_all(line.as_bytes());
@@ -477,21 +605,33 @@ pub(crate) mod chat_rebuild {
 /// Iterator that streams session updates from a JSONL file without loading all into memory.
 /// Each call to `next()` reads and parses one line.
 pub struct UpdatesIterator {
-    reader: BufReader<std::fs::File>,
-    line_buffer: String,
+    reader: BufReader<xai_file_utils::session_file::DecodedFile>,
+    line_buffer: Vec<u8>,
+    done: bool,
+    read_error: Option<io::Error>,
 }
 
 impl UpdatesIterator {
+    /// Report terminal transport errors after a tolerant line-parsing pass.
+    pub fn finish(mut self) -> io::Result<()> {
+        if let Some(error) = self.read_error {
+            return Err(error);
+        }
+        std::io::copy(&mut self.reader, &mut std::io::sink())?;
+        Ok(())
+    }
     /// Create a new iterator over updates in the given file.
     /// Returns None if the file doesn't exist.
     pub fn open(path: &Path) -> io::Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
-        let file = std::fs::File::open(path)?;
+        let file = xai_file_utils::session_file::open(path)?;
         Ok(Some(Self {
             reader: BufReader::new(file),
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
+            done: false,
+            read_error: None,
         }))
     }
 
@@ -508,21 +648,32 @@ impl Iterator for UpdatesIterator {
     type Item = io::Result<SessionUpdate>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.line_buffer.clear();
-        match self.reader.read_line(&mut self.line_buffer) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let line = self.line_buffer.trim();
-                if line.is_empty() {
-                    return self.next();
+        while !self.done {
+            self.line_buffer.clear();
+            match self.reader.read_until(b'\n', &mut self.line_buffer) {
+                Ok(0) => self.done = true,
+                Ok(_) => {
+                    let line = self.line_buffer.trim_ascii();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    return Some(
+                        std::str::from_utf8(line)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                            .and_then(|line| {
+                                SessionUpdateEnvelope::from_str(line)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                            }),
+                    );
                 }
-                match SessionUpdateEnvelope::from_str(line) {
-                    Ok(update) => Some(Ok(update)),
-                    Err(e) => Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                Err(error) => {
+                    self.done = true;
+                    self.read_error = Some(io::Error::new(error.kind(), error.to_string()));
+                    return Some(Err(error));
                 }
             }
-            Err(e) => Some(Err(e)),
         }
+        None
     }
 }
 
@@ -771,29 +922,18 @@ pub struct CopySessionOptions {
     pub copy_plan_mode_state: bool,
     /// Whether to copy the signals file. Defaults to `true`.
     pub copy_signals: bool,
+    pub copy_usage: bool,
     /// Whether to copy `tool_state.json` (persisted tool state). Defaults to `true`.
     pub copy_tool_state: bool,
     /// Whether to copy `announcement_state.json`. Defaults to `true`.
     pub copy_announcement_state: bool,
-    /// Whether to copy the `compaction/` segment archive (`segment_*.md` +
-    /// `INDEX.md`, the verbose pre-compaction transcripts). Defaults to
-    /// `false` — these can be large and most copy paths don't need them. Forks
-    /// enable it so the child retains the parent's pre-compaction history.
     pub copy_compaction_segments: bool,
     /// When true, apply fork-safety filtering to copied chat history:
     /// - Strip synthetic user messages (doom loop warnings, compaction metadata)
     /// - Truncate at the last complete turn boundary
     /// - Remove trailing incomplete assistant responses
     pub fork_filter: bool,
-    /// Number of inherited parent conversation items. Stored in the child's
-    /// summary so compaction can preserve the inherited prefix.
     pub inherited_prefix_len: Option<usize>,
-    /// When true, strip `reasoning` (thinking/reasoning_content) from all
-    /// assistant messages in the copied chat history.
-    ///
-    /// Set for forks so that the new session does not inherit the prior
-    /// model's chain-of-thought -- each fork starts with a clean slate
-    /// for reasoning on the new prompt.
     pub strip_reasoning: bool,
     /// The original workspace directory this worktree session was spawned from.
     /// Propagated to the forked session's `Summary::source_workspace_dir`.
@@ -814,6 +954,7 @@ impl Default for CopySessionOptions {
             copy_plan_state: true,
             copy_plan_mode_state: true,
             copy_signals: true,
+            copy_usage: true,
             copy_tool_state: true,
             copy_announcement_state: true,
             copy_compaction_segments: false,
@@ -959,6 +1100,12 @@ pub enum AppendUpdateError {
 }
 
 #[derive(Debug)]
+pub enum AppendChatError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
+#[derive(Debug)]
 pub enum AppendCwdSwitchError {
     NotCommitted(io::Error),
     Committed {
@@ -983,6 +1130,45 @@ impl std::fmt::Display for AppendUpdateError {
     }
 }
 
+impl AppendChatError {
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for AppendChatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionFileSet {
+    pub updates: bool,
+    pub chat: bool,
+    pub summary: bool,
+    pub plan: bool,
+    pub rewind_points: bool,
+}
+
+impl SessionFileSet {
+    pub(crate) const ALL: Self = Self {
+        updates: true,
+        chat: true,
+        summary: true,
+        plan: true,
+        rewind_points: true,
+    };
+
+    pub(crate) fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 /// Storage adapter trait for session persistence
 /// Abstracts over different storage backends (JSONL, SQLite, etc.)
 #[async_trait]
@@ -995,6 +1181,8 @@ pub trait StorageAdapter: Send + Sync {
     /// wins. Also marks the title manual (`Summary::title_is_manual`) so
     /// clients restore the prompt-border title on resume.
     async fn update_session_title(&self, info: &Info, session_title: String) -> io::Result<()>;
+
+    async fn set_session_kind_if_absent(&self, info: &Info, kind: String) -> io::Result<()>;
 
     /// Set the session title only if the session has no title yet, used by
     /// automatic LLM title generation so it never overwrites a manual
@@ -1017,6 +1205,10 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Replace or clear (`None`) the per-turn dashboard summary
     /// (`(text, prompt_id)`) in `summary.json`; last-writer-wins.
+    async fn regenerate_generated_title(&self, info: &Info, title: String) -> io::Result<bool>;
+
+    async fn set_last_recap(&self, info: &Info, recap: Option<String>) -> io::Result<()>;
+
     async fn set_last_turn_summary(
         &self,
         info: &Info,
@@ -1052,6 +1244,16 @@ pub trait StorageAdapter: Send + Sync {
     /// Append a chat message and increment counter.
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()>;
 
+    async fn append_chat_message_commit_aware(
+        &self,
+        info: &Info,
+        message: &ConversationItem,
+    ) -> Result<(), AppendChatError> {
+        self.append_chat_message(info, message)
+            .await
+            .map_err(AppendChatError::NotCommitted)
+    }
+
     /// Append one working-directory switch generation exactly once.
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1064,17 +1266,15 @@ pub trait StorageAdapter: Send + Sync {
         )))
     }
 
-    /// Update the current model in summary (delegates to
-    /// `update_current_model_and_agent` with `agent_name = None`).
+    /// Update the current model in summary (delegates to `update_current_model_and_agent` with no agent change).
     async fn update_current_model(&self, info: &Info, model_id: &acp::ModelId) -> io::Result<()> {
-        self.update_current_model_and_agent(info, model_id, None, None, None)
+        self.update_current_model_and_agent(info, model_id, None, None, None, None)
             .await
     }
 
-    /// Update the current model and agent name in summary.
-    /// `agent_name` is the resolved agent definition name
-    /// persisted so session resume doesn't depend on the mutable model catalog.
-    /// `None` leaves the existing `agent_name` unchanged (used by legacy callers
+    /// Update the current model and, when `agent` is set, the session's selected agent.
+    /// Persisted so session resume doesn't depend on the mutable model catalog.
+    /// `None` leaves the existing agent unchanged (used by legacy callers
     /// that only update the model ID).
     /// `resolved_tool_policy` persists the provider-route tool surface alongside
     /// the model identity when present; `None` leaves any existing policy alone.
@@ -1082,8 +1282,9 @@ pub trait StorageAdapter: Send + Sync {
         &self,
         info: &Info,
         model_id: &acp::ModelId,
-        agent_name: Option<&str>,
+        agent: Option<&crate::session::persistence::PersistedAgent>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        context_window: Option<Option<std::num::NonZeroU64>>,
         resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     ) -> io::Result<()>;
 
@@ -1116,27 +1317,44 @@ pub trait StorageAdapter: Send + Sync {
         request_id: Option<&str>,
     ) -> io::Result<()>;
 
-    /// Write/update the plan state
     async fn write_plan_state(&self, info: &Info, state: &TodoState) -> io::Result<()>;
 
-    /// Write/update plan mode lifecycle state
     async fn write_plan_mode_state(
         &self,
         info: &Info,
         state: &crate::session::plan_mode::PlanModeSnapshot,
     ) -> io::Result<()>;
 
-    /// Write/update the session signals snapshot
     async fn write_signals(&self, info: &Info, signals: &SessionSignals) -> io::Result<()>;
 
-    /// Write/update the announcement tracking state
+    async fn read_usage(
+        &self,
+        info: &Info,
+    ) -> io::Result<Option<crate::session::usage_file::SessionUsageFile>>;
+
+    async fn write_usage(
+        &self,
+        info: &Info,
+        usage: &crate::session::usage_file::SessionUsageFile,
+    ) -> io::Result<()>;
+
+    /// Apply a turn to the latest usage on disk in one cross-process transaction.
+    async fn record_usage_turn(
+        &self,
+        info: &Info,
+        turn_number: u32,
+        ended_at: String,
+        live: &crate::session::usage_file::UsageSummary,
+        prev_live: Option<&crate::session::usage_file::UsageSummary>,
+        cursor: (Option<u32>, Option<u32>),
+    ) -> io::Result<(Option<u32>, Option<u32>)>;
+
     async fn write_announcement_state(
         &self,
         info: &Info,
         state: &crate::session::announcement_state::AnnouncementState,
     ) -> io::Result<()>;
 
-    /// Write/update the goal mode orchestration state
     async fn write_goal_mode_state(
         &self,
         info: &Info,
@@ -1153,45 +1371,41 @@ pub trait StorageAdapter: Send + Sync {
 
     async fn delete_workflow_run_state(&self, info: &Info, run_id: &str) -> io::Result<()>;
 
-    /// Load all persisted data for a session
     async fn load_session(&self, info: &Info) -> io::Result<PersistedData>;
 
-    /// Load session data WITHOUT updates (for memory efficiency when updates
-    /// will be streamed). Implementations also do NOT read rewind points here;
-    /// those are deferred and lazily loaded on demand from the path returned by
-    /// [`rewind_points_file_path`](StorageAdapter::rewind_points_file_path).
     async fn load_session_without_updates(&self, info: &Info) -> io::Result<PersistedDataLight>;
 
-    /// Loads the summary of the session
     async fn load_summary(&self, info: &Info) -> io::Result<Summary>;
 
-    /// List session summaries, optionally filtered by current working directory.
     /// When `cwd` is `None`, returns summaries for all sessions.
     async fn list_sessions(&self, cwd: Option<&str>) -> io::Result<Vec<Summary>>;
 
-    /// Permanently delete a session's stored data (all files for the
-    /// session). Implementations must treat a missing session as success
-    /// (idempotent delete).
     async fn delete_session(&self, info: &Info) -> io::Result<()>;
 
-    /// Append a rewind point for session rewind functionality
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()>;
 
-    /// Load all rewind points for a session
     async fn load_rewind_points(&self, info: &Info) -> io::Result<Vec<RewindPoint>>;
 
-    /// Sync all session files to disk. Called before CopyFile to ensure all writes are persisted.
-    async fn sync_session_files(&self, info: &Info) -> io::Result<()>;
+    /// Compress settled local histories; adapters without local files may skip it.
+    async fn compress_history(&self, _info: &Info) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn sync_session_files(&self, info: &Info) -> io::Result<()> {
+        self.sync_session_files_selected(info, SessionFileSet::ALL)
+            .await
+    }
+
+    async fn sync_session_files_selected(
+        &self,
+        info: &Info,
+        files: SessionFileSet,
+    ) -> io::Result<()>;
 
     /// Truncate rewind points from a specific prompt index (inclusive)
     /// Used when rewinding to remove future history
     async fn truncate_rewind_points_from(&self, info: &Info, from_index: usize) -> io::Result<()>;
 
-    /// Merge rewind points at indices `>= target_index` into the point at
-    /// `target_index - 1` and drop the folded points, as a read-modify-write on
-    /// disk (used after a ConversationOnly rewind). Reading the current on-disk
-    /// set makes this authoritative: it never relies on a (possibly partially
-    /// loaded) in-memory tracker, so historical points can't be lost.
     async fn merge_rewind_points_from(&self, info: &Info, target_index: usize) -> io::Result<()>;
 
     /// Replace the entire chat history (used for compaction and rewind)
@@ -1313,8 +1527,9 @@ pub use jsonl::JsonlStorageAdapter;
 #[cfg(any(test, feature = "test-support"))]
 pub use replay::load_updates_for_replay_at;
 pub use replay::{
-    PreparedReplay, ReplayEmission, ReplayPathHint, load_updates_for_replay, prepare_replay_lines,
-    stream_replay_updates_at, stream_replay_updates_at_hinted,
+    PreparedReplay, ReplayEmission, ReplayLookupFallback, ReplayPathHint, ReplayedUpdate,
+    load_updates_for_replay, prepare_replay_lines, replay_would_emit, stream_replay_updates_at,
+    stream_replay_updates_at_hinted,
 };
 pub(crate) use replay::{ReplayToolCollapser, filter_delta_replay_lines};
 
@@ -1931,11 +2146,21 @@ impl PromptExtractEvent {
 /// original [`UpdatesIterator`]-based path, but safely terminating any
 /// in-progress user-message accumulation).
 pub struct PromptExtractIterator {
-    reader: std::io::BufReader<std::fs::File>,
-    line_buffer: String,
+    reader: std::io::BufReader<xai_file_utils::session_file::DecodedFile>,
+    line_buffer: Vec<u8>,
+    done: bool,
+    read_error: Option<io::Error>,
 }
 
 impl PromptExtractIterator {
+    /// Report terminal transport errors after collecting prompt events.
+    pub fn finish(mut self) -> io::Result<()> {
+        if let Some(error) = self.read_error {
+            return Err(error);
+        }
+        std::io::copy(&mut self.reader, &mut std::io::sink())?;
+        Ok(())
+    }
     /// Open a `updates.jsonl` file for selective prompt extraction.
     ///
     /// Returns `None` if the file does not exist.
@@ -1943,10 +2168,12 @@ impl PromptExtractIterator {
         if !path.exists() {
             return Ok(None);
         }
-        let file = std::fs::File::open(path)?;
+        let file = xai_file_utils::session_file::open(path)?;
         Ok(Some(Self {
             reader: std::io::BufReader::new(file),
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
+            done: false,
+            read_error: None,
         }))
     }
 }
@@ -1955,21 +2182,33 @@ impl Iterator for PromptExtractIterator {
     type Item = PromptExtractEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
+        while !self.done {
             self.line_buffer.clear();
-            match std::io::BufRead::read_line(&mut self.reader, &mut self.line_buffer) {
-                Ok(0) => return None, // EOF
-                Err(_) => return Some(PromptExtractEvent::NotUserMessage),
+            match std::io::BufRead::read_until(&mut self.reader, b'\n', &mut self.line_buffer) {
+                Ok(0) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(error) => {
+                    self.done = true;
+                    self.read_error = Some(error);
+                    return Some(PromptExtractEvent::NotUserMessage);
+                }
                 Ok(_) => {}
             }
 
-            let line = self.line_buffer.trim();
+            let line = self.line_buffer.trim_ascii();
             if line.is_empty() {
                 continue;
             }
 
-            return Some(parse_prompt_extract_event(line));
+            return Some(
+                std::str::from_utf8(line)
+                    .map(parse_prompt_extract_event)
+                    .unwrap_or(PromptExtractEvent::NotUserMessage),
+            );
         }
+        None
     }
 }
 
@@ -1991,105 +2230,87 @@ impl Iterator for PromptExtractIterator {
 /// space: `prompt_index == prompts.len()` after load, matching live turn
 /// stamping (not raw user-message count).
 pub fn collect_prompts_from_events(iter: impl Iterator<Item = PromptExtractEvent>) -> Vec<String> {
-    let mut prompts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_user = false;
-    let mut current_run_pi: Option<usize> = None;
-    let mut current_counts = false;
-    let mut seen_marker = false;
+    let mut accumulator = PromptAccumulator::default();
+    for event in iter {
+        accumulator.push(event);
+    }
+    accumulator.finish()
+}
 
-    fn flush(
-        prompts: &mut Vec<String>,
-        current: &mut String,
-        in_user: &mut bool,
-        current_run_pi: &mut Option<usize>,
-        current_counts: &mut bool,
-    ) {
-        if *in_user {
-            if *current_counts {
-                let trimmed = current.trim().to_string();
+/// Reduces prompt events as they are read, retaining only the prompt state
+/// needed to honor later rewinds rather than a copy of every transcript event.
+#[derive(Default)]
+struct PromptAccumulator {
+    prompts: Vec<String>,
+    current: String,
+    in_user: bool,
+    current_run_pi: Option<usize>,
+    current_counts: bool,
+    seen_marker: bool,
+}
+
+impl PromptAccumulator {
+    fn flush(&mut self) {
+        if self.in_user {
+            if self.current_counts {
+                let trimmed = self.current.trim().to_string();
                 if !trimmed.is_empty() {
-                    prompts.push(trimmed);
+                    self.prompts.push(trimmed);
                 }
             }
-            current.clear();
-            *in_user = false;
-            *current_run_pi = None;
-            *current_counts = false;
+            self.current.clear();
+            self.in_user = false;
+            self.current_run_pi = None;
+            self.current_counts = false;
         }
     }
 
-    for event in iter {
+    fn push(&mut self, event: PromptExtractEvent) {
         match event {
             PromptExtractEvent::UserTextChunk { text, prompt_index } => {
                 if prompt_index.is_some() {
-                    seen_marker = true;
+                    self.seen_marker = true;
                 }
-                let counts = if seen_marker {
+                let counts = if self.seen_marker {
                     prompt_index.is_some()
                 } else {
                     true
                 };
-                let new_run = if !in_user {
+                let new_run = if !self.in_user {
                     true
-                } else if seen_marker || prompt_index.is_some() {
-                    prompt_index != current_run_pi
+                } else if self.seen_marker || prompt_index.is_some() {
+                    prompt_index != self.current_run_pi
                 } else {
                     false
                 };
                 if new_run {
-                    flush(
-                        &mut prompts,
-                        &mut current,
-                        &mut in_user,
-                        &mut current_run_pi,
-                        &mut current_counts,
-                    );
-                    in_user = true;
-                    current_run_pi = prompt_index;
-                    current_counts = counts;
-                    current.push_str(&text);
+                    self.flush();
+                    self.in_user = true;
+                    self.current_run_pi = prompt_index;
+                    self.current_counts = counts;
+                    self.current.push_str(&text);
                 } else {
-                    current.push_str(&text);
-                    if current_run_pi.is_none() && prompt_index.is_some() {
-                        current_run_pi = prompt_index;
-                        current_counts = true;
+                    self.current.push_str(&text);
+                    if self.current_run_pi.is_none() && prompt_index.is_some() {
+                        self.current_run_pi = prompt_index;
+                        self.current_counts = true;
                     }
                 }
             }
             PromptExtractEvent::RewindTo(target_index) => {
                 // Flush any in-progress user message before truncating.
                 // Rewinding TO prompt N keeps prompts[0..N].
-                flush(
-                    &mut prompts,
-                    &mut current,
-                    &mut in_user,
-                    &mut current_run_pi,
-                    &mut current_counts,
-                );
-                prompts.truncate(target_index);
+                self.flush();
+                self.prompts.truncate(target_index);
             }
-            PromptExtractEvent::NotUserMessage => {
-                flush(
-                    &mut prompts,
-                    &mut current,
-                    &mut in_user,
-                    &mut current_run_pi,
-                    &mut current_counts,
-                );
-            }
+            PromptExtractEvent::NotUserMessage => self.flush(),
         }
     }
 
-    flush(
-        &mut prompts,
-        &mut current,
-        &mut in_user,
-        &mut current_run_pi,
-        &mut current_counts,
-    );
-
-    prompts
+    fn finish(mut self) -> Vec<String> {
+        self.flush();
+        self.prompts
+    }
 }
 /// Collect assistant text from a stream of [`SessionUpdate`]s.
 ///
@@ -2395,6 +2616,319 @@ pub(crate) fn parse_prompt_extract_event(line: &str) -> PromptExtractEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_runs_file_sync_barrier_before_rename_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+        std::fs::write(&target, b"old").unwrap();
+
+        let target_bytes_at_sync = std::cell::RefCell::new(Vec::new());
+        write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| {
+                *target_bytes_at_sync.borrow_mut() = std::fs::read(&target).unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target_bytes_at_sync.borrow().as_slice(),
+            b"old",
+            "the sync barrier must run on the temp file before the rename commits"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atomic_write_syncs_parent_directory_after_the_rename_commits_a_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+
+        let events = std::cell::RefCell::new(Vec::new());
+        write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| {
+                events.borrow_mut().push("sync_file");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push(
+                    if std::fs::read(&target).is_ok_and(|bytes| bytes == b"new") {
+                        "sync_parent_after_rename"
+                    } else {
+                        "sync_parent_before_rename"
+                    },
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["sync_file", "sync_parent_after_rename"],
+            "the parent-directory sync must run after the rename commits the new entry"
+        );
+    }
+
+    #[test]
+    fn atomic_write_syncs_parent_directory_after_rename_even_when_replacing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+        std::fs::write(&target, b"old").unwrap();
+
+        let parent_syncs = std::cell::Cell::new(0);
+        write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| Ok(()),
+            || {
+                parent_syncs.set(parent_syncs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            parent_syncs.get(),
+            1,
+            "a retry after a failed create-barrier would otherwise skip the parent sync"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atomic_write_retries_parent_sync_after_a_failed_create_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+
+        let first = write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| Ok(()),
+            || Err(io::Error::other("directory barrier failed")),
+        );
+        assert_eq!(first.unwrap_err().to_string(), "directory barrier failed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        let parent_syncs = std::cell::Cell::new(0);
+        write_bytes_atomic_with(
+            &target,
+            b"newer",
+            |_| Ok(()),
+            || {
+                parent_syncs.set(parent_syncs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(parent_syncs.get(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), b"newer");
+    }
+
+    #[test]
+    fn create_dir_all_durable_syncs_every_directory_gaining_an_entry_on_a_fresh_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let group = root.path().join("sessions").join("cwd");
+        let session = group.join("session-id");
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        create_dir_all_durable_with(
+            &session,
+            |dir| std::fs::create_dir_all(dir),
+            |dir| {
+                synced.borrow_mut().push(dir.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(session.is_dir());
+        assert_eq!(
+            synced.borrow().as_slice(),
+            [
+                group.clone(),
+                root.path().join("sessions"),
+                root.path().to_path_buf()
+            ],
+            "each directory holding a newly created entry must be synced, up to the first pre-existing ancestor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_fresh_create_skips_the_filesystem_root() {
+        let unique = format!("grok-durable-create-{}", uuid::Uuid::now_v7());
+        let top = Path::new("/").join(&unique);
+        let dir = top.join("sessions").join("id");
+        assert!(
+            !top.exists(),
+            "test unique top-level path must not already exist: {}",
+            top.display()
+        );
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        create_dir_all_durable_with(
+            &dir,
+            |_dir| Ok(()),
+            |path| {
+                synced.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let synced = synced.borrow();
+        assert!(
+            !synced.iter().any(|path| is_fs_root(path)),
+            "a fresh create whose chain reaches a top-level directory must not fsync /, got {synced:?}"
+        );
+        assert!(
+            synced.iter().any(|path| path == &top),
+            "the new top-level directory itself must still be synced, got {synced:?}"
+        );
+        assert!(
+            synced.iter().any(|path| path == &top.join("sessions")),
+            "intermediate parents that gained an entry must still be synced, got {synced:?}"
+        );
+    }
+
+    #[test]
+    fn create_dir_all_durable_resyncs_ancestors_when_an_empty_chain_already_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("sessions").join("cwd").join("session-id");
+        std::fs::create_dir_all(&session).unwrap();
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        create_dir_all_durable_with(
+            &session,
+            |dir| std::fs::create_dir_all(dir),
+            |dir| {
+                synced.borrow_mut().push(dir.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let synced = synced.borrow();
+        assert!(
+            synced.iter().any(|path| path == session.parent().unwrap()),
+            "a retry must re-sync the parent that holds the session direntry, got {synced:?}"
+        );
+        assert!(
+            !synced.iter().any(|path| is_fs_root(path)),
+            "must not fsync the filesystem root, got {synced:?}"
+        );
+    }
+
+    #[test]
+    fn create_dir_all_durable_occupied_existing_chain_pays_no_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("sessions").join("cwd").join("session-id");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("summary.json"), b"{}").unwrap();
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        create_dir_all_durable_with(
+            &session,
+            |dir| std::fs::create_dir_all(dir),
+            |dir| {
+                synced.borrow_mut().push(dir.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            synced.borrow().is_empty(),
+            "resume of a populated session dir must not fsync ancestors, got {:?}",
+            synced.borrow()
+        );
+    }
+
+    #[test]
+    fn create_dir_all_durable_retries_ancestor_syncs_after_a_failed_create_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("sessions").join("cwd").join("session-id");
+
+        let first = create_dir_all_durable_with(
+            &session,
+            |dir| std::fs::create_dir_all(dir),
+            |_| Err(io::Error::other("directory barrier failed")),
+        );
+        assert_eq!(first.unwrap_err().to_string(), "directory barrier failed");
+        assert!(session.is_dir());
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        create_dir_all_durable_with(
+            &session,
+            |dir| std::fs::create_dir_all(dir),
+            |dir| {
+                synced.borrow_mut().push(dir.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            synced
+                .borrow()
+                .iter()
+                .any(|path| path == session.parent().unwrap()),
+            "a retry after create+failed sync must still durableize the new direntry"
+        );
+    }
+
+    #[test]
+    fn atomic_write_parent_sync_error_propagates_and_keeps_the_committed_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+
+        let error = write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| Ok(()),
+            || Err(io::Error::other("directory barrier failed")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "directory barrier failed");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"new",
+            "a failed directory barrier reports the error but never unwinds the committed rename"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_sync_barrier_error_propagates_keeps_target_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("summary.json");
+        std::fs::write(&target, b"old").unwrap();
+
+        let error = write_bytes_atomic_with(
+            &target,
+            b"new",
+            |_| Err(io::Error::other("file barrier failed")),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "file barrier failed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "a failed sync must remove its temp file"
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

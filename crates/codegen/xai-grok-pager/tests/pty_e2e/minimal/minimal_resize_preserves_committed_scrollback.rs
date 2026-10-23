@@ -3,9 +3,8 @@
 use crate::common::*;
 
 /// Resize hazard: minimal mode uses only the built-in viewport
-/// machinery and never re-emits committed history (`resize_purge_rerender` /
-/// `emit_to_scrollback` are forbidden). The terminal reflows committed
-/// scrollback natively on resize. This commits a tall response into native
+/// machinery and reprints committed entries after resize while avoiding the
+/// inline crate's string-history helpers. This commits a tall response into native
 /// scrollback, resizes the terminal smaller (rows AND cols), and asserts the
 /// committed content survives (not wiped, not double-printed), the pager does
 /// not panic or exit, and the prompt is still functional afterwards.
@@ -35,8 +34,8 @@ async fn minimal_resize_preserves_committed_scrollback() {
         harness.scrollback_text()
     );
 
-    // Resize smaller in both dimensions. The terminal reflows committed history
-    // natively; minimal must neither reprint (double-print) nor wipe it.
+    // Resize smaller in both dimensions. The new-width reprint must retain
+    // the committed content without duplicates.
     harness.resize(30, 80).expect("resize smaller");
     harness.update(Duration::from_millis(800));
 

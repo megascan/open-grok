@@ -1,5 +1,5 @@
 pub mod activity;
-pub mod antigravity;
+pub mod antigravity_acp;
 pub mod app;
 pub mod auth_method;
 pub mod chat_modes;
@@ -10,12 +10,14 @@ pub mod feedback_client;
 pub mod folder_trust;
 pub(crate) mod handlers;
 pub mod init;
+pub mod media_tool_config;
 pub(crate) mod model_context;
 pub mod model_providers;
 pub mod models;
 pub mod mvp_agent;
 pub(crate) mod otel_gate;
 pub(crate) mod proxy;
+pub(crate) mod proxy_headers;
 pub mod relay;
 pub(crate) mod restore_code;
 pub mod roster;
@@ -28,6 +30,7 @@ pub(crate) mod subscription_check;
 pub(crate) mod update_chunk_merge;
 
 pub use mvp_agent::MvpAgent;
+pub use mvp_agent::SessionSetupPhase;
 pub use relay::{RelayConfig, RelayHandle, spawn_relay_connection};
 pub use server::{ServerConfig, run_agent_server};
 

@@ -11,6 +11,7 @@
 pub mod context;
 pub mod dispatch;
 pub mod error;
+pub mod mcp_structured_content;
 pub mod notification;
 pub mod render;
 pub mod search;
@@ -18,11 +19,13 @@ pub mod streaming;
 pub mod tool;
 
 pub use context::{
-    BehaviorVersion, Cancellation, Cwd, ListToolsContext, SessionContext, ToolCallContext,
-    TraceContext, TypedExtensions, WorkspaceBindMetadata, WorkspaceViewerContext,
+    BehaviorVersion, Cancellation, Cwd, ListToolsContext, McpCallMetadata, SessionContext,
+    ToolApprovalPolicy, ToolCallContext, TraceContext, TypedExtensions, WorkspaceBindMetadata,
+    WorkspaceViewerContext,
 };
 pub use dispatch::ToolDispatch;
 pub use error::{ToolError, ToolErrorKind};
+pub use mcp_structured_content::render_structured_content;
 pub use notification::{
     AsyncUserMessage, BashExecutionBackgrounded, BashExecutionComplete, BashExecutionFailed,
     BashExecutionTimeout, BashNotificationBase, BashOutputChunk, FileRead, FileWritten,

@@ -37,13 +37,15 @@ pub mod timing;
 
 pub use content::{
     AgentTurnExpectation, ContentController, InferenceEndpoint, InferenceExpectation,
-    InferenceRequestMatcher, MockModel, ScriptedResponse, SseEvent, sse,
+    InferenceRequestMatcher, MockCanAdministerTeam, MockModel, MockUserTeam, ScriptedResponse,
+    SseEvent, sse,
 };
 pub use env::pager_binary;
 pub use flows::{
     inference_request_count, oauth_credential_ops, seed_fake_oauth,
-    seed_fake_oauth_coding_data_opted_out, seed_fake_oauth_team_member, seed_fake_oauth_zdr_team,
-    submit_turn, wait_for_labels_absent, wait_for_model_via_new_sessions,
+    seed_fake_oauth_coding_data_opted_out, seed_fake_oauth_team_member,
+    seed_fake_oauth_team_member_can_administer, seed_fake_oauth_zdr_team, submit_turn,
+    wait_for_labels_absent, wait_for_model_via_new_sessions,
 };
 pub use host_clipboard::HostClipboardTextGuard;
 pub use leader::LeaderCluster;
@@ -405,6 +407,10 @@ impl PtyHarness {
         self.screen.contains(text)
     }
 
+    pub fn terminal_modes(&self) -> ptyctl::term::TerminalModes {
+        self.screen.terminal().terminal_modes()
+    }
+
     /// Pump PTY output until `condition` becomes true or `timeout` expires.
     ///
     /// The condition is checked before the first pump and after each output
@@ -582,6 +588,11 @@ impl PtyHarness {
     /// above the pinned viewport depending on how much has accumulated.
     pub fn full_text(&self) -> String {
         self.screen.full_text()
+    }
+
+    /// Native select→copy (WRAPLINE-joined, pads trimmed). Prefer over [`Self::full_text`] for clipboard-shaped asserts.
+    pub fn native_copy_text(&self) -> String {
+        self.screen.native_copy_text()
     }
 
     /// Whether scrollback + visible screen contains `text`.

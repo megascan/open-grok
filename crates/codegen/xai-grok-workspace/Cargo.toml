@@ -18,9 +18,11 @@ dirs = "6"
 parking_lot = { workspace = true }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 ignore = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "fs",
@@ -39,20 +41,24 @@ xai-grok-tools = { path = "../xai-grok-tools" }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 # `DiagHandle`, held by the hub config and threaded through `connect_hub`.
 xai-grok-diag-server = { workspace = true }
+xai-grok-lifecycle = { path = "../xai-grok-lifecycle" }
 xai-grok-workspace-client = { path = "../xai-grok-workspace-client" }
 # Daemon/process-lifecycle machinery for `bin/workspace_server.rs` only; the
 # library never references it.
 xai-grok-workspace-daemon = { path = "../xai-grok-workspace-daemon" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-config = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 # Leaf config value types (RemoteSettings, BoolFlag) for the folder-trust decision.
 xai-grok-config-types = { workspace = true }
 toml = { workspace = true, features = ["preserve_order"] }
+toml_edit = { workspace = true }
 dashmap = { workspace = true }
 agent-client-protocol = { workspace = true }
 xai-acp-lib = { workspace = true }
 xai-codebase-graph = { path = "../xai-codebase-graph" }
 xai-grok-paths = { path = "../xai-grok-paths" }
+xai-dirs = { path = "../xai-dirs" }
 base64 = { workspace = true }
 infer = { workspace = true }
 sha2 = { workspace = true, features = ["force-soft"] }
@@ -65,7 +71,7 @@ xai-fuzzy-file-search = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 smallvec = { workspace = true }
 chrono = { workspace = true }
-tree-sitter = "0.25.10"
+tree-sitter = { workspace = true }
 tree-sitter-bash = "0.25"
 url = { workspace = true }
 xai-grok-env = { workspace = true }
@@ -73,6 +79,7 @@ humantime-serde = { workspace = true }
 prometheus = { workspace = true }
 glob = "0.3"
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
+xai-grok-egress-proxy = { path = "../xai-grok-egress-proxy" }
 xai-grok-hooks = { path = "../xai-grok-hooks" }
 xai-hunk-tracker = { path = "../xai-hunk-tracker" }
 # `metrics` enables the SDK's metric-donation client (periodic Prometheus
@@ -136,6 +143,7 @@ default-bazel = [
     ]
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 xai-test-utils = { path = "../../common/xai-test-utils" }

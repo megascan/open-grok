@@ -13,8 +13,16 @@ use serde::Serialize;
 use super::enums::PermissionMode;
 pub use super::enums::PrCreationSource;
 
+mod active_agent_message;
+mod feedback;
+mod file_acceleration;
 mod permission_analytics;
+mod sandbox;
+pub use active_agent_message::*;
+pub use feedback::*;
+pub use file_acceleration::*;
 pub use permission_analytics::*;
+pub use sandbox::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
 pub trait TelemetryEvent: Serialize + Send + 'static {
@@ -87,6 +95,11 @@ pub enum PromptSuggestionAction {
     Accepted,
     /// The user explicitly dismissed the ghost text (Esc).
     Dismissed,
+    SkippedCatalog,
+    Fetched,
+    FetchedEmpty,
+    Filtered,
+    FetchFailed,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -99,6 +112,7 @@ pub enum YoloTrigger {
 
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AccessKind {
     Read,
     Edit,
@@ -106,6 +120,8 @@ pub enum AccessKind {
     Grep,
     Mcp,
     Web,
+    AgentMessage,
+    Other,
 }
 
 /// Outcome of one CLI binary install/update attempt.
@@ -222,6 +238,22 @@ impl PermissionOutcome {
 pub enum CompactionTrigger {
     Manual,
     Auto,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionModeLabel {
+    Summary,
+    Transcript,
+    Segments,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwoPassOutcome {
+    Disabled,
+    SinglePass,
+    TwoPass,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -387,6 +419,8 @@ pub enum LoginFailureKind {
     /// `is_connect`: a dead TCP connect *or* a TLS handshake killed
     /// mid-flight. `os_error` tells them apart.
     TransportConnect,
+    CertificateUntrusted,
+    CertificateInvalid,
     /// In-flight request cut short: reset, close, timeout, body phase.
     TransportInterrupted,
     /// Client-side request construction / redirect policy defect.
@@ -464,6 +498,14 @@ pub struct PromptSuggestion {
     pub chars: usize,
     /// Number of whitespace-separated words in the suggestion.
     pub words: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +552,9 @@ pub struct CompactionTriggered {
     pub model_id: String,
     pub user_context_provided: bool,
     pub compaction_id: String,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass_enabled: bool,
+    pub is_subagent: bool,
 }
 
 #[derive(Serialize)]
@@ -520,27 +565,78 @@ pub struct CompactionCompleted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     pub compaction_id: String,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass: TwoPassOutcome,
+    pub segments_queued: u32,
+    pub degenerate_retries: u32,
+    pub input_overflow_retries: u32,
+    pub is_subagent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_compaction_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_compaction_ms: Option<u64>,
 }
 
 /// Emits paired `compaction_triggered` + `compaction_completed` events with
 /// a shared `compaction_id`. Guarantees both events fire and correlate.
+pub struct CompactionBeginParams {
+    pub trigger: CompactionTrigger,
+    pub tokens_used: u64,
+    pub context_window: u64,
+    pub model_id: String,
+    pub user_context_provided: bool,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass_enabled: bool,
+    pub is_subagent: bool,
+}
+
+pub struct CompactionCompleteStats {
+    pub tokens_after: u64,
+    pub two_pass_used: bool,
+    pub segments_queued: u32,
+    pub degenerate_retries: u32,
+    pub input_overflow_retries: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct CompactionTiming {
+    pub model_wait_ms: Option<u64>,
+    pub pre_compaction_ms: Option<u64>,
+    pub post_compaction_ms: Option<u64>,
+}
+
 pub struct CompactionScope {
     pub compaction_id: String,
     pub tokens_before: u64,
     pub model_id: String,
     start: std::time::Instant,
+    _active: crate::activity::ActivityGaugeGuard,
+    compaction_mode: CompactionModeLabel,
+    two_pass_enabled: bool,
+    is_subagent: bool,
 }
 
 impl CompactionScope {
-    pub fn begin(
-        trigger: CompactionTrigger,
-        tokens_used: u64,
-        context_window: u64,
-        model_id: String,
-        user_context_provided: bool,
-    ) -> Self {
+    pub fn begin(params: CompactionBeginParams) -> Self {
+        let CompactionBeginParams {
+            trigger,
+            tokens_used,
+            context_window,
+            model_id,
+            user_context_provided,
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
+        } = params;
         let compaction_id = uuid::Uuid::new_v4().to_string();
         let percentage = xai_token_estimation::usage_percentage_u8(tokens_used, context_window);
+        let active = crate::activity::COMPACTIONS_ACTIVE.enter();
+        debug_assert!(
+            crate::activity::COMPACTIONS_ACTIVE.get() >= 1,
+            "CompactionTriggered must stamp a self-inclusive count"
+        );
         crate::session_ctx::log_event(CompactionTriggered {
             trigger,
             tokens_used,
@@ -549,22 +645,43 @@ impl CompactionScope {
             model_id: model_id.clone(),
             user_context_provided,
             compaction_id: compaction_id.clone(),
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
         });
         Self {
             compaction_id,
             tokens_before: tokens_used,
             model_id,
             start: std::time::Instant::now(),
+            _active: active,
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
         }
     }
 
-    pub fn complete(self, tokens_after: u64) {
+    pub fn complete(self, stats: CompactionCompleteStats, timing: CompactionTiming) {
+        let two_pass = match (self.two_pass_enabled, stats.two_pass_used) {
+            (false, _) => TwoPassOutcome::Disabled,
+            (true, true) => TwoPassOutcome::TwoPass,
+            (true, false) => TwoPassOutcome::SinglePass,
+        };
         crate::session_ctx::log_event(CompactionCompleted {
             duration_ms: self.start.elapsed().as_millis() as u64,
             tokens_before: self.tokens_before,
-            tokens_after,
+            tokens_after: stats.tokens_after,
             model_id: Some(self.model_id),
             compaction_id: self.compaction_id,
+            compaction_mode: self.compaction_mode,
+            two_pass,
+            segments_queued: stats.segments_queued,
+            degenerate_retries: stats.degenerate_retries,
+            input_overflow_retries: stats.input_overflow_retries,
+            is_subagent: self.is_subagent,
+            model_wait_ms: timing.model_wait_ms,
+            pre_compaction_ms: timing.pre_compaction_ms,
+            post_compaction_ms: timing.post_compaction_ms,
         });
     }
 }
@@ -623,12 +740,69 @@ pub enum SubagentLimitDisposition {
     Failed,
 }
 
+/// Whether the parent's task tool advertised an explicit child-model argument.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelSelectionKind {
+    Selectable,
+    Inherited,
+}
+
+/// How the eligible model catalog classified when a task tool was constructed.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelCatalogKind {
+    Provisional,
+    Empty,
+    UnknownFamily,
+    FirstPartyOnly,
+    ThirdPartyOnly,
+    Mixed,
+}
+
+/// Which agent the presentation was latched for.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPresentationAudience {
+    Primary,
+    Subagent,
+}
+
+/// One task-tool construction: what the catalog looked like and what the model was shown.
+#[derive(Serialize)]
+pub struct SubagentModelPresentationApplied {
+    pub selection: SubagentModelSelectionKind,
+    pub classification: SubagentModelCatalogKind,
+    pub eligible_count: u32,
+    pub inheritance_enabled: bool,
+    /// Tier that resolved the feature: `requirement` | `env` | `config` | `remote` | `default`.
+    pub feature_source: String,
+    pub audience: SubagentPresentationAudience,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelRejectionReason {
+    HiddenSelection,
+}
+
+/// An explicit child-model argument was refused; no child work ran.
+#[derive(Serialize)]
+pub struct SubagentModelOverrideRejected {
+    pub parent_session_id: String,
+    pub owner: SubagentOwnerKind,
+    pub reason: SubagentModelRejectionReason,
+}
+
 #[derive(Serialize)]
 pub struct SubagentLaunched {
     pub subagent_id: String,
     pub parent_session_id: String,
     pub subagent_type: String,
     pub owner: SubagentOwnerKind,
+    /// The selection mode of the originating task call; absent for harness-origin spawns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<SubagentModelSelectionKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_run_id: Option<String>,
     /// Time parked in the admission queue; absent if admitted immediately.
@@ -660,6 +834,18 @@ pub struct SubagentCompleted {
     pub tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_prepare_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_bootstrap_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_build_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_setup_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_to_first_turn_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -720,11 +906,29 @@ impl SubagentLimitHit {
     }
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitWaitOutcome {
+    Recovered,
+    BudgetSpent,
+    Unresolved,
+}
+
+#[derive(Serialize)]
+pub struct SubagentRateLimitWaited {
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub waited_ms: u64,
+    pub budget_ms: u64,
+    pub outcome: RateLimitWaitOutcome,
+}
+
 /// Where a workflow script came from.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceKind {
     Builtin,
+    Bundled,
     File,
     Inline,
 }
@@ -768,6 +972,10 @@ pub enum WorkflowRunEndStatus {
 pub struct WorkflowRunEnded {
     pub run_id: String,
     pub parent_session_id: String,
+    pub source: WorkflowSourceKind,
+    /// Built-in workflow names only; user script names stay local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     pub status: WorkflowRunEndStatus,
     /// Cumulative across the run's episodes.
     pub duration_ms: u64,
@@ -906,6 +1114,7 @@ pub enum ExtensionsModalTab {
     Plugins,
     Marketplace,
     Skills,
+    Workflows,
     McpServers,
 }
 
@@ -958,10 +1167,20 @@ pub struct HookExecuted {
 #[derive(Serialize)]
 pub struct HookBlocked {
     pub hook_name: String,
+    pub cause: HookBlockCause,
 }
 
 /// Per-callback outcome of a `PreToolUse` gate. A deny returns early, so callbacks
 /// still pending at that point are not logged.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBlockCause {
+    Denied,
+    UnusableRewrite,
+    StopBlocked,
+    PromptBlocked,
+}
+
 #[derive(Serialize)]
 pub struct ClientHookGate {
     pub callback_id: String,
@@ -1005,6 +1224,38 @@ pub struct SkillDispatched {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_source: Option<String>,
     pub trigger: SkillTrigger,
+    /// The validated frontmatter `origin` slug (the tool that wrote the skill). None = hand-written, or no frontmatter in hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_origin: Option<String>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSurfaceKind {
+    Skill,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessChangeOp {
+    Added,
+    Removed,
+}
+
+/// One item of the user's harness changed; emitted once per item alongside the count-only `skill_added` / `skill_removed`.
+#[derive(Serialize)]
+pub struct HarnessChanged {
+    pub kind: HarnessSurfaceKind,
+    pub op: HarnessChangeOp,
+    pub name: String,
+    /// Where the skill is loaded from, same vocabulary as `SkillDispatched::skill_source`; independent of `origin`.
+    pub skill_source: String,
+    /// The validated frontmatter `origin` slug. None = hand-written or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_source: Option<String>,
+    pub success: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1046,6 +1297,52 @@ pub struct McpToolCalled {
     pub qualified_name: String,
     pub success: bool,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileInputKind {
+    Arguments,
+    Invocation,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileInputOutcome {
+    Success,
+    Failed,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileLimitKind {
+    Source,
+    Sources,
+    Snapshots,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputUsed {
+    pub kind: McpFileInputKind,
+    pub model_id: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputCompleted {
+    pub kind: McpFileInputKind,
+    pub outcome: McpFileInputOutcome,
+    pub source_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub duration_ms: u64,
+    pub model_id: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputLimitHit {
+    pub kind: McpFileLimitKind,
+    pub limit_bytes: u64,
+    pub observed_bytes: u64,
+    pub model_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1274,6 +1571,8 @@ pub struct ProcessResourceUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub footprint_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_files: Option<u64>,
@@ -1293,6 +1592,12 @@ pub struct PromptLatency {
     pub mcp_tools_registered: u32,
     pub mcp_strategy: McpStrategy,
     pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    pub ttlb_ms: u64,
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,9 +1616,29 @@ pub struct TurnCompleted {
     pub error_category: Option<String>,
 }
 
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationScope {
+    Turn,
+    Compaction,
+}
+
+#[derive(Serialize, Clone, Copy)]
+pub struct CancellationCompleted {
+    pub latency_ms: u64,
+    pub scope: CancellationScope,
+}
+
 /// Model issued a shell tool call whose command is `true` (keepalive thrash signal).
 #[derive(Serialize)]
 pub struct ShellTrueNoop {
+    pub tool_name: String,
+}
+
+#[derive(Serialize)]
+pub struct ActionStationarityNudge {
+    pub problematically_repeating: bool,
+    pub run_len: u32,
     pub tool_name: String,
 }
 
@@ -1321,6 +1646,7 @@ pub struct ShellTrueNoop {
 #[derive(Serialize)]
 pub struct ActionStationarityStop {
     pub true_noop: bool,
+    pub problematically_repeating: bool,
     pub run_len: u32,
     pub tool_name: String,
 }
@@ -1329,11 +1655,359 @@ pub struct ActionStationarityStop {
 // Tool Calls
 // ---------------------------------------------------------------------------
 
+/// Host invocation id. Only a UUID is representable, so a provider call id or a path cannot be written here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct InvocationId(String);
+
+impl InvocationId {
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+
+    pub fn from_host(id: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(id).ok().map(|_| Self(id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Qualified registry id, or the one opaque class for unknown, custom, and dynamic names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CanonicalToolId(String);
+
+impl CanonicalToolId {
+    pub const OPAQUE: &'static str = "opaque";
+
+    pub fn opaque() -> Self {
+        Self(Self::OPAQUE.to_owned())
+    }
+
+    /// `Namespace:id` from a finalized registration. Rejects aliases, MCP names, and paths.
+    pub fn from_qualified(id: &str) -> Option<Self> {
+        let (namespace, tool) = id.split_once(':')?;
+        if namespace.is_empty()
+            || tool.is_empty()
+            || namespace == "MCP"
+            || tool.contains(':')
+            || id.contains("__")
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains(' ')
+            || !namespace.chars().all(|c| c.is_ascii_alphanumeric())
+            || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Some(Self(id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Managed behavior version. Anything else is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ToolContractVersion(&'static str);
+
+impl ToolContractVersion {
+    pub const ALLOWED: &'static [&'static str] = &["current", "legacy-0.4.10"];
+
+    pub fn from_registered(version: &str) -> Option<Self> {
+        Self::ALLOWED
+            .iter()
+            .find(|known| **known == version)
+            .map(|known| Self(known))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Requested model that product events already treat as a grok model id. Custom names stay absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ProductModelId(String);
+
+impl ProductModelId {
+    pub fn from_requested(model: &str) -> Option<Self> {
+        if !is_approved_model_id(model) || crate::redact_common::redact_owned(model).is_some() {
+            return None;
+        }
+        Some(Self(model.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_approved_model_id(model: &str) -> bool {
+    if model == "grok" {
+        return true;
+    }
+    let Some(rest) = model.strip_prefix("grok-") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 64
+        && !rest.starts_with('-')
+        && !rest.ends_with('-')
+        && !rest.contains("--")
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolSourceStatus {
+    Unknown,
+    Succeeded,
+    Empty,
+    Failed,
+    Partial,
+}
+
+impl ToolSourceStatus {
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+pub enum ToolSourceReason {
+    #[serde(rename = "not_instrumented")]
+    #[strum(serialize = "not_instrumented")]
+    NotInstrumented,
+    #[serde(rename = "search.unclassified_exit")]
+    #[strum(serialize = "search.unclassified_exit")]
+    SearchUnclassifiedExit,
+    #[serde(rename = "read.not_found")]
+    #[strum(serialize = "read.not_found")]
+    ReadNotFound,
+    #[serde(rename = "read.directory")]
+    #[strum(serialize = "read.directory")]
+    ReadDirectory,
+    #[serde(rename = "read.denied")]
+    #[strum(serialize = "read.denied")]
+    ReadDenied,
+    #[serde(rename = "read.ignored")]
+    #[strum(serialize = "read.ignored")]
+    ReadIgnored,
+    #[serde(rename = "read.binary")]
+    #[strum(serialize = "read.binary")]
+    ReadBinary,
+    #[serde(rename = "read.token_limit")]
+    #[strum(serialize = "read.token_limit")]
+    ReadTokenLimit,
+    #[serde(rename = "read.io")]
+    #[strum(serialize = "read.io")]
+    ReadIo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum InvocationSource {
+    Model,
+    UserDirect,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolOutputLimit {
+    Unobserved,
+    NotLimited,
+    Limited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadFileRole {
+    SkillEntry,
+    SkillSupport,
+    Instruction,
+    Memory,
+    Ordinary,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSkillMatch {
+    Registered,
+    Unregistered,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSkillSource {
+    Local,
+    Repo,
+    User,
+    Server,
+    Bundled,
+    Plugin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSelection {
+    Full,
+    ModelWindow,
+    DefaultWindow,
+    SkillFullRead,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadLimitKind {
+    None,
+    Lines,
+    Bytes,
+    Tokens,
+    Multiple,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CapApplicability {
+    Applies,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CapDisposition {
+    Unobserved,
+    WithinLimit,
+    Truncated,
+    Rejected,
+    Exempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadProfile {
+    pub read_file_role: ReadFileRole,
+    pub read_skill_match: ReadSkillMatch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_skill_source: Option<ReadSkillSource>,
+    pub read_selection: ReadSelection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_source_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_returned_lines: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_returned_bytes: Option<i64>,
+    pub read_limit_kind: ReadLimitKind,
+    pub read_lines_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_lines_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_lines_observed: Option<i64>,
+    pub read_lines_disposition: CapDisposition,
+    pub read_bytes_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes_observed: Option<i64>,
+    pub read_bytes_disposition: CapDisposition,
+    pub read_tokens_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_tokens_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_tokens_observed: Option<i64>,
+    pub read_tokens_disposition: CapDisposition,
+}
+
+/// Content-free location class. The path itself is not a product field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PathScope {
+    Workspace,
+    Tmp,
+    Home,
+    Other,
+}
+
+#[doc(hidden)]
+pub fn completed_for_test(tool_name: &str, model: &str) -> ToolCallCompleted {
+    ToolCallCompleted {
+        tool_name: tool_name.to_owned(),
+        outcome: xai_grok_session_events::types::ToolOutcome::Success,
+        hook_rewrote: false,
+        duration_ms: 1,
+        tool_result_size_bytes: None,
+        model_id: ProductModelId::from_requested(model),
+        invocation_id: InvocationId::from_host("018f6b6c-7b3a-7c3a-8c3a-000000000001")
+            .expect("fixed invocation id"),
+        tool_id: CanonicalToolId::opaque(),
+        tool_version: None,
+        source_status: ToolSourceStatus::Unknown,
+        source_reason: Some(ToolSourceReason::NotInstrumented),
+        path_scope: None,
+        invocation_source: None,
+        output_limit: None,
+        read: None,
+        external_model_id: model.to_owned(),
+        file_path: None,
+        parameters: None,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ToolCallCompleted {
     pub tool_name: String,
     pub outcome: xai_grok_session_events::types::ToolOutcome,
+    pub hook_rewrote: bool,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_size_bytes: Option<u64>,
+    /// Snapshotted requested model, only when it is an approved grok model id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<ProductModelId>,
+    pub invocation_id: InvocationId,
+    pub tool_id: CanonicalToolId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<ToolContractVersion>,
+    pub source_status: ToolSourceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_reason: Option<ToolSourceReason>,
+    /// Registered read, search-replace, and write ids. A client-facing rename still qualifies.
+    /// Absent for an unknown id or a missing path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_scope: Option<PathScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_source: Option<InvocationSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<ToolOutputLimit>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadProfile>,
+    /// Raw requested model for the external stream. Not a product field.
+    #[serde(skip)]
+    pub external_model_id: String,
     /// Primary file path of the call, for the external stream only
     /// (`#[serde(skip)]`: never serialized to product events/analytics). Always reduced to
     /// `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
@@ -1364,6 +2038,10 @@ pub struct ModelResponseReceived {
     pub reasoning_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_ticks: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,7 +2080,53 @@ pub struct SessionEnded {
     pub model_id: String,
 }
 
+#[derive(Serialize, Default)]
+pub struct SessionEndTimings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_save_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_consolidate_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_dispatch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_stop_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows_drain_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows_persist_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_drain_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_tasks_save_ms: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct AuthLockWait {
+    pub wait_ms: u64,
+    pub budget_ms: u64,
+}
+
+#[derive(Serialize)]
+pub struct AuthLockTimeout {
+    pub budget_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_state: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct AuthLockReplacedOutFromUnder {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_age_secs: Option<u64>,
+}
+
 // Pager events (called from xai-grok-pager via log_event)
 // ---------------------------------------------------------------------------
 
@@ -1422,14 +2146,35 @@ pub struct AgentConnect {
     pub auth_mode: crate::startup::AuthMode,
 }
 
+/// A `session/new` that never reached `session created`. Maps to the create-timeout counter only.
+#[derive(Serialize)]
+pub struct SessionCreateFailed {
+    pub outcome: crate::startup::StartupOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stuck_phase: Option<String>,
+    pub elapsed_ms: u64,
+}
+
 /// End to end startup: process start to a usable session, with the phase
 /// breakdown that accounts for it.
 #[derive(Serialize)]
-pub struct StartupComplete {
+pub struct StartupCompleted {
     pub total_ms: u64,
     pub outcome: crate::startup::StartupOutcome,
     pub phases: String,
     pub auth_mode: crate::startup::AuthMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_load_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_replay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_git_scan_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_spawn_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_frame_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1441,6 +2186,16 @@ pub struct PagerSlashCommand {
 #[derive(Serialize)]
 pub struct PlanSubmit {
     pub action: String,
+}
+
+#[derive(Serialize)]
+pub struct EventLoopStall {
+    pub max_stall_ms: u64,
+    pub window_ms: u64,
+    pub events_handled: u32,
+    pub stall_compaction_active: bool,
+    pub stall_subagents_active: u32,
+    pub stall_mcp_servers_connected: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,6 +2273,7 @@ pub struct AnnouncementCtaClicked {
 pub enum CodingDataConsentSource {
     PrivacyBanner,
     Settings,
+    FeedbackTraceCard,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -1539,6 +2295,29 @@ pub struct CodingDataConsentSelected {
     pub choice: CodingDataConsentChoice,
     pub previous_choice: CodingDataConsentChoice,
     pub changed: bool,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackTraceConsentChoice {
+    TurnOn,
+    /// Upload only the session attached to this feedback report.
+    SendThisSession,
+    NoUpload,
+    /// Close the in-modal trace prompt without choosing.
+    Dismissed,
+    NeverAsk,
+}
+
+#[derive(Serialize)]
+pub struct FeedbackTraceCardShown {
+    pub reenables_sharing: bool,
+}
+
+#[derive(Serialize)]
+pub struct FeedbackTraceConsentSelected {
+    pub choice: FeedbackTraceConsentChoice,
+    pub reenables_sharing: bool,
 }
 
 /// Flat snapshot of the terminal environment for telemetry.
@@ -1615,6 +2394,29 @@ pub struct ClipboardImagePaste {
     /// MIME type when outcome == "image", else "".
     pub image_mime: String,
     /// Wall-clock duration of the clipboard read in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Why a paste-time attachment probe did not attach its result.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardProbeDropReason {
+    PasteboardChangedBeforeRead,
+    PasteboardChangedAfterRead,
+    BracketedPayloadMismatch,
+    BracketedOriginReadFailed,
+    ReadFailed,
+    Timeout,
+    PersistFailed,
+    Panicked,
+}
+
+#[derive(Serialize)]
+pub struct ClipboardPasteProbeDropped {
+    #[serde(flatten)]
+    pub terminal: TerminalTelemetry,
+    pub reason: ClipboardProbeDropReason,
+    pub image_hash: String,
     pub duration_ms: u64,
 }
 
@@ -1819,6 +2621,25 @@ pub struct ExternalOtelExportHealth {
     pub export_successes: u64,
 }
 
+#[derive(Serialize)]
+pub struct StatusLineConfigured {
+    pub kind: &'static str,
+    pub row_shows_a_problem: bool,
+    pub items: String,
+    pub custom_items: bool,
+}
+
+#[derive(Serialize)]
+pub struct StatusLineHealth {
+    pub kind: &'static str,
+    pub had_content: bool,
+    pub runs_ok: u64,
+    pub runs_failed: u64,
+    pub runs_timed_out: u64,
+    pub runs_abandoned: u64,
+    pub slowest_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Credit limit
 // ---------------------------------------------------------------------------
@@ -1858,6 +2679,7 @@ pub enum CreditLimitChoice {
     PayAsYouGo,
     /// Unified-billing / credits-pool users: purchase prepaid credits.
     PurchaseCredits,
+    RetryLastPrompt,
 }
 
 /// User clicked an option in the credit-limit upsell.
@@ -1995,12 +2817,69 @@ pub struct CliUpdate {
     pub error_kind: Option<CliUpdateErrorKind>,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneHistoryMode {
+    Shallow,
+    Full,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneOutcome {
+    Success,
+    Failed,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneFailureStage {
+    Configuration,
+    Validation,
+    Preflight,
+    Daemon,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CloneEnded {
+    pub requested_history: CloneHistoryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_history: Option<CloneHistoryMode>,
+    pub duration_ms: u64,
+    pub outcome: CloneOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<CloneFailureStage>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Event name bindings
 // ─────────────────────────────────────────────────────────────────────────────
 
 telemetry_event!(ManualAuth, "manual_auth");
+telemetry_event!(AuthLockWait, "auth_lock_wait");
+telemetry_event!(AuthLockTimeout, "auth_lock_timeout");
+telemetry_event!(
+    AuthLockReplacedOutFromUnder,
+    "auth_lock_replaced_out_from_under"
+);
+telemetry_event!(SandboxCommandEnded, "sandbox_command_ended");
+telemetry_event!(SandboxViolationSettled, "sandbox_violation_settled");
+telemetry_event!(SandboxGrantRecorded, "sandbox_grant_recorded");
+telemetry_event!(SandboxGrantRevoked, "sandbox_grant_revoked");
+telemetry_event!(
+    FileAccelerationSessionStarted,
+    "file_acceleration_session_started"
+);
+telemetry_event!(
+    FileAccelerationSessionEnded,
+    "file_acceleration_session_ended"
+);
+telemetry_event!(
+    FileAccelerationUnavailableHit,
+    "file_acceleration_unavailable_hit"
+);
 telemetry_event!(CliUpdate, "cli_update");
+telemetry_event!(CloneEnded, "clone_ended");
 
 telemetry_event!(Login, "login", external = crate::external::schema::map_auth);
 telemetry_event!(LoginPickerShown, "login_picker_shown");
@@ -2052,6 +2931,21 @@ telemetry_event!(
     external = crate::external::schema::map_subagent_completed
 );
 telemetry_event!(SubagentLimitHit, "subagent_limit_hit");
+telemetry_event!(SubagentRateLimitWaited, "subagent_rate_limit_waited");
+telemetry_event!(
+    SubagentModelPresentationApplied,
+    "subagent_model_presentation_applied"
+);
+telemetry_event!(
+    SubagentModelOverrideRejected,
+    "subagent_model_override_rejected"
+);
+telemetry_event!(
+    ActiveAgentMessageCompleted,
+    "active_agent_message_completed"
+);
+telemetry_event!(ActiveAgentMessageLimitHit, "active_agent_message_limit_hit");
+telemetry_event!(ActiveAgentMessageSettled, "active_agent_message_settled");
 telemetry_event!(WorkflowRunStarted, "workflow_run_started");
 telemetry_event!(WorkflowRunEnded, "workflow_run_ended");
 telemetry_event!(
@@ -2087,6 +2981,7 @@ telemetry_event!(HookBlocked, "hook_blocked");
 telemetry_event!(ClientHookGate, "client_hook_gate");
 telemetry_event!(SkillAdded, "skill_added");
 telemetry_event!(SkillRemoved, "skill_removed");
+telemetry_event!(HarnessChanged, "harness_changed");
 telemetry_event!(
     SkillDispatched,
     "skill_dispatched",
@@ -2104,6 +2999,9 @@ telemetry_event!(
 );
 telemetry_event!(McpInitCompleted, "mcp_init_completed");
 telemetry_event!(McpToolCalled, "mcp_tool_called");
+telemetry_event!(McpFileInputUsed, "mcp_file_input_used");
+telemetry_event!(McpFileInputCompleted, "mcp_file_input_completed");
+telemetry_event!(McpFileInputLimitHit, "mcp_file_input_limit_hit");
 telemetry_event!(
     SessionHarness,
     "session_harness",
@@ -2115,12 +3013,17 @@ telemetry_event!(
     "session_new",
     external = crate::external::schema::map_session_new
 );
+// No external mapping: the fork defers upstream's SessionCreateTimeout
+// OTLP chain (see external/schema.rs); the product event still logs.
+telemetry_event!(SessionCreateFailed, "session_create_failed");
 telemetry_event!(
     PromptSubmitted,
     "prompt_submitted",
     external = crate::external::schema::map_user_prompt
 );
 telemetry_event!(UserFeedback, "user_feedback");
+telemetry_event!(FeedbackModalOpened, "feedback_modal_opened");
+telemetry_event!(FeedbackDraftOp, "feedback_draft_op");
 telemetry_event!(RolloutSurvey, "rollout_survey");
 telemetry_event!(PrCreated, "pr_created");
 telemetry_event!(PrMerged, "pr_merged");
@@ -2130,6 +3033,7 @@ telemetry_event!(MultiAgentDiscard, "multi_agent_discard");
 telemetry_event!(RepoChanges, "repo_changes");
 telemetry_event!(NonGitDecisionEvent, "non_git_decision");
 telemetry_event!(PromptLatency, "prompt_latency");
+telemetry_event!(CancellationCompleted, "cancellation_completed");
 telemetry_event!(HeapThresholdCrossed, "heap_threshold_crossed");
 telemetry_event!(ProcessResourceUsage, "process_resource_usage");
 telemetry_event!(ProcessResourceLimits, "process_resource_limits");
@@ -2139,6 +3043,7 @@ telemetry_event!(
     external = crate::external::schema::map_turn_completed
 );
 telemetry_event!(ShellTrueNoop, "shell_true_noop");
+telemetry_event!(ActionStationarityNudge, "action_stationarity_nudge");
 telemetry_event!(ActionStationarityStop, "action_stationarity_stop");
 telemetry_event!(
     ToolCallCompleted,
@@ -2157,27 +3062,35 @@ telemetry_event!(
     "session_ended",
     external = crate::external::schema::map_session_end
 );
+telemetry_event!(SessionEndTimings, "session_end_timings");
 telemetry_event!(
     AgentConnect,
     "agent_connect",
     external = crate::external::schema::map_agent_connect
 );
 telemetry_event!(
-    StartupComplete,
-    "startup_complete",
-    external = crate::external::schema::map_startup_complete
+    StartupCompleted,
+    "startup_completed",
+    external = crate::external::schema::map_startup_completed
 );
 telemetry_event!(PagerSlashCommand, "pager_slash_command");
 telemetry_event!(PlanSubmit, "plan_submit");
+telemetry_event!(EventLoopStall, "event_loop_stall");
 telemetry_event!(SuperGrokUpsellShown, "supergrok_upsell_shown");
 telemetry_event!(SuperGrokUpsellClicked, "supergrok_upsell_clicked");
 telemetry_event!(AnnouncementCtaShown, "announcement_cta_shown");
 telemetry_event!(AnnouncementCtaClicked, "announcement_cta_clicked");
 telemetry_event!(CodingDataConsentSelected, "coding_data_consent_selected");
+telemetry_event!(FeedbackTraceCardShown, "feedback_trace_card_shown");
+telemetry_event!(
+    FeedbackTraceConsentSelected,
+    "feedback_trace_consent_selected"
+);
 telemetry_event!(TerminalTelemetry, "terminal_context");
 telemetry_event!(DisplayRefreshProbe, "display_refresh_probe");
 telemetry_event!(BackspaceNoEffect, "backspace_no_effect");
 telemetry_event!(ClipboardImagePaste, "clipboard_image_paste");
+telemetry_event!(ClipboardPasteProbeDropped, "clipboard_paste_probe_dropped");
 telemetry_event!(PasteKeyEmptyHostClipboard, "paste_key_empty_host_clipboard");
 telemetry_event!(ClipboardCopy, "clipboard_copy");
 telemetry_event!(NotificationEmitted, "notification_emitted");
@@ -2195,6 +3108,8 @@ telemetry_event!(CreditLimitHit, "credit_limit_hit");
 telemetry_event!(CreditLimitUpsellShown, "credit_limit_upsell_shown");
 telemetry_event!(CreditLimitUpsellClicked, "credit_limit_upsell_clicked");
 telemetry_event!(SubscriptionActivated, "subscription_activated");
+telemetry_event!(StatusLineConfigured, "status_line_configured");
+telemetry_event!(StatusLineHealth, "status_line_health");
 telemetry_event!(
     ApiError,
     "api_error",
@@ -2214,14 +3129,26 @@ telemetry_event!(ExternalOtelExportHealth, "external_otel_export_health");
 
 // Session lifecycle (structs in session_metrics)
 telemetry_event!(crate::session_metrics::SessionStarted, "session_started");
+telemetry_event!(
+    crate::session_metrics::SessionContextSnapshot,
+    "session_context_snapshot"
+);
 telemetry_event!(crate::session_metrics::Turn, "turn");
 telemetry_event!(
     crate::session_metrics::TurnCompletedLifecycle,
     "turn_completed_lifecycle"
 );
 telemetry_event!(
+    crate::session_metrics::DoomLoopDetected,
+    "doom_loop_detected"
+);
+telemetry_event!(
     crate::session_metrics::DoomLoopRecovery,
     "doom_loop_recovery"
+);
+telemetry_event!(
+    crate::session_metrics::LongReasoningReminderTurn,
+    "long_reasoning_reminder"
 );
 telemetry_event!(
     crate::session_metrics::TraceUploadAttempted,
@@ -2268,10 +3195,429 @@ telemetry_event!(
     crate::memory_telemetry::MemorySessionSummary,
     "memory_session_summary"
 );
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2ControlsPinned,
+    "memory_v2_controls_pinned"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2CaptureLifecycle,
+    "memory_v2_capture_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FlushResult,
+    "memory_v2_flush_result"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2BatchDreamEnded,
+    "memory_v2_batch_dream_ended"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2DreamLifecycle,
+    "memory_v2_dream_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2GcCompleted,
+    "memory_v2_gc_completed"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2CarryoverCompleted,
+    "memory_v2_carryover_completed"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2Forgotten,
+    "memory_v2_forgotten"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FailClosed,
+    "memory_v2_fail_closed"
+);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hook_block_causes_are_closed_content_free_values() {
+        for (cause, label) in [
+            (HookBlockCause::Denied, "denied"),
+            (HookBlockCause::UnusableRewrite, "unusable_rewrite"),
+            (HookBlockCause::StopBlocked, "stop_blocked"),
+            (HookBlockCause::PromptBlocked, "prompt_blocked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(HookBlocked {
+                    hook_name: "check".to_owned(),
+                    cause,
+                })
+                .unwrap(),
+                serde_json::json!({"hook_name": "check", "cause": label})
+            );
+        }
+    }
+
+    #[test]
+    fn event_fields_shadow_reserved_keys_only_on_the_allowlist() {
+        const SOURCES: &[&str] = &[
+            include_str!("mod.rs"),
+            include_str!("active_agent_message.rs"),
+            include_str!("feedback.rs"),
+            include_str!("file_acceleration.rs"),
+            include_str!("sandbox.rs"),
+            include_str!("permission_analytics.rs"),
+            include_str!("../session_metrics.rs"),
+            include_str!("../memory_telemetry.rs"),
+        ];
+
+        let mut registry: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            for chunk in src.split("telemetry_event!(").skip(1) {
+                let path = chunk
+                    .trim_start()
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                let name = path.rsplit("::").next().unwrap_or(path);
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|context| context.is_alphanumeric() || context == '_')
+                {
+                    registry.push(name);
+                }
+            }
+        }
+
+        let mut fields: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for src in SOURCES {
+            let mut lines = src.lines();
+            while let Some(line) = lines.next() {
+                let Some(decl) = line.trim_start().strip_prefix("pub struct ") else {
+                    continue;
+                };
+                let name = decl
+                    .split(|context: char| !context.is_alphanumeric() && context != '_')
+                    .next()
+                    .unwrap_or_default();
+                let entry = fields.entry(name).or_default();
+                if !decl.contains('{') || decl.contains('}') {
+                    continue;
+                }
+                for body in lines.by_ref() {
+                    if body == "}" {
+                        break;
+                    }
+                    let body_line = body.trim_start();
+                    if body_line.starts_with("//") || body_line.starts_with('#') {
+                        continue;
+                    }
+                    let body_line = body_line.strip_prefix("pub ").unwrap_or(body_line);
+                    if let Some((ident, _)) = body_line.split_once(':')
+                        && !ident.is_empty()
+                        && ident.chars().all(|context| {
+                            context.is_ascii_lowercase()
+                                || context.is_ascii_digit()
+                                || context == '_'
+                        })
+                    {
+                        entry.push(ident.to_string());
+                    }
+                }
+            }
+        }
+
+        let reserved: std::collections::BTreeSet<&str> =
+            crate::client::RESERVED_EVENT_KEYS.iter().copied().collect();
+        let mut shadows: std::collections::BTreeSet<(String, String)> = Default::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for event in registry {
+            assert!(seen.insert(event), "event {event} registered twice");
+            let event_fields = fields
+                .get(event)
+                .unwrap_or_else(|| panic!("registered event {event} has no parsed struct"));
+            for field in event_fields {
+                if reserved.contains(field.as_str()) {
+                    shadows.insert((event.to_string(), field.clone()));
+                }
+            }
+        }
+        assert!(
+            seen.len() > 100,
+            "the registry walk collapsed: {}",
+            seen.len()
+        );
+
+        const ALLOWED: &[(&str, &str)] = &[
+            ("DoomLoopDetected", "session_id"),
+            ("DoomLoopDetected", "turn_number"),
+            ("DoomLoopRecovery", "session_id"),
+            ("DoomLoopRecovery", "turn_number"),
+            ("LongReasoningReminderTurn", "session_id"),
+            ("LongReasoningReminderTurn", "turn_number"),
+            ("FileAccelerationSessionEnded", "session_id"),
+            ("FileAccelerationSessionStarted", "session_id"),
+            ("FileAccelerationUnavailableHit", "session_id"),
+            ("MemoryFlushComplete", "session_id"),
+            ("MemoryFlushStart", "session_id"),
+            ("MemoryInjection", "session_id"),
+            ("MemoryReindex", "session_id"),
+            ("MemorySearch", "session_id"),
+            ("MemorySearchEmpty", "session_id"),
+            ("MemorySessionInit", "session_id"),
+            ("MemorySessionSummary", "session_id"),
+            ("MemoryWatcherSync", "session_id"),
+            ("ModelSwitched", "session_id"),
+            ("NonGitDecisionEvent", "session_id"),
+            ("ProcessResourceUsage", "footprint_bytes"),
+            ("ProcessResourceUsage", "rss_bytes"),
+            ("PromptSuggestion", "session_id"),
+            ("RolloutSurvey", "session_id"),
+            ("SessionHarness", "session_id"),
+            ("SessionLoad", "session_id"),
+            ("SessionNew", "session_id"),
+            ("SessionContextSnapshot", "session_id"),
+            ("SessionStarted", "session_id"),
+            ("TraceUploadAttempted", "session_id"),
+            ("TraceUploadAttempted", "turn_number"),
+            ("TraceUploadFailed", "session_id"),
+            ("TraceUploadFailed", "turn_number"),
+            ("TraceUploadSkipped", "session_id"),
+            ("TraceUploadSkipped", "turn_number"),
+            ("TraceUploadSucceeded", "session_id"),
+            ("TraceUploadSucceeded", "turn_number"),
+            ("Turn", "session_id"),
+            ("Turn", "turn_number"),
+            ("TurnCompletedLifecycle", "session_id"),
+            ("TurnCompletedLifecycle", "turn_number"),
+            ("UserFeedback", "session_id"),
+            ("FeedbackDraftOp", "session_id"),
+            ("FeedbackModalOpened", "session_id"),
+        ];
+        let allowed: std::collections::BTreeSet<(String, String)> = ALLOWED
+            .iter()
+            .map(|(stream, field)| (stream.to_string(), field.to_string()))
+            .collect();
+        assert_eq!(
+            shadows, allowed,
+            "reserved-key shadows changed; extend the allowlist only for intentional event-owned values"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn clone_ended_is_content_free_and_omits_absent_fields() {
+        assert_eq!(CloneEnded::NAME, "clone_ended");
+        assert_eq!(
+            serde_json::to_value(CloneEnded {
+                requested_history: CloneHistoryMode::Shallow,
+                effective_history: Some(CloneHistoryMode::Shallow),
+                duration_ms: 42,
+                outcome: CloneOutcome::Success,
+                failure_stage: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "requested_history": "shallow",
+                "effective_history": "shallow",
+                "duration_ms": 42,
+                "outcome": "success",
+            })
+        );
+        let failed = serde_json::to_value(CloneEnded {
+            requested_history: CloneHistoryMode::Shallow,
+            effective_history: None,
+            duration_ms: 7,
+            outcome: CloneOutcome::Failed,
+            failure_stage: Some(CloneFailureStage::Preflight),
+        })
+        .unwrap();
+        assert_eq!(failed["failure_stage"], "preflight");
+        assert!(failed.get("effective_history").is_none());
+        let text = failed.to_string();
+        assert!(!text.contains("http"), "{text}");
+        assert!(!text.contains("path"), "{text}");
+        assert!(!text.contains("url"), "{text}");
+        assert!(!text.contains("repo"), "{text}");
+    }
+
+    #[test]
+    fn process_resource_usage_omits_allocated_bytes_when_unavailable() {
+        assert_eq!(
+            serde_json::to_value(ProcessResourceUsage {
+                trigger: ResourceReportTrigger::Periodic,
+                rss_bytes: None,
+                peak_rss_bytes: None,
+                footprint_bytes: None,
+                allocated_bytes: Some(4_096),
+                threads: None,
+                open_files: None,
+                resident_sessions: 2,
+                session_threads: 3,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "trigger": "periodic",
+                "allocated_bytes": 4_096,
+                "resident_sessions": 2,
+                "session_threads": 3,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ProcessResourceUsage {
+                trigger: ResourceReportTrigger::Periodic,
+                rss_bytes: None,
+                peak_rss_bytes: None,
+                footprint_bytes: None,
+                allocated_bytes: None,
+                threads: None,
+                open_files: None,
+                resident_sessions: 2,
+                session_threads: 3,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "trigger": "periodic",
+                "resident_sessions": 2,
+                "session_threads": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_call_completed_omits_tool_result_size_bytes_when_absent() {
+        let mut with_size = completed_for_test("bash", "grok");
+        with_size.duration_ms = 7;
+        with_size.tool_result_size_bytes = Some(2_048);
+        assert_eq!(
+            serde_json::to_value(with_size).unwrap(),
+            serde_json::json!({
+                "tool_name": "bash",
+                "outcome": "success",
+                "hook_rewrote": false,
+                "duration_ms": 7,
+                "tool_result_size_bytes": 2_048,
+                "model_id": "grok",
+                "invocation_id": "018f6b6c-7b3a-7c3a-8c3a-000000000001",
+                "tool_id": "opaque",
+                "source_status": "unknown",
+                "source_reason": "not_instrumented",
+            })
+        );
+        let mut without_size = completed_for_test("bash", "not-a-grok-model");
+        without_size.duration_ms = 7;
+        assert_eq!(
+            serde_json::to_value(without_size).unwrap(),
+            serde_json::json!({
+                "tool_name": "bash",
+                "outcome": "success",
+                "hook_rewrote": false,
+                "duration_ms": 7,
+                "invocation_id": "018f6b6c-7b3a-7c3a-8c3a-000000000001",
+                "tool_id": "opaque",
+                "source_status": "unknown",
+                "source_reason": "not_instrumented",
+            })
+        );
+    }
+
+    #[test]
+    fn read_profile_serializes_a_token_rejection_without_the_path() {
+        let mut event = completed_for_test("read_note", "grok-4.6");
+        event.file_path = Some("/tmp/secret-project/SKILL.md".into());
+        event.source_status = ToolSourceStatus::Failed;
+        event.source_reason = Some(ToolSourceReason::ReadTokenLimit);
+        event.output_limit = Some(ToolOutputLimit::Limited);
+        event.read = Some(ReadProfile {
+            read_file_role: ReadFileRole::SkillEntry,
+            read_skill_match: ReadSkillMatch::Unregistered,
+            read_skill_source: None,
+            read_selection: ReadSelection::Unknown,
+            read_source_bytes: None,
+            read_returned_lines: None,
+            read_returned_bytes: None,
+            read_limit_kind: ReadLimitKind::Tokens,
+            read_lines_applicability: CapApplicability::Applies,
+            read_lines_limit: Some(1_000),
+            read_lines_observed: None,
+            read_lines_disposition: CapDisposition::Unobserved,
+            read_bytes_applicability: CapApplicability::NotApplicable,
+            read_bytes_limit: None,
+            read_bytes_observed: None,
+            read_bytes_disposition: CapDisposition::Unobserved,
+            read_tokens_applicability: CapApplicability::Applies,
+            read_tokens_limit: Some(25_000),
+            read_tokens_observed: None,
+            read_tokens_disposition: CapDisposition::Rejected,
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            Some("tokens"),
+            json.get("read_limit_kind")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            Some("rejected"),
+            json.get("read_tokens_disposition")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            Some(25_000),
+            json.get("read_tokens_limit")
+                .and_then(serde_json::Value::as_i64)
+        );
+        assert!(json.get("read_tokens_observed").is_none());
+        assert_eq!(
+            Some("skill_entry"),
+            json.get("read_file_role")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert!(!json.to_string().contains("secret-project"));
+        assert!(!json.to_string().contains("SKILL.md"));
+    }
+
+    #[test]
+    fn auth_lock_wait_event_carries_wait_and_budget() {
+        assert_eq!(
+            serde_json::to_value(AuthLockWait {
+                wait_ms: 4321,
+                budget_ms: 25_000,
+            })
+            .unwrap(),
+            serde_json::json!({ "wait_ms": 4321, "budget_ms": 25_000 })
+        );
+    }
+
+    #[test]
+    fn auth_lock_timeout_event_omits_an_unknown_holder_state() {
+        assert_eq!(
+            serde_json::to_value(AuthLockTimeout {
+                budget_ms: 25_000,
+                holder_state: Some("stuck_live"),
+            })
+            .unwrap(),
+            serde_json::json!({ "budget_ms": 25_000, "holder_state": "stuck_live" })
+        );
+        assert_eq!(
+            serde_json::to_value(AuthLockTimeout {
+                budget_ms: 10_000,
+                holder_state: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "budget_ms": 10_000 })
+        );
+    }
+
+    #[test]
+    fn auth_lock_replaced_event_omits_unknown_holder_fields() {
+        assert_eq!(
+            serde_json::to_value(AuthLockReplacedOutFromUnder {
+                holder_pid: Some(42),
+                holder_state: Some("alive"),
+                holder_age_secs: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "holder_pid": 42, "holder_state": "alive" })
+        );
+    }
 
     fn terminal_telemetry_fixture() -> TerminalTelemetry {
         TerminalTelemetry {
@@ -2436,6 +3782,7 @@ mod tests {
                 skill_name: "pdf".into(),
                 plugin_source: None,
                 trigger,
+                skill_origin: None,
             })
             .unwrap();
             assert_eq!(
@@ -2443,6 +3790,108 @@ mod tests {
                 serde_json::json!({ "skill_name": "pdf", "trigger": <&'static str>::from(trigger) })
             );
         }
+    }
+
+    #[test]
+    fn skill_dispatched_carries_skill_origin_when_set() {
+        let value = serde_json::to_value(SkillDispatched {
+            skill_name: "pdf".into(),
+            plugin_source: None,
+            trigger: SkillTrigger::SkillMdRead,
+            skill_origin: Some("learn".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "skill_name": "pdf",
+                "trigger": "skill_md_read",
+                "skill_origin": "learn",
+            }),
+            value
+        );
+    }
+
+    #[test]
+    fn harness_changed_name_and_shape() {
+        assert_eq!(HarnessChanged::NAME, "harness_changed");
+        let with_origin = serde_json::to_value(HarnessChanged {
+            kind: HarnessSurfaceKind::Skill,
+            op: HarnessChangeOp::Added,
+            name: "pdf".into(),
+            skill_source: "user".into(),
+            origin: Some("learn".into()),
+            plugin_source: None,
+            success: true,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "kind": "skill",
+                "op": "added",
+                "name": "pdf",
+                "skill_source": "user",
+                "origin": "learn",
+                "success": true,
+            }),
+            with_origin
+        );
+        let omitted = serde_json::to_value(HarnessChanged {
+            kind: HarnessSurfaceKind::Skill,
+            op: HarnessChangeOp::Removed,
+            name: "pdf".into(),
+            skill_source: "bundled".into(),
+            origin: None,
+            plugin_source: None,
+            success: false,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "kind": "skill",
+                "op": "removed",
+                "name": "pdf",
+                "skill_source": "bundled",
+                "success": false,
+            }),
+            omitted
+        );
+    }
+
+    #[test]
+    fn workflow_run_ended_omits_workflow_name_when_none() {
+        let ended = |source: WorkflowSourceKind, workflow_name: Option<String>| {
+            serde_json::to_value(WorkflowRunEnded {
+                run_id: "wf_1".into(),
+                parent_session_id: "s1".into(),
+                source,
+                workflow_name,
+                status: WorkflowRunEndStatus::Interrupted,
+                duration_ms: 10,
+                agents_used: 0,
+                agent_budget: None,
+                agents_failed: 0,
+                peak_concurrent_agents: 0,
+                slot_waits: 0,
+                slot_wait_ms_total: 0,
+                slot_wait_ms_max: 0,
+            })
+            .unwrap()
+        };
+        let builtin = ended(WorkflowSourceKind::Builtin, Some("learn".into()));
+        assert_eq!(Some(&serde_json::json!("builtin")), builtin.get("source"));
+        assert_eq!(
+            Some(&serde_json::json!("learn")),
+            builtin.get("workflow_name")
+        );
+        let bundled = ended(WorkflowSourceKind::Bundled, Some("learn-traces".into()));
+        assert_eq!(Some(&serde_json::json!("bundled")), bundled.get("source"));
+        assert_eq!(
+            Some(&serde_json::json!("learn-traces")),
+            bundled.get("workflow_name")
+        );
+        let file = ended(WorkflowSourceKind::File, None);
+        assert_eq!(Some(&serde_json::json!("file")), file.get("source"));
+        assert_eq!(None, file.get("workflow_name"));
     }
 
     #[test]
@@ -2493,6 +3942,172 @@ mod tests {
                 "attempt": 2,
                 "context_window": 128_000,
                 "compaction_id": "cid-2",
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_triggered_name_and_shape() {
+        assert_eq!(CompactionTriggered::NAME, "compaction_triggered");
+        let event = serde_json::to_value(CompactionTriggered {
+            trigger: CompactionTrigger::Auto,
+            tokens_used: 100_000,
+            context_window: 128_000,
+            percentage: 78,
+            model_id: "grok-4".into(),
+            user_context_provided: false,
+            compaction_id: "cid-1".into(),
+            compaction_mode: CompactionModeLabel::Segments,
+            two_pass_enabled: true,
+            is_subagent: false,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "trigger": "auto",
+                "tokens_used": 100_000,
+                "context_window": 128_000,
+                "percentage": 78,
+                "model_id": "grok-4",
+                "user_context_provided": false,
+                "compaction_id": "cid-1",
+                "compaction_mode": "segments",
+                "two_pass_enabled": true,
+                "is_subagent": false,
+            })
+        );
+
+        let disarmed = serde_json::to_value(CompactionTriggered {
+            trigger: CompactionTrigger::Manual,
+            tokens_used: 10_000,
+            context_window: 128_000,
+            percentage: 8,
+            model_id: "grok-4".into(),
+            user_context_provided: false,
+            compaction_id: "cid-2".into(),
+            compaction_mode: CompactionModeLabel::Summary,
+            two_pass_enabled: false,
+            is_subagent: false,
+        })
+        .unwrap();
+        assert_eq!(
+            disarmed,
+            serde_json::json!({
+                "trigger": "manual",
+                "tokens_used": 10_000,
+                "context_window": 128_000,
+                "percentage": 8,
+                "model_id": "grok-4",
+                "user_context_provided": false,
+                "compaction_id": "cid-2",
+                "compaction_mode": "summary",
+                "two_pass_enabled": false,
+                "is_subagent": false,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_completed_name_and_shape() {
+        assert_eq!(CompactionCompleted::NAME, "compaction_completed");
+        let with_model = serde_json::to_value(CompactionCompleted {
+            duration_ms: 63_000,
+            tokens_before: 399_000,
+            tokens_after: 15_000,
+            model_id: Some("grok-4".into()),
+            compaction_id: "cid-1".into(),
+            compaction_mode: CompactionModeLabel::Summary,
+            two_pass: TwoPassOutcome::TwoPass,
+            segments_queued: 0,
+            degenerate_retries: 1,
+            input_overflow_retries: 2,
+            is_subagent: false,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            with_model,
+            serde_json::json!({
+                "duration_ms": 63_000,
+                "tokens_before": 399_000,
+                "tokens_after": 15_000,
+                "model_id": "grok-4",
+                "compaction_id": "cid-1",
+                "compaction_mode": "summary",
+                "two_pass": "two_pass",
+                "segments_queued": 0,
+                "degenerate_retries": 1,
+                "input_overflow_retries": 2,
+                "is_subagent": false,
+            })
+        );
+
+        let no_model = serde_json::to_value(CompactionCompleted {
+            duration_ms: 1,
+            tokens_before: 1,
+            tokens_after: 1,
+            model_id: None,
+            compaction_id: "cid-2".into(),
+            compaction_mode: CompactionModeLabel::Transcript,
+            two_pass: TwoPassOutcome::Disabled,
+            segments_queued: 0,
+            degenerate_retries: 0,
+            input_overflow_retries: 0,
+            is_subagent: true,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            no_model,
+            serde_json::json!({
+                "duration_ms": 1,
+                "tokens_before": 1,
+                "tokens_after": 1,
+                "compaction_id": "cid-2",
+                "compaction_mode": "transcript",
+                "two_pass": "disabled",
+                "segments_queued": 0,
+                "degenerate_retries": 0,
+                "input_overflow_retries": 0,
+                "is_subagent": true,
+            })
+        );
+
+        let single_pass = serde_json::to_value(CompactionCompleted {
+            duration_ms: 2,
+            tokens_before: 2,
+            tokens_after: 2,
+            model_id: None,
+            compaction_id: "cid-3".into(),
+            compaction_mode: CompactionModeLabel::Segments,
+            two_pass: TwoPassOutcome::SinglePass,
+            segments_queued: 1,
+            degenerate_retries: 0,
+            input_overflow_retries: 0,
+            is_subagent: false,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            single_pass,
+            serde_json::json!({
+                "duration_ms": 2,
+                "tokens_before": 2,
+                "tokens_after": 2,
+                "compaction_id": "cid-3",
+                "compaction_mode": "segments",
+                "two_pass": "single_pass",
+                "segments_queued": 1,
+                "degenerate_retries": 0,
+                "input_overflow_retries": 0,
+                "is_subagent": false,
             })
         );
     }

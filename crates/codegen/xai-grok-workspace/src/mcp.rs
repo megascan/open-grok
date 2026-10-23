@@ -15,34 +15,48 @@ use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::servers::{McpClient, parse_mcp_qualified_name};
 use xai_tool_protocol::ToolId;
-use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput};
+use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput, render_structured_content};
 use xai_tool_types::ToolDescription;
 
 /// Adapts [`McpClient`] to the [`McpTransport`] trait for [`McpBridge`].
 pub(crate) struct McpClientTransportAdapter {
-    client: Arc<McpClient>,
+    /// `None` once closed: the hub's handlers keep the adapter alive after a stop, and must not keep the client.
+    client: arc_swap::ArcSwapOption<McpClient>,
 }
 
 impl McpClientTransportAdapter {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client: arc_swap::ArcSwapOption::new(Some(client)),
+        }
+    }
+
+    fn client(&self) -> Result<Arc<McpClient>, xai_computer_hub_mcp_adapter::McpError> {
+        self.client.load_full().ok_or_else(|| {
+            xai_computer_hub_mcp_adapter::McpError::Transport("MCP transport closed".into())
+        })
     }
 }
 
 #[async_trait]
 impl McpTransport for McpClientTransportAdapter {
     async fn initialize(&self) -> Result<McpServerInfo, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client
+        let client = self.client()?;
+        // Hub requests have no agent call identity. Account for them while they
+        // are in flight so untagged server requests cannot be misattributed.
+        let _request = client.begin_outbound_request();
+        let service = client
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
         let info = service.peer_info().ok_or_else(|| {
             xai_computer_hub_mcp_adapter::McpError::Transport("no peer info after init".into())
         })?;
+        // rmcp 3.x makes the server implementation identity optional on peer info.
+        let server_info = info.server_info.as_ref();
         Ok(McpServerInfo {
-            name: info.server_info.name.clone(),
-            version: info.server_info.version.clone(),
+            name: server_info.map(|si| si.name.clone()).unwrap_or_default(),
+            version: server_info.map(|si| si.version.clone()).unwrap_or_default(),
             capabilities: serde_json::to_value(&info.capabilities).unwrap_or_default(),
         })
     }
@@ -50,8 +64,11 @@ impl McpTransport for McpClientTransportAdapter {
     async fn list_tools(
         &self,
     ) -> Result<Vec<McpToolDefinition>, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client
+        let client = self.client()?;
+        // Hub requests have no agent call identity. Account for them while they
+        // are in flight so untagged server requests cannot be misattributed.
+        let _request = client.begin_outbound_request();
+        let service = client
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -86,52 +103,60 @@ impl McpTransport for McpClientTransportAdapter {
         name: &str,
         arguments: Value,
     ) -> Result<McpCallResult, xai_computer_hub_mcp_adapter::McpError> {
-        let service = self
-            .client
-            .ensure_initialized()
-            .await
-            .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
+        // `McpClient::call_tool` holds the non-agent request guard across every
+        // MRTR round and sends cancellation if a pending request is dropped.
+        let client = self.client()?;
         // MCP spec requires arguments to be an object; coerce if needed.
-        let args_object = match arguments {
-            Value::Object(map) => Some(map),
-            Value::Null => None,
+        let arguments = match arguments {
+            Value::Object(_) | Value::Null => arguments,
             other => {
                 let mut wrapper = serde_json::Map::new();
                 wrapper.insert("value".to_string(), other);
-                Some(wrapper)
+                Value::Object(wrapper)
             }
         };
-        let result = service
-            .call_tool({
-                let mut params = rmcp::model::CallToolRequestParams::new(name.to_string());
-                params.arguments = args_object;
-                params
-            })
+        let result = client
+            .call_tool(name, arguments)
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
 
-        Ok(McpCallResult {
-            content: result
-                .content
-                .into_iter()
-                .map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
-                    rmcp::model::ContentBlock::Image(img) => McpContent::Image {
-                        mime_type: img.mime_type,
-                        data: img.data,
-                    },
-                    _ => McpContent::Text {
-                        text: "[unsupported content type]".to_string(),
-                    },
-                })
-                .collect(),
-            is_error: result.is_error.unwrap_or(false),
-        })
+        Ok(mcp_call_result_from_rmcp(result))
     }
 
     async fn close(&self) -> Result<(), xai_computer_hub_mcp_adapter::McpError> {
-        // No-op: cleanup happens when McpClient is dropped.
+        // Letting go of the client is what ends a stdio child, once no in-flight call still holds its
+        // service; a call routed in afterwards fails here.
+        self.client.store(None);
         Ok(())
+    }
+}
+
+/// Preserve structured output and MCP metadata on the hub bridge.
+fn mcp_call_result_from_rmcp(result: rmcp::model::CallToolResult) -> McpCallResult {
+    let mut content: Vec<McpContent> = result
+        .content
+        .into_iter()
+        .map(|c| match c {
+            rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
+            rmcp::model::ContentBlock::Image(img) => McpContent::Image {
+                mime_type: img.mime_type,
+                data: img.data,
+            },
+            _ => McpContent::Text {
+                text: "[unsupported content type]".to_string(),
+            },
+        })
+        .collect();
+    let texts = content.iter().filter_map(|c| match c {
+        McpContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    });
+    let structured = render_structured_content(result.structured_content.as_ref(), texts);
+    content.extend(structured.map(|text| McpContent::Text { text }));
+    McpCallResult {
+        content,
+        is_error: result.is_error.unwrap_or(false),
+        meta: result.meta.unwrap_or_default().0,
     }
 }
 
@@ -207,6 +232,28 @@ pub(crate) fn server_name_from_mcp_error(e: &xai_grok_mcp::servers::McpError) ->
     e.server_name().unwrap_or("unknown")
 }
 
+/// Compose a host-owned built-in `entry` into `servers`: same-named entries are dropped so none
+/// can take its first-party posture, and it goes first so any server cap keeps it.
+pub fn compose_built_in(
+    servers: Vec<agent_client_protocol::McpServer>,
+    entry: agent_client_protocol::McpServer,
+) -> Vec<agent_client_protocol::McpServer> {
+    let name = xai_grok_mcp::servers::mcp_server_name(&entry);
+    let (same_name, mut composed): (Vec<_>, Vec<_>) = servers
+        .into_iter()
+        .partition(|server| xai_grok_mcp::servers::mcp_server_name(server) == name);
+    let impersonating = same_name.iter().filter(|server| **server != entry).count();
+    if impersonating > 0 {
+        tracing::warn!(
+            dropped = impersonating,
+            server = name,
+            "dropping MCP servers that use a reserved built-in server name"
+        );
+    }
+    composed.insert(0, entry);
+    composed
+}
+
 /// Bridge config factory for MCP bridge connections.
 pub(crate) fn make_bridge_config(
     session_id: xai_tool_protocol::SessionId,
@@ -255,6 +302,71 @@ mod tests {
         async fn close(&self) -> Result<(), McpError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn bridged_result_preserves_meta_and_structured_content_without_duplication() {
+        let data = serde_json::json!({"items": [1, 2]});
+        let meta = serde_json::Map::from_iter([("app_name".into(), "TextEdit".into())]);
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("summary")]);
+        result.structured_content = Some(data.clone());
+        result.meta = Some(rmcp::model::MetaObject(meta.clone()));
+        let bridged = super::mcp_call_result_from_rmcp(result);
+        assert_eq!(bridged.meta, meta);
+        assert!(
+            matches!(&bridged.content[..], [McpContent::Text { text: summary }, McpContent::Text { text: structured }] if summary == "summary" && structured == &data.to_string())
+        );
+
+        let mut inlined =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                data.to_string(),
+            )]);
+        inlined.structured_content = Some(data);
+        let bridged = super::mcp_call_result_from_rmcp(inlined);
+        assert_eq!(bridged.content.len(), 1);
+        assert!(bridged.meta.is_empty());
+    }
+
+    #[test]
+    fn compose_built_in_reserves_the_name_and_leads_the_list() {
+        let composed = compose_built_in(
+            vec![
+                stdio("other", "/other"),
+                stdio("built_in", "/impersonator"),
+                stdio("built_in", "/impersonator-2"),
+            ],
+            stdio("built_in", "/host"),
+        );
+        assert_eq!(
+            composed,
+            vec![stdio("built_in", "/host"), stdio("other", "/other")]
+        );
+    }
+
+    /// A host re-feeding its own composed list (hot reload) must not warn about itself.
+    #[test]
+    fn compose_built_in_warns_only_for_a_differing_same_named_entry() {
+        let host = stdio("built_in", "/host");
+        let ((), re_fed) = crate::capturing_warn_logs(|| {
+            let composed =
+                compose_built_in(vec![host.clone(), stdio("other", "/other")], host.clone());
+            assert_eq!(2, composed.len());
+        });
+        assert!(!re_fed.contains("reserved"), "own entry re-fed: {re_fed}");
+        let ((), impersonated) = crate::capturing_warn_logs(|| {
+            compose_built_in(vec![stdio("built_in", "/impersonator")], host.clone());
+        });
+        assert!(
+            impersonated.contains("reserved") && impersonated.contains("dropped=1"),
+            "impersonator: {impersonated}"
+        );
+    }
+
+    fn stdio(name: &str, command: &str) -> agent_client_protocol::McpServer {
+        agent_client_protocol::McpServer::Stdio(agent_client_protocol::McpServerStdio::new(
+            name, command,
+        ))
     }
 
     #[tokio::test]

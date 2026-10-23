@@ -31,6 +31,8 @@ impl crate::types::tool_metadata::ToolMetadata for MonitorTool {
 
 **Output volume**: Every stdout line is a main-agent wake. Print only `DONE`/`FAILED`/`CANCELLED`. No progress or CHANGE lines. Use `grep --line-buffered` in pipes (plain `grep` buffers and delays events by minutes).
 
+**Responsiveness**: Emit `FAILED` to notify immediately when any required item fails; never wait for unrelated work to finish. Include every tracked failure signal in this immediate failure condition.
+
 Set `persistent: true` for session-length watches (PR monitoring, log tails) -- the monitor runs${%- if tools.by_kind.kill_task_action %} until you call ${{ tools.by_kind.kill_task_action }} or${%- endif %} until the session ends. Otherwise it stops at `timeout_ms` (default 10h)."#
     }
 
@@ -106,94 +108,108 @@ impl xai_tool_runtime::Tool for MonitorTool {
             (terminal, notif, cwd, session_folder, owner)
         };
 
+        let notification_handle = notification_handle.with_delivery_scope(
+            ctx.get::<crate::notification::BackgroundDeliveryScope>()
+                .map(|scope| (*scope).clone()),
+        );
+
         // Output file lives in the session folder alongside bash terminal logs.
         let output_file = session_folder
             .join("terminal")
             .join(format!("monitor-{}.log", ctx.call_id.as_str()));
-        let bg_handle = terminal
-            .run_background(crate::computer::types::TerminalRunRequest {
-                command: input.command.clone(),
-                working_directory: cwd.clone(),
-                env: std::collections::HashMap::from([(
-                    "PYTHONUNBUFFERED".to_string(),
-                    "1".to_string(),
-                )]),
-                timeout: if resolved_timeout == 0 {
-                    Duration::from_secs(86400 * 365) // long-running (until kill or session end)
-                } else {
-                    Duration::from_millis(resolved_timeout)
-                },
-                output_byte_limit: 10 * 1024 * 1024,
-                output_file,
-                notification_handle: notification_handle.clone(),
-                tool_call_id: ctx.call_id.as_str().to_owned(),
-                display_command: Some(format!("[monitor] {description}")),
-                auto_background_on_timeout: false,
-                foreground_block_budget: None,
-                kind: crate::computer::types::TaskKind::Monitor,
-                owner_session_id,
-                description: Some(description.clone()).filter(|d| !d.trim().is_empty()),
-            })
-            .await
-            .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
-
-        let task_id = bg_handle.task_id.clone();
-        let tray_description = Some(description.clone()).filter(|d| !d.trim().is_empty());
-
-        // Notify the pager so the monitor appears in the tasks pane
-        // (same notification that bash background tasks send).
-        notification_handle.send_backgrounded(crate::notification::BashExecutionBackgrounded {
-            base: crate::notification::BashNotificationBase {
-                tool_call_id: ctx.call_id.as_str().to_owned(),
-                // Send the real monitor command (so the block viewer shows the
-                // actual script). The human-readable description travels in
-                // `monitor_description` so the pager can render a "Monitor" tag
-                // instead of bash-highlighting a "[monitor] …" pseudo-command.
-                command: input.command.clone(),
-                output: Vec::new(),
-                total_bytes: 0,
-                truncated: false,
-                cwd,
-            },
-            output_file: bg_handle.output_file.clone(),
-            task_id: task_id.clone(),
-            monitor_description: tray_description.clone(),
-            description: tray_description,
-        });
-
-        // Spawn the stdout processing pipeline.
-        // Reads the output file, processes lines through the rate limiter,
-        // and emits MonitorEvent notifications.
-        let pipeline_task_id = task_id.clone();
-        let pipeline_description = description;
-        // Weak handle: the pipeline must not keep the session's terminal backend
-        // (and the monitored process) alive past session end. See
-        // `run_monitor_pipeline`.
-        let pipeline_terminal = std::sync::Arc::downgrade(&terminal);
-        let pipeline_notif = notification_handle.clone();
-        let pipeline_output_file = bg_handle.output_file;
-
-        // Resolve the kill tool name before spawning the pipeline (resources
-        // can't cross the spawn boundary).
         let kill_tool_name = crate::types::template_renderer::TemplateRenderer::resolve_tool_name(
             &resources,
             crate::types::tool::ToolKind::KillTaskAction,
         )
         .await;
-
-        let pipeline_kill_name = kill_tool_name.clone();
-        tokio::spawn(async move {
-            run_monitor_pipeline(
-                &pipeline_task_id,
-                &pipeline_description,
-                pipeline_terminal,
-                &pipeline_notif,
-                &pipeline_output_file,
-                pipeline_kill_name,
-                0, // fresh pipeline — read from start
-            )
-            .await;
-        });
+        let start_scope = notification_handle.child_delivery_scope();
+        let start_handle = notification_handle.with_delivery_scope(Some(start_scope.clone()));
+        let mut start_delivery = notification_handle
+            .reserve_delivery()
+            .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_unavailable", error))?;
+        start_delivery.mark_started();
+        let request = crate::computer::types::TerminalRunRequest {
+            command: input.command.clone(),
+            working_directory: cwd.clone(),
+            env: std::collections::HashMap::from([(
+                "PYTHONUNBUFFERED".to_string(),
+                "1".to_string(),
+            )]),
+            timeout: if resolved_timeout == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(resolved_timeout)
+            },
+            output_byte_limit: 10 * 1024 * 1024,
+            output_file,
+            notification_handle: start_handle.clone(),
+            tool_call_id: ctx.call_id.as_str().to_owned(),
+            display_command: Some(format!("[monitor] {description}")),
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: crate::computer::types::TaskKind::Monitor,
+            owner_session_id,
+            description: Some(description.clone()).filter(|d| !d.trim().is_empty()),
+        };
+        let worker_terminal = terminal.clone();
+        let worker_handle = start_handle.clone();
+        let worker_command = input.command.clone();
+        let worker_description = description.clone();
+        let worker_call_id = ctx.call_id.as_str().to_owned();
+        let worker_kill_name = kill_tool_name.clone();
+        let task_id = tokio::spawn(async move {
+            let result = match worker_terminal.run_background(request).await {
+                Ok(bg_handle) => {
+                    let task_id = bg_handle.task_id.clone();
+                    let label = Some(worker_description.clone()).filter(|d| !d.trim().is_empty());
+                    worker_handle.send_backgrounded(
+                        crate::notification::BashExecutionBackgrounded {
+                            base: crate::notification::BashNotificationBase {
+                                tool_call_id: worker_call_id,
+                                command: worker_command,
+                                output: Vec::new(),
+                                total_bytes: 0,
+                                truncated: false,
+                                cwd,
+                            },
+                            output_file: bg_handle.output_file.clone(),
+                            task_id: task_id.clone(),
+                            monitor_description: label.clone(),
+                            description: label,
+                        },
+                    );
+                    let pipeline_id = task_id.clone();
+                    let pipeline_terminal = std::sync::Arc::downgrade(&worker_terminal);
+                    let pipeline_handle = worker_handle.clone();
+                    tokio::spawn(async move {
+                        run_monitor_pipeline(
+                            &pipeline_id,
+                            &worker_description,
+                            pipeline_terminal,
+                            &pipeline_handle,
+                            &bg_handle.output_file,
+                            worker_kill_name,
+                            0,
+                        )
+                        .await;
+                    });
+                    Ok(task_id)
+                }
+                Err(error) => Err(xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    error.to_string(),
+                )),
+            };
+            let receipt = start_scope.wait_bounded(Duration::from_secs(30)).await;
+            start_delivery.resolve(receipt.clone());
+            receipt
+                .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_failed", error))?;
+            result
+        })
+        .await
+        .map_err(|error| {
+            xai_tool_runtime::ToolError::custom("terminal_worker_failed", error.to_string())
+        })??;
 
         let kill_tool_display =
             kill_tool_name.unwrap_or_else(|| "kill_command_or_subagent".to_string());
@@ -229,8 +245,8 @@ impl xai_tool_runtime::Tool for MonitorTool {
 /// Background pipeline: polls the task output and feeds lines through
 /// the processing pipeline (line processor -> rate limiter -> XML wrap -> notification).
 ///
-/// `pub(crate)` so `reparent_notifications` can re-spawn the pipeline on the
-/// parent's runtime when a subagent exits and its monitors are reparented.
+/// Available to terminal backends so `reparent_notifications` can re-spawn the
+/// pipeline on the parent's runtime when a subagent's monitors are reparented.
 ///
 /// Holds the backend as a [`Weak`](std::sync::Weak), never a strong `Arc`: a
 /// persistent monitor loops for the session's whole lifetime, so a strong ref
@@ -238,7 +254,7 @@ impl xai_tool_runtime::Tool for MonitorTool {
 /// on shared-runtime hosts (hosts that build one backend per session on a
 /// shared runtime). With a `Weak` the pipeline stops once the session drops
 /// its backend, letting `shutdown_all()` reap the process.
-pub(crate) async fn run_monitor_pipeline(
+pub async fn run_monitor_pipeline(
     task_id: &str,
     description: &str,
     terminal: std::sync::Weak<dyn crate::computer::types::TerminalBackend>,
@@ -615,7 +631,8 @@ mod tests {
                 parent_handle,
                 Arc::downgrade(&backend),
             )
-            .await;
+            .await
+            .expect("reparent notifications");
 
         // The re-spawned pipeline streams post-reparent ticks, all of which must
         // carry the parent owner.

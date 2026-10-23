@@ -236,6 +236,13 @@ struct CustomModelDeleteParams {
     key: String,
 }
 
+/// Params for `open-grok/custom-models/upsert-many`: the model rows the wizard
+/// just confirmed for one server address.
+#[derive(serde::Deserialize)]
+struct CustomModelBatchParams {
+    models: Vec<crate::custom_models::CustomModelRecord>,
+}
+
 fn persisted_perplexity_web_search_enabled() -> anyhow::Result<bool> {
     let root = crate::config::load_effective_config()?;
     Ok(root
@@ -1401,6 +1408,7 @@ impl acp::Agent for MvpAgent {
             });
         let model = model_rx
             .await
+            .map(|current| current.id)
             .unwrap_or_else(|_| self.sampling_config.borrow().model.clone());
         let mut parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>> = None;
         let verbatim = arguments
@@ -1584,6 +1592,7 @@ impl acp::Agent for MvpAgent {
             .cmd_tx
             .send(SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
+                origin: None,
                 prompt_blocks: arguments.prompt.clone(),
                 prompt_mode,
                 artifact_upload_ctx: trace_context
@@ -1600,6 +1609,7 @@ impl acp::Agent for MvpAgent {
                 respond_to: tx,
                 persist_ack: None,
                 parsed_prompt_tx,
+                initial_child_prompt_ready: None,
             })
             .map_err(|e| {
                 acp::Error::internal_error()
@@ -1641,6 +1651,7 @@ impl acp::Agent for MvpAgent {
                                 last_turn_usage: None,
                                 prompt_usage: None,
                                 cancellation_category: None,
+                                cancellation_context: None,
                                 cancel_trigger: None,
                                 structured_output: None,
                                 tool_overrides: applied_tool_overrides.clone(),
@@ -1665,20 +1676,20 @@ impl acp::Agent for MvpAgent {
                 .as_ref()
                 .map(|ok| ok.stop_reason)
                 .map_err(Clone::clone);
-            let (stop_reason_value, agent_result_value) = crate::sampling::error::prompt_complete_fields(
-                &mapped,
-            );
             let turn_id = arguments
                 .meta
                 .as_ref()
                 .and_then(|m| m.get("turnId"))
                 .and_then(|v| v.as_u64());
-            let mut payload = serde_json::json!({
-                "sessionId": arguments.session_id.to_string(),
-                "promptId": prompt_id.as_str(),
-                "stopReason": stop_reason_value,
-                "agentResult": agent_result_value,
-            });
+            let mut payload = crate::session::turn_completion::prompt_complete_payload(
+                &arguments.session_id, &prompt_id, &mapped,
+            );
+            if let Some(category) = stop_result.as_ref().ok().and_then(|ok| ok.completion_kind.cancellation_category_meta()) {
+                payload["cancellationCategory"] = serde_json::json!(category);
+            }
+            if let Some(context) = stop_result.as_ref().ok().and_then(|ok| ok.completion_kind.cancellation_context_meta()) {
+                payload["cancellationContext"] = context;
+            }
             if let Some(tid) = turn_id {
                 payload["turnId"] = serde_json::json!(tid);
             }
@@ -2197,19 +2208,8 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 let last_turn_usage = last_turn_usage_for_meta;
-                let cancellation_category = match &completion_kind {
-                    crate::session::commands::PromptCompletionKind::Cancelled {
-                        category: Some(cat),
-                        ..
-                    } => Some(format!("{cat:?}")),
-                    crate::session::commands::PromptCompletionKind::MaxTurnsReached {
-                        ..
-                    } => Some("max_turns_reached".to_string()),
-                    crate::session::commands::PromptCompletionKind::StationarityEnded => {
-                        Some("action_stationarity".to_string())
-                    }
-                    _ => None,
-                };
+                let cancellation_category = completion_kind.cancellation_category_meta();
+                let cancellation_context = completion_kind.cancellation_context_meta();
                 Ok(
                     acp::PromptResponse::new(stop_reason)
                         .meta(
@@ -2221,6 +2221,7 @@ impl acp::Agent for MvpAgent {
                                     last_turn_usage: last_turn_usage.as_ref(),
                                     prompt_usage,
                                     cancellation_category,
+                                    cancellation_context,
                                     cancel_trigger,
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,
@@ -2431,7 +2432,13 @@ impl acp::Agent for MvpAgent {
                 .send(
                     SessionCommand::Cancel(crate::session::CancelOptions {
                         cancel_subagents,
-                        rewind_if_no_output,
+                        history: if rewind_if_no_output {
+                            crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                                prompt_id: args.meta.as_ref()
+                                    .and_then(|meta| meta.get("promptId"))
+                                    .and_then(serde_json::Value::as_str).map(str::to_owned),
+                            }
+                        } else { crate::session::CancelHistoryDisposition::Keep },
                         trigger: cancel_trigger,
                         user_initiated: true,
                         ..Default::default()
@@ -2748,6 +2755,32 @@ impl acp::Agent for MvpAgent {
                             self.models_manager.current_model_id(),
                             available.values().cloned().collect(),
                         );
+                        crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
+                            models,
+                            self.models_manager.list_custom_models(),
+                            warning,
+                        )))
+                    }
+                    Err(error) => crate::extensions::to_ext_response::<serde_json::Value>(Err(error)),
+                }
+            }
+            "open-grok/custom-providers/discover" => {
+                let params =
+                    crate::extensions::parse_params::<crate::custom_providers::CustomProviderDiscoverParams>(&args)?;
+                crate::extensions::to_ext_response(
+                    crate::custom_providers::discover_models(params).await,
+                )
+            }
+            "open-grok/custom-models/upsert-many" => {
+                let params = crate::extensions::parse_params::<CustomModelBatchParams>(&args)?;
+                match self.models_manager.upsert_custom_models(params.models).await {
+                    Ok(warnings) => {
+                        let available = self.models_manager.available();
+                        let models = acp::SessionModelState::new(
+                            self.models_manager.current_model_id(),
+                            available.values().cloned().collect(),
+                        );
+                        let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
                         crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
                             models,
                             self.models_manager.list_custom_models(),
@@ -3076,7 +3109,12 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
             "x.ai/session/cache" => crate::extensions::cache::handle(self, &args).await,
-            "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
+            crate::extensions::memory::MEMORY_FLUSH_METHOD
+            | crate::extensions::memory::MEMORY_DREAM_METHOD
+            | crate::extensions::memory::MEMORY_REWRITE_METHOD
+            | crate::extensions::memory::MEMORY_LIST_METHOD
+            | crate::extensions::memory::MEMORY_TOGGLE_METHOD
+            | crate::extensions::memory::MEMORY_FORGET_METHOD => {
                 crate::extensions::memory::handle(self, &args).await
             }
             "x.ai/skills/refresh-baseline" => {
@@ -3370,10 +3408,12 @@ impl acp::Agent for MvpAgent {
             }
             s if s.starts_with("x.ai/skills/") || s == "x.ai/workflows/list" => {
                 let compat = self.cfg.borrow().compat_resolved;
+                let cwd = crate::extensions::skills::request_cwd(&args);
+                let registry = self.plugin_registry_for_cwd(cwd.as_deref()).await;
                 crate::extensions::skills::handle(
                         self,
                         &args,
-                        self.plugin_registry_handle.snapshot().as_deref(),
+                        registry.as_deref(),
                         compat,
                     )
                     .await

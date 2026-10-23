@@ -6,12 +6,13 @@
 //!
 //! Output format: `ANCHOR→CONTENT` (e.g. `22:abc:rst→  let x = 1;`).
 
-use crate::implementations::grok_build::read_file::{ReadFileInput, run_read_file};
-use crate::types::context::TruncationConfig;
-
+use crate::implementations::grok_build::read_file::{
+    ReadFileInput, byte_budget_marker, extract_file_content_lines, lines_within_byte_budget,
+    run_read_file_with_snapshot,
+};
 use crate::types::output::ReadFileOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
-use crate::types::resources::{FileSystem, Params, TruncationCfg};
+use crate::types::resources::Params;
 use crate::types::tool::{ToolKind, ToolNamespace};
 
 use super::anchor::split_lines;
@@ -42,7 +43,14 @@ pub(crate) fn format_hashline_content(
     let mut raw_output = String::new();
     let mut first_line: Option<usize> = None;
 
-    for (i, line) in all_lines.iter().enumerate().skip(skip).take(take) {
+    let real_lines = file_content.split_inclusive('\n').count().max(1);
+    for (i, line) in all_lines
+        .iter()
+        .take(real_lines)
+        .enumerate()
+        .skip(skip)
+        .take(take)
+    {
         let line_num = i + 1; // 1-based
 
         if first_line.is_none() {
@@ -106,6 +114,10 @@ impl crate::types::tool_metadata::ToolMetadata for HashlineReadTool {
 
     fn tool_namespace(&self) -> ToolNamespace {
         ToolNamespace::GrokBuildHashline
+    }
+
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("target_file")
     }
 
     fn description_template(&self) -> &str {
@@ -189,65 +201,92 @@ impl xai_tool_runtime::Tool for HashlineReadTool {
         // `None`: the hashline tool does not stream, so it needs no
         // text-path streamability signal (see `run_read_file`).
         let invoking = crate::types::tool_metadata::invoking_param_names(&ctx);
-        let result = run_read_file(
+        let mut snapshot = None;
+        let result = run_read_file_with_snapshot(
             input,
             cwd_override,
             None,
             resources.clone(),
             None,
             &invoking,
+            None,
+            Some(&mut snapshot),
         )
         .await?;
 
-        match result {
-            ReadFileOutput::FileContent(mut fc) => {
-                // Empty file: preserve the system-reminder from run_read_file.
-                if fc.raw_output.is_empty() && fc.total_lines == 0 {
-                    fc.content_concise = None;
-                    return Ok(ReadFileOutput::FileContent(fc));
-                }
-
-                // Read the full file for anchor generation. Anchors depend
-                // on full-file context (chunk fingerprints span multiple
-                // lines), so we need complete content even for windowed reads.
-                let (full_content, scheme, max_lines) = {
+        match (result, snapshot) {
+            (ReadFileOutput::FileContent(mut fc), Some(snapshot)) => {
+                // Anchor the exact snapshot used for the raw window and read
+                // checks. The scheme may depend on context outside the window.
+                let scheme = {
                     let res = resources.lock().await;
                     let params = res
                         .get::<Params<HashlineSchemeParams>>()
                         .cloned()
                         .unwrap_or_default();
-                    let s = params
+                    params
                         .0
                         .build_scheme()
-                        .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
-                    let fs = res.require::<FileSystem>()?.0.clone();
-                    let content = match fs.read_file(&fc.absolute_path).await {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                        Err(_) => fc.raw_output.clone(),
-                    };
-                    let ml = res
-                        .get::<TruncationCfg>()
-                        .map(|t| t.0.max_lines_read())
-                        .unwrap_or_else(|| TruncationConfig::default().max_lines_read());
-                    (content, s, ml)
+                        .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
                 };
+                let (mut hashline_content, _) = format_hashline_content(
+                    &snapshot.content,
+                    Some(snapshot.start_line),
+                    Some(snapshot.line_count),
+                    &*scheme,
+                );
 
-                let effective_limit = Some(fc.limit.unwrap_or(usize::MAX).min(max_lines));
-                let (hashline_content, _raw) =
-                    format_hashline_content(&full_content, fc.offset, effective_limit, &*scheme);
-
+                // The shared reader's budget is measured on its own format.
+                // Reapply it to the anchored format so prefixes are counted too.
+                if let Some(budget) = snapshot.byte_budget {
+                    let full_len = hashline_content.len();
+                    let kept = if full_len > budget {
+                        lines_within_byte_budget(&hashline_content, budget).min(snapshot.line_count)
+                    } else {
+                        snapshot.line_count
+                    };
+                    if full_len > budget {
+                        if kept < snapshot.line_count {
+                            // `kept` is positive and smaller than the rendered
+                            // line count, so the separator after that line exists.
+                            let cut = hashline_content
+                                .match_indices('\n')
+                                .nth(kept - 1)
+                                .expect("separator after retained line")
+                                .0;
+                            hashline_content.truncate(cut);
+                        }
+                        // Like the shared reader, report a budget cut even
+                        // when the first line alone must exceed the budget.
+                        let marker = byte_budget_marker(
+                            full_len.saturating_sub(hashline_content.len()),
+                            fc.total_lines,
+                            snapshot.start_line,
+                            kept,
+                            invoking.resolve("offset"),
+                        );
+                        hashline_content.push_str(&marker);
+                    }
+                    // Keep the structured window in sync even when the
+                    // anchored and standard formats fit different line counts.
+                    fc.raw_output = extract_file_content_lines(
+                        &snapshot.content,
+                        Some(snapshot.start_line as i64),
+                        Some(kept),
+                        fc.total_lines,
+                    )
+                    .raw_output;
+                }
+                hashline_content.push_str(&snapshot.trailing_rules);
                 fc.content = hashline_content;
                 fc.content_concise = None; // hashline has only one format
-                // Drop tool-layer captures: `hashline_content` keeps the
-                // original URIs intact, so session-layer extraction will
-                // catch them — clearing here avoids double-injection.
+                // Original URIs remain in hashline content for session-layer
+                // extraction, so avoid injecting the shared captures twice.
                 fc.extracted_images.clear();
-                // raw_output, offset, limit, tracking remain as set by
-                // run_read_file — windowed semantics preserved.
                 Ok(ReadFileOutput::FileContent(fc))
             }
-            // Non-text results (images, errors) pass through unchanged.
-            other => Ok(other),
+            // Non-text, empty and rejected results pass through unchanged.
+            (other, _) => Ok(other),
         }
     }
 }
@@ -270,6 +309,180 @@ mod tests {
         resources.insert(FileSystem(Arc::new(LocalFs)));
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
         resources
+    }
+
+    #[tokio::test]
+    async fn hashline_uses_one_text_snapshot_for_window_and_anchors() {
+        use crate::computer::types::{AsyncFileSystem, ComputerError};
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ChangingFs(AtomicUsize);
+        #[async_trait::async_trait]
+        impl AsyncFileSystem for ChangingFs {
+            async fn read_file(&self, _path: &Path) -> Result<Vec<u8>, ComputerError> {
+                let read = self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(if read == 0 {
+                    b"alpha\nbeta\n".to_vec()
+                } else {
+                    b"changed\nother\n".to_vec()
+                })
+            }
+            async fn write_file(&self, _path: &Path, _data: &[u8]) -> Result<(), ComputerError> {
+                unimplemented!()
+            }
+            async fn delete_file(&self, _path: &Path) -> Result<(), ComputerError> {
+                unimplemented!()
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("snapshot.txt"), "placeholder").unwrap();
+        let fs = Arc::new(ChangingFs(AtomicUsize::new(0)));
+        let mut resources = test_resources(tmp.path());
+        resources.insert(FileSystem(fs.clone()));
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            test_ctx(resources.into_shared()),
+            ReadFileInput {
+                path: "snapshot.txt".into(),
+                offset: Some(2),
+                limit: Some(1),
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ReadFileOutput::FileContent(fc) = result else {
+            panic!("expected file content");
+        };
+        assert_eq!(fs.0.load(Ordering::SeqCst), 1);
+        assert_eq!(fc.total_lines, 2);
+        assert_eq!(fc.raw_output, "beta\n");
+        let (anchor, text) = fc.content.split_once('→').unwrap();
+        assert_eq!(text, "beta");
+        let anchor = super::super::scheme::ParsedAnchor::parse(anchor).unwrap();
+        let scheme = HashlineSchemeParams::default().build_scheme().unwrap();
+        assert_eq!(
+            super::super::anchor::validate_against_content(&*scheme, &anchor, "alpha\nbeta\n"),
+            super::super::scheme::ValidationResult::Valid,
+        );
+    }
+
+    #[tokio::test]
+    async fn hashline_budget_counts_anchors_and_preserves_resume_window() {
+        use crate::implementations::grok_build::read_file::ReadFileParams;
+        use crate::types::resources::InvokingToolParamNames;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("lines.txt"),
+            "alpha-xxxx\nbeta-xxxxx\ngamma-xxxx\ndelta-xxxx\n",
+        )
+        .unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(Params(ReadFileParams {
+            max_output_bytes: Some(30),
+            ..Default::default()
+        }));
+        let mut ctx = test_ctx(resources.into_shared());
+        ctx.extensions.insert(InvokingToolParamNames(
+            [("offset".to_owned(), "start_line".to_owned())].into(),
+        ));
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            ctx,
+            ReadFileInput {
+                path: "lines.txt".into(),
+                offset: Some(2),
+                limit: None,
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ReadFileOutput::FileContent(fc) = result else {
+            panic!("expected file content");
+        };
+        let (body, marker) = fc.content.rsplit_once('\n').unwrap();
+        assert!(body.len() <= 30, "body exceeds budget: {body:?}");
+        assert!(body.ends_with("→beta-xxxxx"));
+        assert!(marker.contains("showing lines 2-2; rerun with start_line=3"));
+        assert_eq!(fc.raw_output, "beta-xxxxx\n");
+        assert_eq!(fc.total_lines, 4);
+    }
+
+    #[tokio::test]
+    async fn hashline_budget_keeps_an_oversized_first_line() {
+        use crate::implementations::grok_build::read_file::ReadFileParams;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("long.txt"), "single line\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(Params(ReadFileParams {
+            max_output_bytes: Some(1),
+            ..Default::default()
+        }));
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            test_ctx(resources.into_shared()),
+            ReadFileInput {
+                path: "long.txt".into(),
+                offset: None,
+                limit: None,
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ReadFileOutput::FileContent(fc) = result else {
+            panic!("expected file content");
+        };
+        assert!(fc.content.contains("→single line"));
+        assert!(
+            fc.content
+                .contains("showing lines 1-1; rerun with offset=2")
+        );
+        assert_eq!(fc.raw_output, "single line\n");
+    }
+
+    #[tokio::test]
+    async fn hashline_window_handles_blank_crlf_and_whole_instruction_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("blank.txt"), "a\r\n\r\nz").unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "one\ntwo\nthree\n").unwrap();
+        for (path, offset, limit, expected_raw, expected_lines) in [
+            ("blank.txt", Some(2), Some(1), "\n", 1),
+            ("AGENTS.md", Some(2), Some(1), "one\ntwo\nthree\n", 3),
+        ] {
+            let result = xai_tool_runtime::Tool::run(
+                &HashlineReadTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                ReadFileInput {
+                    path: path.into(),
+                    offset,
+                    limit,
+                    pages: None,
+                    format: None,
+                },
+            )
+            .await
+            .unwrap();
+            let ReadFileOutput::FileContent(fc) = result else {
+                panic!("expected file content for {path}");
+            };
+            assert_eq!(fc.raw_output, expected_raw);
+            assert_eq!(fc.content.lines().count(), expected_lines);
+            if path == "blank.txt" {
+                assert!(fc.content.starts_with("2:"));
+                assert!(fc.content.ends_with('→'));
+            } else {
+                assert!(fc.content.starts_with("1:"));
+                assert!(fc.content.contains("→three"));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -317,6 +530,15 @@ mod tests {
         assert_eq!(content_lines.len(), 2);
         assert!(content_lines[0].starts_with("2:"));
         assert!(content_lines[1].starts_with("3:"));
+    }
+
+    #[test]
+    fn hashline_formatter_does_not_expose_a_phantom_line() {
+        let scheme = HashlineSchemeParams::default().build_scheme().unwrap();
+        let (full, _) = format_hashline_content("one\ntwo\n", None, None, &*scheme);
+        assert_eq!(full.lines().count(), 2);
+        let (past, _) = format_hashline_content("one\ntwo\n", Some(3), None, &*scheme);
+        assert!(past.is_empty());
     }
 
     #[test]
@@ -574,6 +796,41 @@ mod tests {
                 // no longer emits "... lines not shown ..."
             }
             other => panic!("Expected FileContent, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_and_past_eof_offsets_match_core_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\n").unwrap();
+        for offset in [-1, 3] {
+            let input = ReadFileInput {
+                path: "lines.txt".into(),
+                offset: Some(offset),
+                limit: Some(1),
+                pages: None,
+                format: None,
+            };
+            let result = xai_tool_runtime::Tool::run(
+                &HashlineReadTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                input,
+            )
+            .await
+            .unwrap();
+            let ReadFileOutput::FileContent(fc) = result else {
+                panic!("{result:?}");
+            };
+            assert_eq!(fc.total_lines, 2);
+            if offset == -1 {
+                assert!(
+                    fc.content.starts_with("2:") && fc.content.ends_with("→two"),
+                    "{}",
+                    fc.content
+                );
+            } else {
+                assert!(fc.content.is_empty(), "{}", fc.content);
+            }
         }
     }
 

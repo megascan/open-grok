@@ -5,8 +5,10 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +17,24 @@ use serde_json::Value;
 
 pub(crate) type BoxWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) type TerminalWait = Box<dyn FnOnce() -> BoxWait + Send>;
+
+/// An SSE comment the hang body flushes so the response head reaches the client, then the stream
+/// produces no chunk; a comment carries no event, so the client's idle timer runs from here.
+const HANG_OPENING_FRAME: &[u8] = b": grok-mock stream open\n\n";
+pub const SSE_HOLD_EVENT: &str = "grok-mock-hold";
+
+#[derive(Clone)]
+pub(crate) struct BodyHold(Arc<dyn Fn() -> BoxWait + Send + Sync>);
+
+impl BodyHold {
+    pub(crate) fn new(wait: impl Fn() -> BoxWait + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wait))
+    }
+
+    fn wait(&self) -> BoxWait {
+        (self.0)()
+    }
+}
 
 /// One SSE event as data: optional `event:` name plus the `data:` payload.
 #[derive(Debug, Clone)]
@@ -39,6 +59,14 @@ impl SseEvent {
             data: data.into(),
         }
     }
+
+    /// Pause the stream until the mock releases this marker.
+    pub fn hold() -> Self {
+        Self {
+            event: Some(SSE_HOLD_EVENT.to_owned()),
+            data: String::new(),
+        }
+    }
 }
 
 /// Body of a [`ScriptedResponse`].
@@ -48,6 +76,11 @@ pub enum ScriptedBody {
     Sse(Vec<SseEvent>),
     /// Raw body bytes, served verbatim (byte-controllable malformed SSE etc.).
     Raw(String),
+    /// Fail the body immediately, closing the connection before a response is delivered.
+    Dropped,
+    /// The head reaches the client, then the body stalls forever with no chunk, so the client's
+    /// inference idle timeout fires.
+    Hang,
 }
 
 /// A scripted reply served by a matched expectation or compatibility FIFO.
@@ -87,6 +120,24 @@ impl ScriptedResponse {
         }
     }
 
+    /// A 200 stream whose head reaches the client, then never yields a chunk, so the client's
+    /// inference idle timeout fires.
+    pub fn hang() -> Self {
+        Self {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+            body: ScriptedBody::Hang,
+        }
+    }
+
+    pub fn dropped() -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body: ScriptedBody::Dropped,
+        }
+    }
+
     pub(crate) fn is_sse(&self) -> bool {
         matches!(self.body, ScriptedBody::Sse(_))
     }
@@ -109,6 +160,16 @@ impl ScriptedResponse {
         delay: Option<std::time::Duration>,
         before_terminal: Option<TerminalWait>,
     ) -> Response {
+        self.into_response_with_hold(delay, before_terminal, None)
+            .await
+    }
+
+    pub(crate) async fn into_response_with_hold(
+        self,
+        delay: Option<std::time::Duration>,
+        before_terminal: Option<TerminalWait>,
+        body_hold: Option<BodyHold>,
+    ) -> Response {
         let mut resp = match self.body {
             ScriptedBody::Json(v) => {
                 if let Some(wait) = before_terminal {
@@ -122,6 +183,31 @@ impl ScriptedResponse {
                 }
                 s.into_response()
             }
+            ScriptedBody::Dropped => {
+                if let Some(wait) = before_terminal {
+                    wait().await;
+                }
+                Response::new(Body::from_stream(stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("the mock dropped the connection"))
+                })))
+            }
+            ScriptedBody::Hang => {
+                if let Some(wait) = before_terminal {
+                    wait().await;
+                }
+                let body = stream::unfold(false, |flushed| async move {
+                    if flushed {
+                        std::future::pending::<()>().await;
+                        None
+                    } else {
+                        Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from_static(HANG_OPENING_FRAME)),
+                            true,
+                        ))
+                    }
+                });
+                Response::new(Body::from_stream(body))
+            }
             ScriptedBody::Sse(events) => {
                 let last_idx = events.len().checked_sub(1);
                 let mut events: Vec<_> = events.into_iter().enumerate().map(Some).collect();
@@ -129,8 +215,8 @@ impl ScriptedResponse {
                     events.push(None);
                 }
                 let stream = stream::unfold(
-                    (events.into_iter(), before_terminal),
-                    move |(mut events, mut before_terminal)| async move {
+                    (events.into_iter(), before_terminal, body_hold),
+                    move |(mut events, mut before_terminal, body_hold)| async move {
                         loop {
                             let item = events.next()?;
                             let Some((idx, scripted_event)) = item else {
@@ -139,6 +225,12 @@ impl ScriptedResponse {
                                 }
                                 continue;
                             };
+                            if scripted_event.event.as_deref() == Some(SSE_HOLD_EVENT) {
+                                if let Some(hold) = &body_hold {
+                                    hold.wait().await;
+                                }
+                                continue;
+                            }
                             if let Some(d) = delay {
                                 tokio::time::sleep(d).await;
                             }
@@ -153,7 +245,10 @@ impl ScriptedResponse {
                                 Some(name) => event.event(name),
                                 None => event,
                             };
-                            return Some((Ok::<_, Infallible>(event), (events, before_terminal)));
+                            return Some((
+                                Ok::<_, Infallible>(event),
+                                (events, before_terminal, body_hold),
+                            ));
                         }
                     },
                 );

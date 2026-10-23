@@ -28,6 +28,8 @@ use crate::implementations::grok_build::image_gen::ImageGenInput;
 use crate::implementations::grok_build::list_dir::ListDirInput;
 use crate::implementations::grok_build::read_file::ReadFileInput;
 use crate::implementations::grok_build::search_replace::SearchReplaceInput;
+use crate::implementations::grok_build::send_feedback::SendFeedbackInput;
+use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput;
 use crate::implementations::grok_build::session_collaboration::{
     ListSessionsInput, MessageSessionInput, ReadSessionInput,
 };
@@ -114,6 +116,8 @@ pub enum ToolInput {
     EnterPlanMode(EnterPlanModeInput),
     ExitPlanMode(ExitPlanModeInput),
     AskUserQuestion(AskUserQuestionInput),
+    #[serde(alias = "SendAgentMessage")]
+    SendSubagentMessage(SendSubagentMessageInput),
     Lsp(LspToolInput),
     Monitor(crate::implementations::grok_build::monitor::types::MonitorInput),
     SchedulerCreate(crate::implementations::grok_build::scheduler::create::SchedulerCreateInput),
@@ -121,6 +125,14 @@ pub enum ToolInput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
+    ProposeMission(crate::implementations::grok_build::mission::ProposeMissionInput),
+    StartMissionRun(crate::implementations::grok_build::mission::StartMissionRunInput),
+    DismissHandoffItems(crate::implementations::grok_build::mission::DismissHandoffItemsInput),
+    InspectMissionReadiness(
+        crate::implementations::grok_build::mission::InspectMissionReadinessInput,
+    ),
+    EndFeatureRun(crate::implementations::grok_build::mission::EndFeatureRunInput),
+    SendFeedback(SendFeedbackInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }
@@ -132,7 +144,7 @@ impl ToolInput {
     /// `None`. Add any new dispatcher here.
     pub fn dispatch_target_name(&self) -> Option<String> {
         match self {
-            ToolInput::UseTool(input) => Some(input.tool_name.clone()),
+            ToolInput::UseTool(input) => input.target_name().map(str::to_owned),
             _ => None,
         }
     }
@@ -140,6 +152,20 @@ impl ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_send_agent_message_input_envelope_deserializes() {
+        let input: ToolInput = serde_json::from_value(serde_json::json!({
+            "variant": "SendAgentMessage",
+            "subagent_id": "sub-1",
+            "text": "follow up",
+        }))
+        .expect("legacy input envelope must remain replayable");
+        let ToolInput::SendSubagentMessage(input) = input else {
+            panic!("expected renamed input variant");
+        };
+        assert_eq!(input.subagent_id, "sub-1");
+        assert_eq!(input.text, "follow up");
+    }
     #[test]
     fn try_into_input_succeeds_for_matching_variant() {
         let input = ToolInput::ListDir(ListDirInput {
@@ -151,10 +177,12 @@ mod tests {
     }
     #[test]
     fn dispatch_target_name_resolves_meta_dispatch_tools() {
-        let use_tool = ToolInput::UseTool(UseToolInput {
-            tool_name: "linear__save_issue".to_string(),
-            tool_input: serde_json::json!({}),
-        });
+        let use_tool = ToolInput::UseTool(UseToolInput::Inline(
+            crate::implementations::use_tool::InlineMcpInvocation {
+                tool_name: "linear__save_issue".to_string(),
+                tool_input: serde_json::json!({}),
+            },
+        ));
         assert_eq!(
             use_tool.dispatch_target_name().as_deref(),
             Some("linear__save_issue")
@@ -188,6 +216,7 @@ mod tests {
             timeout: None,
             description: "list files".into(),
             is_background: false,
+            block_until_ms: None,
         })
         .try_into();
         assert_eq!(bash.unwrap().command, "ls");

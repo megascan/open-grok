@@ -23,6 +23,25 @@ use crate::types::output::{ToolOutput, ToolRunResult};
 use crate::types::resources::{OwnerSessionId, State, Terminal};
 use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::ToolKind;
+use xai_tool_types::BackgroundNoticeNaming;
+
+#[derive(Debug, Clone)]
+pub struct BackgroundNoticeNames {
+    pub task_output_tool: String,
+    pub task_ids_param: String,
+    pub timeout_ms_param: String,
+    pub notified_on_completion: bool,
+}
+
+impl BackgroundNoticeNames {
+    pub fn naming(&self) -> BackgroundNoticeNaming<'_> {
+        BackgroundNoticeNaming {
+            task_output_tool: &self.task_output_tool,
+            task_ids_param: &self.task_ids_param,
+            timeout_ms_param: &self.timeout_ms_param,
+        }
+    }
+}
 
 /// Result of executing a tool through the bridge.
 ///
@@ -117,6 +136,24 @@ impl ToolBridge {
             .and_then(|r| r.tool_for_kind(kind).map(str::to_string))
     }
 
+    pub async fn background_notice_naming(&self) -> BackgroundNoticeNames {
+        use crate::implementations::grok_build::task;
+        let resources = &self.registry.resources;
+        let (task_output_tool, task_ids_param, timeout_ms_param) =
+            task::resolve_background_notice_names(resources).await;
+        let notified_on_completion = task::notified_on_completion(resources).await;
+        BackgroundNoticeNames {
+            task_output_tool,
+            task_ids_param,
+            timeout_ms_param,
+            notified_on_completion,
+        }
+    }
+
+    pub fn tool_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        self.registry.tool_name_for_registry_id(registry_id)
+    }
+
     /// [`ToolKind`] for a registered tool by client-facing name, or
     /// `None` for unknown names. Sync — uses the registry's
     /// `RwLock::read`.
@@ -127,6 +164,11 @@ impl ToolBridge {
     /// Get only built-in tool definitions (exclude MCP tools).
     pub async fn tool_definitions_builtins_only(&self) -> Vec<ToolDefinition> {
         self.registry.tool_definitions_builtins_only()
+    }
+
+    /// Built-in tool definitions with `use_tool` advertised inline-only (no MCP file forms).
+    pub async fn tool_definitions_builtins_only_inline_mcp(&self) -> Vec<ToolDefinition> {
+        self.registry.tool_definitions_builtins_only_inline_mcp()
     }
 
     /// Render a prompt template through [`TemplateRenderer`] with extra
@@ -487,6 +529,19 @@ impl ToolBridge {
         }
     }
 
+    pub async fn background_foreground_commands(
+        &self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<crate::computer::types::BackgroundedForeground> {
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .background_foreground_commands(owner_session_id)
+                .await
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Kill all running background tasks.
     pub async fn kill_all_background_tasks(&self) {
         if let Some(terminal) = &self.terminal {
@@ -510,7 +565,7 @@ impl ToolBridge {
         old_owner_session_id: &str,
         new_owner_session_id: &str,
         new_handle: crate::notification::types::ToolNotificationHandle,
-    ) {
+    ) -> Result<(), String> {
         if let Some(terminal) = &self.terminal {
             // Weak anchored by this bridge's backend `Arc` (lives as long as the session).
             let backend_weak = std::sync::Arc::downgrade(terminal);
@@ -521,7 +576,9 @@ impl ToolBridge {
                     new_handle,
                     backend_weak,
                 )
-                .await;
+                .await
+        } else {
+            Err("terminal backend is unavailable for reparenting".to_owned())
         }
     }
 
@@ -543,6 +600,13 @@ impl ToolBridge {
     /// Used by the host session to inject `ToolIndex` for search_tool.
     pub async fn update_resource<T: Send + Sync + 'static>(&self, resource: T) {
         let _ = self.registry.update_resource(resource).await;
+    }
+
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        self.registry.update_resources_with(seed).await;
     }
 
     /// Kill a background task, recording who initiated the kill.
@@ -851,6 +915,42 @@ mod tests {
             is_backgrounded: false,
             output_total_bytes: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn default_reparent_succeeds_only_without_live_owned_tasks() {
+        let mut sibling = completed_task("sibling", Some("sibling"));
+        sibling.completed = false;
+        let completed = completed_task("completed", Some("child"));
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![sibling.clone(), completed],
+        });
+        assert!(
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    crate::notification::ToolNotificationHandle::noop(),
+                    Arc::downgrade(&backend)
+                )
+                .await
+                .is_ok()
+        );
+
+        let mut child = sibling;
+        child.owner_session_id = Some("child".into());
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal { tasks: vec![child] });
+        assert!(
+            backend
+                .reparent_notifications(
+                    "child",
+                    "parent",
+                    crate::notification::ToolNotificationHandle::noop(),
+                    Arc::downgrade(&backend)
+                )
+                .await
+                .is_err()
+        );
     }
 
     /// Regression: subagents share the parent's terminal backend, so the

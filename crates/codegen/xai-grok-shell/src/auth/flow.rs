@@ -11,6 +11,15 @@ use crate::http::TransportFailureKind;
 use crate::util::grok_home;
 use xai_grok_telemetry::events::{LoginFailed, LoginFailureKind};
 
+macro_rules! auth_info {
+    ($($arg:tt)*) => {
+        xai_tty_utils::cli_output::write_checked(
+            std::io::stderr().lock(),
+            format_args!("{}\n", format_args!($($arg)*)),
+        )
+    };
+}
+
 pub(crate) type StderrCallback = Box<dyn Fn(&str)>;
 
 /// Reject a cached credential for reuse if it lacks `oidc_issuer`, has a
@@ -205,7 +214,7 @@ pub struct AuthChannels {
 
 /// Sets no `GROK_AUTH_EXPIRED`: operator binaries, which live outside this
 /// repo, read that variable as "headless, don't prompt" and decline the run.
-async fn run_external_auth_provider(
+pub(super) async fn run_external_auth_provider(
     command: &str,
     auth_manager: &Arc<AuthManager>,
     over_stale_credential: bool,
@@ -463,6 +472,8 @@ fn failure_kind(transport: TransportFailureKind, is_decode: bool) -> LoginFailur
     match transport {
         TransportFailureKind::Unreachable => LoginFailureKind::TransportConnect,
         TransportFailureKind::Interrupted => LoginFailureKind::TransportInterrupted,
+        TransportFailureKind::CertificateUntrusted => LoginFailureKind::CertificateUntrusted,
+        TransportFailureKind::CertificateInvalid => LoginFailureKind::CertificateInvalid,
         TransportFailureKind::Permanent => LoginFailureKind::TransportPermanent,
     }
 }
@@ -647,7 +658,7 @@ async fn run_auth_flow_inner(
                     error = %e,
                     "auth: external auth provider failed, falling through to interactive login"
                 );
-                eprintln!("Signing in with browser instead...");
+                auth_info!("Signing in with browser instead...")?;
             }
         }
     }
@@ -787,20 +798,8 @@ pub(crate) async fn try_noninteractive_auth_no_mint(
 /// Policy behind [`try_noninteractive_auth_no_mint`], with the `AuthManager`
 /// injected for tests.
 async fn try_noninteractive_auth_no_mint_with(auth_manager: &Arc<AuthManager>) -> Option<GrokAuth> {
-    match tokio::time::timeout(
-        crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-        try_ensure_fresh_auth_with(auth_manager),
-    )
-    .await
-    {
-        Ok(Some(auth)) => return Some(auth),
-        Ok(None) => {}
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_secs = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT.as_secs(),
-                "boot auth refresh timed out; using cached/expired session (mint deferred to background)"
-            );
-        }
+    if let super::SilentRefresh::Renewed(auth) = auth_manager.silent_refresh().await {
+        return Some(*auth);
     }
     // Expired-but-refreshable cached session self-heals on the first 401; no
     // cold mint on the readiness path.
@@ -869,11 +868,10 @@ async fn persist_or_use_minted(auth_manager: &AuthManager, new_auth: GrokAuth) -
 }
 
 /// Print the CLI "signed in" confirmation, clearing the spinner line first.
-fn report_signed_in(auth: &GrokAuth) {
-    eprint!("\r\x1b[K");
+pub(super) fn report_signed_in(auth: &GrokAuth) -> std::io::Result<()> {
     match auth.email {
-        Some(ref email) => eprintln!("✓ Signed in as {email}"),
-        None => eprintln!("✓ Signed in"),
+        Some(ref email) => auth_info!("\r\x1b[K✓ Signed in as {email}"),
+        None => auth_info!("\r\x1b[K✓ Signed in"),
     }
 }
 
@@ -916,7 +914,7 @@ pub async fn ensure_authenticated_with_override(
 
     // Context only — the flow below prints the "Signing in…" line itself.
     if let Some(msg) = message_prefix {
-        eprintln!("{msg}");
+        auth_info!("{msg}")?;
     }
 
     let (auth, did_auth) = run_auth_flow(
@@ -931,7 +929,7 @@ pub async fn ensure_authenticated_with_override(
     .await?;
 
     if did_auth {
-        report_signed_in(&auth);
+        report_signed_in(&auth)?;
     }
 
     Ok(auth)
@@ -1001,15 +999,15 @@ pub async fn run_cli_login(
         )
         .await?;
         if did_auth {
-            report_signed_in(&auth);
+            report_signed_in(&auth)?;
         }
         auth
     } else {
         // OIDC has no device endpoint, so `--device-auth` falls back here.
         if device_auth && crate::auth::oidc::is_configured(&config.grok_com_config) {
-            eprintln!(
+            auth_info!(
                 "Device-code login isn't available for your SSO provider; using browser sign-in."
-            );
+            )?;
         }
         // Loopback. `reauth=true` clears creds up front (legacy-scope hygiene),
         // so abandoning logs you out — unlike the device branch above.
@@ -1027,13 +1025,17 @@ pub async fn run_cli_login(
     // Sync this principal's config now rather than waiting for the background
     // tick. Stay quiet about absence/failure during login — confirm only when
     // config was actually applied; `open-grok setup` reports the no-config case.
+    apply_post_login_config(authenticated).await
+}
+
+pub(super) async fn apply_post_login_config(authenticated: GrokAuth) -> anyhow::Result<()> {
     let outcome = crate::managed_config::post_login_sync(Some(authenticated)).await;
     match outcome {
         crate::managed_config::ManagedConfigSync::Updated { is_team: true } => {
-            eprintln!("Applied your team's managed configuration.");
+            auth_info!("Applied your team's managed configuration.")?;
         }
         crate::managed_config::ManagedConfigSync::Updated { is_team: false } => {
-            eprintln!("Applied your deployment's managed configuration.");
+            auth_info!("Applied your deployment's managed configuration.")?;
         }
         _ => {}
     }
@@ -1112,19 +1114,19 @@ pub fn run_cli_logout(config: &crate::agent::config::Config) -> anyhow::Result<(
     let result = perform_logout(&auth_manager, None)
         .map_err(|e| anyhow::anyhow!("Failed to clear auth: {e}"))?;
     if !result.was_logged_in {
-        eprintln!("No cached session to log out of.");
+        auth_info!("No cached session to log out of.")?;
         if result.api_key_still_set {
-            eprintln!("You are authenticated via XAI_API_KEY (environment variable).");
+            auth_info!("You are authenticated via XAI_API_KEY (environment variable).")?;
         }
         return Ok(());
     }
     if let Some(email) = result.email {
-        eprintln!("Logged out (was signed in as {email})");
+        auth_info!("Logged out (was signed in as {email})")?;
     } else {
-        eprintln!("Logged out");
+        auth_info!("Logged out")?;
     }
     if result.api_key_still_set {
-        eprintln!("XAI_API_KEY is still set and will be used for authentication.");
+        auth_info!("XAI_API_KEY is still set and will be used for authentication.")?;
     }
     Ok(())
 }
@@ -1140,7 +1142,7 @@ pub fn run_cli_wafer_login(api_key: &str) -> anyhow::Result<()> {
     }
     crate::auth::store_wafer_api_key(&grok_home::grok_home(), api_key)
         .map_err(|e| anyhow::anyhow!("Failed to save Wafer AI API key: {e}"))?;
-    eprintln!("Connected Wafer AI API key.");
+    auth_info!("Connected Wafer AI API key.")?;
     Ok(())
 }
 
@@ -1148,7 +1150,7 @@ pub fn run_cli_wafer_login(api_key: &str) -> anyhow::Result<()> {
 pub fn run_cli_wafer_logout() -> anyhow::Result<()> {
     crate::auth::clear_wafer_api_key(&grok_home::grok_home())
         .map_err(|e| anyhow::anyhow!("Failed to clear Wafer AI API key: {e}"))?;
-    eprintln!("Signed out of Wafer AI.");
+    auth_info!("Signed out of Wafer AI.")?;
     Ok(())
 }
 
@@ -1163,7 +1165,7 @@ pub fn run_cli_zai_login(api_key: &str) -> anyhow::Result<()> {
     }
     crate::auth::store_zai_api_key(&grok_home::grok_home(), api_key)
         .map_err(|e| anyhow::anyhow!("Failed to save Z AI API key: {e}"))?;
-    eprintln!("Connected Z AI API key.");
+    auth_info!("Connected Z AI API key.")?;
     Ok(())
 }
 
@@ -1171,7 +1173,7 @@ pub fn run_cli_zai_login(api_key: &str) -> anyhow::Result<()> {
 pub fn run_cli_zai_logout() -> anyhow::Result<()> {
     crate::auth::clear_zai_api_key(&grok_home::grok_home())
         .map_err(|e| anyhow::anyhow!("Failed to clear Z AI API key: {e}"))?;
-    eprintln!("Signed out of Z AI.");
+    auth_info!("Signed out of Z AI.")?;
     Ok(())
 }
 
@@ -1186,7 +1188,7 @@ pub fn run_cli_runinfra_login(api_key: &str) -> anyhow::Result<()> {
     }
     crate::auth::store_runinfra_api_key(&grok_home::grok_home(), api_key)
         .map_err(|e| anyhow::anyhow!("Failed to save RunInfra API key: {e}"))?;
-    eprintln!("Connected RunInfra API key.");
+    auth_info!("Connected RunInfra API key.")?;
     Ok(())
 }
 
@@ -1194,7 +1196,7 @@ pub fn run_cli_runinfra_login(api_key: &str) -> anyhow::Result<()> {
 pub fn run_cli_runinfra_logout() -> anyhow::Result<()> {
     crate::auth::clear_runinfra_api_key(&grok_home::grok_home())
         .map_err(|e| anyhow::anyhow!("Failed to clear RunInfra API key: {e}"))?;
-    eprintln!("Signed out of RunInfra.");
+    auth_info!("Signed out of RunInfra.")?;
     Ok(())
 }
 
@@ -1209,7 +1211,7 @@ pub fn run_cli_gemini_login(api_key: &str) -> anyhow::Result<()> {
     }
     crate::auth::store_gemini_api_key(&grok_home::grok_home(), api_key)
         .map_err(|e| anyhow::anyhow!("Failed to save Gemini API key: {e}"))?;
-    eprintln!("Connected Google Gemini API key.");
+    auth_info!("Connected Google Gemini API key.")?;
     Ok(())
 }
 
@@ -1217,7 +1219,7 @@ pub fn run_cli_gemini_login(api_key: &str) -> anyhow::Result<()> {
 pub fn run_cli_gemini_logout() -> anyhow::Result<()> {
     crate::auth::clear_gemini_api_key(&grok_home::grok_home())
         .map_err(|e| anyhow::anyhow!("Failed to clear Gemini API key: {e}"))?;
-    eprintln!("Signed out of Google Gemini.");
+    auth_info!("Signed out of Google Gemini.")?;
     Ok(())
 }
 
@@ -1797,6 +1799,7 @@ mod tests {
             user_blocked_reason: None,
             team_blocked_reasons: vec![],
             coding_data_retention_opt_out: false,
+            can_administer_team: None,
             has_grok_code_access: None,
             refresh_token: None,
             expires_at: None,

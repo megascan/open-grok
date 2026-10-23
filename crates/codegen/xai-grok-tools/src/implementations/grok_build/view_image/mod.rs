@@ -74,6 +74,9 @@ impl crate::types::tool_metadata::ToolMetadata for ViewImageTool {
     fn description_template(&self) -> &str {
         DESCRIPTION
     }
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("path")
+    }
     fn requires_expr(&self) -> Expr<ToolRequirement> {
         Expr::True
     }

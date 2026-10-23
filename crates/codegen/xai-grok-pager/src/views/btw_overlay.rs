@@ -6,6 +6,7 @@
 //! panel stays on screen until the user presses Esc, at which point
 //! the content is persisted to scrollback as a collapsed `BtwBlock`.
 
+use crate::render::SafeBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -123,8 +124,9 @@ impl BtwOverlayState {
                     block_line_idx: idx,
                     screen_y: 0,
                     screen_x: 0,
-                    selectable_cols: 0..text.width() as u16,
+                    selectable_cols: 0..crate::scrollback::types::str_display_cells(&text) as u16,
                     text,
+                    painted_region: None,
                     joiner_to_previous,
                 });
             }
@@ -248,7 +250,6 @@ pub fn render_btw_panel(
     };
     let border_style = Style::default().fg(border_color).bg(bg);
 
-    // ── Clear area and draw rounded border ──
     Clear.render(area, buf);
     buf.set_style(area, Style::default().bg(bg));
     Block::default()
@@ -306,10 +307,8 @@ pub fn render_btw_panel(
         hint_x = (area.x + area.width).saturating_sub(1 + hint_w);
     }
 
-    // ── Title in top border: " /btw <question> " ──
-    // Reserve the hint's columns (everything left of `hint_x`, minus the title's
-    // own two padding spaces) so a long question truncates instead of hiding the
-    // hint.
+    // Reserve the hint's columns so a long question truncates instead of hiding the hint
+    // The title may use everything left of `hint_x`, minus its own two padding spaces
     let question = state.question();
     let title_prefix = "/btw ";
     let max_title = hint_x.saturating_sub(title_x).saturating_sub(2) as usize;
@@ -367,7 +366,6 @@ pub fn render_btw_panel(
         hit.clear();
     }
 
-    // ── Body (between borders) ──
     let body_y = area.y + 1;
     match state {
         BtwOverlayState::Loading { .. } => {
@@ -395,7 +393,7 @@ pub fn render_btw_panel(
             let visible_count = end.saturating_sub(content_skip);
             for (row, idx) in (content_skip..end).enumerate() {
                 let bl = &block_output.lines[idx];
-                buf.set_line(
+                buf.set_line_safe_bidi(
                     content_x,
                     body_y + row as u16,
                     &bl.content,
@@ -409,8 +407,9 @@ pub fn render_btw_panel(
                     block_line_idx: idx,
                     screen_y: body_y + row as u16,
                     screen_x: content_x,
-                    selectable_cols: 0..text.width() as u16,
+                    selectable_cols: 0..crate::scrollback::types::str_display_cells(&text) as u16,
                     text,
+                    painted_region: None,
                     joiner_to_previous,
                 });
             }

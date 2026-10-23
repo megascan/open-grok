@@ -5,6 +5,7 @@
 use super::ctx::NO_SESSION_NOTICE;
 use super::voice::voice_stop_on_submit;
 use crate::app::actions::Effect;
+use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::scrollback::block::RenderBlock;
@@ -47,11 +48,46 @@ pub(super) fn dispatch_interject(
     text: String,
     images: Vec<crate::prompt_images::PastedImage>,
 ) -> Vec<Effect> {
-    // Hard-reset only — `text` may not be from the composer.
-    let _ = voice_stop_on_submit(app);
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    dispatch_interject_on(app, id, text, images)
+}
+
+/// Same as [`dispatch_interject`], but targets `agent_id` instead of the focused pane.
+/// Used when a `/btw` answer lands on a non-active session.
+pub(super) fn dispatch_interject_on(
+    app: &mut AppView,
+    id: AgentId,
+    text: String,
+    images: Vec<crate::prompt_images::PastedImage>,
+) -> Vec<Effect> {
+    dispatch_interject_on_inner(app, id, text, images, /* user_submit */ true)
+}
+
+/// Wait-start / Enter flush: same wire send, without submit side effects (voice stop, history, toast).
+pub(super) fn dispatch_interject_from_held_queue(
+    app: &mut AppView,
+    id: AgentId,
+    text: String,
+    images: Vec<crate::prompt_images::PastedImage>,
+) -> Vec<Effect> {
+    dispatch_interject_on_inner(app, id, text, images, /* user_submit */ false)
+}
+
+fn dispatch_interject_on_inner(
+    app: &mut AppView,
+    id: AgentId,
+    text: String,
+    images: Vec<crate::prompt_images::PastedImage>,
+    user_submit: bool,
+) -> Vec<Effect> {
+    // Voice is app-wide and bound to the focused composer
+    // A /btw answer on another session must not commit interim text or kill dictation on the pane the user is actually talking into
+    if user_submit && matches!(app.active_view, ActiveView::Agent(active) if active == id) {
+        // Hard-reset only; `text` may not be from the composer
+        let _ = voice_stop_on_submit(app);
+    }
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
@@ -59,19 +95,22 @@ pub(super) fn dispatch_interject(
     // Submitting an interjection retires any edit-contextual ephemeral tip —
     // even when there is no active session, matching the prompt/bash/
     // feedback/remember paths.
-    agent.ephemeral_tip.clear_on_submit();
+    if user_submit {
+        agent.ephemeral_tip.clear_on_submit();
+        agent.release_hook_block_hold();
+    }
 
     // A Kimi service/key change invalidates the sampler that owns this
     // session. Preserve the already-consumed payload locally until the
     // automatic rebind finishes instead of letting an explicit interject use
     // the stale credential.
-    if agent.session.provider_rebind_pending {
-        requeue_consumed_prompt(
-            agent,
-            &text,
-            images,
-            "Kimi service update in progress; prompt queued",
-        );
+    if agent.session.provider_rebind_pending || agent.session.pending_context_switch.is_some() {
+        let notice = if agent.session.pending_context_switch.is_some() {
+            "Model change in progress; prompt queued"
+        } else {
+            "Kimi service update in progress; prompt queued"
+        };
+        requeue_consumed_prompt(agent, &text, images, notice);
         return vec![];
     }
 
@@ -80,22 +119,32 @@ pub(super) fn dispatch_interject(
         return vec![];
     };
 
-    record_interject_prompt_history(agent, &text);
+    if user_submit {
+        agent.record_prompt_in_history(&text);
+    }
 
     // Push a standard user prompt block locally for instant feedback, and
     // record its id so the broadcast echo (`x.ai/session/interjection`) is
     // deduped instead of rendering a second copy on this pane.
     let interjection_id = uuid::Uuid::new_v4().to_string();
     agent.self_interjection_ids.insert(interjection_id.clone());
-    agent
+    let entry_id = agent
         .scrollback
         .push_block(RenderBlock::interjection_prompt(&text));
+    agent
+        .interjection_painted_blocks
+        .insert(interjection_id.clone(), entry_id);
+    agent
+        .interjection_retry_images
+        .insert(interjection_id.clone(), images.clone());
 
     // The composer is NOT touched here: the producer that consumed composer
     // text (the InterjectPrompt registry arm) clears it at the call site;
     // every other producer (Send now, edit-interject, plan review comments)
     // carries non-composer text and must keep the user's draft/stash.
-    agent.show_toast("Interjection sent");
+    if user_submit {
+        agent.show_toast("Interjection sent");
+    }
 
     // Image-bearing interjection: build text + image content blocks via the
     // same helper as the queued-prompt drain path (orphan-placeholder
@@ -103,11 +152,14 @@ pub(super) fn dispatch_interject(
     let blocks = if images.is_empty() {
         None
     } else {
-        Some(crate::prompt_images::build_content_blocks_with_workspace(
+        let build = crate::prompt_images::build_content_blocks_with_workspace_report(
             text.clone(),
             images,
             Some(std::path::Path::new(&agent.session.cwd)),
-        ))
+        );
+        app.pending_image_notices
+            .extend(agent.skipped_image_send_notice(&build.skipped_display_numbers));
+        Some(build.blocks)
     };
 
     vec![Effect::SendInterject {
@@ -126,7 +178,10 @@ pub(super) fn dispatch_send_prompt_now(
     app: &mut AppView,
     text: String,
     images: Vec<crate::prompt_images::PastedImage>,
+    image_notice: Option<String>,
 ) -> Vec<Effect> {
+    // The composer that raised the notice is already cleared, so it shows even when the send bails below.
+    app.pending_image_notices.extend(image_notice);
     // Hard-reset only — `text` may be a queue row, not the composer.
     let _ = voice_stop_on_submit(app);
     let ActiveView::Agent(id) = app.active_view else {
@@ -136,13 +191,20 @@ pub(super) fn dispatch_send_prompt_now(
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    agent.release_hook_block_hold();
+    agent.credit_limit_stashed_prompt = None;
 
     // Mid-outage guard (mirrors the plain prompt path): the producers already
     // consumed the payload (composer text / queue row), so requeue it locally
     // instead of firing into a dead channel and losing the message.
-    if reconnect_pending || agent.session.provider_rebind_pending {
+    if reconnect_pending
+        || agent.session.provider_rebind_pending
+        || agent.session.pending_context_switch.is_some()
+    {
         let toast = if reconnect_pending {
             "Reconnecting, please wait..."
+        } else if agent.session.pending_context_switch.is_some() {
+            "Model change in progress; prompt queued"
         } else {
             "Kimi service update in progress; prompt queued"
         };
@@ -158,7 +220,7 @@ pub(super) fn dispatch_send_prompt_now(
         return vec![];
     };
 
-    record_interject_prompt_history(agent, &text);
+    agent.record_prompt_in_history(&text);
 
     let prompt_id = uuid::Uuid::new_v4().to_string();
     // Self-originated: the ACP gate must treat this prompt's deltas as ours.
@@ -167,11 +229,14 @@ pub(super) fn dispatch_send_prompt_now(
     // marker.
     super::queue::arm_send_now_and_paint_dispatched(agent, &prompt_id, &text);
 
-    let blocks = crate::prompt_images::build_content_blocks_with_workspace(
+    let build = crate::prompt_images::build_content_blocks_with_workspace_report(
         text.clone(),
         images,
         Some(std::path::Path::new(&agent.session.cwd)),
     );
+    app.pending_image_notices
+        .extend(agent.skipped_image_send_notice(&build.skipped_display_numbers));
+    let blocks = build.blocks;
 
     // Optimistic queue-pane echo, reconciled by the shell's queue broadcast.
     let sid_str = session_id.0.to_string();
@@ -188,24 +253,6 @@ pub(super) fn dispatch_send_prompt_now(
         blocks,
         prompt_id,
     }]
-}
-
-/// Record an interjection in prompt history (Ctrl+R finds interjections).
-/// Shared by `dispatch_interject` and the edited-queued-interject arm — the
-/// user typed both, so both must be recallable.
-pub(super) fn record_interject_prompt_history(agent: &mut AgentView, text: &str) {
-    let trimmed_key = text.trim().to_string();
-    if trimmed_key.is_empty() {
-        return;
-    }
-    agent
-        .session
-        .prompt_history
-        .retain(|p| p.trim() != trimmed_key);
-    agent.session.prompt_history.insert(0, text.to_string());
-    if agent.session.prompt_history.len() > 200 {
-        agent.session.prompt_history.truncate(200);
-    }
 }
 
 #[cfg(test)]
@@ -436,6 +483,7 @@ mod tests {
             Action::SendPromptNow {
                 text: "do not use the stale sampler".into(),
                 images: vec![],
+                image_notice: None,
             },
             &mut app,
         );

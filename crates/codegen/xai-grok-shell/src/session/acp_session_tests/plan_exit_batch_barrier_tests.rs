@@ -152,7 +152,7 @@ async fn assert_mixed_batch_snapshot(write_first: bool) {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        actor.execute_tool_calls(batch),
+        actor.execute_tool_calls(batch, None),
     )
     .await
     .expect("execute_tool_calls must not hang")
@@ -202,6 +202,9 @@ async fn mixed_permission_cancel_skips_exit_reverse_request() {
             use xai_grok_tools::implementations::grok_build::enter_plan_mode::EnterPlanModeTool;
             use xai_grok_tools::implementations::grok_build::exit_plan_mode::ExitPlanModeTool;
             use xai_grok_tools::registry::types::ToolConfig;
+            use xai_grok_workspace::permission::types::{
+                PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+            };
             use xai_grok_workspace::permission::{ClientType, spawn_permission_manager};
 
             let (gateway_tx, mut gateway_rx) =
@@ -255,7 +258,12 @@ async fn mixed_permission_cancel_skips_exit_reverse_request() {
                 xai_acp_lib::AcpAgentGatewaySender::new(gateway_tx),
                 cwd,
                 ClientType::Generic,
-                None,
+                Some(PermissionConfig::new(vec![PermissionRule {
+                    action: RuleAction::Ask,
+                    tool: ToolFilter::Bash,
+                    pattern: Some("*".into()),
+                    pattern_mode: PatternMode::Glob,
+                }])),
                 vec![],
                 vec![],
                 false,
@@ -265,10 +273,15 @@ async fn mixed_permission_cancel_skips_exit_reverse_request() {
 
             let exit_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let exit_fired_task = exit_fired.clone();
+            let permission_requested =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let permission_requested_task = permission_requested.clone();
             let responder = tokio::task::spawn_local(async move {
                 while let Some(msg) = gateway_rx.recv().await {
                     match msg {
                         xai_acp_lib::AcpClientMessage::RequestPermission(args) => {
+                            permission_requested_task
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = args
                                 .response_tx
                                 .send(Ok(acp::RequestPermissionResponse::new(
@@ -293,15 +306,19 @@ async fn mixed_permission_cancel_skips_exit_reverse_request() {
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                actor.execute_tool_calls(vec![
-                    bash_call("call_bash_reject"),
-                    exit_plan_mode_call("call_exit"),
-                ]),
+                actor.execute_tool_calls(
+                    vec![
+                        bash_call("call_bash_reject"),
+                        exit_plan_mode_call("call_exit"),
+                    ],
+                    None,
+                ),
             )
             .await
             .expect("execute_tool_calls must not hang")
             .expect("execute_tool_calls must not error");
 
+            assert!(permission_requested.load(std::sync::atomic::Ordering::SeqCst));
             assert!(
                 !exit_fired.load(std::sync::atomic::Ordering::SeqCst),
                 "exit must not reverse-request after an earlier permission cancel"

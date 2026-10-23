@@ -9,7 +9,7 @@
 //!
 //! SIGINT / SIGTERM / SIGHUP are handled in a tokio task. The handler runs
 //! in normal Rust context (not actual signal-handler context), so it can use
-//! the full [`super::emit_terminal_teardown_sequences`] path
+//! the full [`crate::app::terminal_restore::emit_terminal_teardown_sequences`] path
 //! (`with_locked_stderr`, conditional cursor-style reset, multiplexer flush) plus
 //! `disable_raw_mode`, then flush Sentry/OpenTelemetry, then exit.
 //!
@@ -28,6 +28,10 @@ use super::ScreenMode;
 
 /// Whether the active screen mode is fullscreen. Set by [`install`].
 static SCREEN_MODE_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_mode(mode: ScreenMode) {
+    SCREEN_MODE_FULLSCREEN.store(mode.is_fullscreen(), Ordering::Release);
+}
 
 /// Most recently active session ID for signal-handler cleanup.
 /// `parking_lot::Mutex` avoids poisoning in the `-> !` exit path.
@@ -236,7 +240,7 @@ fn shutdown_with_terminal_restore(exit_code: i32) -> ! {
     };
     // Signal-path shutdown has no terminal handle, so fall back to the screen
     // bottom for the final cursor position.
-    super::emit_terminal_teardown_sequences(mode, None);
+    crate::app::terminal_restore::emit_terminal_teardown_sequences(mode, None);
     let _ = crossterm::terminal::disable_raw_mode();
     // Mark after teardown so concurrent paths see TERMINAL_OWNED == true
     // until all escape sequences and tcsetattr have been written.

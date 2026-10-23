@@ -7,6 +7,41 @@ use crate::session::persistence::PersistenceMsg;
 use super::store::WorkflowRunStore;
 use super::tracker::WorkflowRunState;
 
+pub(crate) fn emit_wake_resolved(gateway: &xai_acp_lib::AcpAgentGatewaySender, prompt_id: &str) {
+    emit_wake_resolved_with_generation(gateway, prompt_id, None);
+}
+
+pub(crate) fn emit_wake_resolved_with_generation(
+    gateway: &xai_acp_lib::AcpAgentGatewaySender,
+    prompt_id: &str,
+    generation: Option<&str>,
+) {
+    if let Ok(params) = serde_json::value::to_raw_value(
+        &serde_json::json!({"prompt_id": prompt_id, "generation": generation}),
+    ) {
+        gateway.forward_fire_and_forget(agent_client_protocol::ExtNotification::new(
+            "x.ai/background_wake_resolved",
+            params.into(),
+        ));
+    }
+}
+
+pub(crate) fn emit_workflow_wake_decision(
+    gateway: &xai_acp_lib::AcpAgentGatewaySender,
+    run_id: &str,
+    revision: u64,
+    will_wake: bool,
+) {
+    if let Ok(params) = serde_json::value::to_raw_value(&serde_json::json!({
+        "run_id": run_id, "revision": revision, "will_wake": will_wake,
+    })) {
+        gateway.forward_fire_and_forget(agent_client_protocol::ExtNotification::new(
+            "x.ai/workflow_wake_decision",
+            params.into(),
+        ));
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct WorkflowNotifySender {
     session_id: agent_client_protocol::SessionId,
@@ -30,11 +65,46 @@ impl WorkflowNotifySender {
         }
     }
 
+    pub(crate) fn wake_decision(&self, run_id: &str, revision: u64, will_wake: bool) {
+        emit_workflow_wake_decision(&self.gateway, run_id, revision, will_wake);
+    }
+
+    /// Reserve before launch returns, then settle only after the client has
+    /// received the workflow start. The bridge itself never waits on the actor.
+    pub(crate) fn emit_start(
+        &self,
+        state: &WorkflowRunState,
+        elapsed_ms: u64,
+        delivery: Option<xai_grok_tools::notification::BackgroundStartReservation>,
+    ) -> Result<(), String> {
+        if let Err(error) = self.store.persist(state) {
+            tracing::warn!(run_id = %state.run_id, %error, "failed to queue workflow manifest");
+        }
+        let receipt = self.dispatch(build_workflow_updated(state, elapsed_ms, 0), true);
+        if let Some(mut delivery) = delivery {
+            delivery.mark_started();
+            tokio::spawn(async move {
+                let result = match receipt {
+                    Some(receipt) => {
+                        tokio::time::timeout(std::time::Duration::from_secs(30), receipt)
+                            .await
+                            .map_err(|_| "workflow lifecycle delivery timed out".to_owned())
+                            .and_then(|result| result.map_err(|error| error.to_string()))
+                            .and_then(|result| result.map_err(|error| error.to_string()))
+                    }
+                    None => Err("could not serialize workflow start notification".into()),
+                };
+                delivery.resolve(result);
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn emit(&self, state: &WorkflowRunState, elapsed_ms: u64, active_agents: u32) {
         if let Err(error) = self.store.persist(state) {
             tracing::warn!(run_id = %state.run_id, %error, "failed to queue workflow manifest");
         }
-        self.dispatch(
+        let _ = self.dispatch(
             build_workflow_updated(state, elapsed_ms, active_agents),
             true,
         );
@@ -49,7 +119,7 @@ impl WorkflowNotifySender {
         if let Err(error) = self.store.persist(state) {
             tracing::warn!(run_id = %state.run_id, %error, "failed to queue workflow manifest");
         }
-        self.dispatch(
+        let _ = self.dispatch(
             build_workflow_updated(state, elapsed_ms, active_agents),
             false,
         );
@@ -62,13 +132,17 @@ impl WorkflowNotifySender {
         active_agents: u32,
         persist_update: bool,
     ) {
-        self.dispatch(
+        let _ = self.dispatch(
             build_workflow_updated(state, elapsed_ms, active_agents),
             persist_update,
         );
     }
 
-    fn dispatch(&self, update: XaiSessionUpdate, persist: bool) {
+    fn dispatch(
+        &self,
+        update: XaiSessionUpdate,
+        persist: bool,
+    ) -> Option<tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<()>>> {
         let mut meta = None;
         crate::util::event_id::ensure_event_id_meta(&self.session_id.0, &mut meta);
         let notification = XaiSessionNotification {
@@ -89,8 +163,9 @@ impl WorkflowNotifySender {
                 "x.ai/session_notification",
                 raw.into(),
             );
-            self.gateway.forward_fire_and_forget(ext);
+            return Some(self.gateway.forward_with_completion(ext));
         }
+        None
     }
 }
 

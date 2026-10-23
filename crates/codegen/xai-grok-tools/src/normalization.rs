@@ -109,6 +109,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SwarmWait(_)
         | ToolInput::ListAgents(_)
         | ToolInput::AgentMessageSend(_)
+        | ToolInput::SendSubagentMessage(_)
         | ToolInput::WaitAgent(_)
         | ToolInput::ListSessions(_)
         | ToolInput::ReadSession(_)
@@ -140,11 +141,30 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
         | ToolInput::Workflow(_)
+        | ToolInput::ProposeMission(_)
+        | ToolInput::StartMissionRun(_)
+        | ToolInput::DismissHandoffItems(_)
+        | ToolInput::InspectMissionReadiness(_)
+        | ToolInput::EndFeatureRun(_)
+        | ToolInput::SendFeedback(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_messages_do_not_copy_bodies_into_canonical_metadata() {
+        let input = super::ToolInput::SendSubagentMessage(
+            crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput {
+                subagent_id: "child".into(),
+                text: "private task context".into(),
+                delivery: None,
+                queue: false,
+            },
+        );
+        assert!(super::canonical_input(&input).is_none());
+    }
+
     use super::*;
     fn parse(v: serde_json::Value) -> ToolInput {
         serde_json::from_value(v).expect("valid ToolInput")

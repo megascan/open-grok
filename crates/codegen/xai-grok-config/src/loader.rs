@@ -5,38 +5,36 @@
 
 use std::path::Path;
 
-use crate::paths::{system_config_dir, user_grok_home};
+use crate::paths::{resolve_grok_home, system_config_dir, user_grok_home};
 use crate::validation::{load_requirements, load_system_requirements};
 use crate::version_overrides::{self, apply_version_overrides};
 
-/// Read and parse a TOML file WITHOUT `$VAR` expansion (empty table if absent).
-/// Shared core of [`load_toml_file`] and the hook-layer read.
-fn read_toml_file(path: &Path) -> std::io::Result<toml::Value> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => match toml::from_str::<toml::Value>(&s) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // Built from the span, never from Display — Display echoes the
-                // offending source line, which may carry a secret. Safe to log and
-                // to return to a client.
-                let detail = toml_error_detail(&s, &e);
-                tracing::error!(file = %path.display(), "config toml has syntax errors: {detail}");
-                Err(std::io::Error::other(detail))
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(toml::Value::Table(toml::map::Map::new()))
-        }
-        Err(e) => {
-            tracing::error!(file = %path.display(), "config file unreadable: {e}");
-            Err(e)
-        }
+/// Parse TOML source already read from `path` (which only labels the error). Empty source is an empty table.
+fn parse_toml_source(path: &Path, source: &str) -> std::io::Result<toml::Value> {
+    if source.trim().is_empty() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
     }
+    toml::from_str::<toml::Value>(source).map_err(|e| {
+        // The detail is built from the span, never from Display: Display echoes the offending source line, which may carry a secret
+        // Safe to log and to return to a client
+        let detail = toml_error_detail(source, &e);
+        tracing::error!(file = %path.display(), "config toml has syntax errors: {detail}");
+        std::io::Error::other(detail)
+    })
 }
 
 /// Load and parse a TOML file, expanding `$VAR` references. Empty table if absent.
 pub fn load_toml_file(path: &Path) -> std::io::Result<toml::Value> {
-    let mut v = read_toml_file(path)?;
+    let mut v = match std::fs::read_to_string(path) {
+        Ok(s) => parse_toml_source(path, &s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(e) => {
+            tracing::error!(file = %path.display(), "config file unreadable: {e}");
+            return Err(e);
+        }
+    };
     expand_env_vars_in_toml(&mut v);
     Ok(v)
 }
@@ -86,7 +84,10 @@ pub fn load_config_file(path: &Path) -> std::io::Result<toml::Value> {
 }
 
 pub fn load_from_disk() -> std::io::Result<toml::Value> {
-    load_user_config_layer(user_grok_home().as_deref(), USER_CONFIG_FILENAME)
+    // Live `$OPENGROK_HOME`: `user_grok_home()` / `grok_home()` are OnceLock and miss
+    // EnvGuard/tests (same reason user `config.toml` persist resolves live). A
+    // stale cache would read a different file than the last settings write.
+    load_user_config_layer(resolve_grok_home().as_deref(), USER_CONFIG_FILENAME)
 }
 
 /// User config filename (`$OPENGROK_HOME/config.toml`), shared by the loaders here.
@@ -98,6 +99,10 @@ pub const MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
 /// Requirements (cloud-cache) filename — the sibling server-synced artifact.
 pub const REQUIREMENTS_FILENAME: &str = "requirements.toml";
 
+pub const TRUSTED_FOLDERS_FILENAME: &str = "trusted_folders.toml";
+pub const SANDBOX_CONFIG_FILENAME: &str = "sandbox.toml";
+pub const TRUSTED_HOOK_PROJECTS_FILENAME: &str = "trusted-hook-projects";
+pub const TRUSTED_PLUGINS_FILENAME: &str = "trusted-plugins";
 pub fn load_managed_config() -> std::io::Result<toml::Value> {
     load_user_config_layer(user_grok_home().as_deref(), MANAGED_CONFIG_FILENAME)
 }
@@ -172,12 +177,16 @@ pub fn managed_config_layers_at(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookProvenance {
-    /// `/etc/opengrok/managed_config.toml`.
+    /// `/etc/opengrok/managed_config.toml` (root-owned).
     SystemManaged,
-    /// `$OPENGROK_HOME/managed_config.toml` (server-synced).
+    /// `$OPENGROK_HOME/managed_config.toml` (server-synced, user-writable).
     Managed,
-    /// `requirements.toml` (user or system tier).
+    /// System-tier `requirements.toml` (root-owned, e.g. `/etc/opengrok`).
     Requirements,
+    /// `$OPENGROK_HOME/requirements.toml` while its bytes match the server-signed envelope (see [`crate::signed_policy::signed_requirements_attest`]).
+    SignedRequirements,
+    /// `$OPENGROK_HOME/requirements.toml` without a signed attestation (user-writable).
+    UserRequirements,
     /// `$OPENGROK_HOME/config.toml`.
     User,
     /// A JSON hook file (the hooks directory, a vendor settings file, or a
@@ -201,12 +210,66 @@ impl Default for HookProvenance {
 }
 
 impl HookProvenance {
+    /// Admin policy tiers; the user cannot disable or skip their hooks.
+    /// Every disable path must consult this predicate rather than re-derive the rule from names or paths.
+    /// Root-owned tiers qualify by OS ownership, `SignedRequirements` by the server's signature over the exact bytes.
+    /// `Managed` stays disableable even though the same envelope signs `managed_config.toml`: that file is distribution (defaults the user may override), requirements is enforcement.
+    /// The unsigned `$OPENGROK_HOME` tiers never qualify, since the user owns that directory.
+    pub fn is_managed_policy(self) -> bool {
+        matches!(
+            self,
+            Self::SystemManaged | Self::Requirements | Self::SignedRequirements
+        )
+    }
+
+    /// The label a config tier stamps on its hook names (`{label}:{event}[i].hooks[j]`); `None` for hooks that do not come from a config layer.
+    /// The one place a tier's label is spelled; [`Self::from_config_label`] is its inverse.
+    pub fn config_label(self) -> Option<&'static str> {
+        Some(match self {
+            Self::SystemManaged => "system_managed",
+            Self::Managed => "managed",
+            Self::Requirements => "requirements/system",
+            Self::SignedRequirements => "requirements/signed",
+            Self::UserRequirements => "requirements/user",
+            Self::User => "user",
+            Self::File | Self::Plugin | Self::Unknown => return None,
+        })
+    }
+
+    /// The config tier whose [`Self::config_label`] is `label`, if any.
+    pub fn from_config_label(label: &str) -> Option<Self> {
+        [
+            Self::SystemManaged,
+            Self::Managed,
+            Self::Requirements,
+            Self::SignedRequirements,
+            Self::UserRequirements,
+            Self::User,
+        ]
+        .into_iter()
+        .find(|tier| tier.config_label() == Some(label))
+    }
+
+    pub fn authority_rank(self) -> u8 {
+        match self {
+            Self::SystemManaged => 7,
+            Self::Requirements => 6,
+            Self::SignedRequirements => 5,
+            Self::Managed => 4,
+            Self::UserRequirements => 3,
+            Self::User => 2,
+            Self::File | Self::Plugin => 1,
+            Self::Unknown => 0,
+        }
+    }
     /// The snake_case wire string (matches the derived serde representation).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SystemManaged => "system_managed",
             Self::Managed => "managed",
             Self::Requirements => "requirements",
+            Self::SignedRequirements => "signed_requirements",
+            Self::UserRequirements => "user_requirements",
             Self::User => "user",
             Self::File => "file",
             Self::Plugin => "plugin",
@@ -225,6 +288,8 @@ impl std::str::FromStr for HookProvenance {
             "system_managed" => Self::SystemManaged,
             "managed" => Self::Managed,
             "requirements" => Self::Requirements,
+            "signed_requirements" => Self::SignedRequirements,
+            "user_requirements" => Self::UserRequirements,
             "user" => Self::User,
             "file" => Self::File,
             "plugin" => Self::Plugin,
@@ -291,54 +356,76 @@ pub fn hook_config_layers() -> Vec<HookConfigLayer> {
     hook_config_layers_at(system_config_dir().as_deref(), user_grok_home().as_deref())
 }
 
+#[cfg(unix)]
+fn warn_unless_root_owned(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => tracing::warn!(
+            path = %path.display(),
+            "policy-tier hooks file is a symlink; its hooks cannot be disabled — ensure the target is admin-controlled"
+        ),
+        Ok(meta) if meta.uid() != 0 => tracing::warn!(
+            path = %path.display(),
+            uid = meta.uid(),
+            "policy-tier hooks file is not root-owned; its hooks cannot be disabled — enforcement assumes admin ownership"
+        ),
+        Ok(meta) if meta.mode() & 0o022 != 0 => tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:o}", meta.mode() & 0o777),
+            "policy-tier hooks file is group- or world-writable; its hooks cannot be disabled — restrict write access to root"
+        ),
+        _ => {}
+    }
+}
+#[cfg(not(unix))]
+fn warn_unless_root_owned(_path: &Path) {}
 /// [`hook_config_layers`] with explicit directories, for tests.
 pub fn hook_config_layers_at(
     system_dir: Option<&Path>,
     user_home: Option<&Path>,
 ) -> Vec<HookConfigLayer> {
-    /// One candidate config-hook layer: which directory + filename to read, and
-    /// the provenance/label to stamp on hooks found there.
+    /// One candidate config-hook layer: which directory and filename to read, the provenance to stamp on hooks found there,
+    /// and the provenance it is upgraded to when the file's bytes carry a signed attestation.
     struct LayerSpec<'a> {
         dir: Option<&'a Path>,
         filename: &'a str,
         provenance: HookProvenance,
-        source_name: &'a str,
+        signed_upgrade: Option<HookProvenance>,
     }
 
-    // Highest config authority first, matching `effective_config_base` precedence
-    // (requirements > user > managed > system_managed; user overrides managed in
-    // this model). Order only affects which label a byte-identical duplicate keeps
-    // under first-wins dedup; every distinct hook runs regardless.
+    // Highest config authority first, matching `effective_config_base` precedence (requirements > user > managed > system_managed)
+    // Byte-identical duplicates resolve by `HookProvenance::authority_rank` regardless of this order; every distinct hook runs regardless
+    // Only the requirements tier is upgraded by signature; `managed_config.toml` is signed too but stays `Managed` (see `is_managed_policy`)
     let specs = [
         LayerSpec {
             dir: system_dir,
             filename: REQUIREMENTS_FILENAME,
             provenance: HookProvenance::Requirements,
-            source_name: "requirements/system",
+            signed_upgrade: None,
         },
         LayerSpec {
             dir: user_home,
             filename: REQUIREMENTS_FILENAME,
-            provenance: HookProvenance::Requirements,
-            source_name: "requirements/user",
+            provenance: HookProvenance::UserRequirements,
+            signed_upgrade: Some(HookProvenance::SignedRequirements),
         },
         LayerSpec {
             dir: user_home,
             filename: USER_CONFIG_FILENAME,
             provenance: HookProvenance::User,
-            source_name: "user",
+            signed_upgrade: None,
         },
         LayerSpec {
             dir: user_home,
             filename: MANAGED_CONFIG_FILENAME,
             provenance: HookProvenance::Managed,
-            source_name: "managed",
+            signed_upgrade: None,
         },
         LayerSpec {
             dir: system_dir,
             filename: MANAGED_CONFIG_FILENAME,
             provenance: HookProvenance::SystemManaged,
-            source_name: "system_managed",
+            signed_upgrade: None,
         },
     ];
 
@@ -347,23 +434,41 @@ pub fn hook_config_layers_at(
         dir,
         filename,
         provenance,
-        source_name,
+        signed_upgrade,
     } in specs
     {
-        let Some(path) = dir.map(|d| d.join(filename)) else {
+        let Some(dir) = dir else {
             continue;
         };
+        let path = dir.join(filename);
         if !path.is_file() {
             continue;
         }
-        // No `$VAR` expansion: a literal `${VAR}` must reach the hook runner, which
-        // does the single expansion (expanding here would double-expand).
-        let mut value = match read_toml_file(&path) {
-            Ok(v) => v,
+        // One read feeds both the attestation and the parse, so a swap between them cannot stamp user bytes with signed provenance
+        let source = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "skipping config layer whose hooks could not be read");
                 continue;
             }
+        };
+        let provenance = match signed_upgrade {
+            Some(upgraded) if crate::signed_policy::signed_requirements_attest(dir, &source) => {
+                upgraded
+            }
+            _ => provenance,
+        };
+        // The root-owned tiers' exemption rests on OS ownership: a misconfigured system dir would silently create non-disableable hooks, so make it loud; classification stays unchanged (root ownership is the documented requirement, not portably verifiable)
+        if matches!(
+            provenance,
+            HookProvenance::SystemManaged | HookProvenance::Requirements
+        ) {
+            warn_unless_root_owned(&path);
+        }
+        // No `$VAR` expansion: a literal `${VAR}` must reach the hook runner, which does the single expansion (expanding here would double-expand)
+        // A syntax error is already logged with redacted detail by `parse_toml_source`
+        let Ok(mut value) = parse_toml_source(&path, &source) else {
+            continue;
         };
         // Apply `[[version_overrides]]` (parity with `load_config_file`); deep-merge
         // only, no `$VAR` expansion, so the raw-read invariant holds.
@@ -378,6 +483,11 @@ pub fn hook_config_layers_at(
             tracing::warn!(path = %path.display(), "ignoring non-table `hooks` value in config layer");
             continue;
         }
+        // Every provenance in `specs` is a config tier and has a label; a `None` here is a programming error, kept loud rather than fatal
+        let Some(source_name) = provenance.config_label() else {
+            tracing::error!(path = %path.display(), ?provenance, "config layer has no tier label; skipping its hooks");
+            continue;
+        };
         layers.push(HookConfigLayer {
             provenance,
             source_name: source_name.to_string(),
@@ -394,6 +504,7 @@ pub struct ConfigLayers {
     pub system_managed: toml::Value,
     pub managed: toml::Value,
     pub user: toml::Value,
+    pub env_overlay: Option<toml::Value>,
     pub user_requirements: Option<toml::Value>,
     pub system_requirements: Option<toml::Value>,
     /// macOS MDM requirements; highest requirements tier when present.
@@ -407,6 +518,7 @@ impl Default for ConfigLayers {
             system_managed: toml::Value::Table(Default::default()),
             managed: toml::Value::Table(Default::default()),
             user: toml::Value::Table(Default::default()),
+            env_overlay: None,
             user_requirements: None,
             system_requirements: None,
             mdm_requirements: None,
@@ -470,6 +582,7 @@ impl ConfigLayers {
             system_managed,
             managed,
             user,
+            env_overlay: crate::env_overlay::load_env_overlay(),
             user_requirements,
             system_requirements,
             mdm_requirements,
@@ -484,9 +597,20 @@ impl ConfigLayers {
 
     /// Layer merge only (no campaign overlay).
     pub fn effective_config_base(&self) -> toml::Value {
+        self.merge_with_overlay(true)
+    }
+
+    pub fn effective_config_base_without_overlay(&self) -> toml::Value {
+        self.merge_with_overlay(false)
+    }
+
+    fn merge_with_overlay(&self, include_overlay: bool) -> toml::Value {
         let mut merged = self.system_managed.clone();
         deep_merge_toml(&mut merged, &self.managed);
         deep_merge_toml(&mut merged, &self.user);
+        if include_overlay && let Some(overlay) = &self.env_overlay {
+            deep_merge_toml(&mut merged, overlay);
+        }
         if let Some(req) = &self.user_requirements {
             deep_merge_toml(&mut merged, req);
         }
@@ -558,6 +682,9 @@ impl ConfigLayers {
         active: &[crate::campaigns::CampaignEntry],
     ) {
         crate::campaigns::apply_active_campaign_patches(merged, active);
+        if let Some(overlay) = &self.env_overlay {
+            deep_merge_toml(merged, overlay);
+        }
         self.reapply_requirements(merged);
     }
 
@@ -654,7 +781,7 @@ pub fn load_dismissed_ids_from_home() -> std::collections::HashSet<String> {
 pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::io::Result<()> {
     match xai_grok_version::installed_semver() {
         Ok(version) => apply_version_overrides(value, &version)
-            .map_err(|e| std::io::Error::other(e.to_string())),
+            .map_err(|error| std::io::Error::other(error.redacted())),
         Err(_) => {
             if let Some(table) = value.as_table_mut() {
                 table.remove(version_overrides::VERSION_OVERRIDES_KEY);
@@ -754,6 +881,58 @@ pub fn expand_env_vars_in_string(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_hook_authority_is_not_user_claimable() {
+        use super::HookProvenance;
+        for provenance in [HookProvenance::SystemManaged, HookProvenance::Requirements] {
+            assert!(provenance.is_managed_policy());
+            assert!(provenance.authority_rank() > HookProvenance::Managed.authority_rank());
+        }
+        for provenance in [
+            HookProvenance::Managed,
+            HookProvenance::UserRequirements,
+            HookProvenance::User,
+            HookProvenance::File,
+            HookProvenance::Plugin,
+            HookProvenance::Unknown,
+        ] {
+            assert!(!provenance.is_managed_policy());
+            assert_eq!(
+                provenance.as_str().parse::<HookProvenance>().unwrap(),
+                provenance
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<HookProvenance>("\"future_policy\"").unwrap(),
+            HookProvenance::Unknown,
+        );
+    }
+
+    #[test]
+    fn env_overlay_is_excluded_from_security_view_and_clamped_by_requirements() {
+        let layers = super::ConfigLayers {
+            user: toml::from_str("[features]\nweb_fetch = false\n[models]\ndefault = 'local'")
+                .unwrap(),
+            env_overlay: Some(
+                toml::from_str("[features]\nweb_fetch = true\n[models]\ndefault = 'overlay'")
+                    .unwrap(),
+            ),
+            user_requirements: Some(toml::from_str("[models]\ndefault = 'required'").unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            layers.effective_config_base()["features"]["web_fetch"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            layers.effective_config_base_without_overlay()["features"]["web_fetch"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            layers.effective_config_base()["models"]["default"].as_str(),
+            Some("required")
+        );
+    }
     use super::*;
 
     fn write(dir: &Path, name: &str, contents: &str) {
@@ -791,6 +970,76 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(cmd, "${HOME}/u.sh");
+    }
+
+    #[test]
+    fn user_requirements_layer_is_not_managed_policy() {
+        let user_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_home.path().join("requirements.toml"),
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"x.sh\"\n",
+        )
+        .unwrap();
+        let layers = hook_config_layers_at(None, Some(user_home.path()));
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].provenance(), HookProvenance::UserRequirements);
+        assert_eq!(layers[0].source_name(), "requirements/user");
+        assert!(!layers[0].provenance().is_managed_policy());
+    }
+
+    /// The same `$OPENGROK_HOME/requirements.toml` stamps the exempt `SignedRequirements` while its bytes verify against the server's signature, and drops back to `UserRequirements` the moment they differ.
+    #[test]
+    fn signed_requirements_layer_is_managed_policy_until_edited() {
+        use crate::signed_policy::tests::{payload, sign, test_keypair};
+        let home = tempfile::tempdir().unwrap();
+        let requirements = "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"/opt/guard.sh\"\n";
+        write(home.path(), REQUIREMENTS_FILENAME, requirements);
+
+        let (kp, pubkey) = test_keypair();
+        let signed = crate::signed_policy::SignedPayload {
+            requirements: Some(requirements.into()),
+            ..payload()
+        };
+        crate::signed_policy::write_sidecar(home.path(), &sign(&kp, &signed)).unwrap();
+
+        let provenance_of = |layers: Vec<HookConfigLayer>| {
+            let Some(layer) = layers.first() else {
+                panic!("expected one requirements layer: {layers:?}");
+            };
+            assert_eq!(layers.len(), 1);
+            (layer.provenance(), layer.source_name().to_string())
+        };
+        crate::signed_policy::test_seam::with_keys(&[("v1", &pubkey)], || {
+            assert_eq!(
+                provenance_of(hook_config_layers_at(None, Some(home.path()))),
+                (
+                    HookProvenance::SignedRequirements,
+                    "requirements/signed".to_string()
+                )
+            );
+
+            // One appended byte and the file is the user's again
+            write(
+                home.path(),
+                REQUIREMENTS_FILENAME,
+                &format!("{requirements}\n"),
+            );
+            assert_eq!(
+                provenance_of(hook_config_layers_at(None, Some(home.path()))),
+                (
+                    HookProvenance::UserRequirements,
+                    "requirements/user".to_string()
+                )
+            );
+        });
+        // A build without the signing key never grants the exemption
+        write(home.path(), REQUIREMENTS_FILENAME, requirements);
+        crate::signed_policy::test_seam::with_dark(|| {
+            assert_eq!(
+                provenance_of(hook_config_layers_at(None, Some(home.path()))).0,
+                HookProvenance::UserRequirements
+            );
+        });
     }
 
     #[test]
@@ -1084,6 +1333,15 @@ mod tests {
         assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
     }
 
+    #[test]
+    fn load_user_config_layer_treats_empty_file_as_empty_table() {
+        let dir = std::env::temp_dir().join(format!("grok-load-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), b"").unwrap();
+        let v = load_user_config_layer(Some(&dir), "config.toml").unwrap();
+        assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn load_user_config_layer_reads_file_when_home_present() {
         use std::io::Write;

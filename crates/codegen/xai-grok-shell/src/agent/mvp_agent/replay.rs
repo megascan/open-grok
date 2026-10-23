@@ -219,10 +219,15 @@ impl MvpAgent {
             .unwrap_or(0);
 
         // Inline blocking I/O: spawn_blocking has multi-second latency on LocalSet.
-        let raw_contents = match std::fs::read_to_string(updates_path) {
+        let raw_contents = match xai_file_utils::session_file::read_to_string(updates_path) {
             Ok(s) if !s.is_empty() => s,
-            _ => return Ok((0, 0, Vec::new())),
+            Ok(_) => return Ok((0, 0, Vec::new())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((0, 0, Vec::new()));
+            }
+            Err(error) => return Err(acp::Error::internal_error().data(error.to_string())),
         };
+        // Replay cursors are decoded byte offsets, independent of on-disk compression.
         let end_offset = raw_contents.len() as u64;
 
         let mut prepared = {
@@ -328,30 +333,30 @@ impl MvpAgent {
         target_client_id: Option<&serde_json::Value>,
         mark_replay: bool,
         code_mode_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
-    ) -> Vec<ReplayCompletionRx> {
+    ) -> Result<Vec<ReplayCompletionRx>, acp::Error> {
         use std::io::Read;
 
         let Some(updates_path) = updates_file_path.as_ref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
-        let mut file = match std::fs::File::open(updates_path) {
+        let mut file = match xai_file_utils::session_file::open(updates_path) {
             Ok(f) => f,
-            Err(_) => return Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(acp::Error::internal_error().data(error.to_string())),
         };
         let mut full_contents = String::new();
-        if file.read_to_string(&mut full_contents).is_err() {
-            return Vec::new();
-        }
+        file.read_to_string(&mut full_contents)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let Ok(from_offset) = usize::try_from(from_offset) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if from_offset > full_contents.len() || !full_contents.is_char_boundary(from_offset) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (prior_contents, contents) = full_contents.split_at(from_offset);
         if contents.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let live_lines =
@@ -394,7 +399,7 @@ impl MvpAgent {
             );
         }
 
-        completions
+        Ok(completions)
     }
 }
 

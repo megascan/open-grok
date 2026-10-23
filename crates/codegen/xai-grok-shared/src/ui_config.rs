@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use xai_grok_config_types::DisplayRefreshSettings;
+use xai_grok_status_line::StatusLineConfig;
 
 pub use xai_grok_tools::types::ImageGenerationProvider;
 
@@ -86,11 +87,6 @@ pub struct UiConfig {
     /// Whether swarm orchestration is the persistent default. `None`/`false` is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swarm_mode: Option<bool>,
-    /// Whether Antigravity CLI (`agy`) models may serve as subagents for the
-    /// task/swarm/workflow tools. `None`/`false` is off. Only meaningful when
-    /// the CLI is installed; the settings row is hidden otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub antigravity_subagents: Option<bool>,
     /// Read by `load_permission_mode()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
@@ -112,6 +108,9 @@ pub struct UiConfig {
     /// `None` = off (client default; opt-in). Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_timeline: Option<bool>,
+    /// The dashboard preview includes the selected session's reply panel. Unset means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_preview: Option<bool>,
     /// Snap a just-sent prompt to the viewport top. `None` = on (default).
     /// Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +194,10 @@ pub struct UiConfig {
     /// `true` = mixed Code Mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<ToolModePreference>,
+    /// Opt-in persistent work for the root Codex session.
+    pub codex_persistent_mode: Option<bool>,
+    /// Opt-in model-selected Guardian review of browser/computer MCP calls.
+    pub codex_guardian_review: Option<bool>,
     /// Image generation service for new sessions. Grok uses xAI Imagine with
     /// xAI credentials. OpenAI uses the Codex Images API with isolated Codex
     /// OAuth credentials.
@@ -273,6 +276,12 @@ pub struct UiConfig {
     /// Written by the pager's Advanced Settings toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "status_line_should_not_be_saved")]
+    pub status_line: StatusLineConfig,
+}
+
+fn status_line_should_not_be_saved(status_line: &StatusLineConfig) -> bool {
+    status_line.is_default() || status_line.problem().is_some()
 }
 
 /// User-config opt-outs for the per-tip contextual hints, serialized as
@@ -353,12 +362,12 @@ impl Default for UiConfig {
             compact_mode: false,
             simple_mode: None,
             swarm_mode: None,
-            antigravity_subagents: None,
             permission_mode: None,
             approval_mode: None,
             default_selected_permission: None,
             show_timestamps: None,
             show_timeline: None,
+            dashboard_preview: None,
             page_flip_on_send: None,
             confirm_before_rewind: None,
             auto_dark_theme: None,
@@ -376,6 +385,8 @@ impl Default for UiConfig {
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
             code_mode: None,
+            codex_persistent_mode: None,
+            codex_guardian_review: None,
             image_generation_provider: None,
             cancel_subagents_on_turn_cancel: None,
             keep_text_selection: None,
@@ -393,11 +404,16 @@ impl Default for UiConfig {
             enter_steers: None,
             display_refresh: DisplayRefreshSettings::default(),
             stream_tool_calls: None,
+            status_line: StatusLineConfig::default(),
         }
     }
 }
 
 impl UiConfig {
+    pub fn dashboard_preview_enabled(&self) -> bool {
+        self.dashboard_preview.unwrap_or(true)
+    }
+
     /// The single source of truth for the timeline-sidebar default (opt-in).
     /// Flip this one line to change the default everywhere.
     ///
@@ -479,6 +495,45 @@ impl UiConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_typo_in_the_status_line_cannot_fail_the_rest_of_the_ui_table() {
+        let ui: UiConfig = serde_json::from_str(
+            r#"{"theme": "kanagawa", "status_line": {"type": "builtin", "items": "cwd"}}"#,
+        )
+        .expect("[ui] must survive whatever the status line says");
+        assert_eq!(ui.theme.as_deref(), Some("kanagawa"));
+        assert!(ui.status_line.problem().is_some());
+        let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+        assert_eq!(saved["theme"], "kanagawa");
+        assert!(
+            saved.get("status_line").is_none(),
+            "a section we misread must not be written back over"
+        );
+    }
+    #[test]
+    fn only_a_status_line_we_read_in_full_is_written_back() {
+        for json in [
+            r#"{"status_line": {"type": "enabled"}}"#,
+            r#"{"status_line": {"type": "static", "text": "hi"}}"#,
+            r#"{"status_line": {"type": "builtin", "items": "cwd"}}"#,
+            r#"{"status_line": "builtin"}"#,
+            r#"{"status_line": {"padding": 2}}"#,
+            "{}",
+        ] {
+            let ui: UiConfig = serde_json::from_str(json).expect("[ui] survives it");
+            let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+            assert!(saved.get("status_line").is_none(), "{json}");
+        }
+        for json in [
+            r#"{"status_line": {"type": "command", "command": "x"}}"#,
+            r#"{"status_line": {"type": "off"}}"#,
+        ] {
+            let ui: UiConfig = serde_json::from_str(json).expect("[ui] survives it");
+            let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+            assert!(saved.get("status_line").is_some(), "{json}");
+        }
+    }
+
     use super::*;
 
     #[test]

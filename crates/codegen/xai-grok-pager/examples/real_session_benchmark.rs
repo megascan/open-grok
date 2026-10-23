@@ -171,7 +171,8 @@ fn main() {
     println!("--- Parsing SubagentSpawned events ---");
     let start = Instant::now();
 
-    let content = std::fs::read_to_string(&updates_path).expect("Failed to read updates.jsonl");
+    let content = xai_file_utils::session_file::read_to_string(&updates_path)
+        .expect("Failed to read updates.jsonl");
 
     let mut events: Vec<SubagentSpawnedEvent> = Vec::new();
     let mut line_count = 0;

@@ -73,6 +73,7 @@ async fn hook_deny_via_exit_code_only() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let pre_result =
@@ -103,6 +104,7 @@ async fn hook_fail_open_on_crash() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let pre_result =
@@ -117,35 +119,6 @@ async fn hook_fail_open_on_crash() {
         pre_result.results.len(),
         1,
         "the failure must still appear in run_results for UI scrollback"
-    );
-}
-
-#[tokio::test]
-async fn hook_fail_open_on_timeout() {
-    let dir = tempfile::tempdir().unwrap();
-
-    write_hook(
-        dir.path(),
-        "safety.json",
-        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"sleep 10","timeout":1}]}]}}"#,
-    );
-
-    let (registry, errors) = load_hooks(Some(dir.path()), None);
-    assert!(errors.is_empty());
-
-    let ctx = RunContext {
-        session_id: "test",
-        workspace_root: dir.path().to_str().unwrap(),
-        process_scope: None,
-    };
-
-    let pre_result =
-        dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
-            .await;
-    assert_eq!(
-        pre_result.decision,
-        HookDecision::Allow,
-        "fail-open: a timing-out hook must not block the tool call"
     );
 }
 
@@ -166,6 +139,7 @@ async fn matcher_filters_tool_name() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let pre_result = dispatcher::dispatch_pre_tool_use(
@@ -199,6 +173,7 @@ async fn non_blocking_dispatch() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let results = dispatcher::dispatch_non_blocking(
@@ -238,6 +213,7 @@ async fn first_deny_stops_chain() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let pre_result = dispatcher::dispatch_pre_tool_use(
@@ -271,31 +247,7 @@ async fn hook_receives_stdin_envelope() {
         session_id: "test-sess-123",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
-    };
-
-    let pre_result =
-        dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
-            .await;
-    assert_eq!(pre_result.decision, HookDecision::Allow);
-}
-
-#[tokio::test]
-async fn shell_pipe_command_works() {
-    let dir = tempfile::tempdir().unwrap();
-
-    write_hook(
-        dir.path(),
-        "pipe.json",
-        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"cat | echo '{\"decision\":\"allow\"}'"}]}]}}"#,
-    );
-
-    let (registry, errors) = load_hooks(Some(dir.path()), None);
-    assert!(errors.is_empty());
-
-    let ctx = RunContext {
-        session_id: "test",
-        workspace_root: dir.path().to_str().unwrap(),
-        process_scope: None,
+        disabled: Default::default(),
     };
 
     let pre_result =
@@ -340,12 +292,17 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
                 tool_input: serde_json::json!({"command": "bad_cmd"}),
                 tool_input_truncated: false,
                 error: "command not found".into(),
+                duration_ms: Some(7),
+                is_interrupt: false,
                 subagent_type: None,
             },
             assertions: vec![
                 ("hookEventName", "post_tool_use_failure".into()),
+                ("hook_event_name", "PostToolUseFailure".into()),
                 ("toolName", "run_terminal_cmd".into()),
                 ("error", "command not found".into()),
+                ("durationMs", serde_json::json!(7)),
+                ("isInterrupt", serde_json::json!(false)),
             ],
         },
         Case {
@@ -359,6 +316,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             },
             assertions: vec![
                 ("hookEventName", "permission_denied".into()),
+                ("hook_event_name", "PermissionDenied".into()),
                 ("toolName", "run_terminal_cmd".into()),
             ],
         },
@@ -370,6 +328,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             },
             assertions: vec![
                 ("hookEventName", "pre_compact".into()),
+                ("hook_event_name", "PreCompact".into()),
                 ("source", "auto".into()),
             ],
         },
@@ -381,6 +340,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             },
             assertions: vec![
                 ("hookEventName", "post_compact".into()),
+                ("hook_event_name", "PostCompact".into()),
                 ("source", "manual".into()),
             ],
         },
@@ -395,6 +355,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             },
             assertions: vec![
                 ("hookEventName", "stop_failure".into()),
+                ("hook_event_name", "StopFailure".into()),
                 ("error", "rate_limit".into()),
                 ("errorDetails", "429 Too Many Requests".into()),
                 ("lastAssistantMessage", "Turn failed: rate limited".into()),
@@ -413,6 +374,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             },
             assertions: vec![
                 ("hookEventName", "stop_cancelled".into()),
+                ("hook_event_name", "StopCancelled".into()),
                 ("reason", "user_interrupt".into()),
                 ("cancelledBy", "user".into()),
                 ("cancelTrigger", "ctrl_c".into()),
@@ -447,6 +409,7 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             session_id: "test",
             workspace_root: dir.path().to_str().unwrap(),
             process_scope: None,
+            disabled: Default::default(),
         };
 
         let results =
@@ -537,6 +500,7 @@ async fn runner_injected_vars_override_extra_env_at_spawn() {
         session_id: real_session,
         workspace_root: real_workspace,
         process_scope: None,
+        disabled: Default::default(),
     };
 
     let result =
@@ -658,6 +622,7 @@ async fn direct_exec_command_with_env_var_resolves_at_load_time() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
     let result =
         dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
@@ -728,6 +693,7 @@ async fn http_hook_url_env_expansion_end_to_end() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
     let pre_result =
         dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
@@ -811,6 +777,7 @@ async fn lenient_parsing_with_mixed_claude_events() {
         session_id: "test",
         workspace_root: dir.path().to_str().unwrap(),
         process_scope: None,
+        disabled: Default::default(),
     };
     let result = dispatcher::dispatch_pre_tool_use(
         &registry,
@@ -819,4 +786,60 @@ async fn lenient_parsing_with_mixed_claude_events() {
     )
     .await;
     assert_eq!(result.decision, HookDecision::Allow);
+}
+
+#[tokio::test]
+async fn hook_fail_open_on_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+
+    write_hook(
+        dir.path(),
+        "safety.json",
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"sleep 10","timeout":1}]}]}}"#,
+    );
+
+    let (registry, errors) = load_hooks(Some(dir.path()), None);
+    assert!(errors.is_empty());
+
+    let ctx = RunContext {
+        session_id: "test",
+        workspace_root: dir.path().to_str().unwrap(),
+        process_scope: None,
+        disabled: Default::default(),
+    };
+
+    let pre_result =
+        dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
+            .await;
+    assert_eq!(
+        pre_result.decision,
+        HookDecision::Allow,
+        "fail-open: a timing-out hook must not block the tool call"
+    );
+}
+
+#[tokio::test]
+async fn shell_pipe_command_works() {
+    let dir = tempfile::tempdir().unwrap();
+
+    write_hook(
+        dir.path(),
+        "pipe.json",
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"cat | echo '{\"decision\":\"allow\"}'"}]}]}}"#,
+    );
+
+    let (registry, errors) = load_hooks(Some(dir.path()), None);
+    assert!(errors.is_empty());
+
+    let ctx = RunContext {
+        session_id: "test",
+        workspace_root: dir.path().to_str().unwrap(),
+        process_scope: None,
+        disabled: Default::default(),
+    };
+
+    let pre_result =
+        dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
+            .await;
+    assert_eq!(pre_result.decision, HookDecision::Allow);
 }

@@ -32,6 +32,13 @@ const TOTAL_TOKENS_KEY: &str = "totalTokens";
 /// `_meta` key holding the per-event id used for cursor-based reconnect.
 const EVENT_ID_KEY: &str = "eventId";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayLookupFallback {
+    #[default]
+    Relocation,
+    HintedOnly,
+}
+
 /// Optional location hints so child `updates.jsonl` lookup can skip a full
 /// `~/.opengrok/sessions` RelocationView scan.
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,6 +49,7 @@ pub struct ReplayPathHint<'a> {
     /// Child working directory when it differs from the parent (worktree /
     /// custom cwd). Tried before [`Self::parent_cwd`].
     pub child_cwd: Option<&'a Path>,
+    pub fallback: ReplayLookupFallback,
 }
 
 #[doc(hidden)]
@@ -69,6 +77,12 @@ pub struct PreparedReplay<'a> {
 pub enum ReplayEmission {
     Emitted,
     Empty,
+}
+
+#[derive(Debug)]
+pub enum ReplayedUpdate {
+    Acp(acp::SessionUpdate, Option<acp::Meta>),
+    Xai(XaiUpdate),
 }
 
 /// Collapses ToolCall + ToolCallUpdates into one ToolCall during replay.
@@ -215,6 +229,9 @@ pub(crate) fn resolve_replay_updates_path(
     {
         return Ok(Some(path));
     }
+    if hint.fallback == ReplayLookupFallback::HintedOnly {
+        return Ok(None);
+    }
     let sessions_root = grok_home.join("sessions");
     let view = RelocationView::load_for_sessions_root(&sessions_root).map_err(io::Error::other)?;
     let Some(session_dir) = view
@@ -236,14 +253,54 @@ pub(crate) fn resolve_replay_updates_path(
 pub fn stream_replay_updates_at<F: FnMut(acp::SessionUpdate)>(
     session_id: &str,
     grok_home: &std::path::Path,
-    f: F,
+    mut f: F,
 ) -> std::io::Result<ReplayEmission> {
-    stream_replay_updates_at_hinted(session_id, grok_home, ReplayPathHint::default(), f)
+    stream_replay_updates_at_hinted(session_id, grok_home, ReplayPathHint::default(), |update| {
+        if let ReplayedUpdate::Acp(update, _) = update {
+            f(update);
+        }
+    })
+}
+
+pub fn replay_would_emit(
+    session_id: &str,
+    grok_home: &Path,
+    hint: ReplayPathHint<'_>,
+) -> io::Result<bool> {
+    let Some(path) = resolve_replay_updates_path(session_id, grok_home, hint)? else {
+        return Ok(false);
+    };
+    let contents = xai_file_utils::session_file::read_to_string(&path)?;
+    let live = rewind_filtered_live(&contents);
+    let transport_ids = super::code_mode_transport_call_ids(live.iter().copied(), &HashSet::new());
+    for line in live {
+        if line_is_dropped_on_replay(line)
+            || super::line_is_code_mode_transport_update(line, &transport_ids)
+        {
+            continue;
+        }
+        let Ok(SessionUpdate::Acp(notification)) = SessionUpdateEnvelope::from_str(line) else {
+            continue;
+        };
+        match notification.update {
+            acp::SessionUpdate::AvailableCommandsUpdate(_) => {}
+            acp::SessionUpdate::ToolCallUpdate(update) => {
+                if matches!(
+                    update.fields.status,
+                    Some(acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed)
+                ) {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// [`stream_replay_updates_at`] with parent/child cwd hints so child hydrate
 /// can skip a full sessions-root scan on the common encoded-cwd path.
-pub fn stream_replay_updates_at_hinted<F: FnMut(acp::SessionUpdate)>(
+pub fn stream_replay_updates_at_hinted<F: FnMut(ReplayedUpdate)>(
     session_id: &str,
     grok_home: &std::path::Path,
     hint: ReplayPathHint<'_>,
@@ -252,7 +309,7 @@ pub fn stream_replay_updates_at_hinted<F: FnMut(acp::SessionUpdate)>(
     let Some(updates_path) = resolve_replay_updates_path(session_id, grok_home, hint)? else {
         return Ok(ReplayEmission::Empty);
     };
-    let raw_contents = std::fs::read_to_string(&updates_path)?;
+    let raw_contents = xai_file_utils::session_file::read_to_string(&updates_path)?;
     let live = rewind_filtered_live(&raw_contents);
     let transport_ids = super::code_mode_transport_call_ids(live.iter().copied(), &HashSet::new());
     let mut collapser = ReplayToolCollapser::new();
@@ -265,19 +322,20 @@ pub fn stream_replay_updates_at_hinted<F: FnMut(acp::SessionUpdate)>(
         }
         match SessionUpdateEnvelope::from_str(line) {
             Ok(SessionUpdate::Acp(notif)) => {
+                let notif = *notif;
                 let update = strip_context_wrappers(notif.update);
                 if let Some(update) = collapser.push(update) {
                     forwarded = true;
-                    f(update);
+                    f(ReplayedUpdate::Acp(update, notif.meta));
                 }
             }
-            Ok(SessionUpdate::Xai(_)) => {}
+            Ok(SessionUpdate::Xai(notification)) => f(ReplayedUpdate::Xai(notification.update)),
             Err(e) => tracing::debug!(error = %e, "skipping unparseable replay line"),
         }
     }
     for update in collapser.take_pending() {
         forwarded = true;
-        f(update);
+        f(ReplayedUpdate::Acp(update, None));
     }
     Ok(if forwarded {
         ReplayEmission::Emitted
@@ -292,7 +350,7 @@ pub(crate) fn for_each_replay_update_in_file<F: FnMut(acp::SessionUpdate)>(
     updates_path: &std::path::Path,
     mut f: F,
 ) -> std::io::Result<bool> {
-    let raw_contents = std::fs::read_to_string(updates_path)?;
+    let raw_contents = xai_file_utils::session_file::read_to_string(updates_path)?;
     let live = rewind_filtered_live(&raw_contents);
     let transport_ids = super::code_mode_transport_call_ids(live.iter().copied(), &HashSet::new());
     let mut forwarded = false;
@@ -510,4 +568,51 @@ pub(crate) fn filter_delta_replay_lines(contents: &str) -> Vec<&str> {
         .filter(|l| !l.trim().is_empty() && !line_is_dropped_on_replay(l))
         .collect();
     filter_rewind_lines(live)
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    #[test]
+    fn gzip_typed_replay_matches_plain_and_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let contents = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": 1, "method": "session/update",
+                "params": {"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "hello"}
+                }}
+            })
+        );
+        std::fs::write(&path, &contents).unwrap();
+        let mut expected = Vec::new();
+        assert!(
+            for_each_replay_update_in_file(&path, |update| {
+                expected.push(serde_json::to_value(update).unwrap());
+            })
+            .unwrap()
+        );
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(contents.as_bytes()).unwrap();
+        let mut bytes = encoder.finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut actual = Vec::new();
+        assert!(
+            for_each_replay_update_in_file(&path, |update| {
+                actual.push(serde_json::to_value(update).unwrap());
+            })
+            .unwrap()
+        );
+        assert_eq!(actual, expected);
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(for_each_replay_update_in_file(&path, |_| {}).is_err());
+    }
 }

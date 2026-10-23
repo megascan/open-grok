@@ -44,6 +44,27 @@ MvpAgent  (LocalSet)
 | Path helpers | `xai-grok-shared/src/session/mod.rs` (`session_dir`), `xai-grok-tools` / `xai-grok-shell-base` `util/grok_home` |
 | ACP entry | `…/agent/mvp_agent/acp_agent.rs` (`new_session`, `load_session`) |
 
+### 1.0.13 integration boundaries
+
+The migration status and outstanding validation are recorded in
+[`../upstream/1.0.13-parity.md`](../upstream/1.0.13-parity.md).
+
+- `turn_task.rs` binds completion to prompt id, epoch and pointer identity;
+  `FinalizationGate` prevents promotion while completion or cancellation owns
+  the prior task. A matching prompt id alone is insufficient after respawn.
+- `TurnCompleted` uses the durable append rail and retains optional
+  `error_kind`, `elapsed_ms`, cancellation category and cancellation context.
+  The legacy prompt-complete notification derives its result from the same
+  canonical error mapping; it is not a replacement for durable replay.
+- Client `_meta.sessionKind` may claim `headless`; the `subagent*` namespace is
+  server-reserved. Existing persisted session kind is not overwritten on load.
+- MCP elicitation lives on the root session's LocalSet. Its inbox is installed
+  before startup handshakes, and the coordinator follows current attachment
+  interactivity rather than frozen spawn hints.
+- Status-line updates are transient and capability-gated per attachment.
+  Reattaching requests a fresh snapshot; headless/uninterested attachments do
+  not inherit the previous client's status subscription.
+
 ---
 
 ## Session identity
@@ -95,8 +116,34 @@ Under `$OPENGROK_HOME/sessions/<encoded-cwd>/<session-id>/`:
 | Path | Role |
 | --- | --- |
 | `summary.json` | Index + sticky metadata (`Summary`). Written under `summary.json.lock`. |
-| `updates.jsonl` | **Authoritative ACP stream for resume / rewind / cross-compaction replay.** Envelope: `{ timestamp, method, params }` for ACP `session/update` or `_x.ai/session/update`. |
+| `updates.jsonl` | Authoritative ACP presentation stream and timeline markers. Envelope: `{ timestamp, method, params }` for ACP `session/update` or `_x.ai/session/update`. It does not contain the complete model-facing history. |
 | `chat_history.jsonl` | Model-facing `ConversationItem` lines (format version in summary; `CHAT_FORMAT_VERSION = 1`). Compaction rewrites this file wholesale via `ReplaceChatHistory`. |
+
+### Gzip history storage
+
+`chat_history.jsonl` and `updates.jsonl` retain their canonical names but may
+contain gzip bytes. Use `xai_file_utils::session_file` for reads; it detects the
+encoding from the opened file. Plain histories remain supported. Metadata,
+checkpoints, rewind points, and other logs retain their existing formats.
+
+Whole history snapshots of at least 64 KiB are compressed when gzip saves space.
+The persistence actor also flushes and compresses append histories after 30
+seconds without a persistence message and when its channel closes. Active writes
+may leave plain JSONL, including after an abrupt process exit. Old sessions are
+converted lazily when written; there is no startup migration of all sessions.
+
+Compression, snapshot replacement, and append share each history's `.jsonl.lock`.
+Before appending, gzip is decoded into an atomic plain replacement under that
+lock. Transformations preserve permissions and sync the temporary file before
+rename. A decode failure preserves the original file and rejects the append.
+Readers retain their opened file across replacements; replay offsets and byte
+limits refer to decoded bytes. Full reads validate gzip trailers, and iterator
+consumers must call `finish()` to surface decoder errors, including unread tails.
+
+For manual inspection, check `file /absolute/session/updates.jsonl`; use
+`gzip -dc /absolute/session/updates.jsonl | jq .` for a gzip file and `jq .` on a
+plain file. Older Open Grok binaries without gzip support cannot read compressed
+histories. See [gzip verification](../verification/thread-gzip-2026-10-17.md).
 
 ### Plan / goals / tools
 
@@ -236,7 +283,7 @@ JsonlStorageAdapter       (filesystem; optional torn-tail heal on append)
 
 ### Fork
 
-**Module:** `session/fork.rs` → `JsonlStorageAdapter::copy_session_data(_sync)`.
+**Module:** `session/fork.rs` → `JsonlStorageAdapter::copy_new_session_data_sync` (subagent bootstrap uses the separate copy path).
 
 ```text
 ForkSessionRequest
@@ -254,7 +301,9 @@ copy_session_data (spawn_blocking for true parallelism off LocalSet)
 background backend upsert if allows_xai_export (telemetry; not required for local success)
 ```
 
-`CopySessionOptions` flags control plan/signals/tool_state/announcement copy, cwd transform, strip reasoning, fork filter, inherited prefix, etc. Defaults copy plan/signals/tool state; **do not** copy compaction segments unless enabled (size).
+`CopySessionOptions` flags control plan/signals/tool_state/announcement copy, cwd transform, strip reasoning, fork filter, inherited prefix, etc. Whole-history forks can copy compaction archives when enabled. A fork at a prompt instead selects an inclusive boundary, omits unversioned future sidecars and archive segments, clips valid usage, and retains a sanitized plan-mode restriction when the saved snapshot requires it. A compacted point fork requires an exact surviving checkpoint prefix in the current model-facing chat; it fails if that history or the target is unavailable. Source-session references and unsupported cwd references in retained checkpoints also fail closed.
+
+Forks read source files independently; there is no atomic snapshot or persistence flush handshake with a live source, including queued plan-mode changes. Callers must not assume a fork is a consistent view of a changing live session. A coordinated live-source snapshot is still needed.
 
 Worktree resume/fork also lives in `session/worktree.rs` / workspace worktree APIs.
 
@@ -264,13 +313,13 @@ Worktree resume/fork also lives in `session/worktree.rs` / workspace worktree AP
 
 | Mode | Conversation | Files |
 | --- | --- | --- |
-| `All` | Truncate / replay to target | Revert to snapshots at target |
-| `ConversationOnly` | Truncate / replay | Leave disk files; may merge rewind points on disk |
+| `All` | Truncate to target | Revert to snapshots at target |
+| `ConversationOnly` | Truncate | Leave disk files; may merge rewind points on disk |
 | `FilesOnly` | Leave chat | Revert files only (prompt index validation exempt when conversation is server-side) |
 
 Semantics: restore state **before** prompt N ran (keep prompts `0..N-1`).
 
-**Cross-compaction:** after any compaction, in-memory user-message counts diverge from `prompt_index`. Always use `helpers/replay.rs` → `replay_to_prompt(updates.jsonl, session_dir, target)` which understands `CompactionCheckpoint` and `RewindMarker`. Do not rely on `truncate_to_prompt_index` alone post-compaction.
+**Cross-compaction:** after compaction, use the surviving checkpoint and its exact matching model-facing history as the truncation boundary. ACP updates omit prompt expansion, tool data, and other model-facing items, so reconstructing from them is not faithful. If an exact history is unavailable, reject the rewind before changing conversation or files. A file restore failure reports the already restored paths and preserves conversation and rewind snapshots for retry.
 
 Persistence messages after rewind:
 

@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use crate::computer::content_search::{ContentSearchJob, ContentSearchRequest};
 use crate::notification::types::ToolNotificationHandle;
 
 // ============================================================================
@@ -52,7 +53,48 @@ impl From<std::io::Error> for ComputerError {
 pub trait AsyncFileSystem: Send + Sync {
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, ComputerError>;
 
+    fn supports_bounded_read(&self) -> bool {
+        false
+    }
+
+    /// Read a complete regular file without acquiring more than `max_bytes + 1` bytes.
+    /// Unsupported backends must not fall back to an unbounded read.
+    async fn read_file_bounded(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ComputerError> {
+        let _ = (path, max_bytes);
+        Err(ComputerError::io_with_kind(
+            "bounded file reads are not supported by this backend",
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
+
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), ComputerError>;
+
+    /// Pin a plan-file-only capability for one tool invocation. Backends must
+    /// opt in only when they can enforce the boundary at the actual write.
+    async fn open_plan_file(
+        &self,
+        path: &Path,
+    ) -> Result<crate::types::resources::PlanFile, ComputerError> {
+        let root = crate::types::resources::PlanFileRoot::capture(Path::new("/"))?;
+        self.open_plan_file_at(path, &root).await
+    }
+
+    /// As above, using a root pinned before the tool call. Every descendant
+    /// of that root remains no-follow.
+    async fn open_plan_file_at(
+        &self,
+        _path: &Path,
+        _trusted_root: &crate::types::resources::PlanFileRoot,
+    ) -> Result<crate::types::resources::PlanFile, ComputerError> {
+        Err(ComputerError::io_with_kind(
+            "safe plan-file writes are not supported by this backend",
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
 
     async fn delete_file(&self, path: &Path) -> Result<(), ComputerError>;
 
@@ -70,6 +112,15 @@ pub trait AsyncFileSystem: Send + Sync {
             "file_exists is not supported by this backend",
             std::io::ErrorKind::Unsupported,
         ))
+    }
+
+    /// Offer to answer a grep content search instead of `rg`. `None` declines and
+    /// must not do any I/O. The grep tool runs the returned job first and runs
+    /// `rg` when the job fails. A served result must be exactly what `rg` reports
+    /// for the same request (see [`crate::computer::content_search`]).
+    fn offer_content_search(&self, request: &ContentSearchRequest) -> Option<ContentSearchJob> {
+        let _ = request;
+        None
     }
 }
 
@@ -185,6 +236,9 @@ pub struct BackgroundHandle {
     /// captured.
     pub pid: Option<u32>,
 }
+
+/// The `signal` of a task that was lost, not failed. The pager finalizes it without a failed block
+pub const SESSION_RESTART_SIGNAL: &str = "session_restart";
 
 /// Full snapshot of a task's state.
 /// Used by both local and ACP backends.
@@ -314,6 +368,11 @@ impl KillSource {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BackgroundedForeground {
+    pub tool_call_id: String,
+}
+
 // ============================================================================
 // TerminalBackend trait
 // ============================================================================
@@ -383,11 +442,18 @@ pub trait TerminalBackend: Send + Sync {
     /// without keeping the backend alive. See `run_monitor_pipeline`.
     async fn reparent_notifications(
         &self,
-        _old_owner_session_id: &str,
+        old_owner_session_id: &str,
         _new_owner_session_id: &str,
         _new_handle: crate::notification::types::ToolNotificationHandle,
         _backend_weak: std::sync::Weak<dyn TerminalBackend>,
-    ) {
+    ) -> Result<(), String> {
+        if self.list_tasks().await.into_iter().any(|task| {
+            !task.completed && task.owner_session_id.as_deref() == Some(old_owner_session_id)
+        }) {
+            Err("terminal backend does not support reparenting notifications".to_owned())
+        } else {
+            Ok(())
+        }
     }
 
     /// Move a foreground command to background by tool_call_id.
@@ -395,6 +461,13 @@ pub trait TerminalBackend: Send + Sync {
     /// Returns `true` if a matching foreground process was found.
     async fn background_foreground_command(&self, _tool_call_id: &str) -> bool {
         false
+    }
+
+    async fn background_foreground_commands(
+        &self,
+        _owner_session_id: Option<&str>,
+    ) -> Vec<BackgroundedForeground> {
+        Vec::new()
     }
 
     /// Wait for a background task to complete, with optional timeout.

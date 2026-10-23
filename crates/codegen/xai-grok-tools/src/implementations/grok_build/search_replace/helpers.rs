@@ -158,13 +158,27 @@ pub(crate) enum NormalizedMatchResult {
     Ambiguous,
 }
 
+/// Find every occurrence, including overlapping ones, at UTF-8 boundaries.
+pub(crate) fn overlapping_match_positions<'a>(
+    text: &'a str,
+    pattern: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    let mut next = (!pattern.is_empty()).then_some(0);
+    std::iter::from_fn(move || {
+        let start = next?;
+        let found = start + text[start..].find(pattern)?;
+        next = Some(found + text[found..].chars().next()?.len_utf8());
+        Some(found)
+    })
+}
+
 /// Find match positions using confusable-normalized comparison and remap
 /// them back to the original text's byte coordinates.
 ///
 /// Algorithm:
 /// 1. Build `(normalized_text, offset_map)` via [`build_offset_map`].
 /// 2. Normalize the search pattern the same way.
-/// 3. Find all non-overlapping matches in `normalized_text`.
+/// 3. Find all matches, including overlaps, in `normalized_text`.
 /// 4. Remap each normalized `[start..end]` span back to original bytes
 ///    via `offset_map`.
 /// 5. **Roundtrip validation:** For each candidate, verify that
@@ -184,12 +198,12 @@ pub(crate) fn find_normalized_match_positions(text: &str, pattern: &str) -> Norm
         return NormalizedMatchResult::NoMatch;
     }
 
-    // Collect all non-overlapping matches in normalized space and validate
+    // Collect all matches in normalized space and validate
     // each candidate via roundtrip check.
     let mut validated = Vec::new();
     let mut had_rejected_candidates = false;
 
-    for (norm_start, _) in norm_text.match_indices(&norm_pattern) {
+    for norm_start in overlapping_match_positions(&norm_text, &norm_pattern) {
         let norm_end = norm_start + norm_pattern.len();
         let orig_start = offset_map[norm_start];
         let orig_end = offset_map[norm_end];
@@ -216,14 +230,12 @@ pub(crate) fn find_normalized_match_positions(text: &str, pattern: &str) -> Norm
         });
     }
 
+    if had_rejected_candidates {
+        return NormalizedMatchResult::Ambiguous;
+    }
     if validated.is_empty() {
-        // If we had candidates but all were rejected, that's ambiguity.
-        // If we had zero candidates at all, that's a genuine no-match.
-        return if had_rejected_candidates {
-            NormalizedMatchResult::Ambiguous
-        } else {
-            NormalizedMatchResult::NoMatch
-        };
+        // Rejected candidates were handled above, so this is a genuine miss.
+        return NormalizedMatchResult::NoMatch;
     }
 
     // Reject overlapping remapped spans (fail closed on ambiguity).

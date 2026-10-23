@@ -54,6 +54,48 @@ fn block_stop(index: u32) -> MessageStreamEvent {
     MessageStreamEvent::ContentBlockStop { index }
 }
 
+fn tool_use_start(index: u32, id: &str, input: serde_json::Value) -> MessageStreamEvent {
+    MessageStreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlock::ToolUse {
+            id: id.into(),
+            name: "do_thing".into(),
+            input,
+            cache_control: None,
+        },
+    }
+}
+
+/// The event sequence for one thinking block: start, one text delta, one signature delta, stop.
+fn thinking_block(
+    index: u32,
+    text: &str,
+    sig: &str,
+) -> Vec<Result<MessageStreamEvent, SamplingError>> {
+    vec![
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: StreamDelta::ThinkingDelta {
+                thinking: text.into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: StreamDelta::SignatureDelta {
+                signature: sig.into(),
+            },
+        }),
+        Ok(block_stop(index)),
+    ]
+}
+
 fn message_delta_with_stop(stop: messages::StopReason) -> MessageStreamEvent {
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
@@ -101,6 +143,18 @@ async fn collect(s: impl Stream<Item = SamplingEvent>) -> Vec<SamplingEvent> {
     out
 }
 
+/// The tokens the stream emitted on one channel, in order.
+fn channel_tokens(evs: &[SamplingEvent], channel: SamplingChannel) -> Vec<&str> {
+    evs.iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ChannelToken {
+                channel: c, text, ..
+            } if *c == channel => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn empty_stream_yields_started_then_completed() {
     let raw = stream::iter(Vec::<Result<MessageStreamEvent, SamplingError>>::new()).boxed();
@@ -124,17 +178,7 @@ async fn text_block_assembles_into_completed_response() {
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
 
-    let text_tokens: Vec<&str> = evs
-        .iter()
-        .filter_map(|e| match e {
-            SamplingEvent::ChannelToken {
-                channel: SamplingChannel::Text,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let text_tokens = channel_tokens(&evs, SamplingChannel::Text);
     assert_eq!(text_tokens, vec!["Hello, ", "world!"]);
 
     match evs.last().unwrap() {
@@ -187,17 +231,7 @@ async fn thinking_block_emits_reasoning_channel_and_preserved_in_response() {
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
 
-    let reasoning_tokens: Vec<&str> = evs
-        .iter()
-        .filter_map(|e| match e {
-            SamplingEvent::ChannelToken {
-                channel: SamplingChannel::Reasoning,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let reasoning_tokens = channel_tokens(&evs, SamplingChannel::Reasoning);
     assert_eq!(reasoning_tokens, vec!["let me think..."]);
 
     match evs.last().unwrap() {
@@ -220,30 +254,6 @@ async fn thinking_block_emits_reasoning_channel_and_preserved_in_response() {
 /// each block keeps its own signature rather than collapsing to one.
 #[tokio::test]
 async fn multiple_thinking_blocks_emit_per_block_signatures_in_order() {
-    let thinking_block = |index: u32, text: &str, sig: &str| {
-        vec![
-            Ok(MessageStreamEvent::ContentBlockStart {
-                index,
-                content_block: ContentBlock::Thinking {
-                    thinking: String::new(),
-                    signature: String::new(),
-                },
-            }),
-            Ok(MessageStreamEvent::ContentBlockDelta {
-                index,
-                delta: StreamDelta::ThinkingDelta {
-                    thinking: text.into(),
-                },
-            }),
-            Ok(MessageStreamEvent::ContentBlockDelta {
-                index,
-                delta: StreamDelta::SignatureDelta {
-                    signature: sig.into(),
-                },
-            }),
-            Ok(block_stop(index)),
-        ]
-    };
     let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
     events.extend(thinking_block(0, "first", "sig-1"));
     events.push(Ok(text_block_start(1)));
@@ -267,6 +277,139 @@ async fn multiple_thinking_blocks_emit_per_block_signatures_in_order() {
         vec!["sig-1", "sig-2"],
         "each thinking block emits its own signature in order"
     );
+}
+
+/// A base64 signature whose readable header names the block kind.
+/// Real Anthropic Messages API signatures carry "thinking" or "narration" there.
+fn signature_with_kind(kind: &[u8]) -> String {
+    use base64::Engine as _;
+    let mut bytes = vec![
+        0x08, 0x04, 0x12, 0xf3, 0x06, 0x0a, 0x11, 0x08, 0x11, 0x18, 0x02, 0x38,
+    ];
+    bytes.extend_from_slice(&[0x01, 0x42, kind.len().try_into().expect("kind fits u8")]);
+    bytes.extend_from_slice(kind);
+    // A fake ciphertext tail. `signature_marks_narration` decodes only the first 48 chars
+    bytes.extend_from_slice(&[0xab; 40]);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A narration-signed thinking block re-emits its full text on the Narration channel at its stop.
+/// A "thinking"-signed block never reaches the Narration channel.
+#[tokio::test]
+async fn narration_signed_thinking_block_reemits_on_narration_channel() {
+    let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
+    events.extend(thinking_block(
+        0,
+        "internal reasoning",
+        &signature_with_kind(b"thinking"),
+    ));
+    events.extend(thinking_block(
+        1,
+        "Found the bug; fixing auth.py next.",
+        &signature_with_kind(b"narration"),
+    ));
+    // An empty narration-signed block must emit nothing on the Narration channel
+    events.extend(thinking_block(2, "", &signature_with_kind(b"narration")));
+    events.push(Ok(text_block_start(3)));
+    events.push(Ok(text_delta(3, "final answer")));
+    events.push(Ok(block_stop(3)));
+    events.push(Ok(MessageStreamEvent::MessageStop));
+
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let narration_tokens = channel_tokens(&evs, SamplingChannel::Narration);
+    assert_eq!(
+        narration_tokens,
+        vec!["Found the bug; fixing auth.py next."]
+    );
+
+    // Both non-empty blocks still stream on the Reasoning channel
+    let reasoning_tokens = channel_tokens(&evs, SamplingChannel::Reasoning);
+    assert_eq!(
+        reasoning_tokens,
+        vec!["internal reasoning", "Found the bug; fixing auth.py next."]
+    );
+
+    match evs.last().expect("stream yields events") {
+        SamplingEvent::Completed { response, .. } => {
+            // Narration stays out of the assistant text. On the wire it is a thinking block
+            assert_eq!(response.assistant_text(), "final answer");
+            // Every thinking block survives into passback in order; narration must not evict the reasoning block
+            let summaries: Vec<String> = response
+                .reasoning_items()
+                .map(|r| {
+                    r.summary
+                        .iter()
+                        .map(|rs::SummaryPart::SummaryText(t)| t.text.as_str())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                summaries,
+                vec![
+                    "internal reasoning",
+                    "Found the bug; fixing auth.py next.",
+                    ""
+                ]
+            );
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// The first `SignatureDelta` replaces a start-seeded signature (a gateway sending both must not
+/// double it into passback); later deltas append so a split signature survives whole.
+#[tokio::test]
+async fn start_seeded_signature_is_replaced_then_deltas_append() {
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: "seeded".into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::SignatureDelta {
+                signature: "part-a".into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::SignatureDelta {
+                signature: "part-b".into(),
+            },
+        }),
+        Ok(block_stop(0)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let sigs: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ReasoningCompleted { signature, .. } => Some(signature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sigs, vec!["part-apart-b"]);
+}
+
+#[test]
+fn signature_kind_header_classifies_narration() {
+    assert!(!signature_marks_narration(""));
+    assert!(!signature_marks_narration("abc123"));
+    assert!(!signature_marks_narration("!!!not-base64!!!"));
+    assert!(!signature_marks_narration(&signature_with_kind(
+        b"thinking"
+    )));
+    assert!(signature_marks_narration(&signature_with_kind(
+        b"narration"
+    )));
 }
 
 #[tokio::test]
@@ -438,7 +581,103 @@ async fn pause_turn_and_unknown_stop_reasons_complete_as_stop() {
 /// max_tokens truncation class (fatal, non-retryable), not the
 /// context-length Api class.
 #[tokio::test]
-async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
+async fn max_tokens_text_only_completes_with_length_stop() {
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "cut answ")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.assistant_text(), "cut answ");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// A max_tokens stop carrying a completed tool_use block keeps `stop_reason=Length`.
+/// The ToolCalls override must not mask the truncation: the block's arguments may be a silently-truncated prefix.
+#[tokio::test]
+async fn max_tokens_with_tool_use_keeps_length_stop() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_cut".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let arg_delta = MessageStreamEvent::ContentBlockDelta {
+        index: 0,
+        delta: StreamDelta::InputJsonDelta {
+            partial_json: "{\"x\": \"trunc".into(),
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(arg_delta),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.tool_calls().len(), 1, "tool call still carried");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// A tool_use block closed with zero argument deltas collects as an empty-arguments tool call.
+/// That is the shape `LengthPolicy::verdict` salvages.
+#[tokio::test]
+async fn max_tokens_tool_use_without_arg_deltas_collects_empty_arguments() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_no_args".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.tool_calls().len(), 1);
+            assert_eq!(response.tool_calls()[0].arguments.as_ref(), "");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// Pins the model_context_window_exceeded decision: it maps to the Length stop class and COMPLETES with the partial preserved.
+/// Fail-vs-salvage belongs to `drive_l2`, not this transform.
+#[tokio::test]
+async fn model_context_window_exceeded_completes_with_length_stop() {
     let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
         Ok(message_start()),
         Ok(text_block_start(0)),
@@ -452,21 +691,46 @@ async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
 
-    assert!(
-        !evs.iter()
-            .any(|e| matches!(e, SamplingEvent::Completed { .. })),
-        "context-window truncation must not complete: {evs:?}"
-    );
     match evs.last().unwrap() {
-        SamplingEvent::Failed { error, .. } => {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
             assert_eq!(
-                error.kind,
-                crate::events::SamplingErrorKind::MaxTokensTruncation
+                response.assistant_text(),
+                "truncated answ",
+                "partial content must be preserved"
             );
-            assert!(!error.is_retryable, "truncation is deterministic");
         }
-        other => panic!("expected Failed(MaxTokensTruncation), got {other:?}"),
+        other => panic!("expected Completed(Length), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
+    let events = vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "truncated answ")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(
+            messages::StopReason::ModelContextWindowExceeded,
+        )),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let events = collect(stream_messages(
+        stream::iter(events).boxed(),
+        None,
+        rid(),
+        Duration::from_secs(60),
+    ))
+    .await;
+    let Some(SamplingEvent::Completed { response, .. }) = events.into_iter().last() else {
+        panic!("stream must preserve the partial response before applying policy");
+    };
+    let error =
+        crate::client::apply_length_policy(xai_grok_sampling_types::LengthPolicy::Fail, *response)
+            .expect_err("legacy failure policy remains deterministic");
+    assert!(matches!(error, SamplingError::MaxTokensTruncation));
+    assert!(!error.is_retryable());
 }
 
 /// Pins the pre-existing override: completed tool_use blocks beat a terminal
@@ -993,4 +1257,220 @@ async fn interrupted_tool_use_block_never_emits_arguments_completion() {
             .any(|event| { matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }) })
     );
     assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+}
+
+#[tokio::test]
+async fn ambiguous_empty_tool_waits_for_known_non_length_stop() {
+    for (stop, expected_arguments, expected_stop) in [
+        (
+            Some(messages::StopReason::ToolUse),
+            "{}",
+            StopReason::ToolCalls,
+        ),
+        (
+            Some(messages::StopReason::EndTurn),
+            "{}",
+            StopReason::ToolCalls,
+        ),
+        (
+            Some(messages::StopReason::MaxTokens),
+            "",
+            StopReason::Length,
+        ),
+        (
+            Some(messages::StopReason::ModelContextWindowExceeded),
+            "",
+            StopReason::Length,
+        ),
+        (None, "", StopReason::ToolCalls),
+    ] {
+        let stop_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = stop_observed.clone();
+        let mut raw_events = vec![
+            Ok(message_start()),
+            Ok(tool_use_start(0, "call_empty", serde_json::json!({}))),
+            Ok(block_stop(0)),
+        ];
+        if let Some(stop) = stop {
+            raw_events.push(Ok(message_delta_with_stop(stop)));
+        }
+        raw_events.push(Ok(MessageStreamEvent::MessageDelta {
+            delta: MessageDeltaBody {
+                stop_reason: None,
+                stop_details: None,
+                stop_sequence: None,
+            },
+            usage: MessageDeltaUsage {
+                output_tokens: 7,
+                input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        }));
+        raw_events.push(Ok(MessageStreamEvent::MessageStop));
+        let raw = stream::iter(raw_events)
+            .inspect(move |event| {
+                if matches!(event, Ok(MessageStreamEvent::MessageDelta { delta, .. }) if delta.stop_reason.is_some()) {
+                    observed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .boxed();
+        let mut transformed = pin!(stream_messages(raw, None, rid(), Duration::from_secs(60)));
+        let mut events = Vec::new();
+        while let Some(event) = transformed.next().await {
+            if matches!(
+                &event,
+                SamplingEvent::ToolCallArgumentsComplete { .. }
+                    | SamplingEvent::ToolCallDelta {
+                        arguments_delta: Some(_),
+                        ..
+                    }
+            ) {
+                assert!(stop_observed.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }))
+                .count(),
+            usize::from(expected_arguments == "{}"),
+        );
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(expected_stop));
+                assert_eq!(
+                    response.tool_calls()[0].arguments.as_ref(),
+                    expected_arguments
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn closed_empty_tool_followed_by_error_never_completes() {
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(tool_use_start(0, "call_empty", serde_json::json!({}))),
+        Ok(block_stop(0)),
+        Err(SamplingError::EventStreamError("connection closed".into())),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::ToolCallArgumentsComplete { .. }
+            | SamplingEvent::ToolCallDelta {
+                arguments_delta: Some(_),
+                ..
+            }
+    )));
+    assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+}
+
+#[tokio::test]
+async fn max_tokens_tool_completion_requires_complete_json() {
+    use xai_grok_sampling_types::{LengthPolicy, LengthVerdict};
+
+    for (arguments, complete) in [
+        ("{}", true),
+        ("{\"value\":7}", true),
+        ("{\"value\":", false),
+    ] {
+        let stop_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = stop_observed.clone();
+        let raw = stream::iter(vec![
+            Ok(message_start()),
+            Ok(tool_use_start(0, "call_json", serde_json::json!({}))),
+            Ok(MessageStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::InputJsonDelta {
+                    partial_json: arguments.into(),
+                },
+            }),
+            Ok(block_stop(0)),
+            Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+            Ok(MessageStreamEvent::MessageStop),
+        ])
+        .inspect(move |event| {
+            if matches!(event, Ok(MessageStreamEvent::MessageDelta { .. })) {
+                observed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .boxed();
+        let mut transformed = pin!(stream_messages(raw, None, rid(), Duration::from_secs(60)));
+        let mut completions = 0;
+        let mut completed = false;
+        while let Some(event) = transformed.next().await {
+            match event {
+                SamplingEvent::ToolCallArgumentsComplete { .. } => {
+                    completions += 1;
+                    assert!(complete);
+                    assert!(!stop_observed.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                SamplingEvent::Completed { response, .. } => {
+                    completed = true;
+                    assert_eq!(response.stop_reason, Some(StopReason::Length));
+                    assert_eq!(response.tool_calls()[0].arguments.as_ref(), arguments);
+                    assert_eq!(
+                        LengthPolicy::CompleteToolCalls.verdict(&response),
+                        if complete {
+                            LengthVerdict::SalvageToolCalls
+                        } else {
+                            LengthVerdict::Fail
+                        },
+                    );
+                }
+                SamplingEvent::Failed { error, .. } => panic!("unexpected failure: {error:?}"),
+                _ => {}
+            }
+        }
+        assert!(completed);
+        assert_eq!(completions, usize::from(complete));
+    }
+}
+
+#[tokio::test]
+async fn deferred_empty_tools_preserve_canonical_order() {
+    for (stop, expected_empty_arguments, expected_completions) in [
+        (messages::StopReason::ToolUse, "{}", vec![1, 0]),
+        (messages::StopReason::MaxTokens, "", vec![1]),
+    ] {
+        let raw = stream::iter(vec![
+            Ok(message_start()),
+            Ok(tool_use_start(2, "call_first", serde_json::json!({}))),
+            Ok(tool_use_start(
+                5,
+                "call_second",
+                serde_json::json!({"value": 7}),
+            )),
+            Ok(block_stop(5)),
+            Ok(block_stop(2)),
+            Ok(message_delta_with_stop(stop)),
+            Ok(MessageStreamEvent::MessageStop),
+        ])
+        .boxed();
+        let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+        let completion_indexes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ToolCallArgumentsComplete { tool_index, .. } => Some(*tool_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completion_indexes, expected_completions);
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls[0].id.as_ref(), "call_first");
+                assert_eq!(calls[0].arguments.as_ref(), expected_empty_arguments);
+                assert_eq!(calls[1].id.as_ref(), "call_second");
+                assert_eq!(calls[1].arguments.as_ref(), "{\"value\":7}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
 }

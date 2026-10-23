@@ -3,11 +3,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use xai_grok_hooks::config::HookProvenance;
+use xai_grok_hooks::discovery::HookRegistry;
 
 use xai_grok_hooks::config::{HookSpec, parse_hook_file};
 use xai_grok_hooks::event::HookEventName;
 
 use super::manifest::substitute_env_vars;
+use super::registry::PluginRegistry;
 
 /// Read, pre-filter, parse, and env-inject a plugin's hooks file.
 pub fn parse_plugin_hooks(
@@ -64,6 +69,68 @@ pub fn parse_plugin_hooks_from_value(
         "plugin hooks loaded from manifest inline"
     );
     (specs, warnings)
+}
+
+/// Load only enabled and trusted plugin hooks from the current session registry.
+pub fn active_plugin_hook_specs(registry: &PluginRegistry) -> Vec<HookSpec> {
+    let mut specs = Vec::new();
+    for plugin in registry.active_plugins() {
+        let root = plugin.root_str();
+        let data = plugin.data_dir_str();
+        let parsed = [
+            plugin
+                .hooks_path
+                .as_deref()
+                .map(|path| parse_plugin_hooks(path, &plugin.name, &root, &data)),
+            plugin
+                .inline_hooks
+                .as_ref()
+                .map(|value| parse_plugin_hooks_from_value(value, &plugin.name, &root, &data)),
+        ];
+        for (loaded, warnings) in parsed.into_iter().flatten() {
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
+            specs.extend(loaded);
+        }
+    }
+    specs
+}
+
+/// A top-level session refreshes its plugin hooks; a child inherits its parent's snapshot.
+pub enum PluginHookSource<'a> {
+    Registry(Option<&'a PluginRegistry>),
+    Parent,
+}
+
+pub fn with_plugin_hooks(
+    base: Option<Arc<HookRegistry>>,
+    source: PluginHookSource<'_>,
+) -> Option<Arc<HookRegistry>> {
+    match source {
+        PluginHookSource::Registry(registry) => replace_plugin_hooks(
+            base,
+            registry.map(active_plugin_hook_specs).unwrap_or_default(),
+        ),
+        PluginHookSource::Parent => base,
+    }
+}
+
+pub fn replace_plugin_hooks(
+    base: Option<Arc<HookRegistry>>,
+    specs: Vec<HookSpec>,
+) -> Option<Arc<HookRegistry>> {
+    if specs.is_empty()
+        && !base
+            .as_deref()
+            .is_some_and(|registry| registry.has_layer(HookProvenance::Plugin))
+    {
+        return base;
+    }
+    let mut registry = base.map(Arc::unwrap_or_clone).unwrap_or_default();
+    registry.remove_layer(HookProvenance::Plugin);
+    registry.append_specs(specs);
+    (!registry.is_empty()).then(|| Arc::new(registry))
 }
 
 /// Shared processing pipeline for plugin hooks (file-based or inline).
@@ -649,5 +716,23 @@ mod tests {
         for cmd in &commands {
             assert!(!cmd.contains('$'), "command still contains $: {cmd}");
         }
+    }
+    #[test]
+    fn replacing_plugin_hooks_preserves_user_hooks_and_parent_snapshot() {
+        let value = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type":"command", "command":"true"}]}]}});
+        let (user, errors) = parse_hook_file(&value.to_string(), Path::new("/user/hooks.json"));
+        assert!(errors.is_empty());
+        let (plugin, warnings) = parse_plugin_hooks_from_value(&value, "demo", "/plugin", "/data");
+        assert!(warnings.is_empty());
+        let mut base = HookRegistry::default();
+        base.append_specs(user);
+        base.append_specs(plugin);
+        let base = Arc::new(base);
+        let inherited =
+            with_plugin_hooks(Some(Arc::clone(&base)), PluginHookSource::Parent).unwrap();
+        assert!(Arc::ptr_eq(&base, &inherited));
+        let refreshed = with_plugin_hooks(Some(base), PluginHookSource::Registry(None)).unwrap();
+        assert!(!refreshed.has_layer(HookProvenance::Plugin));
+        assert_eq!(refreshed.all_hooks().len(), 1);
     }
 }

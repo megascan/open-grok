@@ -16,8 +16,9 @@ use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
 use crate::session::helpers::session_compact::{
-    CompactOutput, CompactionOutcome, build_compaction_chat_history,
-    build_two_pass_compaction_prompt, generate_session_compact, is_context_length_error,
+    COMPACT_FAILED_PREFIX, CompactOutput, CompactionOutcome, build_compaction_chat_history,
+    build_compaction_prompt, generate_session_compact, is_context_length_error,
+    retain_session_asset_files,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -26,6 +27,7 @@ use crate::session::two_pass::{
 };
 use agent_client_protocol as acp;
 use std::sync::Arc;
+use xai_chat_state::compaction_image_context::CompactionImageContext;
 use xai_chat_state::compaction_utils::{
     CompactedHistoryInput, CompactionAttempt, build_codex_remote_compaction_v2_history,
     build_compacted_history, codex_remote_compaction_v2_interjections, is_degenerate_summary,
@@ -34,8 +36,10 @@ use xai_chat_state::compaction_utils::{
 };
 use xai_grok_sampling_types::ModelProvider;
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
-/// Default percentage points below the auto-compact threshold at which prefire
-/// (background pass-1) starts, giving pass-1 runway to finish before the limit.
+/// Prefix on the early-guard failure payloads below; the user-facing normalizer strips it (the renderer prepends its own headline).
+const COMPACTION_FAILED_GUARD_PREFIX: &str = "Compaction failed: ";
+/// Default percentage points below the auto-compact threshold at which prefire (background pass-1) starts.
+/// The lead gives pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
 const DEFAULT_PREFIRE_LEAD_PERCENT: u64 = 10;
 const CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
@@ -374,8 +378,11 @@ impl SessionActor {
             }
         };
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
+        let compaction_tool_tokens =
+            xai_chat_state::estimate_tool_specs_tokens(&surface.function_tools);
         match generate_session_compact(
             history,
+            compaction_tool_tokens,
             surface.function_tools,
             surface.hosted_tools,
             client,
@@ -398,6 +405,9 @@ impl SessionActor {
     /// Per-turn prefire decision: usage has reached `threshold - lead` (so there
     /// is still runway before the hard auto-compact line at `threshold`).
     pub(crate) async fn should_prefire_two_pass(&self) -> bool {
+        if self.compaction.is_suppressed() {
+            return false;
+        }
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
         if sampling_cfg
             .as_ref()
@@ -493,7 +503,7 @@ impl SessionActor {
             .iter()
             .map(xai_chat_state::estimate_item_tokens)
             .sum::<u64>();
-        let prompt = build_two_pass_compaction_prompt(None);
+        let prompt = build_compaction_prompt(None, false);
         let pass1_history = build_two_pass_pass1_history(&prefix_prepared, &prompt);
         let started = std::time::Instant::now();
         let out = self.two_pass_sample(pass1_history).await;
@@ -591,7 +601,7 @@ impl SessionActor {
         let tail = &live[cache.prefix_len..];
         let prepared_tail =
             prepare_conversation_for_verbatim_summarization(tail.to_vec(), strips_reasoning);
-        let prompt = build_two_pass_compaction_prompt(user_context);
+        let prompt = build_compaction_prompt(user_context, false);
         let pass2_history =
             build_two_pass_pass2_history(prefix, &prepared_tail, &cache.note1, &prompt);
         let started = std::time::Instant::now();
@@ -744,9 +754,12 @@ impl SessionActor {
     /// The `path.exists()` guard keeps the pointer safe when a session (e.g. a
     /// nested sub-agent) never wrote one -- the hint is simply omitted rather
     /// than dangling.
+    pub(crate) fn transcript_path(&self) -> std::path::PathBuf {
+        crate::session::persistence::session_dir(&self.session_info).join("updates.jsonl")
+    }
+
     pub(crate) fn get_transcript_path(&self) -> Option<String> {
-        let path =
-            crate::session::persistence::session_dir(&self.session_info).join("updates.jsonl");
+        let path = self.transcript_path();
         if path.exists() {
             Some(path.to_string_lossy().into_owned())
         } else {
@@ -932,8 +945,13 @@ impl SessionActor {
 
                     if auto_trigger {
                         let reason = Self::classify_suppress_reason(&error.to_string());
-                        self.suppress_auto_compaction(reason, estimated_tokens, context_window)
-                            .await;
+                        self.suppress_auto_compaction(
+                            reason,
+                            &error.to_string(),
+                            estimated_tokens,
+                            context_window,
+                        )
+                        .await;
                     }
                     return Err(self.to_acp_error(error));
                 }
@@ -956,7 +974,9 @@ impl SessionActor {
         attempts: u32,
         remote_v2: bool,
         compaction: xai_grok_telemetry::events::CompactionScope,
+        mut timing: xai_grok_telemetry::events::CompactionTiming,
     ) -> Result<(), acp::Error> {
+        let post_compaction_start = std::time::Instant::now();
         if compacted_history.is_empty() {
             return Err(acp::Error::internal_error()
                 .data("OpenAI compact endpoint returned no replacement history"));
@@ -1011,7 +1031,10 @@ impl SessionActor {
                 replacement.extend(interjections);
             }
         }
-        self.persist_compaction_segment(segment_messages, "[OpenAI server-side compacted context]");
+        let segments_queued = u32::from(self.persist_compaction_segment(
+            segment_messages,
+            "[OpenAI server-side compacted context]",
+        ));
 
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
         self.chat_state_handle
@@ -1113,7 +1136,17 @@ impl SessionActor {
         );
         span.record("compaction_outcome", CompactionOutcome::Success.as_str());
         span.record("compaction_delta_count", 0i64);
-        compaction.complete(tokens_after);
+        timing.post_compaction_ms = Some(post_compaction_start.elapsed().as_millis() as u64);
+        compaction.complete(
+            xai_grok_telemetry::events::CompactionCompleteStats {
+                tokens_after,
+                two_pass_used: false,
+                segments_queued,
+                degenerate_retries: 0,
+                input_overflow_retries: 0,
+            },
+            timing,
+        );
         tracing::info!(
             session_id = %self.session_info.id.0,
             tokens_before,
@@ -1171,7 +1204,13 @@ impl SessionActor {
             let span = tracing::Span::current();
             span.record("success", false);
             span.record("error", e.to_string().as_str());
-            return Err(e);
+            let kind = crate::session::helpers::session_compact::compact_error_kind(&e)
+                .unwrap_or(crate::session::helpers::session_compact::CompactErrorKind::Failed);
+            let detail =
+                Self::user_facing_compact_error(&crate::sampling::error::acp_error_message(&e));
+            return Err(e.data(
+                crate::session::helpers::session_compact::compact_error_data(kind, &detail),
+            ));
         }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let tokens_after = self.chat_state_handle.get_total_tokens().await;
@@ -1204,6 +1243,7 @@ impl SessionActor {
     async fn suppress_auto_compaction(
         &self,
         reason: SuppressReason,
+        detail: &str,
         estimated_tokens: u64,
         context_window: u64,
     ) {
@@ -1232,29 +1272,42 @@ impl SessionActor {
                     context_window,
                 },
             );
-            let message = match reason {
-                SuppressReason::CreditBlock => {
-                    "out of credits or over your spending limit. Add credits and retry."
-                }
-                SuppressReason::Auth => {
-                    "authentication problem — re-authenticate using /login and retry."
-                }
-                SuppressReason::Size => "this conversation is too large to compact.",
-                SuppressReason::Schema => "this conversation can't be summarized.",
-                SuppressReason::Other => {
-                    "it'll retry on the next turn, or start a new session using /new."
-                }
-            };
             self.send_xai_notification(
                 crate::extensions::notification::SessionUpdate::AutoCompactFailed {
-                    error: message.to_string(),
+                    error: Self::suppress_notification_message(reason, detail),
                 },
             )
             .await;
         }
     }
-    /// Map a deterministic failure's error text to a fixed, content-free
-    /// [`SuppressReason`] (drives telemetry + sticky-vs-per-turn scope).
+    /// Text for the suppression notification, canned per reason; `Other` carries the real error.
+    /// Starts lowercase; the renderer prepends its own headline.
+    fn suppress_notification_message(reason: SuppressReason, detail: &str) -> String {
+        match reason {
+            SuppressReason::CreditBlock => {
+                "out of credits or over your spending limit. Add credits and retry.".to_string()
+            }
+            SuppressReason::Auth => {
+                "authentication problem — re-authenticate using /login and retry.".to_string()
+            }
+            SuppressReason::Size => "this conversation is too large to compact.".to_string(),
+            SuppressReason::Schema => "this conversation can't be summarized.".to_string(),
+            SuppressReason::Other => Self::failure_with_retry_guidance(detail),
+        }
+    }
+    /// Retry/new-session guidance headline, normalized detail on its own line.
+    /// Shared by the `Other` suppress arm and the transient failure; both retry on the next turn.
+    fn failure_with_retry_guidance(detail: &str) -> String {
+        const RETRY_GUIDANCE: &str =
+            "it'll retry on the next turn, or start a new session using /new.";
+        let detail = Self::user_facing_compact_error(detail);
+        if detail.is_empty() {
+            RETRY_GUIDANCE.to_string()
+        } else {
+            format!("{RETRY_GUIDANCE}\n{detail}")
+        }
+    }
+    /// Map a deterministic failure's error text to a fixed, content-free [`SuppressReason`] (drives telemetry and the sticky-vs-per-turn scope).
     fn classify_suppress_reason(error_msg: &str) -> SuppressReason {
         let m = error_msg.to_ascii_lowercase();
         if m.contains("spending-limit")
@@ -1274,22 +1327,32 @@ impl SessionActor {
             SuppressReason::Other
         }
     }
-    /// ACP error payload string (plain string or `{message, ...}`).
-    fn acp_error_message(err: &acp::Error) -> String {
-        match err.data.as_ref() {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(obj) => obj
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| obj.to_string()),
-            None => err.message.clone(),
+    /// Strip the known internal prefixes (wrappers nest), then apply the shared normalize sequence ([`normalize_compact_detail`]).
+    fn user_facing_compact_error(raw: &str) -> String {
+        use crate::session::helpers::session_compact::normalize_compact_detail;
+        const INTERNAL_PREFIXES: &[&str] = &[
+            COMPACT_FAILED_PREFIX,
+            COMPACTION_FAILED_GUARD_PREFIX,
+            xai_grok_compaction::sampler::SAMPLER_BUILD_FAILED_PREFIX,
+            xai_grok_compaction::sampler::SAMPLER_START_FAILED_PREFIX,
+        ];
+        let mut rest = raw.trim();
+        loop {
+            let Some(prefix) = INTERNAL_PREFIXES.iter().find(|p| {
+                rest.as_bytes()
+                    .get(..p.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
+            }) else {
+                break;
+            };
+            rest = rest[prefix.len()..].trim_start();
         }
+        normalize_compact_detail(rest)
     }
     /// Auth/401 compact failure — abort for reauth resubmit; don't sample oversized.
     pub(crate) fn is_auth_compact_error(err: &acp::Error) -> bool {
         matches!(
-            Self::classify_suppress_reason(&Self::acp_error_message(err)),
+            Self::classify_suppress_reason(&crate::sampling::error::acp_error_message(err)),
             SuppressReason::Auth
         )
     }
@@ -1297,12 +1360,13 @@ impl SessionActor {
     /// Separate from `AutoCompactFailed` (user-facing); this aborts the turn.
     pub(crate) async fn surface_compact_auth_failure(&self, err: acp::Error) -> acp::Error {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
-        let detailed = Self::acp_error_message(&err);
+        use crate::extensions::notification::UNAUTHORIZED_NEEDLE;
+        let detailed = crate::sampling::error::acp_error_message(&err);
         let message = if detailed.to_ascii_lowercase().contains("unauthorized") {
             detailed
         } else {
             format!(
-                "Unauthorized (401): compaction failed — re-authenticate with /login \
+                "{UNAUTHORIZED_NEEDLE}: compaction failed — re-authenticate with /login \
                  and retry. ({detailed})"
             )
         };
@@ -1452,6 +1516,15 @@ impl SessionActor {
         codex_turn_state: Arc<std::sync::OnceLock<String>>,
     ) -> Result<(), acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
+        if let Some(store) = self.experimental_context_store() {
+            let source = match trigger {
+                xai_grok_telemetry::events::CompactionTrigger::Manual => "manual",
+                xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
+            };
+            return self
+                .start_experimental_context_window(store, user_context, auto_continue, source)
+                .await;
+        }
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
         self.signals_handle().record_compaction(tokens_before);
@@ -1484,12 +1557,28 @@ impl SessionActor {
             .unwrap_or(false);
         let model_id = sampling_config.map(|c| c.model).unwrap_or_default();
         let compaction = xai_grok_telemetry::events::CompactionScope::begin(
-            trigger,
-            tokens_before,
-            context_window,
-            model_id.clone(),
-            user_context.is_some(),
+            xai_grok_telemetry::events::CompactionBeginParams {
+                trigger,
+                tokens_used: tokens_before,
+                context_window,
+                model_id: model_id.clone(),
+                user_context_provided: user_context.is_some(),
+                compaction_mode: match self.compaction.compaction_mode {
+                    xai_chat_state::CompactionMode::Summary => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Summary
+                    }
+                    xai_chat_state::CompactionMode::Transcript => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Transcript
+                    }
+                    xai_chat_state::CompactionMode::Segments(_) => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Segments
+                    }
+                },
+                two_pass_enabled: self.two_pass_active(),
+                is_subagent: self.startup_hints.is_subagent,
+            },
         );
+        let user_context = self.merge_goal_compaction_user_context(user_context);
         let compact_source = trigger_str;
         self.dispatch_hook(
             xai_grok_hooks::event::HookEventName::PreCompact,
@@ -1508,6 +1597,7 @@ impl SessionActor {
             self.chat_state_handle.pruned_conversation_clone(),
         );
         let provider_conversation = full_conversation.clone();
+        let assembly_start = std::time::Instant::now();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
                 full_conversation.clone(),
@@ -1527,14 +1617,15 @@ impl SessionActor {
                 full_conversation,
             )
         };
+        let pre_compaction_ms = assembly_start.elapsed().as_millis() as u64;
         if conv_len == 0 {
             tracing::error!(
                 session_id = %self.session_info.id.0,
                 "Compaction failed: conversation is empty (ChatStateActor may have died)"
             );
-            return Err(
-                acp::Error::internal_error().data("Compaction failed: conversation is empty")
-            );
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}conversation is empty"
+            )));
         }
         let system_message = match system_message {
             Some(msg) => msg,
@@ -1544,8 +1635,9 @@ impl SessionActor {
                     conversation_len = conv_len,
                     "Compaction failed: no system message in conversation history"
                 );
-                return Err(acp::Error::internal_error()
-                    .data("Compaction failed: no system message in conversation history"));
+                return Err(acp::Error::internal_error().data(format!(
+                    "{COMPACTION_FAILED_GUARD_PREFIX}no system message in conversation history"
+                )));
             }
         };
         if simplified_messages.is_empty() {
@@ -1554,8 +1646,9 @@ impl SessionActor {
                 conversation_len = conv_len,
                 "Compaction failed: simplified conversation is empty"
             );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: simplified conversation is empty"));
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}simplified conversation is empty"
+            )));
         }
         if !simplified_messages
             .iter()
@@ -1567,8 +1660,9 @@ impl SessionActor {
                 simplified_len = simplified_messages.len(),
                 "Compaction failed: no system message in simplified conversation"
             );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: no system message in simplified conversation"));
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}no system message in simplified conversation"
+            )));
         }
         let sampling_config = self.reconstruct_full_config().await;
         let sampling_client = self
@@ -1695,6 +1789,8 @@ impl SessionActor {
             request.reasoning_effort = sampling_config.reasoning_effort;
             request.x_grok_session_id = Some(self.session_info.id.0.to_string());
             request.x_grok_cache_affinity_id = Some(self.prompt_cache_affinity_id());
+            let pre_compaction_ms = assembly_start.elapsed().as_millis() as u64;
+            let model_wait_start = std::time::Instant::now();
             let (replacement, attempts, remote_v2) = self
                 .run_codex_remote_compact_request(
                     sampling_client,
@@ -1719,6 +1815,11 @@ impl SessionActor {
                     attempts,
                     remote_v2,
                     compaction,
+                    xai_grok_telemetry::events::CompactionTiming {
+                        model_wait_ms: Some(model_wait_start.elapsed().as_millis() as u64),
+                        pre_compaction_ms: Some(pre_compaction_ms),
+                        post_compaction_ms: None,
+                    },
                 )
                 .await;
         }
@@ -1751,11 +1852,13 @@ impl SessionActor {
             .borrow()
             .compaction_policy()
             .wall_clock_budget_secs;
+        let compaction_tool_tokens = xai_chat_state::estimate_tool_specs_tokens(&compaction_tools);
         let sampler = crate::session::helpers::full_replace_compaction::ShellCompactionSampler::new(
             use_short_prompt,
             user_context.clone(),
             compaction_tools.clone(),
             compaction_hosted_tools.clone(),
+            compaction_tool_tokens,
             sampling_client,
             self.session_info.id.clone(),
             sampling_config.clone(),
@@ -1783,6 +1886,7 @@ impl SessionActor {
         let two_pass_output = self
             .try_two_pass_pass2_apply(user_context.as_deref(), summary_strips_reasoning)
             .await;
+        let two_pass_used = two_pass_output.is_some();
         let mut compact_summary: Option<String> =
             two_pass_output.as_ref().map(|o| o.content.clone());
         while compact_summary.is_none() {
@@ -1801,7 +1905,8 @@ impl SessionActor {
                 }
                 Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
                     last_error = Some(
-                        acp::Error::internal_error().data("compact failed: nothing to compact"),
+                        acp::Error::internal_error()
+                            .data(format!("{COMPACT_FAILED_PREFIX}nothing to compact")),
                     );
                     break;
                 }
@@ -1813,7 +1918,7 @@ impl SessionActor {
                     };
                     last_error = Some(acp::Error::internal_error().data(
                         observer.last_error_message().unwrap_or_else(|| {
-                            "compact failed: model returned empty response".to_string()
+                            format!("{COMPACT_FAILED_PREFIX}model returned empty response")
                         }),
                     ));
                     break;
@@ -1891,6 +1996,7 @@ impl SessionActor {
                         if auto_trigger {
                             self.suppress_auto_compaction(
                                 SuppressReason::Size,
+                                &message,
                                 estimated_input_tokens,
                                 context_window,
                             )
@@ -1905,6 +2011,7 @@ impl SessionActor {
                             let reason = Self::classify_suppress_reason(&message);
                             self.suppress_auto_compaction(
                                 reason,
+                                &message,
                                 estimated_input_tokens,
                                 context_window,
                             )
@@ -1977,11 +2084,17 @@ impl SessionActor {
         let generate_session_compact = compact_output.content.clone();
         let user_message_prefix = self.build_user_message_prefix().await;
         let conversation = self.chat_state_handle.get_conversation().await;
-        let (discovered_agents_md, all_skills_for_compaction, _agent_edited_paths, state_context) =
+        let (discovered_agents_md, all_skills_for_compaction, _edited_paths, mut state_context) =
             if use_short_prompt {
                 let empty_edited: std::collections::BTreeSet<String> = Default::default();
-                let ctx =
-                    CompactionStateContext::build(&conversation, CompactionInputs::default()).await;
+                let ctx = CompactionStateContext::build(
+                    &conversation,
+                    CompactionInputs {
+                        goal_objective: self.goal_objective_for_compaction(),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 (Vec::<std::path::PathBuf>::new(), vec![], empty_edited, ctx)
             } else {
                 let agents_md: Vec<std::path::PathBuf> = self
@@ -1992,8 +2105,7 @@ impl SessionActor {
                     .await
                     .into_iter()
                     .collect();
-                let bridge_for_skills = self.agent.borrow().tool_bridge().clone();
-                let skills = bridge_for_skills.slash_skills().await;
+                let skills = self.slash_skills_for_resolve().await;
                 let edited_paths = self.chat_state_handle.get_agent_edited_paths().await;
                 let ctx = {
                     let bridge_tasks = self
@@ -2115,6 +2227,7 @@ impl SessionActor {
                             agent_edited_paths: edited_paths.clone(),
                             connected_mcp_servers,
                             todos,
+                            goal_objective: self.goal_objective_for_compaction(),
                             ..Default::default()
                         },
                     )
@@ -2122,6 +2235,38 @@ impl SessionActor {
                 };
                 (agents_md, skills, edited_paths, ctx)
             };
+        if self.is_cursor_harness() {
+            state_context.images = CompactionImageContext::default();
+        }
+        let harvested_paths = std::mem::take(&mut state_context.images.attached_paths);
+        let (kept, dropped_paths) = if harvested_paths.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            match crate::session::persistence::ensure_owner_only_session_dir(&self.session_info) {
+                Ok(session_dir) => {
+                    retain_session_asset_files(
+                        harvested_paths,
+                        &crate::session::image_describe::session_assets_dir(&session_dir),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "compaction: session dir unavailable; attached image paths dropped"
+                    );
+                    (Vec::new(), harvested_paths.len())
+                }
+            }
+        };
+        state_context.images.attached_paths = kept;
+        if dropped_paths > 0 {
+            tracing::debug!(
+                session_id = %self.session_info.id.0,
+                dropped_paths,
+                "compaction: dropped attached image paths that are not session asset files"
+            );
+        }
         use crate::session::helpers::compaction_context::SubagentToolNames;
         let subagent_tool_names: Option<SubagentToolNames> =
             if use_short_prompt || state_context.running_subagents.is_empty() {
@@ -2201,8 +2346,12 @@ impl SessionActor {
                     .map(|b| b as &dyn xai_grok_tools::types::memory_backend::MemoryBackend)
             };
         let suppress_state_reminder = false;
+        let workflow_listing = self.workflow_listing_for_prompt();
         let system_reminder = if suppress_state_reminder {
-            None
+            workflow_listing.as_deref().map(|listing| {
+                let tag = self.reminder_wrapper_tag();
+                format!("<{tag}>\n## Available Workflows\n{listing}\n</{tag}>")
+            })
         } else {
             to_system_reminder(
                 &state_context,
@@ -2211,6 +2360,7 @@ impl SessionActor {
                 memory_ref,
                 subagent_tool_names.as_ref(),
                 mcp_tool_names.as_ref(),
+                workflow_listing.as_deref(),
             )
             .await
         };
@@ -2278,12 +2428,25 @@ impl SessionActor {
         if cancel.is_cancelled() {
             return self.emit_compact_cancelled(auto_trigger).await;
         }
-        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
+        let segments_queued = u32::from(
+            self.persist_compaction_segment(&segment_messages, &generate_session_compact),
+        );
+        tracing::debug!(
+            session_id = %self.session_info.id.0,
+            has_last_user_query = compaction_state_context.last_user_query.is_some(),
+            last_turn_image_parts = compaction_state_context.images.last_turn_image_parts.len(),
+            has_last_turn_image_files = compaction_state_context
+                .images
+                .last_turn_image_files
+                .is_some(),
+            "compaction: last-turn image context"
+        );
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
             .count
             .load(std::sync::atomic::Ordering::Relaxed);
+        let apply_start = std::time::Instant::now();
         let raw_compacted = build_compacted_history(CompactedHistoryInput {
             system_message: system_message.clone(),
             user_message_prefix: user_message_prefix.clone(),
@@ -2330,6 +2493,7 @@ impl SessionActor {
                 summary_count,
             })
         };
+        let post_compaction_ms = apply_start.elapsed().as_millis() as u64;
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
         self.chat_state_handle
             .record_compaction_at(prompt_index_at_compaction);
@@ -2374,12 +2538,13 @@ impl SessionActor {
             )
             .await
         };
-        let new_len = compacted_history.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(compacted_history);
         crate::session::memory::experience_ledger::mark_history_compacted(
             self.memory.experience_run_id(),
         );
+        self.reseed_active_goal_after_compaction().await;
+        let new_len = self.chat_state_handle.get_conversation_len().await;
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -2430,7 +2595,16 @@ impl SessionActor {
             .tool_bridge()
             .on_skill_discovery_compaction()
             .await;
-        self.persist_announcement_state().await;
+        self.rearm_failed_server_announcements().await;
+        if self
+            .tool_bridge_handle()
+            .toolset()
+            .tool_name_for_kind(xai_grok_tools::types::tool::ToolKind::UseTool)
+            .is_some()
+            && let Some(hint) = self.rendered_mcp_hint().await
+        {
+            self.push_system_reminder_with_tag(&hint, self.reminder_wrapper_tag());
+        }
         self.plan_mode.lock().reset_after_compaction();
         self.persist_plan_mode_state();
         self.dispatch_hook(
@@ -2486,7 +2660,20 @@ impl SessionActor {
                 span.record("compaction_itl_max_ms", ms as i64);
             }
         }
-        compaction.complete(tokens_after);
+        compaction.complete(
+            xai_grok_telemetry::events::CompactionCompleteStats {
+                tokens_after,
+                two_pass_used,
+                segments_queued,
+                degenerate_retries: telemetry.degenerate_rejections,
+                input_overflow_retries: input_overflow_rejections,
+            },
+            xai_grok_telemetry::events::CompactionTiming {
+                model_wait_ms: compact_output.model_wait_ms(),
+                pre_compaction_ms: Some(pre_compaction_ms),
+                post_compaction_ms: Some(post_compaction_ms),
+            },
+        );
         Ok(())
     }
     /// Check if auto-compact should be triggered based on context window usage.
@@ -2516,7 +2703,20 @@ impl SessionActor {
         let codex_model_limit = model_id
             .and_then(|model_id| self.models_manager.codex_compaction_metadata(model_id))
             .and_then(|metadata| metadata.auto_compact_token_limit);
-        let limit = auto_compact_token_limit(provider, cw, configured_percent, codex_model_limit);
+        let mut limit =
+            auto_compact_token_limit(provider, cw, configured_percent, codex_model_limit);
+        // A catalog absolute limit belongs to its default window; a smaller
+        // explicit selection must still compact before it fills.
+        if provider == ModelProvider::Codex
+            && self
+                .compaction
+                .context_window_selection
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == cw
+        {
+            let selected_limit = auto_compact_token_limit(provider, cw, configured_percent, None);
+            limit = limit.min(selected_limit);
+        }
         if total_tokens >= limit {
             let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
             Some(AutoCompactTriggerInfo {
@@ -2528,10 +2728,8 @@ impl SessionActor {
             None
         }
     }
-    /// Returns true if the error response indicates tokens exceed the
-    /// model's context window. Inspects only the model-metadata
-    /// portion of the [`SamplingErrorInfo`] (the `context_window`
-    /// field) against the session's tracked token estimate.
+    /// Returns true for a provider-reported context overflow or when a
+    /// response's context-window metadata is below the tracked estimate.
     ///
     /// Called from `handle_sampling_failure` with the
     /// `SamplingErrorInfo` the sampler hands back.
@@ -2539,14 +2737,40 @@ impl SessionActor {
         &self,
         err: &xai_grok_sampler::SamplingErrorInfo,
     ) -> bool {
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
+        if self.compaction.is_suppressed() {
+            return false;
+        }
+        let byte_limit = err.status_code == Some(413)
+            || err
+                .error_code
+                .as_ref()
+                .is_some_and(|code| code.is_byte_size_overflow());
+        if byte_limit
+            || !matches!(
+                err.kind,
+                xai_grok_sampler::SamplingErrorKind::Api
+                    | xai_grok_sampler::SamplingErrorKind::Http
+            )
         {
             return false;
         }
+        if err
+            .error_code
+            .as_ref()
+            .is_some_and(|code| code.is_size_overflow())
+            || xai_grok_sampling_types::is_context_length_error(&err.message)
+        {
+            return true;
+        }
+        self.estimate_exceeds_error_context_window(err).await
+    }
+    /// The request's token estimate exceeds the failed response's reported context window.
+    /// This probable-overflow signal is shared by compact-and-resubmit and the mid-salvage truncated-complete arm.
+    /// The latter must see overflows even while compaction is suppressed.
+    pub(crate) async fn estimate_exceeds_error_context_window(
+        &self,
+        err: &xai_grok_sampler::SamplingErrorInfo,
+    ) -> bool {
         let Some(ref metadata) = err.model_metadata else {
             return false;
         };
@@ -2580,12 +2804,7 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         self.signals_handle()
             .update_context_usage(estimated_total, cw);
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
-        {
+        if self.compaction.is_suppressed() {
             return None;
         }
         if self
@@ -2633,12 +2852,7 @@ impl SessionActor {
     /// Returns `Some` when tool call outputs have pushed the estimated token
     /// count past the context window, indicating pre-emptive compaction is needed.
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
-        {
+        if self.compaction.is_suppressed() {
             return None;
         }
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
@@ -2833,14 +3047,19 @@ impl SessionActor {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
-                if self
-                    .compaction
-                    .auto_compact_suppressed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == SUPPRESS_NONE
-                {
+                let cancelled = self.compaction.cancel.is_cancelled()
+                    || matches!(
+                        crate::session::helpers::session_compact::compact_error_kind(&e),
+                        Some(crate::session::helpers::session_compact::CompactErrorKind::Cancelled)
+                    )
+                    || e.data.as_ref().and_then(|d| d.as_str()).is_some_and(|s| {
+                        s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
+                    });
+                if !cancelled && !self.compaction.is_suppressed() {
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
-                        error: String::new(),
+                        error: Self::failure_with_retry_guidance(
+                            &crate::sampling::error::acp_error_message(&e),
+                        ),
                     })
                     .await;
                 }
@@ -2928,7 +3147,7 @@ impl SessionActor {
     ///
     /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
     /// and an auto-continue prompt will follow.
-    fn persist_compaction_checkpoint(
+    pub(super) fn persist_compaction_checkpoint(
         &self,
         compacted_history: &[ConversationItem],
         prompt_index_at_compaction: usize,
@@ -3021,7 +3240,9 @@ mod inline_auto_compact_flow_tests {
         let state = TokioMutex::new(State {
             running_task: None,
             pending_inputs: VecDeque::new(),
-            combine_edit_holds: std::collections::HashSet::new(),
+            edit_holds: std::collections::HashMap::new(),
+            finalization_gate: Default::default(),
+            hook_block_hold: Default::default(),
             pending_notifications: Vec::new(),
             lifecycle_mutation: None,
             pending_web_search_reload: None,
@@ -3037,6 +3258,7 @@ mod inline_auto_compact_flow_tests {
         let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
             vec![],
             xai_grok_sampling_types::SamplingConfig {
+                max_request_bytes: None,
                 base_url: "http://localhost".to_string(),
                 model: "test".to_string(),
                 max_completion_tokens: None,
@@ -3059,6 +3281,11 @@ mod inline_auto_compact_flow_tests {
         );
         chat_state_handle.record_token_usage(total_tokens);
         SessionActor {
+            hook_disabled: Default::default(),
+            is_chat_kind: false,
+            vcs_root: None,
+            transient_retry_enabled: true,
+            active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
             session_info: SessionInfo {
                 id: acp::SessionId::new("test-auto-compact"),
@@ -3081,7 +3308,7 @@ mod inline_auto_compact_flow_tests {
             mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
             mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
             delivery_tools: std::cell::RefCell::new(Vec::new()),
-            attach_non_interactive: std::cell::Cell::new(false),
+            attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
             chat_state_handle,
             current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
@@ -3098,11 +3325,13 @@ mod inline_auto_compact_flow_tests {
             file_state_tracker: Arc::new(FileStateTracker::new()),
             rewind_pending_prompt: std::sync::Mutex::new(None),
             startup_hints: StartupHints::default(),
+            disable_project_discovery_watcher: true,
             forked_tool_override: None,
             compaction: crate::session::compaction_config::CompactionConfig {
                 threshold_percent: std::cell::Cell::new(threshold_percent),
                 force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 context_window_override: None,
+                context_window_selection: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 count: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
                 previous_model: std::cell::Cell::new(None),
@@ -3113,32 +3342,14 @@ mod inline_auto_compact_flow_tests {
                 prefix_released: std::sync::atomic::AtomicBool::new(false),
                 cancel: Default::default(),
             },
-            memory: crate::session::memory_state::SessionMemory {
-                experience_run_id: uuid::Uuid::now_v7().to_string(),
-                experience_prior_tool_result_ids: std::collections::HashSet::new(),
-                embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
-                active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
-                flush_config: crate::config::MemoryFlushConfig::default(),
-                is_flushing: std::sync::atomic::AtomicBool::new(false),
-                last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
-                storage: std::cell::RefCell::new(None),
-                save_on_end: true,
-                backend_params: None,
-                initial_injection_config: Default::default(),
-                context_injected: std::sync::atomic::AtomicBool::new(false),
-                flush_count: std::sync::atomic::AtomicU64::new(0),
-                last_flush_content: std::cell::RefCell::new(None),
-                flush_success_count: std::sync::atomic::AtomicU64::new(0),
-                flush_error_count: std::sync::atomic::AtomicU64::new(0),
-                search_counter: std::cell::RefCell::new(None),
-                injection_count: std::sync::atomic::AtomicU64::new(0),
-                compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
-                chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                dream_config: Default::default(),
-                dream_count: std::sync::atomic::AtomicU64::new(0),
-                dream_success_count: std::sync::atomic::AtomicU64::new(0),
-                dream_error_count: std::sync::atomic::AtomicU64::new(0),
-            },
+            long_reasoning_reminder:
+                crate::session::long_reasoning_reminder::LongReasoningReminder {
+                    enabled: false,
+                    tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                    delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                },
+            long_reasoning_turn_state: Default::default(),
+            memory: crate::session::memory_state::SessionMemory::empty(),
             session_start: std::time::Instant::now(),
             inference_idle_timeout: std::time::Duration::from_secs(300),
             max_retries: 3,
@@ -3209,9 +3420,18 @@ mod inline_auto_compact_flow_tests {
             ),
             goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
             managed_mcp_handle: Default::default(),
-            initial_client_mcp_servers: vec![],
+            initial_client_mcp_servers: std::cell::RefCell::new(vec![]),
             tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-            mcp_announced_servers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            mcp_announcements: Default::default(),
+            status_wake: Default::default(),
+            status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transient_retries_prompt_total: Default::default(),
+            transient_episode_start: Default::default(),
+            rate_limit_waits: Default::default(),
+            code_mode_hook_followups: Default::default(),
+            hook_stop_latch: Default::default(),
+            sampling_gate: None,
+            image_strip_rewrite_barrier: Default::default(),
             mcp_reminder_mode: McpReminderMode::Delta,
             mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -3219,6 +3439,8 @@ mod inline_auto_compact_flow_tests {
             user_input_generation: std::sync::atomic::AtomicU64::new(0),
             laziness_debug_log: None,
             deferred_prefix: TaskSlot::new(),
+            repo_status_prefetch:
+                crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
             extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
             last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
             last_announced_user_info_hash: std::cell::Cell::new(None),
@@ -3246,12 +3468,16 @@ mod inline_auto_compact_flow_tests {
             turn_summary_task: std::cell::RefCell::new(None),
             turn_summary_generation: std::cell::Cell::new(0),
             turn_summary_enabled: false,
+            title_refresh_enabled: false,
+            title_refresh_task: std::cell::RefCell::new(None),
+            title_refresh_generation: std::cell::Cell::new(0),
+            next_title_refresh_idx: std::cell::Cell::new(0),
             session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             streaming_turn_capture: parking_lot::Mutex::new(
                 crate::session::acp_session::StreamingTurnCapture::default(),
             ),
-            turn_stream_drained: parking_lot::Mutex::new(None),
-            pending_image_strip: parking_lot::Mutex::new(None),
+            turn_stream_drained: parking_lot::Mutex::new(HashMap::new()),
+            pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
             sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
             rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
             image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -3357,7 +3583,7 @@ mod inline_auto_compact_flow_tests {
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 assert!(actor.should_compact_on_error(&err).await);
                 actor
-                    .suppress_auto_compaction(SuppressReason::Other, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Other, "", 1_000, 200_000)
                     .await;
                 assert!(actor.check_auto_compact_needed().await.is_none());
                 assert!(!actor.should_compact_on_error(&err).await);
@@ -3369,7 +3595,7 @@ mod inline_auto_compact_flow_tests {
                 );
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 actor
-                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::CreditBlock, "", 1_000, 200_000)
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3395,7 +3621,7 @@ mod inline_auto_compact_flow_tests {
                 );
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 actor
-                    .suppress_auto_compaction(SuppressReason::Size, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Size, "", 1_000, 200_000)
                     .await;
                 assert!(actor.check_auto_compact_needed().await.is_none());
                 let _ = actor.compaction.auto_compact_suppressed.compare_exchange(
@@ -3433,7 +3659,9 @@ mod inline_auto_compact_flow_tests {
                     create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await,
                 );
                 for reason in [SuppressReason::Size, SuppressReason::Other] {
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor
+                        .suppress_auto_compaction(reason, "", 1_000, 200_000)
+                        .await;
                     assert_ne!(
                         actor.compaction.auto_compact_suppressed.load(Relaxed),
                         SUPPRESS_NONE,
@@ -3476,7 +3704,9 @@ mod inline_auto_compact_flow_tests {
                     (SuppressReason::CreditBlock, SUPPRESS_UNTIL_SUCCESS),
                     (SuppressReason::Auth, SUPPRESS_AUTH),
                 ] {
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor
+                        .suppress_auto_compaction(reason, "", 1_000, 200_000)
+                        .await;
                     assert_eq!(
                         actor.compaction.auto_compact_suppressed.load(Relaxed),
                         expected,
@@ -3517,7 +3747,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, "", 1_000, 200_000)
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3546,7 +3776,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::CreditBlock, "", 1_000, 200_000)
                     .await;
                 actor.clear_auth_compact_suppression();
                 assert_eq!(
@@ -3571,7 +3801,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, "", 1_000, 200_000)
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3657,7 +3887,7 @@ mod inline_auto_compact_flow_tests {
                             persistence_tx,
                         )
                         .await;
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor.suppress_auto_compaction(reason, "", 1_000, 200_000).await;
                     let mut text = None;
                     while let Ok(msg) = persistence_rx.try_recv() {
                         if let PersistenceMsg::Update(
@@ -3939,7 +4169,7 @@ mod inline_auto_compact_flow_tests {
                     create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
                 );
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, "", 1_000, 200_000)
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -4365,32 +4595,13 @@ mod inline_auto_compact_flow_tests {
         )
         .await;
         actor.memory = crate::session::memory_state::SessionMemory {
-            experience_run_id: uuid::Uuid::now_v7().to_string(),
-            experience_prior_tool_result_ids: std::collections::HashSet::new(),
-            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
-            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config
                 .as_ref()
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
-            is_flushing: std::sync::atomic::AtomicBool::new(false),
-            last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
-            save_on_end: true,
-            backend_params: None,
             initial_injection_config: memory_initial_injection_config,
-            context_injected: std::sync::atomic::AtomicBool::new(false),
-            flush_count: std::sync::atomic::AtomicU64::new(0),
-            last_flush_content: std::cell::RefCell::new(None),
-            flush_success_count: std::sync::atomic::AtomicU64::new(0),
-            flush_error_count: std::sync::atomic::AtomicU64::new(0),
-            search_counter: std::cell::RefCell::new(None),
-            injection_count: std::sync::atomic::AtomicU64::new(0),
-            compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
-            chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            dream_config: Default::default(),
-            dream_count: std::sync::atomic::AtomicU64::new(0),
-            dream_success_count: std::sync::atomic::AtomicU64::new(0),
-            dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            ..crate::session::memory_state::SessionMemory::empty()
         };
         actor.idle_flush_timeout = memory_config
             .as_ref()
@@ -4483,7 +4694,7 @@ mod inline_auto_compact_flow_tests {
         xai_grok_sampler::SamplingErrorInfo {
             kind: xai_grok_sampler::SamplingErrorKind::Api,
             status_code: Some(400),
-            message: "prompt is too long".to_string(),
+            message: "request failed".to_string(),
             is_retryable: false,
             retry_after_secs: None,
             should_retry: None,
@@ -4532,8 +4743,7 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
-    /// If the proxy hasn't been updated yet, model_metadata is None — must be
-    /// a no-op for backwards compatibility.
+    /// Missing metadata alone is not evidence of a context overflow.
     #[tokio::test(flavor = "current_thread")]
     async fn test_compact_on_error_noop_without_model_metadata() {
         let local = tokio::task::LocalSet::new();
@@ -4546,7 +4756,7 @@ mod inline_auto_compact_flow_tests {
                 let err = xai_grok_sampler::SamplingErrorInfo {
                     kind: xai_grok_sampler::SamplingErrorKind::Api,
                     status_code: Some(400),
-                    message: "prompt is too long".to_string(),
+                    message: "request failed".to_string(),
                     is_retryable: false,
                     retry_after_secs: None,
                     should_retry: None,

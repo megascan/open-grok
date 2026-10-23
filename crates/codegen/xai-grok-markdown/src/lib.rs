@@ -41,10 +41,12 @@ mod source_map;
 pub mod streaming;
 pub mod style;
 mod syntax;
+#[cfg(test)]
+mod syntax_backend_tests;
 mod url_scan;
 
 // Re-export public API
-pub use buffers::MarkdownBuffers;
+pub use buffers::{CellJoin, MarkdownBuffers, TableCellCopy, TableCopyMeta};
 pub use checkpoint::{Checkpoint, CheckpointKind};
 pub use colors::{
     ColorLevel, adapt_color, adapt_style, detect_color_level, get_color_level,

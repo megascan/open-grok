@@ -6,6 +6,15 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct Claims {
     exp: Option<i64>,
+    sub: Option<String>,
+}
+
+/// Extract the unverified subject for change notifications, never authorization.
+pub fn parse_jwt_subject(token: &str) -> Option<String> {
+    jsonwebtoken::dangerous::insecure_decode::<Claims>(token)
+        .ok()
+        .and_then(|data| data.claims.sub)
+        .filter(|subject| !subject.is_empty())
 }
 
 pub fn parse_jwt_expiration(token: &str) -> Option<DateTime<Utc>> {

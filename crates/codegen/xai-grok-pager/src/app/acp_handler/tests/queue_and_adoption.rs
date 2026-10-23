@@ -1,6 +1,87 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
+    #[test]
+    fn child_queue_changed_routes_parent_message_without_root_adoption() {
+        let mut app = make_app_with_agent("session-parent");
+        let child_id = "session-child";
+        assert!(handle_ext_notification(
+            &queue_changed_versioned("session-parent", &[("root-prompt", 1, "prompt")], None),
+            &mut app,
+        ));
+        assert!(handle(
+            make_ext_session_notification(
+                "session-parent",
+                test_subagent_spawned("session-parent", child_id),
+            ),
+            &mut app,
+        ));
+        app.agents.get_mut(&AgentId(0)).unwrap().active_subagent = Some(child_id.to_string());
+
+        assert!(handle_ext_notification(
+            &queue_changed_versioned(
+                child_id,
+                &[("parent-message-1", 1, "parent_agent_message")],
+                Some("child-running"),
+            ),
+            &mut app,
+        ));
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(parent.shared_queue.len(), 1);
+        assert_eq!(parent.shared_queue[0].id, "root-prompt");
+        assert!(parent.session.current_prompt_id.is_none());
+        assert!(app.pending_running_adoptions.is_empty());
+        assert!(app.pending_effects.is_empty());
+        let child = &parent.subagent_views[child_id];
+        assert_eq!(child.shared_queue.len(), 1);
+        assert_eq!(child.shared_queue[0].id, "parent-message-1");
+        assert_eq!(child.shared_queue[0].kind, "parent_agent_message");
+        assert_eq!(child.shared_queue[0].text, "text parent-message-1");
+        assert_eq!(child.queue.entry_ids().len(), 1);
+        assert!(child.queue.is_visible());
+
+        assert!(handle_ext_notification(
+            &queue_changed_versioned(child_id, &[], None),
+            &mut app,
+        ));
+        assert!(app.shared_prompt_queue(child_id).is_none());
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(parent.shared_queue.len(), 1);
+        assert_eq!(parent.shared_queue[0].id, "root-prompt");
+        let child = &parent.subagent_views[child_id];
+        assert!(child.shared_queue.is_empty());
+        assert!(child.queue.entry_ids().is_empty());
+        assert!(!child.queue.is_visible());
+    }
+
+    #[test]
+    fn viewer_prompt_complete_hook_denied_blocks_queue_and_renders_hook_marker() {
+        let mut app = make_app_with_agent("session-view");
+        app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("session-view", "chunk", "prompt-driver", false),
+            &mut app,
+        );
+        let notification = acp::ExtNotification::new(
+            "x.ai/session/prompt_complete",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": "session-view",
+                "promptId": "prompt-driver",
+                "stopReason": "cancelled",
+                "cancellationCategory": "HookDenied",
+                "cancellationContext": {"hook_name": "prompt-guard", "reason": "blocked"},
+            })).unwrap()),
+        );
+        assert!(handle_ext_notification(&notification, &mut app));
+        let agent = &app.agents[&AgentId(0)];
+        assert!(agent.session.hook_block_hold);
+        assert!(matches!(agent.session.state, AgentState::Idle));
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnBlockedByHook { .. }),
+        ));
+    }
+
     /// The pager reconciles the authoritative shared prompt queue from the
     /// `x.ai/queue/changed` broadcast, and an empty broadcast clears it.
     #[test]
@@ -2424,7 +2505,7 @@
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::TurnFailed { error, .. }) => {
                 assert_eq!(
-                    error, "Request failed \u{2014} boom. Try sending again.",
+                    error, "Request failed: boom. Try sending again.",
                     "agentResult must propagate into the formatted marker"
                 )
             }
@@ -2640,4 +2721,58 @@
                 .contains_key("p1"),
             "a row draining to running keeps its painted block for the adoption"
         );
+    }
+
+    /// A background session's update drains its own queue; the unreadable-image notice lands on the
+    /// visible session and the handler reports a change even though the updated session is off-screen.
+    #[test]
+    fn background_drain_notice_reaches_active_view_and_requests_redraw() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_two_agents();
+        let background = AgentId(0);
+        let foreground = AgentId(1);
+        {
+            let agent = app.agents.get_mut(&background).unwrap();
+            agent.session.enqueue_prompt("look at [Image #2]".into());
+            let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+            image.display_number = 2;
+            image.encoded_bytes = None;
+            image.session_image_path = Some(dir.path().join("gone.png"));
+            agent.session.pending_prompts.back_mut().unwrap().images = vec![image];
+        }
+
+        // An info-only update on the background session: it changes nothing itself, but the
+        // idle session with a queued prompt drains afterwards.
+        let changed = handle(
+            make_ext_session_notification_with_method(
+                "sess-owner",
+                "x.ai/session/update",
+                XaiSessionUpdate::ImageCompressed {
+                    images: vec![compressed_entry(0)],
+                    message: "resized".into(),
+                },
+            ),
+            &mut app,
+        );
+
+        assert!(changed, "a notice on the visible view is a change");
+        assert!(
+            app.agents
+                .get(&background)
+                .unwrap()
+                .session
+                .pending_prompts
+                .is_empty(),
+            "the background queue must have drained"
+        );
+        assert_eq!(
+            app.agents
+                .get(&foreground)
+                .unwrap()
+                .toast
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("Image #2 couldn't be read — not sent")
+        );
+        assert!(app.agents.get(&background).unwrap().toast.is_none());
     }

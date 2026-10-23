@@ -26,6 +26,7 @@ use super::turn_status::SPINNER_DIVISOR;
 use crate::app::agent::{GoalDisplayPhase, GoalDisplayState, GoalDisplayStatus};
 use crate::app::agent_view::McpInitProgress;
 use crate::theme::Theme;
+use crate::views::tasks_pane::TaskStatusCounts;
 
 /// A named status bar item.
 struct StatusEntry {
@@ -67,14 +68,34 @@ impl<'a> AgentStatusBar<'a> {
         self.items.push(StatusEntry { id, line, width });
     }
 
+    /// Prepend an item sized with [`Self::room_for_front`], so it can never
+    /// push the items already pushed off the row.
+    pub fn push_front(&mut self, id: &'static str, line: Line<'static>) {
+        let width = line.width() as u16;
+        self.items.insert(0, StatusEntry { id, line, width });
+    }
+
+    /// Columns a prepended item may take in a row `area_width` wide: what the
+    /// current group and its joining separator leave.
+    pub fn room_for_front(&self, area_width: u16) -> u16 {
+        let joining_sep = if self.items.is_empty() {
+            0
+        } else {
+            SEPARATOR_WIDTH
+        };
+        area_width.saturating_sub(self.right_pad + self.width() + joining_sep)
+    }
+
+    /// Columns the group occupies: items plus the separators between them.
+    fn width(&self) -> u16 {
+        let items: u16 = self.items.iter().map(|e| e.width).sum();
+        let seps = (self.items.len() as u16).saturating_sub(1);
+        items + seps * SEPARATOR_WIDTH
+    }
+
     /// Build a separator span: ` │ ` in dim color.
     fn separator(&self) -> Span<'static> {
-        Span::styled(
-            format!(" {SEPARATOR} "),
-            Style::default()
-                .fg(self.theme.gray_dim)
-                .bg(self.theme.bg_base),
-        )
+        separator(self.theme)
     }
 
     /// Render all items right-aligned into the given area.
@@ -134,9 +155,56 @@ impl<'a> AgentStatusBar<'a> {
     }
 }
 
+/// ` │ ` a step fainter than the chips it divides — the divider between
+/// status-bar items and between the header's title and location.
+pub(crate) fn separator(theme: &Theme) -> Span<'static> {
+    Span::styled(format!(" {SEPARATOR} "), theme.faint().bg(theme.bg_base))
+}
+
+/// Display width of [`separator`].
+const SEPARATOR_WIDTH: u16 = 3;
+
 // ---------------------------------------------------------------------------
 // Goal status line
 // ---------------------------------------------------------------------------
+
+pub(crate) fn task_status_line(
+    counts: TaskStatusCounts,
+    theme: &Theme,
+    is_hovered: bool,
+) -> Option<Line<'static>> {
+    if counts == TaskStatusCounts::default() {
+        return None;
+    }
+    let hover = if is_hovered {
+        ratatui::style::Modifier::BOLD
+    } else {
+        ratatui::style::Modifier::empty()
+    };
+    let running_style = Style::default()
+        .fg(theme.accent_running)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let paused_style = Style::default()
+        .fg(theme.warning)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let mut spans = Vec::with_capacity(2);
+    if counts.running > 0 {
+        spans.push(Span::styled(
+            format!("{} {}", crate::glyphs::diamond_filled(), counts.running),
+            running_style,
+        ));
+    }
+    if counts.paused_workflows > 0 {
+        let prefix = if counts.running > 0 { "  " } else { "" };
+        spans.push(Span::styled(
+            format!("{prefix}P {}", counts.paused_workflows),
+            paused_style,
+        ));
+    }
+    Some(Line::from(spans))
+}
 
 /// Format a token count compactly: `500`, `1.5k`, `50k`, `1.5M`.
 pub(crate) fn format_tokens_compact(tokens: i64) -> String {
@@ -324,6 +392,10 @@ pub fn mcp_status_line(
         ),
     ]))
 }
+
+#[cfg(test)]
+#[path = "agent_status_task_tests.rs"]
+mod task_tests;
 
 #[cfg(test)]
 mod tests {

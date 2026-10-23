@@ -5,6 +5,7 @@ use crate::version::get_installed_grok_version;
 use semver::Version;
 use tracing::warn;
 use xai_grok_shell::util::config::{VersionPolicy, version_satisfies_floor};
+use xai_tty_utils::cli_eprintln as eprintln;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RequiredRangeDecision {

@@ -221,6 +221,14 @@ pub enum ActiveView {
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
 }
+impl ActiveView {
+    pub(crate) fn agent_id(self) -> Option<AgentId> {
+        match self {
+            Self::Agent(agent_id) => Some(agent_id),
+            _ => None,
+        }
+    }
+}
 /// Target restored when leaving the dashboard (Ctrl+\ / Esc).
 /// Consumed by `dispatch_exit_dashboard`; dead agents fall back to
 /// insertion-order first / Welcome.
@@ -264,92 +272,13 @@ fn reconnect_success_hides_mismatch(current: Option<&str>, incoming: &str) -> bo
     current.is_some_and(crate::acp::is_version_mismatch_banner)
         && (incoming.starts_with("Reconnected.") || incoming.starts_with("Session restored."))
 }
-/// Which prompt box in-flight voice dictation appends its finalized text to.
-/// Captured when recording **starts** so a trailing STT final still lands where
-/// the user was dictating, even if they navigate away — or toggle a dashboard
-/// row's peek panel — mid-utterance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceTarget {
-    /// A live agent session's prompt box.
-    Agent(AgentId),
-    /// The dashboard's new-agent dispatch input (no row peek was open at start).
-    DashboardDispatch,
-    /// The dashboard's peek reply input, bound to the agent whose peek was open
-    /// at start. The id pins the row: selecting a different row mid-utterance
-    /// stops capture (the reply widget is shared and clears on row change), so a
-    /// final can't land on the wrong agent's reply.
-    DashboardPeekReply(AgentId),
-}
-/// The voice-dictation lifecycle. Exactly one state holds at a time, so the
-/// "is the mic live / is a start queued / does a Ctrl+Space hold own it / which
-/// box receives finals" facts can never disagree (they once lived as separate
-/// booleans and repeatedly drifted apart). All transitions go through the
-/// `AppView::voice_*` methods.
-///
-/// `hold` marks a session begun by a Ctrl+Space hold-press: its matching
-/// Ctrl+Space release ends it (and only it), while `/voice` / toggle sessions
-/// leave `hold` false so a Ctrl+Space release can't touch them. `target` is the
-/// prompt box bound at
-/// **start**, so a trailing final lands where the user was dictating. `interim`
-/// (the live partial transcript) lives inside the recording states so it can't
-/// linger as a stale overlay once dictation ends.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum VoiceState {
-    /// No dictation in flight.
-    #[default]
-    Idle,
-    /// A start was requested before the lazy pipeline existed; the event loop
-    /// spawns it once and then opens the mic.
-    ColdStart { hold: bool, target: VoiceTarget },
-    /// Mic is open and streaming audio to STT.
-    Recording {
-        hold: bool,
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-    /// Capture was explicitly stopped (Esc / Ctrl+Space / [stop] / Ctrl+Space
-    /// release), but the target — and the last interim — are kept so a trailing
-    /// STT final still lands without the overlay flickering in the meantime.
-    Stopping {
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-}
-impl VoiceState {
-    /// Mic is live (the `Recording` state).
-    pub fn listening(&self) -> bool {
-        matches!(self, Self::Recording { .. })
-    }
-    /// A start is queued for the lazy pipeline (the `ColdStart` state).
-    pub fn pending_cold_start(&self) -> bool {
-        matches!(self, Self::ColdStart { .. })
-    }
-    /// The prompt box that owns this session's dictation, if any.
-    pub fn target(&self) -> Option<VoiceTarget> {
-        match self {
-            Self::ColdStart { target, .. }
-            | Self::Recording { target, .. }
-            | Self::Stopping { target, .. } => Some(*target),
-            Self::Idle => None,
-        }
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn interim(&self) -> Option<&str> {
-        match self {
-            Self::Recording { interim, .. } | Self::Stopping { interim, .. } => interim.as_deref(),
-            _ => None,
-        }
-    }
-    /// Whether a hold-press owns the current session (so its key release ends
-    /// it). `/voice` and toggle-style starts leave this false.
-    pub(crate) fn hold(&self) -> bool {
-        matches!(self, Self::ColdStart { hold, .. } | Self::Recording { hold, .. } if *hold)
-    }
-}
+pub use crate::app::voice_state::{Partial, VoiceState, VoiceTarget};
 /// Entry from the session list wire: welcome/resume pickers and non-leader
 /// dashboard roster fallback (`session_picker_entry_to_roster`).
 #[derive(Debug, Clone)]
 pub struct SessionPickerEntry {
+    pub session_kind: Option<String>,
+    pub last_recap: Option<String>,
     pub id: String,
     pub summary: String,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -721,6 +650,17 @@ pub struct ScreenModeRelaunch {
     /// Active session to reopen via `--resume`.
     pub session_id: String,
 }
+/// The coding-data write in flight. Its reply owns the banner ack; it holds the rollback a failure reverts to.
+/// `opted_in` is independent of `coding_data_retention_opt_out`, which is optimistic and which auth-meta refreshes rewrite mid-flight.
+/// `rollback_to_opted_in` starts from that mirror when idle and is inherited when this write replaces a pending one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCodingDataWrite {
+    /// The choice the write carries.
+    pub opted_in: bool,
+    /// What a failure reverts to: the click-time mirror (possibly the unconfirmed fail-safe default), overwritten by an auth-meta refresh or a superseded write's success.
+    /// Replies are not ordered by server commit, so a late older success can still overwrite a newer value here.
+    pub rollback_to_opted_in: bool,
+}
 /// Root view component — owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -851,10 +791,7 @@ pub struct AppView {
     pub appearance: AppearanceConfig,
     /// Notification service (terminal bell, OSC sequences, title updates).
     pub notification_service: NotificationService,
-    /// Escape sequences (title, progress bar) accumulated by the last
-    /// `update_notifications()` tick. Consumed by `draw()` and appended
-    /// to the frame's `post_flush_escapes` so they are written inside the
-    /// synchronized output block.
+    pub(crate) status_line: crate::app::status_line::StatusLineState,
     pub(crate) pending_notification_escapes: Option<String>,
     /// Notification deferred by several ticks so the terminal has time to
     /// process the idle title escape before the notification fires.
@@ -904,6 +841,7 @@ pub struct AppView {
     /// Whether the plugin marketplace CTA is enabled. Env `GROK_PLUGIN_CTA`
     /// overrides `RemoteSettings.plugin_cta` (remote settings); defaults to `false`.
     pub plugin_cta_enabled: bool,
+    pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team
     /// and API-key auth. `/usage` itself stays available for session token/cost.
     pub usage_visible: bool,
@@ -943,6 +881,20 @@ pub struct AppView {
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
     /// Whether the dashboard is currently loading local sessions (non-leader mode).
     pub dashboard_sessions_loading: bool,
+    pub workspace_store: Option<xai_grok_dashboard_store::WorkspaceStore>,
+    pub workspace_snapshot: Option<xai_grok_dashboard_store::WorkspaceSnapshot>,
+    pub workspace_store_loading: bool,
+    pub workspace_sync_requested: bool,
+    pub workspace_write_in_flight: bool,
+    pub workspace_writes_disabled: bool,
+    pub workspace_retry_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
+    pub workspace_failed_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
     /// Server-authoritative shared prompt queues, keyed by `sessionId`
     /// Reconciled from `x.ai/queue/changed` broadcasts so
     /// every client renders the same ordered queue (including prompts queued
@@ -1083,6 +1035,13 @@ pub struct AppView {
     pub welcome_on_workspace_mode: bool,
     /// Transient welcome toast: (message, wall-clock expiry).
     pub welcome_toast: Option<(String, std::time::Instant)>,
+    /// Nesting depth of `dispatch::dispatch`; image notices surface only when it returns to 0.
+    pub dispatch_depth: u32,
+    /// Image notices raised while one dispatch or ACP message runs (unbound placeholder, unreadable
+    /// attachment, dropped by a command). App-owned so a command that removes its own session
+    /// (`/new`, `/home` in minimal) cannot take the notice down with it; the `unified_log` event is
+    /// written against the originating session when the notice is raised.
+    pub pending_image_notices: Vec<String>,
     /// Sticky hover flag for the privacy banner buttons (redraw on enter/leave).
     pub welcome_on_privacy_banner: bool,
     /// Sticky hover flag for the welcome upgrade CTA (redraw on enter/leave).
@@ -1127,7 +1086,11 @@ pub struct AppView {
     /// Foreign lane completion and deferred native-lane notice.
     pub(crate) session_picker_lanes: crate::views::session_picker::SessionPickerLanes,
     /// Invalidates detail reads when picker rows or filters change.
-    pub(crate) session_picker_detail_generation: u64,
+    pub(crate) session_picker_detail_seq: u64,
+    pub(crate) picker_generation_counter: u64,
+    pub(crate) session_picker_generation: u64,
+    pub(crate) dashboard_session_picker:
+        Option<crate::views::session_picker_surface::SessionPickerSurface>,
     /// The search query `session_picker_entries` were server-fetched with
     /// (`None` = unfiltered fetch). Via
     /// [`crate::views::session_picker::effective_filter_query`], skips the
@@ -1329,12 +1292,9 @@ pub struct AppView {
     pub privacy_banner_reshow_days: Option<u64>,
     /// Local `[privacy].privacy_banner_acked` (RFC 3339 UTC).
     pub privacy_banner_acked: Option<String>,
-    /// Accept awaits ACP success before ack.
-    pub privacy_banner_opt_in_inflight: bool,
-    /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed
-    /// on the `TaskResult`, so an older write's late reply — whose
-    /// `rollback_to_opted_in` was captured before the newer one — cannot
-    /// clobber the current value.
+    pub coding_data_pending_write: Option<PendingCodingDataWrite>,
+    /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed on the `TaskResult`.
+    /// Only the newest result directly sets the mirror; an older success may update the pending rollback, which does not establish commit order.
     pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` = no override (default `true`).
     pub show_tips: Option<bool>,
@@ -1344,6 +1304,8 @@ pub struct AppView {
     /// from the effective TOML merge like `show_tips`. `None` = unset in TOML
     /// (default `true`); toggles write the user layer.
     pub ask_user_question_timeout_enabled: Option<bool>,
+    /// `[features].subagent_model_inheritance` as the settings modal shows it: the saved user key plus the tiers seeded at startup.
+    pub subagent_model_inheritance: crate::settings::FeatureOverrideState,
     /// Whether ZDR users are allowed to use the product.
     /// Server-controlled via RemoteSettings (remote settings). Default `false` (blocked) during beta.
     pub zdr_access_enabled: bool,
@@ -1396,10 +1358,15 @@ pub struct AppView {
     /// other screen mode. Driven by `/minimal` and `/fullscreen`. Captures the
     /// session id at action time so a later teardown cannot drop `--resume`.
     pub relaunch: Option<ScreenModeRelaunch>,
+    pub(crate) pending_screen_mode_switch: Option<ScreenMode>,
     /// Whether importable `.claude/` settings were detected at startup.
     pub has_claude_import: bool,
     /// When set, the welcome screen renders an interactive import modal instead of normal content.
     pub import_claude_modal: Option<crate::views::import_claude_modal::ImportClaudeModalState>,
+    /// When set, the five-step custom-provider wizard overlays the current
+    /// screen. It holds UI state only - every RPC is dispatched as an effect.
+    pub custom_provider_modal:
+        Option<crate::views::custom_provider_modal::CustomProviderModalState>,
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
@@ -1447,6 +1414,9 @@ pub struct AppView {
     /// combinations are unrepresentable; production mutates it only through the
     /// `AppView::voice_*` transition methods.
     pub voice_state: VoiceState,
+    pub voice_session: xai_grok_voice::VoiceSessionId,
+    pub voice_trailing_final: Option<(xai_grok_voice::VoiceSessionId, VoiceTarget)>,
+    pub voice_clip_deadline: Option<Instant>,
 }
 /// Reshow window elapsed? None/0 = never. Unparseable ack fails open (show).
 fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bool {
@@ -1509,6 +1479,11 @@ pub(crate) fn detect_external_auth_provider(
 }
 
 impl AppView {
+    pub(crate) fn alloc_picker_generation(&mut self) -> u64 {
+        self.picker_generation_counter += 1;
+        self.picker_generation_counter
+    }
+
     /// Cancel an automatic Kimi sampler refresh after an authoritative user or
     /// remote switch moved the tab to a different provider.
     pub(crate) fn cancel_pending_kimi_rebind(&mut self, agent_id: AgentId) -> bool {
@@ -1821,6 +1796,10 @@ impl AppView {
             None
         }
     }
+    /// Choice carried by the coding-data write in flight, if any.
+    pub fn coding_data_pending_opted_in(&self) -> Option<bool> {
+        self.coding_data_pending_write.map(|w| w.opted_in)
+    }
     /// Welcome privacy banner visibility gates.
     pub fn privacy_banner_should_show(&self) -> bool {
         if self.screen_mode.is_minimal() {
@@ -1830,6 +1809,9 @@ impl AppView {
             return false;
         }
         if self.is_zdr || self.is_team_non_admin() {
+            return false;
+        }
+        if self.coding_data_pending_write.is_some() {
             return false;
         }
         if !self.coding_data_retention_opt_out {
@@ -1891,6 +1873,9 @@ impl AppView {
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
+        if let Some(pending) = self.coding_data_pending_write.as_mut() {
+            pending.rollback_to_opted_in = !meta.coding_data_retention_opt_out;
+        }
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
         self.gate = meta.gate.clone();
         if was_gated && self.gate.is_none() {
@@ -1923,6 +1908,7 @@ impl AppView {
         if let Some(show) = meta.show_resolved_model {
             self.show_resolved_model = show;
         }
+        crate::app::dispatch::refresh_open_settings_modals(self);
     }
     /// Mirror the provider-neutral `/usage` command gate onto every slash
     /// surface that can run `/usage` (agents, welcome, dashboard dispatch /
@@ -2034,6 +2020,7 @@ impl AppView {
             scroll_config: ScrollConfig::from_settings(),
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
+            status_line: Default::default(),
             pending_notification_escapes: None,
             deferred_notification: None,
             tracing_rx: None,
@@ -2082,6 +2069,8 @@ impl AppView {
             #[cfg(feature = "local-workspace")]
             welcome_on_workspace_mode: false,
             welcome_toast: None,
+            dispatch_depth: 0,
+            pending_image_notices: Vec::new(),
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
@@ -2102,7 +2091,10 @@ impl AppView {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -2174,11 +2166,14 @@ impl AppView {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_opt_in_inflight: false,
+            coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
+            subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+                xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+            ),
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
@@ -2198,13 +2193,16 @@ impl AppView {
             foreign_resume_launch: None,
             quit_for_update: false,
             relaunch: None,
+            pending_screen_mode_switch: None,
             has_claude_import: false,
             import_claude_modal: None,
+            custom_provider_modal: None,
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -2215,6 +2213,14 @@ impl AppView {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: Default::default(),
+            workspace_failed_metadata: Default::default(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -2233,6 +2239,9 @@ impl AppView {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            voice_session: xai_grok_voice::VoiceSessionId::default(),
+            voice_trailing_final: None,
+            voice_clip_deadline: None,
         }
     }
     /// Seed `deferred_model_switch` from CLI `-m`. The CLI effort token is
@@ -2393,96 +2402,6 @@ impl AppView {
             }
         }
     }
-    /// Mic is live (the [`VoiceState::Recording`] state).
-    pub fn voice_listening(&self) -> bool {
-        self.voice_state.listening()
-    }
-    /// Whether the in-flight session is owned by a hold-press (so its key
-    /// release ends it). `/voice` and toggle-style starts leave this false.
-    pub fn voice_hold_owned(&self) -> bool {
-        self.voice_state.hold()
-    }
-    /// The prompt box that owns in-flight dictation, if any.
-    pub fn voice_recording_target(&self) -> Option<VoiceTarget> {
-        self.voice_state.target()
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn voice_interim(&self) -> Option<&str> {
-        self.voice_state.interim()
-    }
-    /// Best-effort one-shot command into the voice pipeline (no-op if it isn't up).
-    fn voice_send(&self, cmd: xai_grok_voice::VoiceCommand) {
-        if let Some(tx) = &self.voice_cmd_tx
-            && tx.try_send(cmd).is_err()
-        {
-            tracing::trace!("voice command dropped: pipeline channel full or closed");
-        }
-    }
-    /// Open the mic now (pipeline already up) and enter [`VoiceState::Recording`]
-    /// bound to `target`. `hold` marks a Ctrl+Space hold-press start.
-    pub(crate) fn voice_begin_recording(&mut self, target: VoiceTarget, hold: bool) {
-        self.voice_send(xai_grok_voice::VoiceCommand::PttPress);
-        self.voice_state = VoiceState::Recording {
-            hold,
-            target,
-            interim: None,
-        };
-    }
-    /// Set the live interim transcript. No-op unless recording, so a late event
-    /// after a stop can't repopulate the overlay.
-    pub(crate) fn voice_set_interim(&mut self, text: String) -> bool {
-        if let VoiceState::Recording { interim, .. } = &mut self.voice_state {
-            *interim = Some(text);
-            true
-        } else {
-            false
-        }
-    }
-    /// Clear the interim in place, keeping the current state. Called when a final
-    /// commits (or yields empty) so the overlay drops the partial without a
-    /// teardown.
-    pub(crate) fn voice_clear_interim(&mut self) {
-        match &mut self.voice_state {
-            VoiceState::Recording { interim, .. } | VoiceState::Stopping { interim, .. } => {
-                *interim = None;
-            }
-            VoiceState::Idle | VoiceState::ColdStart { .. } => {}
-        }
-    }
-    /// Explicit stop (Esc / Ctrl+Space / `[stop]`): release the mic but keep
-    /// the target and last interim so a trailing STT final still lands. Always
-    /// allowed — never leaves a hot mic. No-op unless recording.
-    pub(crate) fn voice_stop_keeping_final(&mut self) {
-        let VoiceState::Recording {
-            target, interim, ..
-        } = &mut self.voice_state
-        else {
-            return;
-        };
-        let target = *target;
-        let interim = interim.take();
-        self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        self.voice_state = VoiceState::Stopping { target, interim };
-    }
-    /// Hard teardown (submit / error / kill-switch / navigate-away): release the
-    /// mic and forget the session — no trailing final, no queued start.
-    pub(crate) fn voice_reset(&mut self) {
-        if self.voice_state.listening() {
-            self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        }
-        self.voice_state = VoiceState::Idle;
-    }
-    /// Ctrl+Space hold release: end only a session a Ctrl+Space hold started —
-    /// cancel a queued hold cold-start, or stop a live hold recording (keeping
-    /// its trailing final). A `/voice` / toggle session (`hold` false) is left
-    /// untouched, so a Ctrl+Space release can neither cancel nor stop it.
-    pub(crate) fn voice_hold_release(&mut self) {
-        match self.voice_state {
-            VoiceState::ColdStart { hold: true, .. } => self.voice_reset(),
-            VoiceState::Recording { hold: true, .. } => self.voice_stop_keeping_final(),
-            _ => {}
-        }
-    }
     /// Whether the active view still owns the bound dictation `target` — i.e. the
     /// box dictation started in is the one currently on screen and selected. The
     /// target is bound at capture start; on the dashboard that means dispatch
@@ -2525,7 +2444,9 @@ impl AppView {
     /// stop controls and the recording session aligned. Event-loop each tick;
     /// no-op unless recording.
     pub fn enforce_voice_session_bound(&mut self) {
-        if !self.voice_state.listening() || self.voice_target_on_active_surface() {
+        if !(self.voice_state.is_listening() || self.voice_state.blocks_new_capture())
+            || self.voice_target_on_active_surface()
+        {
             return;
         }
         self.voice_reset();
@@ -2548,20 +2469,33 @@ impl AppView {
         } else if self.voice_state.pending_cold_start() {
             self.voice_reset();
             Some(InputOutcome::Changed)
+        } else if self.voice_state.blocks_new_capture() {
+            self.voice_reset();
+            self.show_toast(crate::voice::RECORDING_DISCARDED_TOAST);
+            Some(InputOutcome::Changed)
         } else {
             None
         }
     }
+    /// Any key other than Enter closes the dashboard's send echo window.
+    fn close_dashboard_send_echo_window(&mut self, key_event: Option<&crossterm::event::KeyEvent>) {
+        if let Some(key) = key_event
+            && key.code != KeyCode::Enter
+            && let Some(d) = self.dashboard.as_mut()
+        {
+            d.last_send_at = None;
+        }
+    }
     /// App-level Esc owners that consume the key BEFORE any agent input
     /// routing — the render-boundary decision handed to the agent hint path
-    /// (`AgentView::draw` → `esc_would_cancel_turn`) so a hint bar rendered
-    /// beneath one of these never advertises `Esc cancel`.
+    /// (`AgentView::draw` → `esc_would_cancel_turn`, always false) so a hint
+    /// bar rendered beneath one of these never advertises `Esc cancel`.
     ///
     /// Mirrors `handle_input`'s intercepts, in their order: the focused dev
     /// tracing pane (step 1a consumes all non-global keys), the cloud modal
     /// (step 1d), the import-Claude modal (agent-arm intercept),
     /// [`Self::voice_esc_outcome`] — listening OR pending cold-start, the
-    /// handler's actual condition, not the render-only recording flag — and
+    /// handler's actual condition, plus an outstanding clip, not the render-only recording flag — and
     /// the dashboard's attached-agent popup (dashboard-arm intercept). Keep
     /// this list in lockstep with those intercepts when adding a top-level
     /// Esc owner.
@@ -2575,9 +2509,11 @@ impl AppView {
         {
             return true;
         }
-        self.import_claude_modal.is_some()
+        self.custom_provider_modal.is_some()
+            || self.import_claude_modal.is_some()
             || self.voice_listening()
             || self.voice_state.pending_cold_start()
+            || self.voice_state.blocks_new_capture()
     }
     /// Commit interim on real send keys only (not multiline bare Enter).
     fn maybe_commit_voice_interim_before_submit_key(&mut self, key: &crossterm::event::KeyEvent) {
@@ -2620,6 +2556,11 @@ impl AppView {
                 .map(|sid| sid.0.as_ref()),
             _ => None,
         }
+    }
+    /// Show the queued image notices when no dispatch is in flight (a nested dispatch leaves them to
+    /// the outermost one); true when a visible surface changed.
+    pub fn flush_image_notices_if_root(&mut self) -> bool {
+        self.dispatch_depth == 0 && crate::app::dispatch::flush_image_notices(self)
     }
     /// Show a toast on the currently active view.
     ///
@@ -2827,6 +2768,7 @@ impl AppView {
     }
     /// Apply a (possibly hot-reloaded) appearance config to all agents.
     pub fn set_appearance(&mut self, config: AppearanceConfig) {
+        crate::render::bidi::set_enabled(config.scrollback.display.rtl_bidi);
         for agent in self.agents.values_mut() {
             agent.scrollback.set_appearance(config.clone());
             for child in agent.subagent_views.values_mut() {
@@ -3171,6 +3113,21 @@ impl AppView {
             }
             return InputOutcome::Changed;
         }
+        // The custom-provider wizard owns every keystroke while it is open, so
+        // Esc cancels from any step and a stray character never reaches the
+        // prompt underneath. Routing goes through dispatch, which owns the RPCs.
+        if self.custom_provider_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    InputOutcome::Action(Action::CustomProviderWizardKey(*key))
+                }
+                Event::Paste(text) => {
+                    InputOutcome::Action(Action::CustomProviderWizardPaste(text.clone()))
+                }
+                Event::Mouse(_) => InputOutcome::Changed,
+                _ => InputOutcome::Unchanged,
+            };
+        }
         let zdr_blocked = self.is_zdr_blocked();
         let has_access = self.has_access();
         let welcome_pinned_upgrade_cta = crate::views::announcements::promo_cta(
@@ -3482,7 +3439,11 @@ impl AppView {
                 }
             }
             ActiveView::AgentDashboard => {
+                self.close_dashboard_send_echo_window(key_event);
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
+                    return outcome;
+                }
+                if let Some(outcome) = self.handle_dashboard_session_picker_input(ev) {
                     return outcome;
                 }
                 if let Event::Key(key) = ev
@@ -4296,6 +4257,11 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             if key!('s', CONTROL).matches(key) {
                 return InputOutcome::Action(Action::FetchSessionList);
             }
+            if key!('p', CONTROL).matches(key) && !crate::input::key::is_text_input_key(key) {
+                // Fork has no optimistic home session (`LeaveHome`); Ctrl+P leaves
+                // welcome by creating a session, then forwards to open the palette.
+                return InputOutcome::ActionThenForward(Action::NewSession);
+            }
             if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
                 return InputOutcome::Action(Action::QuitForUpdate);
             }
@@ -4845,7 +4811,7 @@ impl AppView {
         agents: &mut IndexMap<AgentId, AgentView>,
         drawn_agent: Option<AgentId>,
     ) -> Option<crate::terminal::overlay::PostFlush> {
-        if crate::terminal::image::detect_graphics_protocol()
+        if crate::terminal::image::prompt_preview_graphics_protocol()
             == crate::terminal::image::GraphicsProtocol::None
         {
             return None;
@@ -4861,8 +4827,11 @@ impl AppView {
                 has_escapes = true;
             }
         }
-        if drawn_agent.is_none() {
-            clears.append(crate::terminal::overlay::clear_kitty().into());
+        if drawn_agent.is_none()
+            && let Some(clear) = crate::terminal::overlay::clear()
+            && (!clear.as_str().is_empty() || crate::terminal::overlay::has_committed_owner())
+        {
+            clears.append(clear.into());
             has_escapes = true;
         }
         has_escapes.then_some(clears)
@@ -5020,14 +4989,6 @@ impl AppView {
         self.maybe_trigger_small_screen_tip();
         self.maybe_trigger_ssh_wrap_tip();
         let compact = self.appearance.prompt.compact;
-        let (header_pad_left, header_pad_right, header_pad_top) = {
-            let layout_cfg = &self.appearance.scrollback.layout;
-            (
-                layout_cfg.eff_hpad_left(compact),
-                layout_cfg.eff_hpad_right(compact),
-                layout_cfg.eff_outer_vpad(compact),
-            )
-        };
         let zdr_blocked_for_draw = self.is_zdr_blocked();
         let has_access = self.has_access();
         let privacy_banner = self.privacy_banner_should_show();
@@ -5048,6 +5009,7 @@ impl AppView {
                 &self.hidden_announcement_ids,
             );
         let agent_mouse_pos = self.last_mouse_pos;
+        let status_line_frame = self.status_line_frame();
         let Self {
             active_view,
             agents,
@@ -5246,6 +5208,16 @@ impl AppView {
                                 compact,
                             );
                         }
+                        if let Some(modal) = self.custom_provider_modal.as_mut() {
+                            let theme = crate::theme::Theme::current();
+                            crate::views::custom_provider_modal::render_custom_provider_modal(
+                                f.buffer_mut(),
+                                view_area,
+                                modal,
+                                &theme,
+                                compact,
+                            );
+                        }
                         if let Some(dialog) = self.new_worktree_dialog.as_ref() {
                             crate::views::new_worktree_dialog::render_new_worktree_dialog(
                                 view_area,
@@ -5303,11 +5275,13 @@ impl AppView {
                             panel.render(full_area, f.buffer_mut());
                         }
                         let has_cloud_modal = false;
-                        let cursor = if has_cloud_modal || self.tutorial.is_some() {
-                            None
-                        } else {
-                            result.cursor_pos
-                        };
+                        let has_remote_modal = false;
+                        let cursor =
+                            if has_cloud_modal || has_remote_modal || self.tutorial.is_some() {
+                                None
+                            } else {
+                                result.cursor_pos
+                            };
                         let on_url = self.welcome_auth_url_rect.as_ref().is_some_and(|r| {
                             matches!(self.auth_state, AuthState::Authenticating { .. })
                                 && self.last_mouse_pos.is_some_and(|(mx, my)| {
@@ -5358,47 +5332,21 @@ impl AppView {
                                 None
                             };
                         let overlay_can_cycle = position.is_some_and(|(_, n)| n > 1);
-                        let (agent_area, header) = if overlay_active {
-                            let theme = crate::theme::Theme::current();
-                            let title = agents
-                                .get(&id)
-                                .map(crate::views::session_title::entry_title)
-                                .unwrap_or_else(|| "(session)".to_string());
-                            let (hover_prev, hover_next, hover_close) = self
-                                .dashboard
-                                .as_ref()
-                                .map(|d| {
-                                    (
-                                        d.overlay_prev_hit.hovered,
-                                        d.overlay_next_hit.hovered,
-                                        d.overlay_close_hit.hovered,
-                                    )
-                                })
-                                .unwrap_or((false, false, false));
-                            let header = crate::views::dashboard::render_dashboard_session_header(
-                                f.buffer_mut(),
-                                view_area,
-                                &theme,
-                                &title,
-                                position,
-                                hover_prev,
-                                hover_next,
-                                hover_close,
-                                header_pad_left,
-                                header_pad_right,
-                                header_pad_top,
-                            );
-                            match header {
-                                Some(chrome) => (chrome.content, Some(chrome)),
-                                None => (view_area, None),
-                            }
-                        } else {
-                            (view_area, None)
+                        let overlay_title = overlay_active
+                            .then(|| {
+                                agents
+                                    .get(&id)
+                                    .and_then(crate::views::session_title::named_title)
+                            })
+                            .flatten();
+                        let overlay_header = crate::app::agent_view::OverlayHeader {
+                            title: overlay_title.as_deref(),
+                            position,
                         };
                         if let Some(d) = self.dashboard.as_mut() {
-                            d.overlay_close_hit.set(header.and_then(|c| c.close_rect));
-                            d.overlay_prev_hit.set(header.and_then(|c| c.prev_rect));
-                            d.overlay_next_hit.set(header.and_then(|c| c.next_rect));
+                            d.overlay_close_hit.clear();
+                            d.overlay_prev_hit.clear();
+                            d.overlay_next_hit.clear();
                         }
                         if let Some(d) = self.dashboard.as_mut()
                             && d.peek_viewport.is_some()
@@ -5427,7 +5375,7 @@ impl AppView {
                                 0
                             };
                             let result = agent.draw(
-                                agent_area,
+                                view_area,
                                 f.buffer_mut(),
                                 registry,
                                 scratch,
@@ -5454,11 +5402,23 @@ impl AppView {
                                     voice_listening,
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
+                                    status_line: status_line_frame.clone(),
+                                    overlay_header,
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {
                                 let theme = crate::theme::Theme::current();
                                 crate::views::import_claude_modal::render_import_claude_modal(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    modal,
+                                    &theme,
+                                    compact,
+                                );
+                            }
+                            if let Some(modal) = self.custom_provider_modal.as_mut() {
+                                let theme = crate::theme::Theme::current();
+                                crate::views::custom_provider_modal::render_custom_provider_modal(
                                     f.buffer_mut(),
                                     view_area,
                                     modal,
@@ -5482,13 +5442,17 @@ impl AppView {
                             }
                             let (cursor_pos, post_flush) = result;
                             let has_cloud = false;
+                            let has_remote_modal = false;
                             if has_cloud
+                                || has_remote_modal
                                 || self.import_claude_modal.is_some()
+                                || self.custom_provider_modal.is_some()
                                 || self.tutorial.is_some()
                             {
                                 link_spans.clear();
                             }
-                            let cursor = if has_cloud || self.tutorial.is_some() {
+                            let cursor = if has_cloud || has_remote_modal || self.tutorial.is_some()
+                            {
                                 None
                             } else {
                                 cursor_pos
@@ -5536,8 +5500,11 @@ impl AppView {
                                 registry,
                                 pending_hint,
                                 dashboard_roster,
+                                self.workspace_dashboard_enabled,
+                                self.workspace_snapshot.as_ref(),
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
+                                self.dashboard_session_picker.as_mut(),
                             );
                             let (popup_cursor, popup_post_flush, drawn_popup_agent) =
                                 if let Some(agent_id) = dashboard.attached_agent {
@@ -5572,6 +5539,7 @@ impl AppView {
                                                     link_spans,
                                                     AppRenderParams {
                                                         esc_owned_before_agent,
+                                                        status_line: status_line_frame.clone(),
                                                         ..Default::default()
                                                     },
                                                 )
@@ -5595,6 +5563,20 @@ impl AppView {
                                     settings,
                                     compact,
                                     None,
+                                );
+                            }
+                            // The Settings trigger row opens the wizard while the
+                            // dashboard surface is still showing, so it must be
+                            // painted here too: an invisible modal that owns every
+                            // keystroke would look like a freeze.
+                            if let Some(modal) = self.custom_provider_modal.as_mut() {
+                                let theme = crate::theme::Theme::current();
+                                crate::views::custom_provider_modal::render_custom_provider_modal(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    modal,
+                                    &theme,
+                                    compact,
                                 );
                             }
                             let stale_clears =
@@ -5746,6 +5728,7 @@ impl AppView {
         let cloud_modal_open = false;
         matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some()))
             || self.import_claude_modal.is_some()
+            || self.custom_provider_modal.is_some()
             || self.new_worktree_dialog.is_some()
             || self.welcome_doc_viewer.is_some()
             || self.tutorial.is_some()
@@ -5760,7 +5743,16 @@ impl AppView {
                                 .is_some_and(|agent| agent.login_or_secret_modal_active())
                     })
             )
+            || matches!(
+                self.active_view,
+                ActiveView::AgentDashboard if self.dashboard_session_picker.is_some()
+            )
             || cloud_modal_open
+            || self.remote_modal_open()
+    }
+    /// The `/remote` modal, behind its backend feature like the field itself.
+    fn remote_modal_open(&self) -> bool {
+        false
     }
     /// Store the resolved per-tip gates and propagate the prompt-relevant tips
     /// (undo + plan nudge) to every agent's prompt. Reused by startup and the
@@ -5950,8 +5942,9 @@ impl AppView {
     /// when a pending action expires (to clear the "press again" hint),
     /// or when new tracing entries arrive via the channel.
     pub fn tick(&mut self) -> bool {
+        self.fps_hud.note_tick();
         let mut needs_redraw = false;
-        needs_redraw |= self.minimal_state.transcript.is_some();
+        needs_redraw |= self.minimal_state.needs_frames();
         needs_redraw |= self.poll_clipboard_focus_tip();
         if matches!(self.active_view, ActiveView::Welcome) {
             self.welcome_tick = self.welcome_tick.wrapping_add(1);
@@ -6055,6 +6048,7 @@ impl AppView {
                 )
             ) && spinner_frame_tick;
             needs_redraw |= agent.drain_blocked();
+            needs_redraw |= agent.resize_preview_needs_tick();
             agent.prompt.slash_controller.set_workflows_available(
                 agent
                     .session
@@ -6062,6 +6056,17 @@ impl AppView {
                     .iter()
                     .any(|c| c.name == "workflow")
                     || !agent.workflow_runs.is_empty(),
+            );
+            agent.prompt.slash_controller.set_workflow_runs(
+                agent
+                    .workflow_runs
+                    .iter()
+                    .map(|run| crate::slash::command::WorkflowRunChoice {
+                        name: run.name.clone(),
+                        status: run.status.clone(),
+                        builtin: run.builtin,
+                    })
+                    .collect(),
             );
             if agent.acp_synced_generation != agent.session.available_commands_generation {
                 agent.prompt.sync_acp_commands(
@@ -6078,6 +6083,7 @@ impl AppView {
             needs_redraw |= agent.poll_scrollback_search();
             needs_redraw |= agent.tick_toast();
             needs_redraw |= agent.tick_extensions_result_notice();
+            needs_redraw |= agent.tick_memory_modal_status();
             needs_redraw |= !loading_replay && agent.tick_ephemeral_tip();
             needs_redraw |= agent.tick_mode_banner();
             needs_redraw |= agent.tick_selection_highlight();
@@ -6143,6 +6149,8 @@ impl AppView {
             }
         }
         needs_redraw |= self.tick_scroll();
+        self.update_status_line();
+        needs_redraw |= self.status_line.take_changed();
         needs_redraw
     }
     /// Flush pending scroll lines (stream gap detection, redraw cadence).
@@ -6218,7 +6226,7 @@ impl AppView {
         if self.gboom_active() {
             return Some(std::time::Duration::from_millis(33));
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return Some(std::time::Duration::from_millis(16));
         }
         None
@@ -6289,10 +6297,13 @@ impl AppView {
     /// the ~12fps welcome logo shimmer and the macOS Cmd link-hover poll —
     /// so an app that *looks* idle doesn't spin a 30fps loop for them.
     pub fn tick_demand(&self) -> TickDemand {
+        self.view_tick_demand().max(self.status_line_tick_demand())
+    }
+    fn view_tick_demand(&self) -> TickDemand {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return TickDemand::Fast;
         }
         if self
@@ -6339,6 +6350,7 @@ impl AppView {
                     || agent.acp_synced_generation != agent.session.available_commands_generation
                     || !agent.session.state.is_idle()
                     || agent.wake_turn_active()
+                    || agent.resize_preview_needs_tick()
                     || agent.session.loading_replay
                     || agent
                         .mcp_init_progress
@@ -6359,6 +6371,7 @@ impl AppView {
                         .extensions_modal
                         .as_ref()
                         .is_some_and(|m| m.result_notice.is_some())
+                    || agent.memory_modal_status_needs_tick()
                     || agent.ephemeral_tip_needs_tick()
                     || agent.mode_switch_banner.is_some()
                     || agent.has_drag_autoscroll()
@@ -6694,6 +6707,7 @@ pub(crate) mod tests {
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
             pending_notification_escapes: None,
+            status_line: Default::default(),
             deferred_notification: None,
             tracing_rx: None,
             active_announcements: vec![],
@@ -6771,11 +6785,14 @@ pub(crate) mod tests {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_opt_in_inflight: false,
+            coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
+            subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+                xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+            ),
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
@@ -6824,6 +6841,8 @@ pub(crate) mod tests {
             #[cfg(feature = "local-workspace")]
             welcome_on_workspace_mode: false,
             welcome_toast: None,
+            dispatch_depth: 0,
+            pending_image_notices: Vec::new(),
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
@@ -6844,7 +6863,10 @@ pub(crate) mod tests {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -6856,8 +6878,10 @@ pub(crate) mod tests {
             foreign_resume_launch: None,
             quit_for_update: false,
             relaunch: None,
+            pending_screen_mode_switch: None,
             has_claude_import: false,
             import_claude_modal: None,
+            custom_provider_modal: None,
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
             pending_effects: Vec::new(),
@@ -6869,6 +6893,7 @@ pub(crate) mod tests {
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -6879,6 +6904,14 @@ pub(crate) mod tests {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: Default::default(),
+            workspace_failed_metadata: Default::default(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -6897,6 +6930,9 @@ pub(crate) mod tests {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            voice_session: xai_grok_voice::VoiceSessionId::default(),
+            voice_trailing_final: None,
+            voice_clip_deadline: None,
         }
     }
     pub(crate) fn test_app_with_agent() -> AppView {
@@ -6929,6 +6965,9 @@ pub(crate) mod tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                pending_context_switch: None,
+                hook_block_hold: false,
+                blocked_prompt: None,
                 provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,
@@ -7201,6 +7240,9 @@ pub(crate) mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            pending_context_switch: None,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -7404,6 +7446,8 @@ pub(crate) mod tests {
         assert_eq!(app.tick_demand(), TickDemand::None, "idle agent parks");
         app.agents.get_mut(&id).unwrap().active_modal =
             Some(crate::views::modal::ActiveModal::SessionPicker {
+                generation: 0,
+                detail_seq: 0,
                 state: crate::views::picker::PickerState::default(),
                 entries: None,
                 loading: true,
@@ -7423,6 +7467,8 @@ pub(crate) mod tests {
             "loading modal picker must keep the spinner animating"
         );
         let foreign_entry = SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "claude-1".into(),
             summary: "claude".into(),
             updated_at: chrono::Utc::now(),
@@ -7949,6 +7995,39 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn needs_animation_gates_memory_modal_copy_message() {
+        use crate::views::memory_modal::MemoryModalState;
+        use crate::views::modal::ActiveModal;
+        let mut app = test_app_with_agent();
+        let id = super::super::agent::AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.active_modal = Some(ActiveModal::MemoryBrowser {
+            state: Box::new(MemoryModalState::new(Vec::new())),
+        });
+        assert!(
+            !app.needs_animation(),
+            "an idle memory modal must not request ticks"
+        );
+        let Some(ActiveModal::MemoryBrowser { state }) =
+            app.agents.get_mut(&id).unwrap().active_modal.as_mut()
+        else {
+            panic!("memory modal open");
+        };
+        state.report_copy(&crate::clipboard::CopyDelivery::File {
+            path: std::path::PathBuf::from("/tmp/last-copy.txt"),
+        });
+        assert!(
+            app.needs_animation(),
+            "copy message countdown must keep ticks alive"
+        );
+        let cleared = (0..=120).any(|_| app.tick());
+        assert!(cleared, "tick must expire the copy message");
+        assert!(
+            !app.needs_animation(),
+            "expired copy message must stop requesting ticks"
+        );
+    }
+    #[test]
     fn needs_animation_gates_pending_acp_command_sync() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
@@ -7997,6 +8076,9 @@ pub(crate) mod tests {
                 prompt_id: "pid-stuck".into(),
                 stop_reason: Some("end_turn".into()),
                 agent_result: None,
+                cancellation_category: None,
+                cancellation_context: None,
+                error_kind: None,
                 cancel_trigger: None,
                 received_at: std::time::Instant::now()
                     - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
@@ -8815,6 +8897,8 @@ pub(crate) mod tests {
     }
     fn welcome_session_entry(id: &str) -> SessionPickerEntry {
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: chrono::Utc::now(),
@@ -9476,160 +9560,111 @@ pub(crate) mod tests {
             "Second Ctrl+C on empty running prompt must CancelTurn, got: {outcome:?}",
         );
     }
+    /// Mid-turn Esc is swallowed at the app level too: no `CancelTurn`, no armed
+    /// double-press, no trigger stamp, draft intact, and a toast naming Ctrl+C.
+    /// Covers both panes, vim on and off, and the minimal screen mode (which
+    /// used to Esc-cancel regardless of vim).
     #[test]
-    fn esc_from_prompt_pane_running_turn_cancels_in_non_vim_mode() {
+    fn esc_mid_turn_hints_ctrl_c_instead_of_cancelling() {
+        for (vim_mode, minimal, pane) in [
+            (false, false, crate::views::agent::ActivePane::Prompt),
+            (true, false, crate::views::agent::ActivePane::Prompt),
+            (true, true, crate::views::agent::ActivePane::Prompt),
+            (false, false, crate::views::agent::ActivePane::Scrollback),
+        ] {
+            let mut app = test_app_with_agent();
+            let id = super::super::agent::AgentId(0);
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent.active_pane = pane;
+            agent.vim_mode = vim_mode;
+            if minimal {
+                agent
+                    .prompt
+                    .set_screen_mode(crate::app::ScreenMode::Minimal);
+            }
+            agent.prompt.textarea.set_text("draft while streaming");
+            let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
+            let ctx = format!("vim={vim_mode} minimal={minimal} pane={pane:?}");
+            assert!(
+                matches!(outcome, InputOutcome::Changed),
+                "{ctx}: mid-turn Esc must swallow, got {outcome:?}"
+            );
+            assert!(
+                app.pending_action.is_none(),
+                "{ctx}: must not arm idle clear"
+            );
+            assert!(
+                app.agents[&id].cancel_trigger_hint.is_none(),
+                "{ctx}: no cancel trigger"
+            );
+            assert!(app.agents[&id].session.state.is_turn_running(), "{ctx}");
+            assert_eq!(
+                "draft while streaming",
+                app.agents[&id].prompt.textarea.text(),
+                "{ctx}: the draft is preserved"
+            );
+            if minimal {
+                assert!(app.agents[&id].toast.is_none(), "{ctx}");
+            } else {
+                assert_eq!(
+                    Some("Press Ctrl+c to cancel the turn"),
+                    app.agents[&id].toast.as_ref().map(|(msg, _)| msg.as_str()),
+                    "{ctx}: the toast names the cancel key"
+                );
+            }
+        }
+    }
+    /// A manual `/compact` in flight (CommandRunning) and a streaming wake
+    /// turn (pane state Idle) get the same hint, not a cancel.
+    #[test]
+    fn esc_during_compact_or_wake_turn_hints_instead_of_cancelling() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
+        agent.session.state = AgentState::CommandRunning {
+            command: crate::app::agent::AgentCommand::Compact,
+            started_at: std::time::Instant::now(),
+        };
         agent.active_pane = crate::views::agent::ActivePane::Prompt;
-        agent.vim_mode = false;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "1× Esc while running must cancel in non-vim mode, got {outcome:?}"
+            matches!(outcome, InputOutcome::Changed),
+            "Esc while /compact runs must swallow, got {outcome:?}"
         );
-        assert!(app.pending_action.is_none());
+        assert!(app.agents[&id].cancel_trigger_hint.is_none());
+        assert!(app.agents[&id].session.state.is_compact_running());
         assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
+            Some("Press Ctrl+c to cancel the turn"),
+            app.agents[&id].toast.as_ref().map(|(msg, _)| msg.as_str())
         );
-    }
-    #[test]
-    fn esc_cancels_running_wake_turn_while_pane_is_idle() {
         let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
         let agent = app.agents.get_mut(&id).unwrap();
         agent.running_wake_turn = Some(crate::app::agent_view::RunningWakeTurn {
             prompt_id: "task-completed-bg1".into(),
             cancel_sent: false,
         });
         agent.active_pane = crate::views::agent::ActivePane::Prompt;
-        agent.vim_mode = false;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "Esc during a wake turn must cancel, got {outcome:?}"
+            matches!(outcome, InputOutcome::Changed),
+            "Esc during a wake turn must swallow, got {outcome:?}"
         );
         assert!(
             app.pending_action.is_none(),
             "must not arm idle clear/rewind"
         );
-        assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
-        );
-    }
-    #[test]
-    fn esc_from_prompt_pane_running_turn_with_draft_cancels_preserving_draft() {
-        let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.active_pane = crate::views::agent::ActivePane::Prompt;
-        agent.vim_mode = false;
-        agent.prompt.textarea.set_text("draft while streaming");
-        let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "mid-turn Esc with draft must cancel in non-vim mode, got {outcome:?}"
-        );
-        assert!(app.pending_action.is_none(), "must not arm idle clear");
-        assert_eq!(
-            app.agents[&id].prompt.textarea.text(),
-            "draft while streaming",
-            "Esc cancel must preserve the draft (not clear it like Ctrl+C)"
-        );
-        assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
-        );
-    }
-    #[test]
-    fn esc_from_scrollback_pane_running_turn_cancels_in_non_vim_mode() {
-        let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.active_pane = crate::views::agent::ActivePane::Scrollback;
-        agent.vim_mode = false;
-        let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "1× Esc from scrollback while running must cancel in non-vim mode, got {outcome:?}"
-        );
-        assert!(app.pending_action.is_none());
-        assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
-        );
-    }
-    #[test]
-    fn esc_from_prompt_pane_running_turn_vim_mode_is_swallowed() {
-        let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.active_pane = crate::views::agent::ActivePane::Prompt;
-        agent.vim_mode = true;
-        agent.prompt.textarea.set_text("draft while streaming");
-        let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            matches!(outcome, InputOutcome::Changed),
-            "1× Esc while running must swallow in vim mode, got {outcome:?}"
-        );
-        assert!(app.pending_action.is_none());
         assert!(app.agents[&id].cancel_trigger_hint.is_none());
-        assert_eq!(
-            app.agents[&id].prompt.textarea.text(),
-            "draft while streaming",
-            "vim mid-turn Esc must not clear the draft or arm idle clear"
-        );
-        assert!(app.agents[&id].session.state.is_turn_running());
-    }
-    #[test]
-    fn esc_from_scrollback_pane_running_turn_vim_mode_is_swallowed() {
-        let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.active_pane = crate::views::agent::ActivePane::Scrollback;
-        agent.vim_mode = true;
-        let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Changed),
-            "1× Esc from scrollback while running must swallow in vim mode, got {outcome:?}"
-        );
-        assert!(app.pending_action.is_none());
-        assert!(app.agents[&id].cancel_trigger_hint.is_none());
-        assert!(app.agents[&id].session.state.is_turn_running());
-    }
-    #[test]
-    fn esc_cancels_turn_gate_truth_table() {
-        assert!(crate::app::esc_cancels_turn(true, true));
-        assert!(crate::app::esc_cancels_turn(true, false));
-        assert!(crate::app::esc_cancels_turn(false, false));
-        assert!(!crate::app::esc_cancels_turn(false, true));
-    }
-    #[test]
-    fn esc_running_turn_minimal_screen_mode_cancels_even_with_vim_on() {
-        let mut app = test_app_with_agent();
-        let id = super::super::agent::AgentId(0);
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.active_pane = crate::views::agent::ActivePane::Prompt;
-        agent.vim_mode = true;
-        agent
-            .prompt
-            .set_screen_mode(crate::app::ScreenMode::Minimal);
-        let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "minimal mode must Esc-cancel even with vim scrollback nav on, got {outcome:?}"
+            app.agents[&id]
+                .running_wake_turn
+                .as_ref()
+                .is_some_and(|wake| !wake.cancel_sent),
+            "the wake turn keeps streaming"
         );
         assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
+            Some("Press Ctrl+c to cancel the turn"),
+            app.agents[&id].toast.as_ref().map(|(msg, _)| msg.as_str())
         );
     }
     #[test]
@@ -9639,7 +9674,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::DashboardDispatch,
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         assert!(app.esc_owned_before_agent(), "listening owns Esc");
         app.voice_state = VoiceState::ColdStart {
@@ -9672,24 +9708,24 @@ pub(crate) mod tests {
         }
         assert!(!app.esc_owned_before_agent());
     }
+    /// While "Cancelling…" Esc is swallowed silently: it neither re-sends
+    /// the cancel nor hints at Ctrl+C (which escalates toward quit in this
+    /// state).
     #[test]
-    fn esc_while_cancelling_retries_cancel() {
+    fn esc_while_cancelling_is_swallowed() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         let agent = app.agents.get_mut(&id).unwrap();
         agent.session.state = AgentState::TurnCancelling;
         agent.active_pane = crate::views::agent::ActivePane::Scrollback;
-        agent.vim_mode = true;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "Esc while cancelling must retry CancelTurn, got {outcome:?}"
+            matches!(outcome, InputOutcome::Changed),
+            "Esc while cancelling must swallow, got {outcome:?}"
         );
         assert!(app.pending_action.is_none());
-        assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
-        );
+        assert!(app.agents[&id].cancel_trigger_hint.is_none());
+        assert!(app.agents[&id].toast.is_none());
     }
     #[test]
     fn esc_cancel_grace_holds_rewind_arm_then_expires() {
@@ -9705,17 +9741,17 @@ pub(crate) mod tests {
                 "earlier",
             ));
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(outcome, InputOutcome::Action(Action::CancelTurn)));
+        assert!(matches!(outcome, InputOutcome::Changed));
         assert!(app.agents[&id].rewind_suppress_deadline.is_some());
         app.agents.get_mut(&id).unwrap().session.state = AgentState::Idle;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
             matches!(outcome, InputOutcome::Changed),
-            "Esc within the post-cancel grace must swallow, got {outcome:?}"
+            "Esc within the mid-turn grace must swallow, got {outcome:?}"
         );
         assert!(
             app.pending_action.is_none(),
-            "post-cancel Esc must not arm the rewind picker"
+            "Esc right after the turn ends must not arm the rewind picker"
         );
         app.agents.get_mut(&id).unwrap().rewind_suppress_deadline = Some(std::time::Instant::now());
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
@@ -9750,14 +9786,16 @@ pub(crate) mod tests {
         let effects = crate::app::dispatch::dispatch(Action::ClearPrompt, &mut app);
         assert!(effects.is_empty());
         assert!(app.agents[&id].prompt.textarea.text().is_empty());
+        let stash = app.agents[&id]
+            .prompt_stash
+            .as_ref()
+            .expect("the cleared draft remains recoverable");
+        assert_eq!(stash.prompt.text, "draft to clear");
         assert_eq!(
-            app.agents[&id]
-                .session
-                .prompt_history
-                .first()
-                .map(String::as_str),
-            Some("draft to clear")
+            stash.cause,
+            crate::app::agent_view::StashCause::ClearedDraft
         );
+        assert!(app.agents[&id].session.prompt_history.is_empty());
     }
     #[test]
     fn idle_empty_with_messages_double_esc_opens_rewind_silent() {
@@ -10482,6 +10520,20 @@ pub(crate) mod tests {
         ));
     }
     #[test]
+    fn welcome_done_ctrl_p_leaves_home() {
+        for focused in [true, false] {
+            let mut app = test_app();
+            app.auth_state = AuthState::Done;
+            app.welcome_prompt_focused = focused;
+            let outcome = app.handle_input(&key_event(KeyCode::Char('p'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(outcome, InputOutcome::ActionThenForward(Action::NewSession)),
+                "focused={focused}: Ctrl+P must leave home to open the command palette, got {outcome:?}"
+            );
+            assert!(app.welcome_prompt.text().is_empty());
+        }
+    }
+    #[test]
     fn welcome_done_ctrl_w_opens_new_worktree_dialog() {
         let mut app = test_app();
         app.auth_state = AuthState::Done;
@@ -11163,14 +11215,14 @@ pub(crate) mod tests {
             !crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
                 .unwrap()
                 .as_str()
-                .contains("a=t")
+                .contains("a=T")
         );
         clear.write_to(&mut Vec::new()).unwrap();
         assert!(
             crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
                 .unwrap()
                 .as_str()
-                .contains("a=t")
+                .contains("a=T")
         );
     }
     #[test]
@@ -11590,7 +11642,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::DashboardDispatch,
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
@@ -11646,7 +11699,8 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.voice_state = VoiceState::Stopping {
             target: VoiceTarget::Agent(id),
-            interim: Some("partial".into()),
+            partial: crate::app::app_view::Partial::Shown("partial".into()),
+            route: None,
         };
         app.active_view = ActiveView::Agent(id);
         assert!(
@@ -11672,7 +11726,8 @@ pub(crate) mod tests {
         app.voice_state = VoiceState::Recording {
             hold: false,
             target: VoiceTarget::Agent(id),
-            interim: None,
+            partial: crate::app::app_view::Partial::None,
+            route: None,
         };
         app.active_view = ActiveView::Agent(id);
         app.dashboard = Some(crate::views::dashboard::DashboardState::new());
@@ -11860,10 +11915,10 @@ pub(crate) mod tests {
         );
         assert!(app.agents[&id].cancel_trigger_hint.is_none());
     }
-    /// Overlay + non-vim: mid-turn Esc CANCELS (matching full-screen), and
-    /// still must not detach to the dashboard.
+    /// Overlay in non-vim mode: mid-turn Esc hints at Ctrl+C (matching
+    /// full-screen), and still must not detach to the dashboard.
     #[test]
-    fn overlay_esc_running_turn_non_vim_cancels_not_backout() {
+    fn overlay_esc_running_turn_non_vim_hints_not_backout() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         app.active_view = ActiveView::Agent(id);
@@ -11877,12 +11932,13 @@ pub(crate) mod tests {
         agent.vim_mode = false;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "running-turn overlay Esc must cancel in non-vim mode, got {outcome:?}",
+            matches!(outcome, InputOutcome::Changed),
+            "running-turn overlay Esc must swallow with a hint, not detach/cancel, got {outcome:?}",
         );
+        assert!(app.agents[&id].cancel_trigger_hint.is_none());
         assert_eq!(
-            app.agents[&id].cancel_trigger_hint,
-            Some(crate::app::actions::CancelTrigger::Esc)
+            Some("Press Ctrl+c to cancel the turn"),
+            app.agents[&id].toast.as_ref().map(|(msg, _)| msg.as_str())
         );
     }
     #[test]
@@ -11907,9 +11963,10 @@ pub(crate) mod tests {
             "vim-mode wake Esc must swallow, not detach, got {outcome:?}",
         );
     }
-    /// Overlay + TurnCancelling: Esc retries cancel (does not detach).
+    /// Overlay while TurnCancelling: Esc is swallowed (neither re-sends the
+    /// cancel nor detaches).
     #[test]
-    fn overlay_esc_cancelling_scrollback_retries_cancel_not_backout() {
+    fn overlay_esc_cancelling_scrollback_swallows_not_backout() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         app.active_view = ActiveView::Agent(id);
@@ -11923,13 +11980,10 @@ pub(crate) mod tests {
         assert!(agent.is_bare_scrollback() && agent.no_input_overlay_pending());
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
-            "cancelling overlay Esc must retry CancelTurn, got {outcome:?}",
+            matches!(outcome, InputOutcome::Changed),
+            "cancelling overlay Esc must swallow, not re-cancel or detach, got {outcome:?}",
         );
-        assert!(
-            !matches!(outcome, InputOutcome::Action(Action::DashboardOverlayExit)),
-            "Esc must not detach while cancelling",
-        );
+        assert!(app.agents[&id].cancel_trigger_hint.is_none());
     }
     /// Counterpart to the back-out: a NON-EMPTY draft Esc in an overlay must
     /// pass through to the agent's policy (arms "press again to clear"), never
@@ -13051,6 +13105,8 @@ pub(crate) mod tests {
     #[test]
     fn welcome_picker_f_cycle_disabled_under_chat_mode() {
         let conversation_entry = SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-welcome-f".into(),
             summary: "chat".into(),
             updated_at: chrono::Utc::now(),

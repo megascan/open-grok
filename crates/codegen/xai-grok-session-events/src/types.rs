@@ -52,6 +52,8 @@ pub enum Event {
         /// hub/proxy hop for the same call.
         #[serde(skip_serializing_if = "ToolCompletedSource::is_shell")]
         source: ToolCompletedSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rewriting_hook: Option<String>,
     },
     PermissionRequested {
         tool_name: String,
@@ -364,6 +366,11 @@ pub enum Event {
         server_name: String,
         url: String,
     },
+    #[serde(rename = "mcp_oauth_probe_resolved")]
+    McpOAuthProbeResolved {
+        server_name: String,
+        verdict: String,
+    },
     McpServerStarting {
         server_name: String,
         transport: String,
@@ -572,7 +579,7 @@ pub enum GoalPauseReasonTelemetry {
 
 /// Outcome of a single tool call. More granular than a boolean -- distinguishes
 /// between tools that executed vs tools that were never run.
-#[derive(Debug, Clone, Copy, Serialize, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ToolOutcome {
@@ -592,6 +599,12 @@ pub enum ToolOutcome {
     InvalidTool,
     /// Tool was running when the turn was cancelled (Cmd+C).
     Cancelled,
+}
+
+impl ToolOutcome {
+    pub fn ran_successfully(self) -> bool {
+        matches!(self, Self::Success)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -618,6 +631,8 @@ pub enum TurnOutcomeLabel {
     Completed,
     Cancelled,
     Error,
+    /// Written at session load for a `turn_started` the previous process never closed.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -692,6 +707,7 @@ mod tests {
             outcome: ToolOutcome::Success,
             tool_call_id: "c1".into(),
             source: ToolCompletedSource::Shell,
+            rewriting_hook: None,
         })
         .unwrap();
         assert!(shell.get("source").is_none());
@@ -702,9 +718,41 @@ mod tests {
             outcome: ToolOutcome::Success,
             tool_call_id: "c1".into(),
             source: ToolCompletedSource::Workspace,
+            rewriting_hook: None,
         })
         .unwrap();
         assert_eq!(workspace["source"], "workspace");
+    }
+
+    #[test]
+    fn tool_completed_records_rewriting_hook_without_changing_source() {
+        let event = serde_json::to_value(Event::ToolCompleted {
+            tool_name: "read_file".into(),
+            duration_ms: 10,
+            outcome: ToolOutcome::Success,
+            tool_call_id: "rewritten-call".into(),
+            source: ToolCompletedSource::Shell,
+            rewriting_hook: Some("project/redact".into()),
+        })
+        .unwrap();
+        assert_eq!(event["rewriting_hook"], "project/redact");
+        assert!(event.get("source").is_none());
+    }
+
+    #[test]
+    fn only_successful_tool_outcome_counts_as_success() {
+        assert!(ToolOutcome::Success.ran_successfully());
+        for outcome in [
+            ToolOutcome::Error,
+            ToolOutcome::PermissionRejected,
+            ToolOutcome::PermissionCancelled,
+            ToolOutcome::Followup,
+            ToolOutcome::HookDenied,
+            ToolOutcome::InvalidTool,
+            ToolOutcome::Cancelled,
+        ] {
+            assert!(!outcome.ran_successfully());
+        }
     }
 
     #[test]

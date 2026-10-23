@@ -11,6 +11,26 @@ use crate::copy::{CopyStats, DirtyFilesReport};
 
 pub(crate) use plan::WorktreePlan;
 
+/// Strategy strings written to `worktrees.db` `creation_mode` and metrics.
+pub const STRATEGY_GROVE_FUSE: &str = "grove-fuse";
+pub const STRATEGY_GROVE_NFS: &str = "grove-nfs";
+/// Deprecated alias for [`STRATEGY_GROVE_NFS`]. Still accepted on read/GC.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const STRATEGY_NFS: &str = "nfs";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const STRATEGY_OVERLAY: &str = "overlay";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const STRATEGY_BTRFS: &str = "btrfs";
+pub const STRATEGY_COPY: &str = "copy";
+pub const STRATEGY_GIT: &str = "git";
+pub const STRATEGY_STANDALONE: &str = "standalone";
+
+/// Projected grove worktree: Linux FUSE, macOS NFS, or the legacy `nfs` spelling.
+#[must_use]
+pub fn is_grove_strategy(s: &str) -> bool {
+    matches!(s, STRATEGY_GROVE_FUSE | STRATEGY_GROVE_NFS | STRATEGY_NFS)
+}
+
 /// Result of worktree creation.
 #[derive(Debug)]
 pub struct CreateWorktreeResult {
@@ -28,6 +48,49 @@ pub struct CreateWorktreeResult {
 
     /// Report about dirty files (modified/untracked/deleted) in the source worktree
     pub dirty_files_report: Option<DirtyFilesReport>,
+
+    /// Which dispatch arm actually ran (`grove-fuse` / `grove-nfs` / `overlay` / `btrfs` / `copy` / `git` / `standalone`).
+    pub resolved_strategy: &'static str,
+
+    /// Arm-specific metadata (NFS mount/backing/pin; overlay/btrfs snapshot paths).
+    pub strategy_metadata: Option<serde_json::Value>,
+}
+
+/// One dispatch arm that did not serve the worktree, and why.
+///
+/// The fork's dispatch does not track typed declines, so reports carry an
+/// empty list; the type exists so callers can render whatever a future
+/// dispatch records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArmSkip {
+    pub arm: String,
+    /// One line describing why the arm declined.
+    pub detail: String,
+}
+
+impl ArmSkip {
+    pub fn new(arm: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            arm: arm.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ArmSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.arm, self.detail)
+    }
+}
+
+/// Skip lines joined for a log field or a fallback message.
+#[must_use]
+pub fn render_arm_skips(skips: &[ArmSkip]) -> String {
+    skips
+        .iter()
+        .map(ArmSkip::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Execute worktree creation plan. This is a blocking operation.
@@ -39,6 +102,15 @@ pub(crate) fn execute_plan(plan: WorktreePlan) -> Result<CreateWorktreeResult> {
 mod tests {
     use super::*;
     use crate::{IgnoredFilesMode, WorkingTreeMode, WorktreeBuilder};
+
+    #[test]
+    fn grove_strategy_names() {
+        assert!(is_grove_strategy(STRATEGY_GROVE_FUSE));
+        assert!(is_grove_strategy(STRATEGY_GROVE_NFS));
+        assert!(is_grove_strategy(STRATEGY_NFS));
+        assert!(!is_grove_strategy(STRATEGY_COPY));
+        assert!(!is_grove_strategy("linked"));
+    }
     use tempfile::TempDir;
     use xai_test_utils::git::{git_commit_all, init_git_repo};
 
@@ -64,6 +136,11 @@ mod tests {
         assert!(result.worktree_path.exists());
         assert!(result.worktree_path.join("file.txt").exists());
         assert!(!result.commit.is_empty());
+        assert_eq!(result.resolved_strategy, "copy");
+        assert!(
+            crate::grove_wt_create_count("copy") >= 1,
+            "grove_wt_create must record the copy arm"
+        );
     }
 
     #[test]

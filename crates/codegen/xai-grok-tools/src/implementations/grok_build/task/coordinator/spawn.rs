@@ -16,9 +16,24 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         let SubagentSpawnRequest {
             mut request,
             result_tx,
+            mut admission_reservation,
         } = command;
         if let Err(rejection) = self.reparent_nested_spawn(&mut request) {
+            if let Some(reservation) = admission_reservation.take() {
+                reservation.reject();
+            }
             let _ = result_tx.send(rejection);
+            return;
+        }
+        if request.cancel_token.is_cancelled() {
+            if let Some(reservation) = admission_reservation.take() {
+                reservation.reject();
+            }
+            let _ = result_tx.send(rejected_spawn_result(
+                &request.id,
+                "subagent was cancelled before admission",
+                true,
+            ));
             return;
         }
         // Late Task spawn after user Stop (detached TaskTool background).
@@ -27,6 +42,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 .spawn_blocked_sessions
                 .contains(&request.parent_session_id)
         {
+            if let Some(reservation) = admission_reservation.take() {
+                reservation.reject();
+            }
             let _ = result_tx.send(rejected_spawn_result(
                 &request.id,
                 "parent session is stopped",
@@ -40,6 +58,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             || self.completed.contains_key(&id)
             || self.queued.contains_id(&id)
         {
+            if let Some(reservation) = admission_reservation.take() {
+                reservation.reject();
+            }
             let _ = result_tx.send(rejected_spawn_result(
                 &id,
                 &format!("Subagent id '{id}' already exists"),
@@ -48,13 +69,29 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             return;
         }
         if let Err(error) = self.register_native_spawn(&mut request) {
+            if let Some(reservation) = admission_reservation.take() {
+                reservation.reject();
+            }
             let _ = result_tx.send(rejected_spawn_result(&id, &error, false));
             return;
         }
+        self.inherit_resume_subagent_type(request.as_mut());
         let running = self.session_running_count(&request.parent_session_id);
-        match self.admission.admit(&request, running) {
+        let decision = self.admission.admit(&request, running);
+        if matches!(
+            &decision,
+            AdmissionDecision::Start | AdmissionDecision::Enqueue
+        ) {
+            if let Some(reservation) = admission_reservation.take() {
+                self.admitted_lifecycles
+                    .insert(id.clone(), reservation.admit(&id));
+            }
+        } else if let Some(reservation) = admission_reservation.take() {
+            reservation.reject();
+        }
+        match decision {
             AdmissionDecision::Start => {
-                self.start_child(*request, Some(result_tx), StartOrigin::Direct)
+                self.start_child(*request, Some(result_tx), StartOrigin::Direct, None)
             }
             AdmissionDecision::Enqueue => {
                 debug_assert!(
@@ -83,6 +120,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         result_tx,
                         deadline,
                     },
+                    wake_origin: None,
                 });
             }
             AdmissionDecision::Reject(error) => {
@@ -157,7 +195,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     /// Counts are computed here, not at call sites: a queued spawn counts
     /// itself in `queue_depth` (the notice fires before the push), a rejected
     /// spawn does not.
-    fn notify_limit(&self, request: &SubagentRequest, decision: SubagentLimitDecision) {
+    pub(super) fn notify_limit(&self, request: &SubagentRequest, decision: SubagentLimitDecision) {
         let Some(sink) = &self.config.limit_sink else {
             return;
         };
@@ -209,6 +247,29 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 snapshot_ref: None,
             },
         );
+    }
+
+    /// In-memory resume source wins over the caller's default type before admission.
+    fn inherit_resume_subagent_type(&self, request: &mut SubagentRequest) {
+        let Some(resume_id) = request
+            .resume_from
+            .as_deref()
+            .filter(|id| xai_tool_types::is_not_sentinel(id))
+        else {
+            return;
+        };
+        if let Some(source) = self.completed.get(resume_id) {
+            if source.request.parent_session_id == request.parent_session_id {
+                request.subagent_type = source.request.subagent_type.clone();
+            }
+            return;
+        }
+        if let Some(subagent_type) = self
+            .runner
+            .durable_resume_type(resume_id, &request.parent_session_id)
+        {
+            request.subagent_type = subagent_type;
+        }
     }
 }
 

@@ -17,25 +17,6 @@ fn byok_from_models(
         .or_else(|| models.values().find_map(|m| m.own_credential()))
 }
 impl MvpAgent {
-    /// Announce a session's new title over ACP. ACP scopes `session/update` to
-    /// sessions the client established, and a rename can name a history row it
-    /// never loaded, so the liveness check belongs here rather than at each
-    /// call site.
-    pub(crate) fn notify_session_info_update(
-        &self,
-        session_id: &agent_client_protocol::SessionId,
-        title: &str,
-    ) {
-        if self.is_resident(session_id) {
-            self.gateway
-                .forward_fire_and_forget(
-                    crate::session::summary::session_info_update_manual(
-                        session_id.clone(),
-                        title,
-                    ),
-                );
-        }
-    }
     pub fn reload_skills_all_sessions(&self) -> usize {
         let session_ids = self.resident_ids();
         for sid in &session_ids {
@@ -73,10 +54,26 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
-    ) -> Result<(OaiCompatClient, String), acp::Error> {
+    ) -> Result<(OaiCompatClient, String, bool), acp::Error> {
         let slug = self.resolve_session_summary_model();
+        // Only a local setting, CLI override, or environment override opts
+        // the user into sending title content to a different provider.
+        let locally_selected = {
+            let cfg = self.cfg.borrow();
+            cfg.session_summary_model_override.as_deref() == Some(slug.as_str())
+                || cfg.models.session_summary.as_deref() == Some(slug.as_str())
+                || std::env::var("GROK_SESSION_SUMMARY_MODEL")
+                    .ok()
+                    .is_some_and(|value| value.trim() == slug.as_str())
+        };
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
+        let intended_provider = crate::agent::config::find_model_by_id(&models, &slug)
+            .map(|entry| entry.info().provider);
+        if locally_selected && intended_provider.is_none() {
+            return Err(acp::Error::auth_required()
+                .data("the configured session-summary model has no usable provider route"));
+        }
         let endpoints = self.models_manager.endpoints();
         let (disable_api_key_auth, alpha_test_key, client_version) = {
             let cfg = self.cfg.borrow();
@@ -95,13 +92,19 @@ impl MvpAgent {
             alpha_test_key,
             client_version,
         ) {
+            Some(cfg) if locally_selected && !crate::agent::config::auxiliary_route_matches_catalog(intended_provider, cfg.provider) => {
+                return Err(acp::Error::auth_required()
+                    .data("the configured session-summary model resolved through a different provider"));
+            }
+            Some(cfg) if !crate::agent::config::auxiliary_route_matches_catalog(intended_provider, cfg.provider) => primary.clone(),
             Some(cfg)
-                if crate::agent::config::should_use_active_for_implicit_aux_model(
+                if !locally_selected && crate::agent::config::should_use_active_for_implicit_aux_model(
                     &slug,
                     crate::models::default_session_summary_model(),
                     &cfg,
                     primary,
                 ) => primary.clone(),
+            Some(cfg) if !locally_selected && cfg.provider != primary.provider => primary.clone(),
             Some(mut cfg) => {
                 crate::agent::config::stamp_session_local_sampler_fields(
                     &mut cfg,
@@ -114,11 +117,15 @@ impl MvpAgent {
             // Keep the active model when the requested helper cannot be
             // resolved. Rewriting only the slug would send an xAI helper name
             // such as `grok-build` to a Codex endpoint and guarantee a 404.
+            None if locally_selected => {
+                return Err(acp::Error::auth_required()
+                    .data("the configured session-summary model has no usable provider credentials"));
+            }
             None => primary.clone(),
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
-        Ok((client, model))
+        Ok((client, model, locally_selected))
     }
     fn has_proxy_credentials(&self) -> bool {
         self.cfg.borrow().endpoints.deployment_key.is_some()
@@ -292,11 +299,10 @@ impl MvpAgent {
     ///
     /// Memoizes the single [`folder_trust::resolve_launch_dir_trust`] gather (see
     /// it for the dedup + TOCTOU contract) so the two one-shot init helpers
-    /// (`ensure_plugin_registry` and `ensure_local_workspace_ops`) share it
-    /// instead of each re-scanning. They share a single point-in-time verdict
-    /// rather than two independent re-scans; the sub-millisecond, startup-only
-    /// window between them is intentional (the cross-session TOCTOU re-scan is
-    /// preserved per the contract).
+    /// (`ensure_local_workspace_ops`) share it instead of each re-scanning.
+    /// Plugin registry builds do not reuse this primer: they read disk config
+    /// through the trust gate, so they resolve (and record) afresh right before
+    /// the read — see [`Self::registry_build_inputs`].
     fn prime_launch_dir_trust(&self) -> (&std::path::Path, bool) {
         let trust = *self
             .launch_dir_trust
@@ -358,21 +364,122 @@ impl MvpAgent {
     /// critical path — on the first session-creating call. Runs the discovery
     /// walk once; per-session `build_for_cwd` still re-resolves project-scoped
     /// plugins for each session's own cwd.
-    pub(super) fn ensure_plugin_registry(&self) {
+    pub(crate) fn ensure_plugin_registry(&self) {
         if self.plugin_registry_initialized.replace(true) {
             return;
         }
-        let (cwd, trusted) = self.prime_launch_dir_trust();
-        let mut plugins = self.cfg.borrow().plugins.clone();
-        plugins.merge_claude_enabled_plugins(Some(cwd));
-        let disk_config = plugins.to_discovery_config();
-        let count = self
-            .plugin_registry_handle
-            .reload(Some(cwd), &disk_config, trusted, false);
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let (trusted, disk_config) =
+            Self::registry_build_inputs(&self.launch_cwd, remote_settings.as_ref());
+        let count = self.plugin_registry_handle.reload(
+            Some(&self.launch_cwd),
+            &disk_config,
+            trusted,
+            false,
+        );
         tracing::debug!(
             plugin_count = count,
             "lazily populated plugin registry snapshot"
         );
+    }
+    /// Inputs for a registry build scoped to `cwd`: a fresh real-remote trust
+    /// verdict, then `[plugins]` from disk. Self-free so callers can run it on
+    /// a blocking thread.
+    ///
+    /// `cfg.plugins` is boot-time state that `config.toml` edits never refresh,
+    /// so a snapshot built from it reports stale `enabled` flags to session-less
+    /// `x.ai/plugins/list` / `x.ai/skills/list`.
+    ///
+    /// Order is load-bearing: the disk read consults the folder-trust gate,
+    /// whose cold-key backstop resolves remote-less and records a durable
+    /// verdict that would make an org kill-switch unliftable for the process;
+    /// resolving first (recording, with the real `RemoteSettings`) makes the
+    /// read a cache hit.
+    pub(crate) fn registry_build_inputs(
+        cwd: &std::path::Path,
+        remote_settings: Option<&crate::util::config::RemoteSettings>,
+    ) -> (bool, xai_grok_agent::plugins::discovery::DiscoveryConfig) {
+        let trusted = folder_trust::resolve_and_record(cwd, remote_settings, false);
+        (
+            trusted,
+            crate::config::resolve_effective_plugins_config(cwd).to_discovery_config(),
+        )
+    }
+    /// The directory the agent was launched in; the shared registry snapshot
+    /// is built for it.
+    pub(crate) fn launch_cwd(&self) -> &std::path::Path {
+        &self.launch_cwd
+    }
+    /// An explicit rebuild populated the shared snapshot; the lazy boot build
+    /// must not run after it (it would rebuild with the startup primer's
+    /// memoized trust, undoing a fresh reload verdict).
+    pub(crate) fn mark_plugin_registry_initialized(&self) {
+        self.plugin_registry_initialized.set(true);
+    }
+    /// [`Self::ensure_plugin_registry`] for async callers: the trust gather,
+    /// config read and discovery walk run on a blocking thread so a pre-session
+    /// pull never stalls the runtime. The result is published back on the
+    /// runtime, and only if nothing else (a concurrent explicit
+    /// `x.ai/plugins/reload`) initialized the registry meanwhile — the newer
+    /// build wins.
+    pub(crate) async fn ensure_plugin_registry_async(&self) {
+        if self.plugin_registry_initialized.get() {
+            return;
+        }
+        let launch_cwd = self.launch_cwd.clone();
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let handle = self.plugin_registry_handle.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let (trusted, disk_config) =
+                Self::registry_build_inputs(&launch_cwd, remote_settings.as_ref());
+            handle.refresh_and_build_for_cwd(&launch_cwd, &disk_config, &[], trusted)
+        })
+        .await;
+        match built {
+            Ok(_) if self.plugin_registry_initialized.get() => {}
+            Ok(registry) => {
+                tracing::debug!(
+                    plugin_count = registry.as_ref().map_or(0, |r| r.len()),
+                    "lazily populated plugin registry snapshot"
+                );
+                self.plugin_registry_handle.publish(registry);
+                self.plugin_registry_initialized.set(true);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "plugin registry build task failed")
+            }
+        }
+    }
+    /// Plugin registry for a pre-session pull (`x.ai/skills/*`,
+    /// `x.ai/commands/list`) scoped to `cwd`: a fresh, non-shared build for
+    /// that cwd when one is given — the launch dir is unrelated to the user's
+    /// workspace in desktop-to-docker and ssh setups — else the shared
+    /// launch-dir snapshot, built on demand. Trust is resolved before the disk
+    /// read either way, and the walks run on a blocking thread.
+    pub(crate) async fn plugin_registry_for_cwd(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>> {
+        let Some(cwd) = cwd else {
+            self.ensure_plugin_registry_async().await;
+            return self.plugin_registry_handle.snapshot();
+        };
+        let cwd = cwd.to_path_buf();
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let handle = self.plugin_registry_handle.clone();
+        match tokio::task::spawn_blocking(move || {
+            let (trusted, disk_cfg) =
+                Self::registry_build_inputs(&cwd, remote_settings.as_ref());
+            handle.build_for_cwd(&cwd, &disk_cfg, &[], trusted)
+        })
+        .await
+        {
+            Ok(registry) => registry,
+            Err(err) => {
+                tracing::warn!(error = %err, "plugin registry build task failed");
+                None
+            }
+        }
     }
     /// Admit client servers and merge local / plugin / client sources.
     ///
@@ -383,6 +490,7 @@ impl MvpAgent {
         client_servers: Vec<acp::McpServer>,
         cwd: &std::path::Path,
     ) -> (Vec<acp::McpServer>, Vec<acp::McpServer>) {
+        self.report_setup_phase(super::session_setup::SessionSetupPhase::PluginRegistry);
         self.ensure_plugin_registry();
         let compat = self.cfg.borrow().compat_resolved;
         let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
@@ -390,6 +498,7 @@ impl MvpAgent {
             cwd,
             &compat,
         );
+        self.report_setup_phase(super::session_setup::SessionSetupPhase::McpMerge);
         let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
             admitted.clone(),
             cwd,
@@ -605,11 +714,9 @@ impl MvpAgent {
     }
     /// Telemetry enabled and not ZDR. Same gate as session `telemetry_enabled`.
     pub(crate) fn product_analytics_enabled(&self) -> bool {
-        self.cfg.borrow().is_telemetry_enabled()
-            && !self
-                .auth_manager
-                .current_or_expired()
-                .is_some_and(|a| a.is_zdr_team())
+        self.cfg
+            .borrow()
+            .product_analytics_enabled(self.auth_manager.current_or_expired().as_ref())
     }
     /// Re-sync the `Send` mirror of `cfg.is_trace_upload_enabled()` that the
     /// per-session collection gates read (`cfg` is `!Send`; the gates run on
@@ -2184,7 +2291,7 @@ impl MvpAgent {
             // The OAuth-only client never sends the static field; the
             // live identity-anchored resolver below is the sole bearer
             // source, so don't copy the token here.
-            api_key: String::new(),
+            api_key: None,
             base_url: crate::codex_auth::inference_base_url(),
             extra_headers: headers,
             api_key_provider: Some(crate::codex_auth::image_api_key_provider(credentials)),
@@ -2196,10 +2303,8 @@ impl MvpAgent {
         }
     }
 
-    /// Both BYOK and session (OAuth) users go direct to `xai_api_base_url`.
-    /// `sampling_config.api_key` carries the OAuth bearer for session users (the
-    /// `api_key_provider` refreshes it per request), so IC authenticates and
-    /// meters Imagine usage per-user.
+    /// Direct to `xai_api_base_url` so IC authenticates and meters Imagine per user; the bearer rule lives in
+    /// `media_tool_config`.
     pub(super) fn prepare_image_gen_config(
         &self,
     ) -> xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig {
@@ -2235,36 +2340,23 @@ impl MvpAgent {
             return self.openai_image_gen_config(&credentials);
         }
 
-        let Some(api_key) = self.xai_media_api_key() else {
+        // Fork gate: only an xAI bearer (session or stored) enables the Grok
+        // route, so a foreign-issuer session never reaches api.x.ai with the
+        // wrong credential.
+        let credentials = self.media_tool_credentials();
+        if credentials.static_bearer.is_none() {
             return ImageGenConfig::Disabled;
-        };
-        let tier_restricted = self.is_tier_restricted_capability();
-        let cfg = self.cfg.borrow();
-        let base_url = cfg.endpoints.xai_api_base_url.clone();
-        let version = cfg
-            .client_version
-            .clone()
-            .unwrap_or_else(|| xai_grok_version::version().to_string());
-        let alpha_test_key = cfg.endpoints.alpha_test_key.clone();
-        let mut headers = indexmap::IndexMap::new();
-        headers.insert("user-agent".to_string(), format!("xai-grok-build/{version}"));
-        inject_proxy_headers(
-            &mut headers,
-            cfg.client_version.as_deref(),
-            alpha_test_key.as_deref(),
-            &base_url,
-        );
-        ImageGenConfig::Enabled {
-            provider,
-            api_key,
-            base_url,
-            extra_headers: headers,
-            api_key_provider: None,
-            image_gen_enabled: cfg.resolve_image_gen().value,
-            image_edit_enabled: cfg.resolve_image_edit().value,
-            model_override: cfg.resolve_image_gen_model_override(),
-            edit_model_override: cfg.resolve_image_edit_model_override(),
-            tier_restricted,
+        }
+        crate::agent::media_tool_config::image_gen_config(&self.cfg.borrow(), &credentials)
+    }
+    /// `tier_restricted` keeps the tools advertised so the model can nudge; the call short-circuits with the SuperGrok
+    /// upsell. Fails open; see `is_tier_restricted_capability`.
+    fn media_tool_credentials(
+        &self,
+    ) -> crate::agent::media_tool_config::MediaToolCredentials {
+        crate::agent::media_tool_config::MediaToolCredentials {
+            static_bearer: self.xai_media_api_key(),
+            tier_restricted: self.is_tier_restricted_capability(),
         }
     }
     /// Build deploy-service config. The tool talks directly to the deployer service.
@@ -2274,49 +2366,17 @@ impl MvpAgent {
         use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
         AppBuilderDeployerConfig::Disabled
     }
-    /// Build video generation config. Video tools call the xAI API directly.
+    /// See [`Self::prepare_image_gen_config`] for the bearer rule.
     pub(super) fn prepare_video_gen_config(
         &self,
     ) -> xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig {
         use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
-        let cfg = self.cfg.borrow();
-        if !cfg.resolve_video_gen().value {
+        // Same fork gate as the Grok image route: no xAI bearer, no video tools.
+        let credentials = self.media_tool_credentials();
+        if credentials.static_bearer.is_none() {
             return VideoGenConfig::Disabled;
         }
-        let Some(api_key) = self.xai_media_api_key() else {
-            return VideoGenConfig::Disabled;
-        };
-        let tier_restricted = self.is_tier_restricted_capability();
-        let zdr_video_output_s3 = cfg
-            .disable_zdr_incompatible_tools
-            .then(|| cfg.zdr_video_output_s3.clone())
-            .flatten()
-            .filter(|s3| s3.is_valid());
-        if cfg.disable_zdr_incompatible_tools && zdr_video_output_s3.is_none() {
-            tracing::info!("video_gen disabled by tools.disable_zdr_incompatible_tools");
-            return VideoGenConfig::Disabled;
-        }
-        let base_url = cfg.endpoints.xai_api_base_url.clone();
-        let version = cfg
-            .client_version
-            .clone()
-            .unwrap_or_else(|| xai_grok_version::version().to_string());
-        let alpha_test_key = cfg.endpoints.alpha_test_key.clone();
-        let mut headers = indexmap::IndexMap::new();
-        headers.insert("user-agent".to_string(), format!("xai-grok-build/{version}"));
-        inject_proxy_headers(
-            &mut headers,
-            cfg.client_version.as_deref(),
-            alpha_test_key.as_deref(),
-            &base_url,
-        );
-        VideoGenConfig::Enabled {
-            api_key,
-            base_url,
-            extra_headers: headers,
-            zdr_video_output_s3: zdr_video_output_s3.map(Box::new),
-            tier_restricted,
-        }
+        crate::agent::media_tool_config::video_gen_config(&self.cfg.borrow(), &credentials)
     }
     pub(super) fn prepare_web_search_config(&self) -> config::PreparedWebSearchConfig {
         if self.cfg.borrow().disable_web_search {
@@ -2353,7 +2413,7 @@ impl MvpAgent {
             &self.cfg.borrow().endpoints,
         )
         .and_then(|mut resolved| {
-            inject_proxy_headers(
+            crate::agent::proxy_headers::inject_proxy_headers(
                 &mut resolved.extra_headers,
                 resolved.client_version.as_deref(),
                 alpha_test_key.as_deref(),
@@ -2497,7 +2557,8 @@ impl MvpAgent {
                 "trace_upload_status"
             );
         }
-        let (subagent_event_tx, subagent_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (subagent_coordinator_sender, subagent_event_rx) = subagent_coordinator::subagent_channels();
+        let subagent_event_tx = subagent_coordinator_sender.event_sender().0.clone();
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
             activity,
@@ -2563,6 +2624,15 @@ impl MvpAgent {
                 ),
             ),
             subagent_event_tx,
+            subagent_coordinator_sender,
+            subagent_sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                crate::config::SubagentsConfig::resolve_sampling_limit(
+                    std::env::var(crate::config::SubagentsConfig::ENV_SAMPLING_LIMIT).ok().as_deref(),
+                    cfg.subagents.sampling_limit,
+                    cfg.remote_settings.as_ref().and_then(|settings| settings.subagents_sampling_limit),
+                    cfg.subagents_max_concurrent,
+                ),
+            )),
             subagent_event_rx: RefCell::new(Some(subagent_event_rx)),
             subagent_presentation: RefCell::new(
                 crate::agent::subagent::SubagentPresentation::new(),
@@ -2709,6 +2779,9 @@ impl MvpAgent {
                 continue;
             }
             if busy {
+                if let Some(handle) = self.resident_handle(&id) {
+                    handle.set_status_line_wanted(false);
+                }
                 self.set_session_live_state(&id, SessionLiveState::Working);
                 kept_resident += 1;
                 tracing::info!(
@@ -2968,8 +3041,8 @@ impl MvpAgent {
         &self,
         subagent_id: &str,
     ) -> xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .cancel(subagent_id)
             .await
@@ -2980,8 +3053,8 @@ impl MvpAgent {
     ) -> Vec<
         xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .list_running(parent_session_id)
             .await
@@ -2992,8 +3065,8 @@ impl MvpAgent {
     ) -> Option<
         xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .inspect(subagent_id)
             .await
@@ -3006,8 +3079,8 @@ impl MvpAgent {
     ) -> Option<
         xai_grok_tools::implementations::grok_build::task::types::SubagentSnapshot,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .query(subagent_id, block, timeout_ms)
             .await
@@ -3017,8 +3090,8 @@ impl MvpAgent {
         parent_session_id: &str,
         prompt_id: &str,
     ) -> Vec<crate::upload::trace::SubagentSpawnedRef> {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .spawned_refs_for_prompt(parent_session_id, prompt_id)
             .await
@@ -3436,6 +3509,16 @@ impl MvpAgent {
                 reasoning_effort_meta_value(override_effort),
             );
             info.meta = Some(map);
+        }
+        if let Some(window) = session_id
+            .and_then(|sid| self.resident_handle(sid))
+            .and_then(|handle| std::num::NonZeroU64::new(handle.context_window_selection.load(std::sync::atomic::Ordering::Relaxed)))
+            && let Some(info) = available_models.iter_mut().find(|info| info.model_id == model_id)
+        {
+            info.meta.get_or_insert_default().insert(
+                xai_grok_sampling_types::CONTEXT_WINDOW_META_KEY.to_owned(),
+                xai_grok_sampling_types::context_window_meta_value(window),
+            );
         }
         acp::SessionModelState::new(model_id, available_models)
     }
@@ -4025,6 +4108,29 @@ impl MvpAgent {
     }
     /// Extract per-client terminal/fs capabilities from request `_meta`
     /// (injected by the leader). Falls back to the shared `init` OnceCell.
+    pub(super) fn resolve_status_line_capability(
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) -> bool {
+        meta.and_then(|meta| meta.get(xai_grok_status_line::CLIENT_STATUS_LINE_META))
+            .or_else(|| init.client_capabilities.meta.as_ref()
+                .and_then(|meta| meta.get(xai_grok_status_line::STATUS_LINE_CAPABILITY)))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn attach_status_line(
+        &self,
+        session_id: &acp::SessionId,
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) {
+        if let Some(handle) = self.resident_handle(session_id) {
+            handle.set_status_line_wanted(Self::resolve_status_line_capability(meta, init));
+            handle.request_status_snapshot();
+        }
+    }
+
     pub(super) fn resolve_client_io_caps(
         meta: Option<&acp::Meta>,
         init: &acp::InitializeRequest,
@@ -4079,12 +4185,14 @@ impl MvpAgent {
             resolved_tool_policy_override,
             persist_initial_model,
             session_meta,
+            persisted_agent_profile,
             model_agent_type,
             session_model_id,
             session_yolo_mode,
             session_auto_mode,
             session_swarm_mode,
             prompt_display_cwd,
+            is_chat_kind,
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
@@ -4258,11 +4366,13 @@ impl MvpAgent {
             }
             _ => None,
         };
+        let session_env_timer = crate::instrumentation_timer!("session.spawn_and_register.session_env");
         let mut session_env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             cwd.as_path(),
             project_env_trusted,
         );
         session_env.extend(envrc.join().await);
+        drop(session_env_timer);
         if no_color {
             session_env.extend(crate::terminal::no_color_env());
         } else {
@@ -4288,6 +4398,7 @@ impl MvpAgent {
                     )
             })?;
         tool_ctx.subagent_event_tx = Some(self.subagent_event_tx.clone());
+        tool_ctx.subagent_coordinator_sender = Some(self.subagent_coordinator_sender.clone());
         tool_ctx.synthetic_trace_tx = self
             .subagent_presentation
             .borrow()
@@ -4343,6 +4454,10 @@ impl MvpAgent {
             .cfg
             .borrow()
             .resolve_compaction_verbatim_input();
+        let long_reasoning_reminder = self
+            .cfg
+            .borrow()
+            .resolve_long_reasoning_reminder();
         let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
         let remote_compaction_v2 = self.cfg.borrow().is_remote_compaction_v2_enabled();
@@ -4367,7 +4482,8 @@ impl MvpAgent {
         );
         let skills = self.cfg.borrow().skills.clone();
         let compat = self.cfg.borrow().compat_resolved;
-        let acp_agent_profile = parse_agent_profile_from_meta(session_meta);
+        let acp_agent_profile = parse_agent_profile_from_meta(session_meta)
+            .or(persisted_agent_profile);
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());
@@ -4756,6 +4872,7 @@ impl MvpAgent {
                     system_prompt_label,
                     compaction_mode,
                     compaction_verbatim_input,
+                    long_reasoning_reminder,
                     compaction_tool_choice,
                     two_pass_enabled,
                     remote_compaction_v2,
@@ -4859,9 +4976,17 @@ impl MvpAgent {
                     None,
                     max_turns,
                     None,
+                    {
+                        let cfg = self.cfg.borrow();
+                        cfg.resolve_subagent_model_inheritance()
+                    },
+                    is_chat_kind,
+                    None,
                 )
                 .await?
         };
+        handle.set_status_line_wanted(Self::resolve_status_line_capability(session_meta, init));
+        handle.request_status_snapshot();
         self.session_registry.set_thread(&session_info.id, session_thread);
         tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);

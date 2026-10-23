@@ -589,12 +589,11 @@ fn storage_view_follows_journal_authority_and_fails_closed_without_it() {
         Some(session_dir(temp.path(), "/a", "card"))
     );
     create_source(temp.path(), "/b", "card", 0);
-    assert_eq!(
+    assert!(
         RelocationView::load(temp.path())
             .unwrap()
             .find_persisted_session_dir("card")
-            .unwrap(),
-        None
+            .is_err()
     );
     fs::create_dir_all(session_dir(temp.path(), "/a", ".hidden")).unwrap();
     assert!(
@@ -630,22 +629,27 @@ fn hinted_replay_skips_non_authoritative_source_while_journal_exists() {
     .unwrap();
 
     let mut texts = Vec::new();
-    let emission = super::super::stream_replay_updates_at_hinted(
-        sid,
-        temp.path(),
-        super::super::ReplayPathHint {
-            parent_cwd: Some(Path::new("/source")),
-            child_cwd: None,
-        },
-        |update| {
-            if let acp::SessionUpdate::UserMessageChunk(chunk) = update
-                && let acp::ContentBlock::Text(text) = chunk.content
-            {
-                texts.push(text.text);
-            }
-        },
-    )
-    .unwrap();
+    let emission =
+        super::super::stream_replay_updates_at_hinted(
+            sid,
+            temp.path(),
+            super::super::ReplayPathHint {
+                parent_cwd: Some(Path::new("/source")),
+                child_cwd: None,
+                ..Default::default()
+            },
+            |update| {
+                if let super::super::ReplayedUpdate::Acp(
+                    acp::SessionUpdate::UserMessageChunk(chunk),
+                    _,
+                ) = update
+                    && let acp::ContentBlock::Text(text) = chunk.content
+                {
+                    texts.push(text.text);
+                }
+            },
+        )
+        .unwrap();
     assert_eq!(emission, super::super::ReplayEmission::Emitted);
     assert_eq!(
         texts,
@@ -686,6 +690,225 @@ fn cwd_scoped_storage_view_fails_for_missing_authority_in_requested_cwd() {
     let view = RelocationView::load(temp.path()).unwrap();
     assert!(view.session_dirs(Some("/requested")).is_err());
     assert!(view.session_dirs(Some("/other")).unwrap().is_empty());
+}
+
+#[test]
+fn incomplete_workspace_scan_keeps_listing_but_fails_closed_for_ambiguous_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let good = create_source(temp.path(), "/visible", "duplicate", 0);
+    let hidden = create_source(temp.path(), "/unreadable", "duplicate", 0);
+    let visible_unique = create_source(temp.path(), "/visible", "unique", 0);
+    create_source(temp.path(), "/visible", "journalled", 0);
+    create_source(temp.path(), "/unreadable", "journalled", 0);
+    let journal = RelocationJournal::test_new(
+        "journalled",
+        "/visible",
+        "/target",
+        RelocationPhase::Prepared,
+    );
+    super::journal::write(temp.path(), &journal, None).unwrap();
+    let blocked = hidden.parent().unwrap();
+    let root = temp.path().join("sessions");
+    let view = RelocationView::load_for_sessions_root_with(&root, |path| {
+        if path == blocked {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            fs::read_dir(path)
+        }
+    })
+    .unwrap();
+
+    let listed = view.session_dirs(None).unwrap();
+    let (listing, complete) = view
+        .listing_dirs_with_completeness(None, &Default::default())
+        .unwrap();
+    assert!(!complete);
+    assert!(listing.contains(&good));
+    assert!(listed.contains(&good));
+    assert!(listed.contains(&visible_unique));
+    assert!(view.session_dirs(Some("/visible")).unwrap().contains(&good));
+    assert!(view.session_dirs(Some("/unreadable")).is_err());
+    assert!(view.find_persisted_session_dir("duplicate").is_err());
+    assert!(view.find_any_session_dir("duplicate").is_err());
+    assert_eq!(
+        view.find_persisted_session_dir("unique").unwrap(),
+        Some(visible_unique)
+    );
+    assert_eq!(
+        view.find_persisted_session_dir("journalled").unwrap(),
+        Some(session_dir(temp.path(), "/visible", "journalled")),
+        "a valid journal, not scan completeness, selects authority"
+    );
+    fs::remove_dir_all(good).unwrap();
+    assert!(view.find_persisted_session_dir("duplicate").is_err());
+}
+
+#[test]
+fn discovery_root_and_journal_authority_remain_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = create_source(temp.path(), "/source", "relocating", 0);
+    let journal = RelocationJournal::test_new(
+        "relocating",
+        "/source",
+        "/target",
+        RelocationPhase::Prepared,
+    );
+    super::journal::write(temp.path(), &journal, None).unwrap();
+    let root = temp.path().join("sessions");
+    assert!(
+        RelocationView::load_for_sessions_root_with(&root, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .is_err()
+    );
+    let blocked = source.parent().unwrap();
+    let view = RelocationView::load_for_sessions_root_with(&root, |path| {
+        if path == blocked {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            fs::read_dir(path)
+        }
+    })
+    .unwrap();
+    assert!(view.find_persisted_session_dir("relocating").is_err());
+    assert!(view.session_dirs(None).is_err());
+}
+
+#[tokio::test]
+async fn storage_listing_skips_unreadable_workspace_and_malformed_summaries() {
+    use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
+
+    struct RestorePermissions(PathBuf, fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let good = create_source(temp.path(), "/good", "healthy", 0);
+    let malformed = create_source(temp.path(), "/good", "malformed", 0);
+    fs::write(malformed.join("summary.json"), b"{broken").unwrap();
+    let unreadable_session = create_source(temp.path(), "/good", "unreadable-session", 0);
+    let unreadable_workspace = create_source(temp.path(), "/bad", "hidden", 0)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let _restore_workspace = RestorePermissions(
+        unreadable_workspace.clone(),
+        fs::metadata(&unreadable_workspace).unwrap().permissions(),
+    );
+    let _restore_session = RestorePermissions(
+        unreadable_session.clone(),
+        fs::metadata(&unreadable_session).unwrap().permissions(),
+    );
+    fs::set_permissions(&unreadable_workspace, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&unreadable_session, fs::Permissions::from_mode(0)).unwrap();
+    // Privileged users can bypass mode bits. The injected-failure test above
+    // still covers scan behavior when a real permission denial is unavailable.
+    if fs::read_dir(&unreadable_workspace).is_ok() {
+        return;
+    }
+    let adapter = JsonlStorageAdapter::with_root(temp.path().to_path_buf());
+    let all = adapter.list_sessions(None).await.unwrap();
+    let scoped = adapter.list_sessions(Some("/good")).await.unwrap();
+    let recent = adapter.list_sessions_recent(10).await.unwrap();
+    assert!(adapter.list_sessions(Some("/bad")).await.is_err());
+    for rows in [all, scoped, recent] {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].info.id.0.as_ref(), "healthy");
+    }
+    assert!(good.join("summary.json").exists());
+}
+
+#[tokio::test]
+async fn failed_relocations_are_excluded_from_listing_and_direct_lookup_stays_strict() {
+    use crate::session::storage::jsonl::JsonlStorageAdapter;
+    let temp = tempfile::tempdir().unwrap();
+    create_source(temp.path(), "/healthy", "healthy", 0);
+    let journal =
+        RelocationJournal::test_new("broken", "/source", "/target", RelocationPhase::Prepared);
+    journal::write(temp.path(), &journal, None).unwrap();
+    let storage = RelocationStorage::new(temp.path().into());
+    let excluded = storage.recover_all_for_listing().unwrap();
+    assert!(excluded.contains("broken"));
+    assert!(storage.recover_all().is_err());
+    let view = RelocationView::load(temp.path()).unwrap();
+    assert!(view.find_persisted_session_dir("broken").is_err());
+    let adapter = JsonlStorageAdapter::with_root(temp.path().into());
+    let (rows, complete) = adapter
+        .list_sessions_with_completeness(None, excluded.clone())
+        .await
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].info.id.0.as_ref(), "healthy");
+    let recent = adapter
+        .list_sessions_recent_with_exclusions(10, excluded)
+        .await
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].info.id.0.as_ref(), "healthy");
+}
+
+#[tokio::test]
+async fn listing_excludes_failed_finalization_even_after_journal_removal() {
+    use crate::session::storage::jsonl::JsonlStorageAdapter;
+    let temp = tempfile::tempdir().unwrap();
+    create_source(temp.path(), "/source", "uncertain", 0);
+    create_source(temp.path(), "/healthy", "healthy", 0);
+    let journal = RelocationJournal::test_new(
+        "uncertain",
+        "/source",
+        "/target",
+        RelocationPhase::RolledBack,
+    );
+    // Rollback synchronizes the target parent even when the target is absent.
+    // A real relocation creates this parent before it writes the journal.
+    fs::create_dir_all(
+        session_dir(temp.path(), "/target", "uncertain")
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    journal::write(temp.path(), &journal, None).unwrap();
+    let base = RelocationStorage::new(temp.path().into());
+    let lease = base.acquire("uncertain").unwrap();
+    let (action, _) = base
+        .recover(&lease)
+        .expect("fixture must reach a terminal proof");
+    assert_eq!(action, RecoveryAction::VerifyRolledBack);
+    drop(lease);
+    let faulted =
+        RelocationStorage::with_fault(temp.path().into(), TestFault::FinalizeNamespaceBarrier);
+    let excluded = faulted.recover_all_for_listing().unwrap();
+    assert!(excluded.contains("uncertain"));
+    assert!(!journal::journal_path(temp.path(), "uncertain").exists());
+    let adapter = JsonlStorageAdapter::with_root(temp.path().into());
+    let (rows, complete) = adapter
+        .list_sessions_with_completeness(None, excluded)
+        .await
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].info.id.0.as_ref(), "healthy");
+}
+
+#[tokio::test]
+async fn malformed_summary_marks_listing_incomplete() {
+    use crate::session::storage::jsonl::JsonlStorageAdapter;
+    let temp = tempfile::tempdir().unwrap();
+    create_source(temp.path(), "/cwd", "healthy", 0);
+    let bad = create_source(temp.path(), "/cwd", "bad", 0);
+    fs::write(bad.join("summary.json"), b"{").unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp.path().into());
+    let (rows, complete) = adapter
+        .list_sessions_with_completeness(None, Default::default())
+        .await
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].info.id.0.as_ref(), "healthy");
 }
 
 #[test]

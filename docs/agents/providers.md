@@ -27,6 +27,24 @@ This page is the agent-oriented map: where code lives, how to change it safely, 
 Types: `xai-grok-sampling-types` (`ApiBackend`, `ModelProvider`, `ProviderProfile`, `ToolMode`, …).  
 Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 
+### Retry and child-session integration
+
+The 1.0.13 shell integration adds request-keyed stream-drain barriers and
+bounded turn-level recovery without changing provider ownership. Retry attempts
+must retain the selected route, credential resolver, opaque-history policy and
+monotonic export boundary. Auth refresh remains provider-specific; transient
+recovery is not permission to fall back to a different provider.
+
+Foreground root turns can use transient recovery unless disabled by resolved
+configuration (`features.turn_transient_retry`,
+`OPENGROK_TRANSIENT_TURN_RETRY`, requirements or remote policy). Current
+attachment interactivity is checked at execution. Child 429 waits use a bounded
+attempt/time budget and a shared sampling semaphore, releasing the permit while
+waiting. Child tool filtering removes root-only workflow/human-question/parent
+message tools while preserving provider-native and flat-team capabilities.
+See [`../upstream/1.0.13-parity.md`](../upstream/1.0.13-parity.md) for outstanding
+compile and regression-test gates.
+
 ## Built-in mapping
 
 | Provider | Backends | Dialect | Hosted tools | Session auth | xAI-only services |
@@ -143,6 +161,27 @@ accepts standard client function tools, has no Responses dialect, hosted
 tools, or native search, and must not receive xAI credentials or xAI-only
 exports.
 
+### Custom endpoint (user-supplied server address)
+
+`custom` (`ModelProvider::Custom`, profile `CUSTOM`) is not a service but the
+profile for an address the user typed. There is no stored credential scope and no
+curated catalog: each wizard-saved `[model.<key>]` row owns its `base_url`,
+`api_backend`, `auth_scheme`, context window, and credential
+(`api_key`/`env_key`). Provider identity still comes from model metadata; the
+host name is never consulted to pick a protocol or a credential.
+
+Backends: Chat Completions, Responses, and Messages. The Responses variant is the
+`OpenAi` dialect (vanilla, stateless, `store: false`), which strips
+`previous_response_id`, cache-key affinity, service tier, `x-grok-*` fields, and
+any background/stream-options state, and replays no opaque history. Code Mode,
+hosted tools, native web search, and xAI services are all off.
+
+Discovery is `GET {base}/models`: `Authorization: Bearer` for the OpenAI formats,
+`x-api-key` + `anthropic-version` for Messages, no redirect following, 20 s
+timeout, key-redacted error excerpts. `open-grok/custom-providers/discover` only
+reads; `open-grok/custom-models/upsert-many` is what persists the user's
+selection as one atomic config write.
+
 ## Layer map (paths)
 
 ```text
@@ -202,6 +241,11 @@ OpenCode Go
 OpenRouter
   xai-grok-shell/src/openrouter_models.rs       # live /models catalog + per-model efforts
   auth/storage.rs                               # openrouter::api_key (generic provider scope)
+
+Custom endpoint (no credential store, no curated catalog)
+  xai-grok-shell/src/custom_providers.rs        # address rules, wire formats, GET /models
+  xai-grok-shell/src/custom_models.rs           # [model.<key>] rows incl. auth_scheme
+  xai-grok-shell/src/util/config/persist.rs     # single/batch [model.*] table writes
 
 Session routing / tools / compaction
   xai-grok-shell/src/session/
@@ -355,6 +399,8 @@ Follow [`../provider-architecture.md`](../provider-architecture.md):
 ## Tests (provider-related)
 
 ```sh
+cargo test --locked -p xai-grok-shell --lib custom_providers
+cargo test --locked -p xai-grok-shell --lib custom_models
 cargo test --locked -p xai-grok-sampling-types
 cargo test --locked -p xai-grok-sampler --test test_actor
 cargo test --locked -p xai-grok-shell --test codex_auth_contract
@@ -378,6 +424,9 @@ Also: shell `session/acp_session_tests/` (auth isolation, model switch, compacti
 | `previous_response_id` on Codex HTTP full-input | Diverges from codex-rs HTTP contract |
 | Replaying Codex compaction to xAI | Opaque items / policy violation |
 | Forgetting export boundary on subagent | Parent tree reopens xAI export paths |
+| Inferring a custom endpoint's protocol or auth header from its host | Proxies and gateways speak any format; only the saved `api_backend` / `auth_scheme` may decide |
+| Deriving `auth_scheme` for rows that are not `provider = "custom"` | Silently switches a built-in or first-party model to `x-api-key` |
+| Following a redirect during BYO discovery | Sends the user's key to a host they never typed |
 
 ## See also
 

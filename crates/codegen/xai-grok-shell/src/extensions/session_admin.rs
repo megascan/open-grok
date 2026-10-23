@@ -28,7 +28,9 @@ use serde::Deserialize;
 use super::{ExtResult, parse_params, to_raw_response};
 use crate::agent::MvpAgent;
 use crate::leader::protocol::InternalMethod;
-use crate::session::persistence::list_summaries;
+use crate::session::persistence::{
+    ValidatedRenameTitle, list_summaries_for_mutation, validate_rename_title,
+};
 use crate::session::storage::StorageAdapter;
 use crate::session::storage::jsonl::JsonlStorageAdapter;
 use crate::session::unified_list::SessionKind;
@@ -92,49 +94,32 @@ struct SessionRenameRequest {
 
 /// Handles renaming a session.
 async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
-    use crate::session::persistence::{
-        MAX_TITLE_BYTES, MAX_TITLE_SCALARS, PersistenceMsg, sanitize_rename_title,
+    use crate::session::persistence::PersistenceMsg;
+
+    let req: SessionRenameRequest = parse_params(args)?;
+    if req.reset_to_auto && req.kind == SessionKind::Chat {
+        return Err(
+            acp::Error::invalid_request().data("chat conversations have no auto-title to restore")
+        );
+    }
+    // Validation (blank/`resetToAuto` mismatch limits, C0/C1 control
+    // stripping) lives in `validate_rename_title` (single authority) so a
+    // `/rename` OSC/CSI payload cannot persist on RemoteSync.
+    let title = match validate_rename_title(&req.title, req.reset_to_auto)? {
+        ValidatedRenameTitle::ResetToAuto => {
+            return reset_session_title_to_auto(agent, &req.session_id, req.cwd.as_deref()).await;
+        }
+        ValidatedRenameTitle::Manual(title) => title,
     };
 
-    let mut req: SessionRenameRequest = parse_params(args)?;
-
-    if req.reset_to_auto {
-        if req.kind == SessionKind::Chat {
-            return Err(acp::Error::invalid_request()
-                .data("chat conversations have no auto-title to restore"));
-        }
-        if !sanitize_rename_title(&req.title).is_empty() {
-            return Err(
-                acp::Error::invalid_request().data("title must be empty when resetToAuto is set")
-            );
-        }
-        return reset_session_title_to_auto(agent, &req.session_id, req.cwd.as_deref()).await;
-    }
-    // Manual titles must be non-blank: `Summary.title_is_manual` binds to a
-    // real `generated_title`, so reject whitespace-only input at the boundary.
-    // Strip C0/C1 controls here (single authority) so a `/rename` OSC/CSI
-    // payload cannot persist on RemoteSync.
-    if req.title.len() > MAX_TITLE_BYTES {
-        return Err(acp::Error::invalid_request().data("title too large"));
-    }
-    req.title = sanitize_rename_title(&req.title).into_owned();
-    if req.title.is_empty() {
-        return Err(acp::Error::invalid_request().data("title must not be blank"));
-    }
-    if req.title.chars().count() > MAX_TITLE_SCALARS {
-        return Err(acp::Error::invalid_request().data(format!(
-            "title too long (max {MAX_TITLE_SCALARS} characters after removing control characters)"
-        )));
-    }
-
     if req.kind == SessionKind::Chat {
-        return rename_chat_conversation(agent, &req.session_id, &req.title).await;
+        return rename_chat_conversation(agent, &req.session_id, &title).await;
     }
 
     let session_id = acp::SessionId::new(Arc::from(req.session_id.as_str()));
 
     // Find the session info, scoping to cwd if provided
-    let summaries = list_summaries(req.cwd.as_deref())
+    let summaries = list_summaries_for_mutation(req.cwd.as_deref())
         .await
         .map_err(|e| acp::Error::internal_error().data(format!("failed to list sessions: {e}")))?;
 
@@ -157,7 +142,7 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     // Update the session title in local storage
     let storage = JsonlStorageAdapter::default();
     storage
-        .update_session_title(&info, req.title.clone())
+        .update_session_title(&info, title.clone())
         .await
         .map_err(|e| {
             acp::Error::internal_error().data(format!("failed to update session title: {e}"))
@@ -168,14 +153,17 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     if let Some(handle) = agent.resident_handle(&session_id) {
         let _ = handle
             .persistence_tx
-            .send(PersistenceMsg::ManualTitleRenamed(req.title.clone()));
+            .send(PersistenceMsg::ManualTitleRenamed(title.clone()));
+        let _ = handle
+            .cmd_tx
+            .send(crate::session::commands::SessionCommand::TitleRenamed { manual: true });
     }
 
     // Update session search index with new title
     crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
 
     // Send a SessionSummaryGenerated notification so the TUI updates its title
-    notify_session_title(agent, session_id, &req.title).await;
+    notify_session_title(agent, session_id, &title).await;
 
     if allows_xai_export
         && agent.is_writeback_storage()
@@ -186,7 +174,7 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
         use crate::session::export::ExportedMetadata;
 
         let mut metadata = ExportedMetadata::from_summary(summary);
-        metadata.title = Some(req.title.clone());
+        metadata.title = Some(title.clone());
         metadata.title_is_manual = Some(true);
         metadata.updated_at = Some(chrono::Utc::now().to_rfc3339());
         if let Err(e) = BackendClient::new()
@@ -203,11 +191,11 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
         spawn_registry_title_update(
             agent,
             &req.session_id,
-            registry_title_for_agent(agent, Some(req.title.clone())),
+            registry_title_for_agent(agent, Some(title.clone())),
         );
     }
 
-    tracing::info!(session_id = %req.session_id, title = %req.title, "Session renamed");
+    tracing::info!(session_id = %req.session_id, %title, "Session renamed");
 
     to_raw_response(&serde_json::json!({ "success": true }))
 }
@@ -225,7 +213,7 @@ async fn reset_session_title_to_auto(
 
     let session_id_acp = acp::SessionId::new(Arc::from(session_id));
 
-    let summaries = list_summaries(cwd)
+    let summaries = list_summaries_for_mutation(cwd)
         .await
         .map_err(|e| acp::Error::internal_error().data(format!("failed to list sessions: {e}")))?;
 
@@ -253,6 +241,9 @@ async fn reset_session_title_to_auto(
     if cleared {
         if let Some(handle) = agent.resident_handle(&session_id_acp) {
             let _ = handle.persistence_tx.send(PersistenceMsg::ResetTitleToAuto);
+            let _ = handle
+                .cmd_tx
+                .send(crate::session::commands::SessionCommand::TitleRenamed { manual: false });
         }
         // Non-resident sessions have no persistence actor / RemoteSync.
         // Mirror the rename writeback path so a dormant unpin cannot leave
@@ -368,21 +359,20 @@ async fn notify_session_title_unpinned(agent: &MvpAgent, session_id: acp::Sessio
 /// `SessionSummaryGenerated`. Manual-rename fan-out stamps
 /// `_meta.x.ai/titleIsManual` so followers can set `display_name`.
 async fn notify_session_title(agent: &MvpAgent, session_id: acp::SessionId, title: &str) {
-    use crate::extensions::notification::{
-        SessionNotification, SessionUpdate, title_is_manual_meta,
-    };
-
-    let notification = SessionNotification {
-        session_id: session_id.clone(),
-        update: SessionUpdate::SessionSummaryGenerated {
-            session_summary: title.to_owned(),
-        },
-        meta: Some(title_is_manual_meta()),
-    };
+    let is_resident = agent.is_resident(&session_id);
+    let (notification, info_update) = crate::session::summary::session_title_notifications(
+        session_id,
+        title,
+        crate::session::summary::SessionTitleNotificationKind::Manual,
+    );
     if let Ok(params) = serde_json::value::to_raw_value(&notification) {
         let ext_notification =
             acp::ExtNotification::new("x.ai/session_notification", params.into());
         let _ = agent.gateway.ext_notification(ext_notification).await;
+    }
+
+    if is_resident {
+        agent.gateway.forward_fire_and_forget(info_update);
     }
 }
 
@@ -524,12 +514,11 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
 
     let params: Params = parse_params(args)?;
 
-    let (handle, cwd) = {
+    let cwd = {
         let h = agent
             .resident_handle(&params.session_id)
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-        let cwd = std::path::PathBuf::from(&h.info.cwd);
-        (h, cwd)
+        std::path::PathBuf::from(&h.info.cwd)
     };
 
     let compat = agent.cfg.borrow().compat_resolved;
@@ -542,26 +531,29 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
         &compat,
     );
 
+    // Assign the resident handle's seed before enqueue. The command carries
+    // the same list so the actor updates its own copy when it runs.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    handle
-        .cmd_tx
-        .send(SessionCommand::UpdateMcpServers {
-            mcp_servers: merged,
-            respond_to: tx,
+    let enqueued = agent
+        .with_resident_mut(&params.session_id, |handle| {
+            handle.initial_client_mcp_servers = admitted.clone();
+            handle
+                .cmd_tx
+                .send(SessionCommand::UpdateMcpServers {
+                    mcp_servers: merged,
+                    client_seed: Some(admitted),
+                    respond_to: tx,
+                })
+                .is_ok()
         })
-        .map_err(|_| acp::Error::internal_error().data("session closed"))?;
+        .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+    if !enqueued {
+        return Err(acp::Error::internal_error().data("session closed"));
+    }
 
-    // Wait for the session actor to finish MCP re-initialization.
     rx.await
         .map_err(|_| acp::Error::internal_error().data("session closed"))?
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-
-    // Store the admitted (not raw) client set: hot-reloads re-merge from this
-    // seed, and a raw list would re-spawn a previously rejected vendor server
-    // once on-disk attribution vanishes.
-    agent.with_resident_mut(&params.session_id, |h| {
-        h.initial_client_mcp_servers = admitted;
-    });
 
     ExtMethodResult::success(serde_json::json!({ "ok": true }))
         .to_ext_response()
@@ -725,6 +717,7 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             .cmd_tx
             .send(SessionCommand::UpdateMcpServers {
                 mcp_servers: merged,
+                client_seed: None,
                 respond_to: tx,
             })
             .is_ok()
@@ -848,20 +841,22 @@ async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
             .resident_handle(&id)
             .map(|h| std::path::PathBuf::from(&h.info.cwd))
     });
-    let mut plugins = agent.cfg.borrow().plugins.clone();
-    plugins.merge_claude_enabled_plugins(session_cwd.as_deref());
-    let disk_cfg = plugins.to_discovery_config();
-    // Folder-trust gates repo-local project plugins (hooks/MCP). Resolve and
-    // record the verdict for this cwd (honoring the real remote), then gate
-    // plugins on it.
-    let project_trusted = session_cwd.as_deref().is_some_and(|c| {
-        let remote_settings = agent.cfg.borrow().remote_settings.clone();
-        crate::agent::folder_trust::resolve_and_record(c, remote_settings.as_ref(), false)
-    });
-    // Explicit desktop `x.ai/plugins/reload`: force a full local-install re-copy.
-    agent
-        .plugin_registry_handle()
-        .reload(session_cwd.as_deref(), &disk_cfg, project_trusted, true);
+    // No resident session → the launch dir. Trust gather, config read and the
+    // discovery walk are blocking filesystem work, so they run off the runtime.
+    let cwd = session_cwd.unwrap_or_else(|| agent.launch_cwd().to_path_buf());
+    let remote_settings = agent.cfg.borrow().remote_settings.clone();
+    let handle = agent.plugin_registry_handle().clone();
+    let rebuilt = tokio::task::spawn_blocking(move || {
+        let (project_trusted, disk_cfg) =
+            MvpAgent::registry_build_inputs(&cwd, remote_settings.as_ref());
+        // Explicit desktop `x.ai/plugins/reload`: force a full local-install re-copy.
+        handle.reload(Some(&cwd), &disk_cfg, project_trusted, true)
+    })
+    .await;
+    if let Err(err) = rebuilt {
+        return Err(acp::Error::internal_error().data(format!("plugin reload task failed: {err}")));
+    }
+    agent.mark_plugin_registry_initialized();
 
     // Eagerly fan out the new registry to every live session: each adopts a
     // cwd-correct snapshot (hooks + MCP + skills + client slash-command
@@ -893,43 +888,14 @@ async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
     let availability = agent.command_availability();
 
     // For a given cwd, compute the plugin registry the same way a session would
-    // at spawn time (via build_for_cwd) and the same way reload_plugins_impl does
-    // (ancestor project config walk + vendor compat merge). This is required so
-    // that `x.ai/commands/list` (the pull used by grok-desktop after session
-    // start) returns plugin-provided slash commands for the target cwd.
-    //
-    // The shared snapshot is only populated at agent boot (using process CWD)
-    // and by explicit reloads. In desktop<->docker (and ssh) setups the agent's
-    // launch CWD is unrelated to the user's chosen workspace dir, so relying on
-    // snapshot() alone meant the post-start pull returned no project plugin
-    // skills until the user manually reloaded.
-    let plugin_reg = if let Some(cwd_str) = &req.cwd {
-        let cwd = Path::new(cwd_str);
-
-        // Folder-trust gates repo-local project plugins (hooks/MCP). Resolve and
-        // record the verdict for this cwd (honoring the real remote) BEFORE the
-        // plugins-config read below: that read gates its project-paths merge on
-        // the recorded verdict, and a cold cwd (client-supplied, no session
-        // resolve yet) must not first take the gate's remote-less backstop —
-        // that would record a kill-switch-blind deny no later resolve can lift.
-        let remote_settings = agent.cfg.borrow().remote_settings.clone();
-        let project_trusted =
-            crate::agent::folder_trust::resolve_and_record(cwd, remote_settings.as_ref(), false);
-
-        // Effective [plugins] config (global + ancestor project configs +
-        // vendor compat merge), shared with reload_plugins_impl and the eager
-        // fan-out so the menu agrees with each session's registry for this cwd.
-        let disk_cfg = crate::config::resolve_effective_plugins_config(cwd).to_discovery_config();
-
-        // Fresh discovery for *this* cwd (includes .opengrok/plugins under it, plus
-        // the cli --plugin-dir dirs). Does not mutate the shared snapshot.
-        agent
-            .plugin_registry_handle()
-            .build_for_cwd(cwd, &disk_cfg, &[], project_trusted)
-    } else {
-        // No cwd: global/user skills only (pre-session case). Use the boot snapshot.
-        agent.plugin_registry_handle().snapshot()
-    };
+    // at spawn time (via build_for_cwd). That is also how reload_plugins_impl
+    // computes it (ancestor project config walk and vendor compat merge). This
+    // makes `x.ai/commands/list` return plugin-provided slash commands for the
+    // target cwd. Without a cwd the shared launch-dir snapshot serves the
+    // pre-session case, built on demand from disk.
+    let plugin_reg = agent
+        .plugin_registry_for_cwd(req.cwd.as_deref().map(Path::new))
+        .await;
 
     let response = crate::session::slash_commands::list_commands(
         req.cwd.as_deref(),

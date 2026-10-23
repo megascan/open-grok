@@ -63,7 +63,7 @@ pub(super) fn dispatch_copy_assistant_message(
             if let Some(entry) = agent.scrollback.entry(i)
                 && let RenderBlock::AgentMessage(msg) = &entry.block
             {
-                agent_messages.push(msg.copy_text(false));
+                agent_messages.push(msg.copy_text(true));
             }
         }
 
@@ -413,6 +413,8 @@ pub(super) fn extensions_modal_tab_fetches(
         Effect::FetchSkillsList {
             agent_id,
             session_id: session_id.clone(),
+            refresh: false,
+            fetch: modal.next_skills_fetch(),
         },
         Effect::FetchWorkflowsList {
             agent_id,
@@ -453,6 +455,7 @@ fn extensions_tab_slash_name(tab: crate::views::extensions_modal::ExtensionsTab)
         ExtensionsTab::Plugins => "plugins",
         ExtensionsTab::Marketplace => "marketplace",
         ExtensionsTab::Skills => "skills",
+        ExtensionsTab::Workflows => "workflows",
         ExtensionsTab::McpServers => "mcps",
     }
 }
@@ -559,14 +562,20 @@ pub(super) fn dispatch_open_config_agents_modal(
     if let Some(tab) = initial_tab {
         modal.active_tab = tab;
     }
+    let request_id = modal.begin_plugin_load();
     agent.agents_modal = Some(modal);
+    let mut effects = vec![Effect::LoadAgentsPluginRegistry {
+        agent_id: id,
+        cwd,
+        request_id,
+    }];
     if let Some(session_id) = session_id {
-        return vec![Effect::FetchSessionAgentName {
+        effects.push(Effect::FetchSessionAgentName {
             agent_id: id,
             session_id,
-        }];
+        });
     }
-    vec![]
+    effects
 }
 
 /// `agentType` / `agent_type` from a catalog `ModelInfo` meta blob.
@@ -684,11 +693,7 @@ pub(super) fn handle_hooks_list_loaded(
         modal.hooks_data = match result {
             Ok(response) => {
                 // Default all groups to collapsed.
-                let mut seen = std::collections::HashSet::new();
-                for hook in &response.hooks {
-                    seen.insert(hook.source_dir.clone());
-                }
-                modal.hooks_collapsed_groups = seen;
+                modal.seed_hook_groups_once(&response.hooks);
                 TabDataState::Loaded(response)
             }
             Err(e) => TabDataState::Error(e),
@@ -818,26 +823,40 @@ pub(super) fn handle_marketplace_list_loaded(
 pub(super) fn handle_skills_toggle_done(
     app: &mut AppView,
     agent_id: AgentId,
-    result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+    session_id: acp::SessionId,
+    fetch: u64,
+    result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
 ) -> Vec<Effect> {
-    use crate::views::extensions_modal::TabDataState;
-    if let Some(agent) = app.agents.get_mut(&agent_id)
-        && let Some(ref mut modal) = agent.extensions_modal
-    {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        return vec![];
+    }
+    let Some(modal) = agent.extensions_modal.as_mut() else {
+        return vec![];
+    };
+    let latest = fetch == modal.skills_fetch;
+    if latest {
         modal.pending_action = None;
         modal.pending_entry_index = None;
-        match result {
-            Ok(skills) => {
-                modal.seed_skills_groups_once(&skills);
-                modal.skills_data = TabDataState::Loaded(skills);
-            }
-            Err(e) => {
-                modal.modal_message = Some(crate::views::extensions_modal::ModalMessage::Error(e));
-            }
-        }
     }
-    // The toggle effect already called x.ai/skills/refresh-baseline
-    // which triggers the session to reload skills and push an
-    // AvailableCommandsUpdate notification with the updated list.
+    match result {
+        Ok(listing) if latest => modal.apply_skills_listing(listing),
+        Ok(_) => {
+            // A newer read may have raced the mutation. Read again after the toggle commits.
+            let fetch = modal.next_skills_fetch();
+            return vec![Effect::FetchSkillsList {
+                agent_id,
+                session_id,
+                refresh: true,
+                fetch,
+            }];
+        }
+        Err(error) if latest => {
+            modal.modal_message = Some(crate::views::extensions_modal::ModalMessage::Error(error));
+        }
+        Err(_) => {}
+    }
     vec![]
 }

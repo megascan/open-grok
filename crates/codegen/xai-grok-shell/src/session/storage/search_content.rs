@@ -1,13 +1,13 @@
 //! Extracting searchable text from session update files and turning it
 //! into index documents.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::path::Path;
 
 use super::search_fts::{SessionDoc, SessionSearchIndex};
 use super::{
-    ContentPeek, PromptExtractEvent, RawLinePeek, RawParamsPeek, XAI_SESSION_UPDATE_METHOD,
-    collect_prompts_from_events,
+    ContentPeek, PromptAccumulator, PromptExtractEvent, RawLinePeek, RawParamsPeek,
+    XAI_SESSION_UPDATE_METHOD,
 };
 use crate::session::persistence::Summary;
 use crate::session::wire_tags::{REWIND_MARKER, USER_MESSAGE_CHUNK};
@@ -15,6 +15,8 @@ use crate::session::wire_tags::{REWIND_MARKER, USER_MESSAGE_CHUNK};
 const SEARCH_CONTENT_CHAR_LIMIT: usize = 200_000;
 
 pub(super) fn should_skip_session(updates_path: &Path, max_size: u64) -> bool {
+    // Cheap optimistic guard. The blocking collector also limits decoded
+    // bytes, because a gzip file can be much smaller than its transcript.
     match std::fs::metadata(updates_path) {
         Ok(meta) => meta.len() > max_size,
         Err(_) => false,
@@ -30,6 +32,8 @@ pub(super) enum UpsertOutcome {
     Unchanged {
         bytes_read: u64,
     },
+    /// Decoded content exceeded the bootstrap budget; retained a title-only row.
+    TooLarge,
     /// Storage backend doesn't expose an updates file path.
     NoContent,
 }
@@ -116,15 +120,25 @@ struct ToolLocationPeek<'a> {
 pub(super) fn collect_all_indexable_content_single_pass(
     updates_path: &Path,
 ) -> io::Result<(String, u64)> {
-    let file = match std::fs::File::open(updates_path) {
+    Ok(collect_all_indexable_content_bounded(updates_path, u64::MAX)?.unwrap_or_default())
+}
+
+/// Return `None` when decoded input exceeds `max_bytes`. The bound is applied
+/// during streaming, before allocating an unbounded line from a gzip file.
+/// Callers perform this work on a blocking thread.
+pub(super) fn collect_all_indexable_content_bounded(
+    updates_path: &Path,
+    max_bytes: u64,
+) -> io::Result<Option<(String, u64)>> {
+    let file = match xai_file_utils::session_file::open(updates_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((String::new(), 0)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some((String::new(), 0))),
         Err(e) => return Err(e),
     };
-    let bytes_read = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let reader = io::BufReader::new(file);
+    let mut reader = io::BufReader::new(file.take(max_bytes.saturating_add(1)));
+    let mut bytes_read = 0u64;
 
-    let mut prompt_events: Vec<PromptExtractEvent> = Vec::new();
+    let mut prompts = PromptAccumulator::default();
     let mut assistant_texts: Vec<String> = Vec::new();
     let mut current_assistant: String = String::new();
     let mut tool_meta: Vec<String> = Vec::new();
@@ -148,17 +162,23 @@ pub(super) fn collect_all_indexable_content_single_pass(
         }
     };
 
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(error = %e, "skipping unreadable line in single-pass content collector");
-                // An I/O error is a turn boundary, matching the
-                // iterator-based collectors.
-                flush_assistant(&mut current_assistant, &mut assistant_texts);
-                prompt_events.push(PromptExtractEvent::NotUserMessage);
-                continue;
-            }
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Propagate gzip corruption, while retaining the existing behavior
+        // of skipping individual malformed UTF-8 records.
+        let count = reader.read_until(b'\n', &mut line)?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count as u64;
+        if bytes_read > max_bytes {
+            return Ok(None);
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            flush_assistant(&mut current_assistant, &mut assistant_texts);
+            prompts.push(PromptExtractEvent::NotUserMessage);
+            continue;
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -200,20 +220,20 @@ pub(super) fn collect_all_indexable_content_single_pass(
                                 .as_ref()
                                 .is_some_and(|m| m.host_turn == Some(true))
                         {
-                            prompt_events.push(PromptExtractEvent::NotUserMessage);
+                            prompts.push(PromptExtractEvent::NotUserMessage);
                         } else {
                             let prompt_index = peek
                                 .update
                                 .meta
                                 .as_ref()
                                 .and_then(|m| m.prompt_index.map(|v| v as usize));
-                            prompt_events.push(PromptExtractEvent::UserTextChunk {
+                            prompts.push(PromptExtractEvent::UserTextChunk {
                                 text: text.into_owned(),
                                 prompt_index,
                             });
                         }
                     } else {
-                        prompt_events.push(PromptExtractEvent::NotUserMessage);
+                        prompts.push(PromptExtractEvent::NotUserMessage);
                     }
                 }
                 Some("agent_message_chunk") => {
@@ -242,11 +262,11 @@ pub(super) fn collect_all_indexable_content_single_pass(
                             assistant_chars += take;
                         }
                     }
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 Some("agent_thought_chunk") => {
                     // Same assistant turn: not indexed, but must not flush.
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 Some("tool_call") => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
@@ -286,11 +306,11 @@ pub(super) fn collect_all_indexable_content_single_pass(
                             }
                         }
                     }
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
                 _ => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
             }
         } else {
@@ -300,14 +320,14 @@ pub(super) fn collect_all_indexable_content_single_pass(
                     if let Some(ref u) = update_peek
                         && let Some(idx) = u.target_prompt_index
                     {
-                        prompt_events.push(PromptExtractEvent::RewindTo(idx));
+                        prompts.push(PromptExtractEvent::RewindTo(idx));
                     } else {
-                        prompt_events.push(PromptExtractEvent::NotUserMessage);
+                        prompts.push(PromptExtractEvent::NotUserMessage);
                     }
                 }
                 _ => {
                     flush_assistant(&mut current_assistant, &mut assistant_texts);
-                    prompt_events.push(PromptExtractEvent::NotUserMessage);
+                    prompts.push(PromptExtractEvent::NotUserMessage);
                 }
             }
         }
@@ -320,7 +340,7 @@ pub(super) fn collect_all_indexable_content_single_pass(
         }
     }
 
-    let prompts = collect_prompts_from_events(prompt_events.into_iter());
+    let prompts = prompts.finish();
 
     let parts = [
         prompts.join("\n\n"),
@@ -338,7 +358,7 @@ pub(super) fn collect_all_indexable_content_single_pass(
         joined = joined[start..].to_string();
     }
 
-    Ok((joined, bytes_read))
+    Ok(Some((joined, bytes_read)))
 }
 
 pub(super) fn build_session_doc(summary: &Summary, content: String) -> SessionDoc {
@@ -406,11 +426,13 @@ pub(super) fn test_summary(session_id: &str, cwd: &str, title: &str) -> Summary 
         generated_title: None,
         title_is_manual: false,
         worktree_label: None,
-        agent_name: None,
+        agent: Default::default(),
         sandbox_profile: None,
         reasoning_effort: None,
+        context_window_selection: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        last_recap: None,
         cache_affinity_id: None,
     }
 }
@@ -418,3 +440,49 @@ pub(super) fn test_summary(session_id: &str, cwd: &str, title: &str) -> Summary 
 #[cfg(test)]
 #[path = "search_content_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    #[test]
+    fn gzip_search_preserves_content_decoded_size_and_corruption_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let contents = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": 1, "method": "session/update",
+                "params": {"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "searchable prompt ".repeat(1000)}
+                }}
+            })
+        );
+        std::fs::write(&path, &contents).unwrap();
+        let expected = collect_all_indexable_content_single_pass(&path).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(contents.as_bytes()).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < contents.len() / 2);
+        std::fs::write(&path, &compressed).unwrap();
+        assert_eq!(
+            collect_all_indexable_content_single_pass(&path).unwrap(),
+            expected
+        );
+        assert!(
+            collect_all_indexable_content_bounded(&path, contents.len() as u64 - 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            collect_all_indexable_content_bounded(&path, contents.len() as u64).unwrap(),
+            Some(expected)
+        );
+        compressed.truncate(compressed.len() - 4);
+        std::fs::write(&path, compressed).unwrap();
+        assert!(collect_all_indexable_content_single_pass(&path).is_err());
+    }
+}

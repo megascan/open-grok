@@ -94,7 +94,7 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rewind_pre_compaction_with_cancelled_turns_truncates_context_gb2961() {
+async fn rewind_pre_compaction_without_original_history_is_rejected() {
     let local = tokio::task::LocalSet::new();
     local.run_until(run_rewind_scenario()).await;
 }
@@ -140,29 +140,19 @@ async fn run_rewind_scenario() {
         })
         .await
         .expect("handle_rewind ok");
-    assert!(resp.success, "rewind should succeed: {resp:?}");
-
-    let conv = actor.chat_state_handle.get_conversation().await;
-    let texts: Vec<String> = conv.iter().map(|c| c.text_content()).collect();
-
-    let _ = std::fs::remove_dir_all(&session_dir);
-
-    assert_eq!(
-        texts,
-        vec!["SYS", "UI0", "P0", "P1", "P2"],
-        "conversation must truncate to prompts 0..2 (got {texts:?})"
-    );
     assert!(
-        !texts
-            .iter()
-            .any(|t| ["P3", "P4", "P5", "P6", "SUMMARY"].contains(&t.as_str())),
-        "post-target prompts / compacted summary must not leak into context: {texts:?}"
+        !resp.success,
+        "rewind must reject unavailable model-facing history: {resp:?}"
     );
-    assert_eq!(
-        actor.chat_state_handle.get_prompt_index().await,
-        3,
-        "prompt_index must be reset to the rewind target"
-    );
+    let after = actor.chat_state_handle.snapshot().await.unwrap();
+    assert_eq!(after.prompt_index, 7);
+    let texts: Vec<_> = after
+        .conversation
+        .iter()
+        .map(ConversationItem::text_content)
+        .collect();
+    assert_eq!(texts, vec!["SYS", "UI1", "SUMMARY", "P5", "R5", "P6"]);
+    let _ = std::fs::remove_dir_all(&session_dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -225,6 +215,21 @@ async fn run_failed_rewind_preserves_runtime_scenario() {
     snapshot.last_compaction_prompt_index = Some(5);
     actor.chat_state_handle.restore_snapshot(snapshot.clone());
 
+    let cwd = std::path::Path::new(&actor.session_info.cwd);
+    let edited_file = cwd.join("failed-rewind.txt");
+    actor
+        .tool_context
+        .fs
+        .write_file(&edited_file, b"current file contents")
+        .await
+        .unwrap();
+    actor
+        .file_state_tracker
+        .add_before_snapshot_for_prompt(3, &edited_file, cwd, Some("old contents".into()))
+        .await;
+    let file_counts_before = actor.rewind_file_counts().await;
+    *actor.rewind_pending_prompt.lock().unwrap() = Some("existing pending".into());
+
     let runtime_slot = actor.rebuild_spec.code_mode_runtime.clone();
     let runtime_before = runtime_slot.current();
     let generation_before = runtime_slot.generation();
@@ -250,11 +255,26 @@ async fn run_failed_rewind_preserves_runtime_scenario() {
         .handle_rewind(RewindRequest {
             target_prompt_index: 3,
             force: true,
-            mode: RewindMode::ConversationOnly,
+            mode: RewindMode::All,
         })
         .await
         .expect("rewind reports validation failure as a response");
     assert!(!response.success, "missing checkpoint must reject rewind");
+    assert_eq!(
+        actor
+            .tool_context
+            .fs
+            .read_to_string(&edited_file)
+            .await
+            .unwrap(),
+        "current file contents",
+        "failed replay must not restore or delete files"
+    );
+    assert_eq!(actor.rewind_file_counts().await, file_counts_before);
+    assert_eq!(
+        actor.rewind_pending_prompt.lock().unwrap().as_deref(),
+        Some("existing pending")
+    );
     assert!(
         response
             .error
@@ -427,7 +447,7 @@ async fn run_file_counts_scenario() {
 /// must be cleared — otherwise the per-model `x-compactions-remaining` header
 /// would wrongly report `0` for a session that no longer holds a summary.
 #[tokio::test(flavor = "current_thread")]
-async fn rewind_before_compaction_clears_stale_compaction_marker() {
+async fn rejected_rewind_keeps_compaction_marker() {
     let local = tokio::task::LocalSet::new();
     local.run_until(run_clears_marker_scenario()).await;
 }
@@ -467,8 +487,7 @@ async fn run_clears_marker_scenario() {
     snap.last_compaction_prompt_index = Some(5);
     actor.chat_state_handle.restore_snapshot(snap);
 
-    // Rewind to prompt 3 — before the compaction point (5), so the summary is
-    // dropped from the rebuilt conversation and the marker must be cleared.
+    // Rewinding before the checkpoint cannot reconstruct exact history.
     let resp = actor
         .handle_rewind(RewindRequest {
             target_prompt_index: 3,
@@ -477,15 +496,17 @@ async fn run_clears_marker_scenario() {
         })
         .await
         .expect("handle_rewind ok");
-    assert!(resp.success, "rewind should succeed: {resp:?}");
+    assert!(
+        !resp.success,
+        "rewind must fail without exact history: {resp:?}"
+    );
 
     let marker = actor
         .chat_state_handle
         .get_last_compaction_prompt_index()
         .await;
 
-    // End-to-end: advertise support so the gate runs, then read the header
-    // off the reconstructed config — it must report a fresh "1", not stale "0".
+    // The retained summary still consumes the available compaction slot.
     actor
         .compactions_remaining
         .set(Some(CompactionsRemaining::Dynamic(true)));
@@ -499,13 +520,14 @@ async fn run_clears_marker_scenario() {
     let _ = std::fs::remove_dir_all(&session_dir);
 
     assert_eq!(
-        marker, None,
-        "pre-compaction rewind must clear the stale compaction marker"
+        marker,
+        Some(5),
+        "rejected rewind must keep the compaction marker"
     );
     assert_eq!(
         header.as_deref(),
-        Some("1"),
-        "header must report 1 after the summary is dropped (got {header:?})"
+        Some("0"),
+        "header must still account for the retained summary (got {header:?})"
     );
 }
 
@@ -566,19 +588,23 @@ async fn run_forked_rewind_scenario() {
     let target_dir = crate::session::persistence::session_dir(&actor.session_info);
     let forked_checkpoint = target_dir.join("compaction_checkpoints/ckptf.json");
 
-    // Simulate the forked session's live post-compaction state.
+    // Simulate the forked session's exact checkpoint followed by marked
+    // post-compaction model history, including its original assistant text.
     let mut snap = actor
         .chat_state_handle
         .snapshot()
         .await
         .expect("snapshot available");
+    let mut p5 = ConversationItem::user("P5");
+    p5.set_prompt_index(5);
+    let mut p6 = ConversationItem::user("P6");
+    p6.set_prompt_index(6);
     snap.conversation = vec![
         ConversationItem::system("SYS"),
-        ConversationItem::user("UI1"),
         ConversationItem::user("SUMMARY"),
-        ConversationItem::user("P5"),
+        p5,
         ConversationItem::assistant("R5"),
-        ConversationItem::user("P6"),
+        p6,
     ];
     snap.prompt_index = 7;
     snap.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
@@ -614,4 +640,134 @@ async fn run_forked_rewind_scenario() {
         prompt_index, 6,
         "prompt_index must be reset to the rewind target"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_file_rewind_reports_partial_result_and_keeps_retry_state() {
+    use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use xai_grok_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper, FsError, MockFs};
+
+    struct FailSecondMutation {
+        inner: MockFs,
+        operations: AtomicUsize,
+        fail_on: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl AsyncFileSystem for FailSecondMutation {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        async fn exists(&self, path: &Path) -> Result<bool, FsError> {
+            self.inner.exists(path).await
+        }
+        async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+            self.inner.read_file(path).await
+        }
+        async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
+            if self.operations.fetch_add(1, Ordering::SeqCst) == self.fail_on.load(Ordering::SeqCst)
+            {
+                return Err(FsError::Other("injected write failure".into()));
+            }
+            self.inner.write_file(path, data).await
+        }
+        async fn delete_file(&self, path: &Path) -> Result<(), FsError> {
+            if self.operations.fetch_add(1, Ordering::SeqCst) == self.fail_on.load(Ordering::SeqCst)
+            {
+                return Err(FsError::Other("injected delete failure".into()));
+            }
+            self.inner.delete_file(path).await
+        }
+    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_persistence_ack_drainer(persistence_rx);
+            let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+            let cwd = PathBuf::from(&actor.session_info.cwd);
+            let fs = Arc::new(FailSecondMutation {
+                inner: MockFs::new(cwd.clone()),
+                operations: AtomicUsize::new(0),
+                fail_on: AtomicUsize::new(1),
+            });
+            let restored_path = cwd.join("restore.txt");
+            let deleted_path = cwd.join("delete.txt");
+            fs.inner.write_file(&restored_path, b"new").await.unwrap();
+            fs.inner
+                .write_file(&deleted_path, b"created")
+                .await
+                .unwrap();
+            actor.tool_context.fs = AsyncFsWrapper::new(fs.clone());
+            actor
+                .file_state_tracker
+                .add_before_snapshot_for_prompt(0, &restored_path, &cwd, Some("old".into()))
+                .await;
+            actor
+                .file_state_tracker
+                .add_before_snapshot_for_prompt(0, &deleted_path, &cwd, None)
+                .await;
+            let counts = actor.rewind_file_counts().await;
+            let mut snapshot = actor.chat_state_handle.snapshot().await.unwrap();
+            snapshot.conversation = vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("info"),
+                ConversationItem::user("prompt"),
+            ];
+            snapshot.prompt_index = 1;
+            snapshot.prompt_texts = vec!["prompt".into()];
+            actor.chat_state_handle.restore_snapshot(snapshot.clone());
+            *actor.rewind_pending_prompt.lock().unwrap() = Some("pending".into());
+            let response = actor
+                .handle_rewind(RewindRequest {
+                    target_prompt_index: 0,
+                    force: true,
+                    mode: RewindMode::All,
+                })
+                .await
+                .unwrap();
+            assert!(!response.success);
+            assert_eq!(
+                response.reverted_files.len(),
+                1,
+                "one successful mutation must be reported"
+            );
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("injected"))
+            );
+            assert_eq!(actor.rewind_file_counts().await, counts);
+            assert_eq!(
+                actor.rewind_pending_prompt.lock().unwrap().as_deref(),
+                Some("pending")
+            );
+            let after = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(
+                serde_json::to_value(after.conversation).unwrap(),
+                serde_json::to_value(snapshot.conversation).unwrap()
+            );
+            assert_eq!(after.prompt_index, 1);
+            fs.fail_on.store(usize::MAX, Ordering::SeqCst);
+            let retried = actor
+                .handle_rewind(RewindRequest {
+                    target_prompt_index: 0,
+                    force: true,
+                    mode: RewindMode::All,
+                })
+                .await
+                .unwrap();
+            assert!(
+                retried.success,
+                "retry should use preserved snapshots: {retried:?}"
+            );
+            assert_eq!(fs.inner.read_file(&restored_path).await.unwrap(), b"old");
+            assert!(!fs.inner.exists(&deleted_path).await.unwrap());
+        })
+        .await;
 }

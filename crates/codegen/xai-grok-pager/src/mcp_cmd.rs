@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use xai_tty_utils::{cli_eprintln as eprintln, cli_println as println};
 
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
@@ -269,11 +270,17 @@ async fn run_add(args: AddArgs) -> Result<()> {
 }
 
 /// Validate an `mcp add` request and build the transport config.
-///
-/// The transport flag fully determines how `command_or_url` is interpreted;
-/// URL-looking commands only produce a warning, never a behavior change.
 fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
     validate_server_name(&args.name)?;
+
+    let inferred_http = args.transport.is_none()
+        && args.url.is_none()
+        && args.args.is_empty()
+        && args.env.is_empty()
+        && args
+            .command_or_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"));
 
     let transport = match args.transport {
         Some(t) => t,
@@ -282,6 +289,7 @@ fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
             Some(t) if t.eq_ignore_ascii_case("sse") => McpTransport::Sse,
             _ => McpTransport::Http,
         },
+        None if inferred_http => McpTransport::Http,
         None => McpTransport::Stdio,
     };
     let explicit_transport = args.transport.is_some();
@@ -388,18 +396,26 @@ fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
             }
             let headers = parse_headers(&args.header)?;
 
+            let mut warnings = Vec::new();
+            if inferred_http {
+                warnings.push(format!(
+                    "No --transport given; '{url}' starts with http(s)://, adding as an HTTP server. Use --transport sse for an SSE server, or --transport stdio to force a stdio command."
+                ));
+            }
+
             Ok(ResolvedAdd {
                 kind: transport,
                 transport: McpServerTransportConfig::StreamableHttp {
                     url: url.to_string(),
                     transport_type: (transport == McpTransport::Sse).then(|| "sse".to_string()),
                     bearer_token_env_var: None,
+                    bearer_token_file: None,
                     headers: (!headers.is_empty()).then_some(headers),
                     oauth_client_id: None,
                     oauth_client_secret_env_var: None,
                     oauth_scopes: None,
                 },
-                warnings: Vec::new(),
+                warnings,
             })
         }
     }
@@ -897,16 +913,21 @@ mod tests {
     }
 
     #[test]
-    fn add_default_transport_warns_on_url_looking_command() {
+    fn add_default_transport_infers_http_for_bare_url() {
         let add = parse_add(&["grok", "mcp", "add", "api", "https://mcp.example.com/mcp"]);
-        let resolved = resolve_add(&add).expect("defaults to stdio with a warning");
+        let resolved = resolve_add(&add).expect("bare URL infers HTTP");
+        assert_eq!(resolved.kind, McpTransport::Http);
         assert!(matches!(
             resolved.transport,
-            McpServerTransportConfig::Stdio { .. }
+            McpServerTransportConfig::StreamableHttp { url, .. }
+                if url == "https://mcp.example.com/mcp"
         ));
         assert_eq!(resolved.warnings.len(), 1);
-        assert!(resolved.warnings[0].contains("--transport http"));
+        assert!(resolved.warnings[0].contains("adding as an HTTP server"));
+    }
 
+    #[test]
+    fn add_default_transport_warns_on_schemeless_url_looking_command() {
         // Scheme-less commands get http:// prepended so the suggested
         // command passes URL validation verbatim.
         let add = parse_add(&["grok", "mcp", "add", "local", "localhost:3000"]);
@@ -915,6 +936,63 @@ mod tests {
             resolved.warnings[0].contains("--transport http local http://localhost:3000"),
             "got: {}",
             resolved.warnings[0]
+        );
+    }
+
+    #[test]
+    fn add_http_inference_preserves_command_arguments_and_environment() {
+        for argv in [
+            vec![
+                "grok",
+                "mcp",
+                "add",
+                "proxy",
+                "https://example.com/proxy",
+                "--",
+                "--stdio",
+            ],
+            vec![
+                "grok",
+                "mcp",
+                "add",
+                "-e",
+                "MODE=stdio",
+                "proxy",
+                "https://example.com/proxy",
+            ],
+            vec![
+                "grok",
+                "mcp",
+                "add",
+                "proxy",
+                "--command",
+                "https://example.com/proxy",
+            ],
+        ] {
+            let resolved = resolve_add(&parse_add(&argv)).expect("command remains stdio");
+            assert_eq!(resolved.kind, McpTransport::Stdio);
+            assert!(matches!(
+                resolved.transport,
+                McpServerTransportConfig::Stdio { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn add_inferred_http_accepts_headers() {
+        let add = parse_add(&[
+            "grok",
+            "mcp",
+            "add",
+            "--header",
+            "X-Example: enabled",
+            "api",
+            "http://localhost:3000/mcp",
+        ]);
+        let resolved = resolve_add(&add).expect("HTTP inference supports headers");
+        assert!(
+            matches!(resolved.transport, McpServerTransportConfig::StreamableHttp { headers: Some(headers), .. }
+            if headers.get("X-Example").map(String::as_str) == Some("enabled"))
         );
     }
 

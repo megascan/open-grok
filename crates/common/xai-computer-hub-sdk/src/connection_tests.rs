@@ -269,6 +269,95 @@ fn resolve_ws_ping_interval_clamps_zero_and_unset_to_default() {
     let custom = Duration::from_secs(7);
     assert_eq!(resolve_ws_ping_interval(Some(custom)), custom);
 }
+#[test]
+fn resolve_initial_connect_attempt_timeout_clamps_zero_and_unset_to_default() {
+    assert_eq!(
+        resolve_initial_connect_attempt_timeout(None),
+        INITIAL_CONNECT_ATTEMPT_TIMEOUT
+    );
+    assert_eq!(
+        resolve_initial_connect_attempt_timeout(Some(Duration::ZERO)),
+        INITIAL_CONNECT_ATTEMPT_TIMEOUT
+    );
+    let custom = Duration::from_secs(3);
+    assert_eq!(
+        resolve_initial_connect_attempt_timeout(Some(custom)),
+        custom
+    );
+}
+#[test]
+fn initial_connect_retryable_classifies_errors() {
+    assert!(initial_connect_retryable(&ClientError::NetworkError(
+        "io".into()
+    )));
+    assert!(initial_connect_retryable(&ClientError::Closed(
+        "bye".into()
+    )));
+    assert!(!initial_connect_retryable(
+        &ClientError::HandshakeAuthFailed { status: 401 }
+    ));
+    assert!(!initial_connect_retryable(&ClientError::InvalidConfig(
+        "cfg".into()
+    )));
+    assert!(!initial_connect_retryable(&ClientError::ProtocolError(
+        "proto".into()
+    )));
+    assert!(!initial_connect_retryable(&ClientError::InsecureScheme {
+        url: Url::parse("ws://hub.example.com/").expect("valid url"),
+    }));
+}
+#[tokio::test]
+async fn initial_connect_times_out_and_bounds_retries_against_black_hole() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
+    let started = std::time::Instant::now();
+    let result = HubConnection::connect(ConnectionConfig {
+        url: Url::parse(&format!("ws://{addr}/")).expect("valid url"),
+        credential,
+        kind: ConnectionKind::Harness,
+        on_reconnect: None,
+        on_disconnect: None,
+        on_terminal_close: None,
+        on_connect: None,
+        server_id: None,
+        server_description: None,
+        server_metadata: None,
+        outbound_buffer: None,
+        tuning: ConnectionTuning {
+            initial_connect_attempt_timeout: Some(Duration::from_millis(100)),
+            reconnect_backoff: Some(Arc::from([Duration::from_millis(10)])),
+            ..Default::default()
+        },
+        alpha_test_key: None,
+        allow_insecure_ws: false,
+        on_fatal: None,
+    })
+    .await;
+    let elapsed = started.elapsed();
+    match result {
+        Err(ClientError::NetworkError(msg)) => {
+            assert!(
+                msg.contains("timed out"),
+                "expected a per-attempt timeout message; got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected NetworkError timeout; got {other:?}"),
+        Ok(_) => panic!("expected NetworkError timeout; got a live connection"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "initial connect was not bounded: {elapsed:?}"
+    );
+}
 /// Resolving a zero ping interval to a non-zero default means
 /// `tokio::time::interval` can be constructed without panicking.
 #[tokio::test]
@@ -1349,9 +1438,21 @@ async fn writer_exits_when_control_channel_closes() {
 /// Socket-less `HubConnection` for tests: observe the sent frame and
 /// resolve the response waiter without a live server or actor task.
 fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>) {
+    test_connection_with(
+        Arc::new(AuthCredential::bearer("test-token")),
+        Vec::new(),
+        AUTH_REFRESH_POLL,
+    )
+}
+/// [`test_connection`] with the provider the socket dials with, the
+/// capabilities its `hello_ack` advertised, and the `auth.refresh` cadence.
+fn test_connection_with(
+    credential: Arc<dyn AuthProvider>,
+    hello_capabilities: Vec<String>,
+    auth_refresh_poll: Duration,
+) -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>) {
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
     let demux = Arc::new(Demux::with_outbound(outbound_tx.clone()));
-    let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
     let (stop_tx, _stop_rx) = mpsc::channel::<()>(1);
     let (reconnect_tx, _reconnect_rx) = mpsc::channel::<()>(1);
     let inner = Arc::new(HubConnectionInner {
@@ -1373,12 +1474,15 @@ fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>)
         reconnect_backoff: resolve_reconnect_backoff(None),
         reconnect_jitter_seed: 1,
         attempt_reset_after: resolve_attempt_reset_after(None),
+        reconnect_after_terminal_close_codes: Vec::new(),
+        auth_refresh_poll,
         outage_seq: AtomicU32::new(0),
         outbound_tx,
         demux: demux.clone(),
         bound_sessions: Arc::new(RefCountedSet::new()),
+        last_binds: dashmap::DashMap::new(),
         connection_id: Arc::new(Mutex::new(None)),
-        hello_capabilities: parking_lot::RwLock::new(Vec::new()),
+        hello_capabilities: parking_lot::RwLock::new(hello_capabilities),
         next_request_id: std::sync::atomic::AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         stop_tx,
@@ -1388,6 +1492,290 @@ fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>)
         writer_error: Arc::new(parking_lot::Mutex::new(None)),
     });
     (Arc::new(HubConnection { inner }), demux, outbound_rx)
+}
+mod auth_refresh_driver {
+    use super::*;
+    use serde_json::json;
+    /// A bearer provider whose token the test rotates.
+    #[derive(Debug)]
+    struct RotatingBearer(parking_lot::Mutex<String>);
+    impl RotatingBearer {
+        fn new(token: &str) -> Arc<Self> {
+            Arc::new(Self(parking_lot::Mutex::new(token.to_owned())))
+        }
+        fn rotate(&self, token: &str) {
+            *self.0.lock() = token.to_owned();
+        }
+    }
+    impl AuthProvider for RotatingBearer {
+        fn current(&self) -> AuthCredential {
+            AuthCredential::bearer(self.0.lock().clone())
+        }
+    }
+    const POLL: Duration = Duration::from_millis(20);
+    const QUIET: Duration = Duration::from_millis(150);
+    fn refresh_capability() -> Vec<String> {
+        vec![Method::AuthRefresh.as_wire_str().to_owned()]
+    }
+    /// A socket-less tool-server connection offered `auth.refresh`, dialed
+    /// with `provider`, plus its driver seeded from `provider.current()`.
+    fn connection_with_driver(
+        provider: &Arc<RotatingBearer>,
+        poll: Duration,
+    ) -> (
+        Arc<HubConnection>,
+        Arc<Demux>,
+        mpsc::Receiver<String>,
+        AuthRefreshDriver,
+    ) {
+        let (conn, demux, outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), poll);
+        let driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &provider.current(),
+            Some(true),
+        )
+        .expect("a bearer tool server with the capability");
+        (conn, demux, outbound_rx, driver)
+    }
+    async fn no_frame_for(outbound_rx: &mut mpsc::Receiver<String>, window: Duration) -> bool {
+        tokio::time::timeout(window, outbound_rx.recv())
+            .await
+            .is_err()
+    }
+    /// The `auth.refresh` frame the driver sent: its id and the bearer.
+    async fn next_refresh(outbound_rx: &mut mpsc::Receiver<String>) -> (Value, String) {
+        let text = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("a frame within 2 s")
+            .expect("outbound open");
+        let frame: Value = serde_json::from_str(&text).expect("json frame");
+        assert_eq!(
+            frame["method"],
+            Method::AuthRefresh.as_wire_str(),
+            "{frame}"
+        );
+        let token = frame["params"]["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_owned();
+        (frame["id"].clone(), token)
+    }
+    fn accept(demux: &Demux, id: Value) {
+        demux.route(json!({ "jsonrpc": "2.0", "id": id, "result": { "exp": 1_800_000_000 } }));
+    }
+    fn refuse(demux: &Demux, id: Value, reason: &str) {
+        demux.route(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32003, "message": "refused", "data": { "reason": reason } },
+        }));
+    }
+    fn refusal(reason: &str) -> Result<i64, AuthRefreshError> {
+        Err(AuthRefreshError::Refused {
+            reason: reason.to_owned(),
+            message: "refused".to_owned(),
+        })
+    }
+    #[test]
+    fn runs_only_for_a_bearer_tool_server_offered_the_capability() {
+        let bearer = AuthCredential::bearer("t1");
+        let headers = AuthCredential::headers([("authorization", "Bearer t1")]).expect("valid");
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, Some(true)).is_some()
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::Harness, &bearer, Some(true)).is_none(),
+            "a harness is never token-bound"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &headers, Some(true))
+                .is_none(),
+            "a header bundle is not a bearer the hub can re-verify"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, Some(false))
+                .is_none(),
+            "the hub did not offer it to this socket"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, None).is_none(),
+            "a hub predating capabilities closes at exp; nothing to send it"
+        );
+    }
+    #[tokio::test]
+    async fn sends_once_per_changed_bearer_and_never_two_at_once() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx, driver) = connection_with_driver(&provider, POLL);
+        let task = tokio::spawn(run_auth_refresh(conn.inner.clone(), driver, POLL));
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "an unchanged bearer is never re-presented"
+        );
+        provider.rotate("t2");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "no second request while the first is unanswered"
+        );
+        accept(&demux, id);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "an acknowledged bearer is not re-presented"
+        );
+        provider.rotate("t3");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token);
+        refuse(&demux, id, "unavailable");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token, "a refused bearer is retried on the next tick");
+        task.abort();
+    }
+    /// The hub bound to a bearer whose accept reply was lost refuses it
+    /// `not_later` forever; the driver takes that as the acknowledgement it
+    /// missed instead of re-presenting it every tick.
+    #[tokio::test]
+    async fn a_not_later_refusal_acknowledges_the_bearer_and_others_do_not() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx, driver) = connection_with_driver(&provider, POLL);
+        let task = tokio::spawn(run_auth_refresh(conn.inner.clone(), driver, POLL));
+        provider.rotate("t2");
+        let (id, _) = next_refresh(&mut outbound_rx).await;
+        refuse(&demux, id, AUTH_REFRESH_NOT_LATER);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "a not_later bearer is one the hub already holds"
+        );
+        provider.rotate("t3");
+        let (id, _) = next_refresh(&mut outbound_rx).await;
+        refuse(&demux, id, "too_soon");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token, "any other refusal is retried");
+        task.abort();
+    }
+    #[test]
+    fn unaccepted_answers_are_counted_until_an_acknowledgement() {
+        let mut driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &AuthCredential::bearer("t1"),
+            Some(true),
+        )
+        .expect("driver");
+        for expected in 1..=AUTH_REFRESH_WARN_AFTER + 1 {
+            driver.settle("t2".to_owned(), refusal("unverified"));
+            assert_eq!(expected, driver.unaccepted_in_a_row);
+            assert_eq!("t1", driver.acknowledged);
+        }
+        driver.settle(
+            "t2".to_owned(),
+            Err(AuthRefreshError::Failed(ClientError::NetworkError(
+                "timed out".to_owned(),
+            ))),
+        );
+        assert_eq!(AUTH_REFRESH_WARN_AFTER + 2, driver.unaccepted_in_a_row);
+        driver.settle("t2".to_owned(), refusal(AUTH_REFRESH_NOT_LATER));
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert_eq!("t2", driver.acknowledged);
+        driver.settle("t3".to_owned(), refusal("too_soon"));
+        driver.settle("t3".to_owned(), Ok(1_800_000_000));
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert_eq!("t3", driver.acknowledged);
+    }
+    /// A provider stuck on a bearer the hub already holds is acknowledged
+    /// each time and still shows up on the counter.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn not_later_is_counted_although_acknowledged() {
+        let mut driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &AuthCredential::bearer("t1"),
+            Some(true),
+        )
+        .expect("driver");
+        let before = crate::metrics::auth_refresh_refused_count(AUTH_REFRESH_NOT_LATER);
+        for _ in 0..5 {
+            driver.settle("t2".to_owned(), refusal(AUTH_REFRESH_NOT_LATER));
+        }
+        assert_eq!("t2", driver.acknowledged);
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert!(
+            crate::metrics::auth_refresh_refused_count(AUTH_REFRESH_NOT_LATER) >= before + 5,
+            "each not_later answer is counted (other tests may add to the same label)"
+        );
+    }
+    /// The metric label is one of a fixed set whatever the hub sends.
+    #[test]
+    fn refusal_reason_label_is_bounded() {
+        let known = refusal("unverified").expect_err("refusal");
+        assert_eq!("unverified", known.reason());
+        let unknown = refusal("some-future-reason").expect_err("refusal");
+        assert_eq!("other", unknown.reason());
+        let failed = AuthRefreshError::Failed(ClientError::NetworkError("x".to_owned()));
+        assert_eq!("failed", failed.reason());
+    }
+    /// A reconnect that dialed with a bearer the provider has since rotated
+    /// past must not wait a whole poll interval to present the fresh one.
+    #[tokio::test]
+    async fn the_first_check_runs_at_phase_start() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, _demux, mut outbound_rx, driver) =
+            connection_with_driver(&provider, Duration::from_secs(60));
+        provider.rotate("t2");
+        let task = tokio::spawn(run_auth_refresh(
+            conn.inner.clone(),
+            driver,
+            Duration::from_secs(60),
+        ));
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn dropping_the_phase_task_ends_a_pending_rotation() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), POLL);
+        let task = spawn_auth_refresh(&conn.inner, &provider.current()).expect("driver spawned");
+        provider.rotate("t2");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        drop(task);
+        refuse(&demux, id, "unavailable");
+        provider.rotate("t3");
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "neither the retry nor the next rotation is presented after the phase ended"
+        );
+    }
+    /// On reconnect the new driver is seeded with the bearer the reconnect
+    /// presented, so a rotation that happened during the outage is not
+    /// presented a second time.
+    #[tokio::test]
+    async fn a_driver_seeded_from_a_rotated_presented_stays_silent_until_the_next_rotation() {
+        let provider = RotatingBearer::new("t1");
+        provider.rotate("t2");
+        let (conn, _demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), POLL);
+        let task = spawn_auth_refresh(&conn.inner, &provider.current()).expect("driver spawned");
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "the presented bearer is what the hub already holds"
+        );
+        provider.rotate("t3");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token);
+        drop(task);
+    }
+    #[tokio::test]
+    async fn nothing_is_sent_without_the_capability() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, _demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), Vec::new(), POLL);
+        assert!(spawn_auth_refresh(&conn.inner, &provider.current()).is_none());
+        provider.rotate("t2");
+        assert!(no_frame_for(&mut outbound_rx, QUIET).await);
+    }
 }
 #[test]
 fn classify_stream_end_prefers_recorded_write_error() {
@@ -1415,6 +1803,80 @@ fn classify_stream_end_prefers_recorded_write_error() {
         classify_stream_end(inner, Some("reset".to_owned())),
         DisconnectCause::WriteError(_)
     ));
+}
+/// One replay entry per tool server; unbinding one keeps the rest, unbinding
+/// the last drops the key, and a close drops them all.
+#[test]
+fn recorded_binds_follow_bind_unbind_and_close() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds").expect("valid");
+    let bind = |server: &str, cwd: Option<&str>| SessionBindServerParams {
+        server_id: ServerId::new(server).expect("valid"),
+        cwd: cwd.map(str::to_owned),
+        metadata: None,
+    };
+    let recorded = |conn: &HubConnection| {
+        conn.inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.clone())
+            .unwrap_or_default()
+    };
+    conn.record_session_bind(&session, bind("a", None));
+    conn.record_session_bind(&session, bind("b", None));
+    conn.record_session_bind(&session, bind("a", Some("/re-bound")));
+    assert_eq!(
+        vec![bind("b", None), bind("a", Some("/re-bound"))],
+        recorded(&conn)
+    );
+    conn.forget_session_bind(&session, Some(&ServerId::new("b").expect("valid")));
+    assert_eq!(vec![bind("a", Some("/re-bound"))], recorded(&conn));
+    conn.forget_session_bind(&session, Some(&ServerId::new("a").expect("valid")));
+    assert!(!conn.inner.last_binds.contains_key(&session));
+    conn.record_session_bind(&session, bind("a", None));
+    conn.forget_session_bind(&session, None);
+    assert!(!conn.inner.last_binds.contains_key(&session));
+}
+/// Forgetting the last server of a session must not take a bind recorded
+/// concurrently down with it: the key is removed only if the entry is still
+/// empty at removal time. Correct code cannot fail this; an unconditional
+/// remove loses `b` on some interleaving.
+#[test]
+fn forgetting_the_last_server_keeps_a_concurrently_recorded_bind() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds-race").expect("valid");
+    let server = |name: &str| ServerId::new(name).expect("valid");
+    for _ in 0..2_000 {
+        conn.record_session_bind(
+            &session,
+            SessionBindServerParams {
+                server_id: server("a"),
+                cwd: None,
+                metadata: None,
+            },
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| conn.forget_session_bind(&session, Some(&server("a"))));
+            scope.spawn(|| {
+                conn.record_session_bind(
+                    &session,
+                    SessionBindServerParams {
+                        server_id: server("b"),
+                        cwd: None,
+                        metadata: None,
+                    },
+                )
+            });
+        });
+        let remaining: Vec<ServerId> = conn
+            .inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.iter().map(|b| b.server_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(vec![server("b")], remaining);
+        conn.forget_session_bind(&session, None);
+    }
 }
 #[test]
 fn supports_is_unknown_until_capabilities_advertised() {
@@ -2860,6 +3322,229 @@ async fn terminal_close_fires_on_terminal_close_then_on_disconnect() {
     }
     conn.request_shutdown();
     conn.await_shutdown().await;
+}
+#[tokio::test]
+async fn terminal_close_stops_actor_by_default() {
+    let addr = spawn_hub_close_after_ack(Some(4103)).await;
+    let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
+    let conn = HubConnection::connect(ConnectionConfig {
+        url: url::Url::parse(&format!("ws://{addr}/v1/tools")).expect("mock url"),
+        credential,
+        kind: ConnectionKind::ToolServer,
+        on_reconnect: None,
+        on_disconnect: None,
+        on_terminal_close: None,
+        on_connect: None,
+        server_id: None,
+        server_description: None,
+        server_metadata: None,
+        outbound_buffer: None,
+        tuning: ConnectionTuning::default(),
+        alpha_test_key: None,
+        allow_insecure_ws: false,
+        on_fatal: None,
+    })
+    .await
+    .expect("initial connect");
+    tokio::time::timeout(Duration::from_secs(5), conn.await_shutdown())
+        .await
+        .expect("default terminal close must stop the actor without an embedder shutdown");
+}
+async fn spawn_hub_close_then_accept(close: u16) -> std::net::SocketAddr {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock hub");
+    let addr = listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        for stay_up in [false, true] {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            let ack = serde_json::json!({
+                "connection_id": if stay_up { "mock-reconnected" } else { "mock" },
+                "user_id": "test",
+                "computer_hub_version": "test",
+                "supported_protocol_versions": ["1.0.0"],
+            });
+            if ws
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    ack.to_string().into(),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if stay_up {
+                while let Some(Ok(_)) = ws.next().await {}
+                return;
+            }
+            let _ = ws
+                .send(tokio_tungstenite::tungstenite::Message::Close(Some(
+                    CloseFrame {
+                        code: CloseCode::from(close),
+                        reason: "test".into(),
+                    },
+                )))
+                .await;
+        }
+    });
+    addr
+}
+#[tokio::test]
+async fn terminal_close_reconnects_when_embedder_opts_in() {
+    let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reconnects_cb = Arc::clone(&reconnects);
+    let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let terminals_cb = Arc::clone(&terminals);
+    let addr = spawn_hub_close_then_accept(4103).await;
+    let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
+    let conn = HubConnection::connect(ConnectionConfig {
+        url: url::Url::parse(&format!("ws://{addr}/v1/tools")).expect("mock url"),
+        credential,
+        kind: ConnectionKind::ToolServer,
+        on_reconnect: Some(Arc::new(Box::new(move |_event| {
+            reconnects_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }))),
+        on_disconnect: None,
+        on_terminal_close: Some(Arc::new(Box::new(move |_code| {
+            terminals_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }))),
+        on_connect: None,
+        server_id: None,
+        server_description: None,
+        server_metadata: None,
+        outbound_buffer: None,
+        tuning: ConnectionTuning {
+            reconnect_backoff: Some(Arc::from([Duration::from_millis(10)])),
+            reconnect_after_terminal_close_codes: vec![4103],
+            ..Default::default()
+        },
+        alpha_test_key: None,
+        allow_insecure_ws: false,
+        on_fatal: None,
+    })
+    .await
+    .expect("initial connect");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if reconnects.load(std::sync::atomic::Ordering::SeqCst) >= 1
+            && terminals.load(std::sync::atomic::Ordering::SeqCst) >= 1
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "opt-in terminal close must fire on_terminal_close then reconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        1,
+        terminals.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal-close callback still fires when reconnect is opted in"
+    );
+    conn.request_shutdown();
+    conn.await_shutdown().await;
+}
+#[tokio::test]
+async fn non_allowlisted_terminal_close_stops_actor_despite_allowlist() {
+    for code in [4100u16, 4101, 4102, 4104] {
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnects_cb = Arc::clone(&reconnects);
+        let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminals_cb = Arc::clone(&terminals);
+        let addr = spawn_hub_close_then_accept(code).await;
+        let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
+        let conn = HubConnection::connect(ConnectionConfig {
+            url: url::Url::parse(&format!("ws://{addr}/v1/tools")).expect("mock url"),
+            credential,
+            kind: ConnectionKind::ToolServer,
+            on_reconnect: Some(Arc::new(Box::new(move |_event| {
+                reconnects_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }))),
+            on_disconnect: None,
+            on_terminal_close: Some(Arc::new(Box::new(move |_code| {
+                terminals_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }))),
+            on_connect: None,
+            server_id: None,
+            server_description: None,
+            server_metadata: None,
+            outbound_buffer: None,
+            tuning: ConnectionTuning {
+                reconnect_backoff: Some(Arc::from([Duration::from_millis(10)])),
+                reconnect_after_terminal_close_codes: vec![4103],
+                ..Default::default()
+            },
+            alpha_test_key: None,
+            allow_insecure_ws: false,
+            on_fatal: None,
+        })
+        .await
+        .expect("initial connect");
+        tokio::time::timeout(Duration::from_secs(5), conn.await_shutdown())
+            .await
+            .unwrap_or_else(|_| panic!("non-allowlisted close {code} must stop the actor"));
+        assert_eq!(
+            1,
+            terminals.load(std::sync::atomic::Ordering::SeqCst),
+            "terminal-close callback fires once for {code}"
+        );
+        assert_eq!(
+            0,
+            reconnects.load(std::sync::atomic::Ordering::SeqCst),
+            "non-allowlisted close {code} must not reconnect"
+        );
+    }
+}
+#[tokio::test]
+async fn default_terminal_close_never_reconnects_for_any_41xx() {
+    for code in [4100u16, 4101, 4102, 4103, 4104] {
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnects_cb = Arc::clone(&reconnects);
+        let addr = spawn_hub_close_then_accept(code).await;
+        let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
+        let conn = HubConnection::connect(ConnectionConfig {
+            url: url::Url::parse(&format!("ws://{addr}/v1/tools")).expect("mock url"),
+            credential,
+            kind: ConnectionKind::ToolServer,
+            on_reconnect: Some(Arc::new(Box::new(move |_event| {
+                reconnects_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }))),
+            on_disconnect: None,
+            on_terminal_close: None,
+            on_connect: None,
+            server_id: None,
+            server_description: None,
+            server_metadata: None,
+            outbound_buffer: None,
+            tuning: ConnectionTuning {
+                reconnect_backoff: Some(Arc::from([Duration::from_millis(10)])),
+                ..Default::default()
+            },
+            alpha_test_key: None,
+            allow_insecure_ws: false,
+            on_fatal: None,
+        })
+        .await
+        .expect("initial connect");
+        tokio::time::timeout(Duration::from_secs(5), conn.await_shutdown())
+            .await
+            .unwrap_or_else(|_| panic!("default close {code} must stop the actor"));
+        assert_eq!(
+            0,
+            reconnects.load(std::sync::atomic::Ordering::SeqCst),
+            "default (empty allowlist) close {code} must not reconnect"
+        );
+    }
 }
 #[tokio::test]
 async fn socket_close_does_not_fire_on_terminal_close() {

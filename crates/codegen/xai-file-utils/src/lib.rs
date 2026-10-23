@@ -19,6 +19,7 @@ pub fn with_auth_retry(
 pub mod gcs;
 pub mod queue;
 pub mod s3;
+pub mod session_file;
 pub mod storage_client;
 pub mod trace_context;
 pub mod upload_config;

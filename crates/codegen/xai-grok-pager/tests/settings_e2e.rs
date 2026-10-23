@@ -21,10 +21,6 @@ use xai_grok_pager::views::settings_modal::{
 };
 use xai_grok_shell::agent::config::UiConfig;
 
-// ---------------------------------------------------------------------------
-// Compile-time exhaustive matrix
-// ---------------------------------------------------------------------------
-
 /// Every setting exercised by this file. Must stay in sync with
 /// `SettingsRegistry::defaults().all()`.
 const ALL_SETTINGS_EXERCISED: &[&str] = &[
@@ -33,6 +29,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "show_timestamps",
     "show_timeline",
     "page_flip_on_send",
+    "dashboard_preview",
     "confirm_before_rewind",
     "combine_queued_prompts",
     "follow_up_behavior",
@@ -41,9 +38,12 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "swarm_mode",
     "vim_mode",
     "remember_tool_approvals",
+    "codex_persistent_mode",
+    "codex_guardian_review",
     "code_mode",
     "image_generation_provider",
     "toolset.ask_user_question.timeout_enabled",
+    "subagent_model_inheritance",
     "keep_text_selection",
     "theme",
     "auto_dark_theme",
@@ -74,9 +74,11 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "custom_model_provider",
     "custom_model_base_url",
     "custom_model_context_window",
+    "custom_model_max_context_window",
     "custom_model_backend",
     "custom_model_env_key",
     "custom_model_save",
+    "custom_provider_wizard",
     "toolset.perplexity_web_search.enabled",
     "perplexity_api_key",
     "toolset.web_search_source.xai",
@@ -96,13 +98,12 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "scroll_lines",
     "invert_scroll",
     "display_refresh_auto_cadence",
-    "antigravity_subagents",
-    "antigravity_skip_permissions",
     "coding_data_sharing",
     "default_selected_permission",
     "plan_mode",
     "show_tips",
     "auto_update",
+    "stream_tool_calls",
     "fork_secondary_model",
     "show_thinking_blocks",
     "prompt_suggestions",
@@ -131,6 +132,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "features.web_fetch",
     "toolset.web_fetch.allow_local",
     "features.two_pass_compaction",
+    "features.context_management.experimental_mode",
     "features.non_git_warning",
     "features.remember_mode",
     "doom_loop_recovery.enabled",
@@ -139,6 +141,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "ui.mouse_reporting_toggle",
     "suggestions.enabled",
     "suggestions.ai_enabled",
+    "sandbox.profile",
     "sandbox.auto_allow_bash",
     "tools.respect_gitignore",
 ];
@@ -146,6 +149,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
 /// Local feature-flag rows and their registry defaults. Space/mouse tests
 /// toggle each to `!default` via `Action::SetLocalFeatureFlag`.
 const LOCAL_FEATURE_FLAG_KEYS: &[(&str, bool)] = &[
+    ("features.context_management.experimental_mode", false),
     ("memory.enabled", false),
     ("memory.dream.enabled", true),
     ("features.telemetry", false),
@@ -162,6 +166,7 @@ const LOCAL_FEATURE_FLAG_KEYS: &[(&str, bool)] = &[
     ("suggestions.enabled", false),
     ("suggestions.ai_enabled", false),
     ("sandbox.auto_allow_bash", false),
+    ("sandbox.profile", false),
     ("tools.respect_gitignore", false),
 ];
 
@@ -194,15 +199,9 @@ fn matrix_is_subset_of_registry() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn make_state() -> SettingsModalState {
     // Voice rows are hidden when the process gate is off (default until startup).
     xai_grok_pager::app::set_voice_mode_enabled_for_test(true);
-    // Same for the antigravity row (hidden unless the CLI presence gate is on).
-    xai_grok_pager::app::set_antigravity_cli_present_for_test(true);
     SettingsModalState::new(
         Arc::new(SettingsRegistry::defaults()),
         UiConfig::default(),
@@ -303,6 +302,9 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
         ("page_flip_on_send", Action::SetPageFlipOnSend(b)) => {
             assert_eq!(b, expected, "SetPageFlipOnSend value differs from expected")
         }
+        ("dashboard_preview", Action::SetDashboardPreview(enabled)) => {
+            assert_eq!(expected, enabled);
+        }
         ("confirm_before_rewind", Action::SetConfirmBeforeRewind(b)) => {
             assert_eq!(
                 b, expected,
@@ -345,6 +347,18 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 "SetRememberToolApprovals value differs from expected"
             )
         }
+        ("codex_persistent_mode", Action::SetCodexPersistentMode(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetCodexPersistentMode value differs from expected"
+            )
+        }
+        ("codex_guardian_review", Action::SetCodexGuardianReview(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetCodexGuardianReview value differs from expected"
+            )
+        }
         ("voice_keybind_enabled", Action::SetVoiceKeybindEnabled(b)) => {
             assert_eq!(
                 b, expected,
@@ -358,6 +372,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
             assert_eq!(
                 b, expected,
                 "SetAskUserQuestionTimeoutEnabled value differs from expected"
+            )
+        }
+        ("subagent_model_inheritance", Action::SetSubagentModelInheritance(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetSubagentModelInheritance value differs from expected"
             )
         }
         ("toolset.perplexity_web_search.enabled", Action::SetPerplexityWebSearch(b)) => assert_eq!(
@@ -413,16 +433,10 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 "SetDisplayRefreshAutoCadence value differs from expected"
             )
         }
-        ("antigravity_subagents", Action::SetAntigravitySubagents(b)) => {
+        ("custom_provider_wizard", Action::SetCustomProviderWizard(b)) => {
             assert_eq!(
                 b, expected,
-                "SetAntigravitySubagents value differs from expected"
-            )
-        }
-        ("antigravity_skip_permissions", Action::SetAntigravitySkipPermissions(b)) => {
-            assert_eq!(
-                b, expected,
-                "SetAntigravitySkipPermissions value differs from expected"
+                "SetCustomProviderWizard value differs from expected"
             )
         }
         ("toolset.x_search.enabled", Action::SetXSearchEnabled(b)) => {
@@ -504,10 +518,6 @@ fn esc_in_filter_mode_exits_filter_not_modal() {
     assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
-// ---------------------------------------------------------------------------
-// Per-setting keyboard paths
-// ---------------------------------------------------------------------------
-
 #[test]
 fn space_on_compact_mode_dispatches_typed_setter() {
     let mut s = make_state();
@@ -541,6 +551,35 @@ fn space_on_page_flip_on_send_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     let default_on = UiConfig::default().page_flip_on_send_enabled();
     assert_set_bool_action(outcome, "page_flip_on_send", !default_on);
+}
+
+#[test]
+fn dashboard_preview_can_be_found_and_toggled_by_keyboard_and_mouse() {
+    for enabled in [true, false] {
+        let mut state = make_state();
+        state.ui_snapshot.dashboard_preview = Some(enabled);
+        let _ = handle_settings_key(&mut state, &press(KeyCode::Char('/')));
+        for c in "dashboard preview".chars() {
+            let _ = handle_settings_key(&mut state, &press(KeyCode::Char(c)));
+        }
+        let _ = handle_settings_key(&mut state, &press(KeyCode::Enter));
+
+        let outcome = handle_settings_key(&mut state, &press(KeyCode::Char(' ')));
+
+        assert_set_bool_action(outcome, "dashboard_preview", !enabled);
+
+        synth_rects(&mut state);
+        let y = row_idx_for(&state, "dashboard_preview") as u16;
+
+        let outcome = handle_settings_mouse(
+            &mut state,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            72,
+            y,
+        );
+
+        assert_set_bool_action(outcome, "dashboard_preview", !enabled);
+    }
 }
 
 #[test]
@@ -648,6 +687,33 @@ fn space_on_remember_tool_approvals_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     // Default is false, so toggling flips it on.
     assert_set_bool_action(outcome, "remember_tool_approvals", true);
+}
+
+#[test]
+fn space_on_codex_persistent_mode_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "codex_persistent_mode");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    // Default is false, so toggling flips it on.
+    assert_set_bool_action(outcome, "codex_persistent_mode", true);
+}
+
+#[test]
+fn space_on_codex_guardian_review_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "codex_guardian_review");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    // Default is false, so toggling flips it on.
+    assert_set_bool_action(outcome, "codex_guardian_review", true);
+}
+
+#[test]
+fn space_on_stream_tool_calls_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "stream_tool_calls");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    // Default is true, so toggling flips it off.
+    assert_set_bool_action(outcome, "stream_tool_calls", false);
 }
 
 #[test]
@@ -935,6 +1001,15 @@ fn space_on_ask_user_question_timeout_dispatches_typed_setter() {
     assert_set_bool_action(outcome, "toolset.ask_user_question.timeout_enabled", false);
 }
 
+/// The `[features]` row reads the next-start resolution (default off), so Space toggles it on.
+#[test]
+fn space_on_subagent_model_inheritance_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "subagent_model_inheritance");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "subagent_model_inheritance", true);
+}
+
 #[test]
 fn enter_on_bool_row_also_toggles() {
     let mut s = make_state();
@@ -1044,6 +1119,100 @@ fn mouse_click_on_contextual_hints_group_opens_sub_sheet_and_toggles_child() {
 // ---------------------------------------------------------------------------
 // Per-setting MOUSE paths (keyboard ↔ mouse parity)
 // ---------------------------------------------------------------------------
+
+/// Models -> Custom models -> **Add a custom provider...** is a trigger row:
+/// Space dispatches `SetCustomProviderWizard(true)`, which opens the same wizard
+/// `/provider` does. It stores nothing, so there is no persist to assert.
+#[test]
+fn space_on_custom_provider_wizard_child_opens_the_wizard() {
+    let mut s = make_state();
+    navigate_to(&mut s, "custom_models");
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingGroup { .. }),
+        "Enter on Custom models must open the sub-sheet, got {:?}",
+        s.mode(),
+    );
+
+    let idx = custom_provider_wizard_child_idx();
+    for _ in 0..idx {
+        let _ = handle_settings_key(&mut s, &press(KeyCode::Char('j')));
+    }
+    assert_eq!(
+        group_child_idx(&s),
+        idx,
+        "walking the sub-sheet must land on the wizard row"
+    );
+    let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(out, "custom_provider_wizard", true);
+}
+
+/// Mouse parity: one click on the group value column opens the sub-sheet, then a
+/// click on the wizard row dispatches the same Action.
+#[test]
+fn mouse_click_on_custom_provider_wizard_child_opens_the_wizard() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let group_row = row_idx_for(&s, "custom_models") as u16;
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        group_row,
+    );
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingGroup { .. }),
+        "click on the group value column must open the sub-sheet, got {:?}",
+        s.mode(),
+    );
+
+    let idx = custom_provider_wizard_child_idx();
+    // The renderer does not run here, so lay out the child hit-rects by hand.
+    s.picker_choice_rects = (0..custom_models_children().len())
+        .map(|i| Rect {
+            x: 0,
+            y: i as u16,
+            width: 80,
+            height: 1,
+        })
+        .collect();
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        1,
+        idx as u16,
+    );
+    assert_set_bool_action(out, "custom_provider_wizard", true);
+}
+
+/// Position of the wizard row inside the `custom_models` sub-sheet, read from
+/// the registry so the tests do not hardcode the child order.
+fn custom_provider_wizard_child_idx() -> usize {
+    custom_models_children()
+        .iter()
+        .position(|key| *key == "custom_provider_wizard")
+        .expect("the wizard row must be a child of Custom models")
+}
+
+fn custom_models_children() -> &'static [&'static str] {
+    match &SettingsRegistry::defaults()
+        .find("custom_models")
+        .expect("custom_models must be registered")
+        .kind
+    {
+        SettingKind::Group { children } => *children,
+        other => panic!("custom_models must stay a Group, got {other:?}"),
+    }
+}
+
+fn group_child_idx(state: &SettingsModalState) -> usize {
+    match state.mode() {
+        SettingsModalMode::PickingGroup { child_idx, .. } => child_idx,
+        other => panic!("expected the group sub-sheet, got {other:?}"),
+    }
+}
 
 /// Lay out enough row_rects so that `handle_settings_mouse` can resolve
 /// a click to the desired row index. We bypass the renderer here because
@@ -1246,6 +1415,48 @@ fn mouse_click_on_remember_tool_approvals_indicator_toggles_in_one_click() {
         row_y,
     );
     assert_set_bool_action(outcome, "remember_tool_approvals", true);
+}
+
+#[test]
+fn mouse_click_on_codex_persistent_mode_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "codex_persistent_mode") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "codex_persistent_mode", true);
+}
+
+#[test]
+fn mouse_click_on_codex_guardian_review_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "codex_guardian_review") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "codex_guardian_review", true);
+}
+
+#[test]
+fn mouse_click_on_stream_tool_calls_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "stream_tool_calls") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "stream_tool_calls", false);
 }
 
 #[test]
@@ -1669,7 +1880,11 @@ fn enter_on_custom_models_group_opens_sheet_and_save_without_id_does_not_upsert(
         s.mode(),
         SettingsModalMode::PickingGroup { child_idx: 0, .. }
     ));
-    for _ in 0..9 {
+    let save_idx = custom_models_children()
+        .iter()
+        .position(|key| *key == "custom_model_save")
+        .expect("custom_model_save must stay a custom_models child");
+    for _ in 0..save_idx {
         let _ = handle_settings_key(&mut s, &press(KeyCode::Char('j')));
     }
     let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
@@ -1743,6 +1958,21 @@ fn mouse_click_on_each_local_feature_flag_indicator_toggles_in_one_click() {
         );
         assert_set_bool_action(outcome, key, !default_on);
     }
+}
+
+/// Value-column click toggles the `[features]` row in one click.
+#[test]
+fn mouse_click_on_subagent_model_inheritance_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "subagent_model_inheritance") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "subagent_model_inheritance", true);
 }
 
 /// Value-column click toggles the Ask-Question timeout in one click.
@@ -1884,10 +2114,6 @@ fn mouse_scroll_up_returns_selection_to_first() {
         _ => panic!("expected setting row at top"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Filter mode
-// ---------------------------------------------------------------------------
 
 /// Filter mode accepts chars into the query editor and must never leak
 /// an `Action`.
@@ -2542,10 +2768,6 @@ fn shift_g_jumps_to_last_filtered_row_under_active_filter() {
     assert!(matches!(outcome, SettingsKeyOutcome::Unchanged));
 }
 
-// ---------------------------------------------------------------------------
-// Selection stability
-// ---------------------------------------------------------------------------
-
 /// Filter keeps selection when the focused row remains visible.
 #[test]
 fn filter_keeps_selection_when_currently_selected_row_remains_visible() {
@@ -2562,10 +2784,6 @@ fn filter_keeps_selection_when_currently_selected_row_remains_visible() {
         "selection should NOT move — show_timestamps was already focused and matches the filter"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Multi-word AND semantics
-// ---------------------------------------------------------------------------
 
 /// One unmatched word in a multi-word query empties the result (AND).
 #[test]
@@ -2604,10 +2822,6 @@ fn filter_and_semantics_narrow_strictly() {
         with_unmatched.iter().map(|m| m.key).collect::<Vec<_>>()
     );
 }
-
-// ---------------------------------------------------------------------------
-// Mouse parity under active filter
-// ---------------------------------------------------------------------------
 
 /// Lay out `row_rects` for filtered state — only visible rows get rects.
 fn synth_rects_filtered(state: &mut SettingsModalState) {
@@ -2790,10 +3004,6 @@ fn render_no_matches_placeholder_includes_query() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// PickingEnum / EditingValue Esc routing
-// ---------------------------------------------------------------------------
-
 /// Esc in `PickingEnum` returns to Browse.
 #[test]
 fn esc_in_picking_enum_mode_returns_to_browse() {
@@ -2815,10 +3025,6 @@ fn esc_in_editing_value_mode_returns_to_browse() {
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
     assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
-
-// ---------------------------------------------------------------------------
-// Registry contracts
-// ---------------------------------------------------------------------------
 
 /// Pins which keys belong to each SettingKind.
 #[test]
@@ -2853,9 +3059,9 @@ fn registry_kind_membership_through_pr_14() {
     assert_eq!(
         bool_keys,
         vec![
-            "antigravity_skip_permissions",
-            "antigravity_subagents",
             "auto_update",
+            "codex_guardian_review",
+            "codex_persistent_mode",
             "collapsed_edit_blocks",
             "combine_queued_prompts",
             "compact_mode",
@@ -2870,10 +3076,13 @@ fn registry_kind_membership_through_pr_14() {
             "contextual_hints.undo",
             "contextual_hints.word_select",
             "custom_model_save",
+            "custom_provider_wizard",
+            "dashboard_preview",
             "diagnostics.crash_handler",
             "display_refresh_auto_cadence",
             "doom_loop_recovery.enabled",
             "enter_steers",
+            "features.context_management.experimental_mode",
             "features.lsp_tools",
             "features.non_git_warning",
             "features.remember_mode",
@@ -2891,11 +3100,14 @@ fn registry_kind_membership_through_pr_14() {
             "remember_tool_approvals",
             "respect_manual_folds",
             "sandbox.auto_allow_bash",
+            "sandbox.profile",
             "show_thinking_blocks",
             "show_timeline",
             "show_timestamps",
             "show_tips",
             "simple_mode",
+            "stream_tool_calls",
+            "subagent_model_inheritance",
             "suggestions.ai_enabled",
             "suggestions.enabled",
             "swarm_mode",
@@ -2990,6 +3202,7 @@ fn registry_kind_membership_through_pr_14() {
         sorted_int,
         vec![
             "custom_model_context_window",
+            "custom_model_max_context_window",
             "max_thoughts_width",
             "scroll_lines",
             "scroll_speed",
@@ -3115,6 +3328,7 @@ fn defaults_round_trip_through_registry() {
             "show_timestamps" => SettingValue::Bool(true),
             "show_timeline" => SettingValue::Bool(false),
             "page_flip_on_send" => SettingValue::Bool(true),
+            "dashboard_preview" => SettingValue::Bool(true),
             "confirm_before_rewind" => SettingValue::Bool(true),
             "combine_queued_prompts" => SettingValue::Bool(false),
             "follow_up_behavior" => SettingValue::Enum("queue"),
@@ -3126,6 +3340,7 @@ fn defaults_round_trip_through_registry() {
             "code_mode" => SettingValue::Enum("direct"),
             "image_generation_provider" => SettingValue::Enum("grok"),
             "toolset.ask_user_question.timeout_enabled" => SettingValue::Bool(true),
+            "subagent_model_inheritance" => SettingValue::Bool(false),
             "keep_text_selection" => SettingValue::Enum("flash"),
             "theme" => SettingValue::Enum("groknight"),
             "auto_dark_theme" => SettingValue::Enum("groknight"),
@@ -3174,9 +3389,11 @@ fn defaults_round_trip_through_registry() {
             "custom_model_provider" => SettingValue::Enum(""),
             "custom_model_base_url" => SettingValue::String(String::new()),
             "custom_model_context_window" => SettingValue::Int(200_000),
+            "custom_model_max_context_window" => SettingValue::Int(0),
             "custom_model_backend" => SettingValue::Enum("chat_completions"),
             "custom_model_env_key" => SettingValue::String(String::new()),
             "custom_model_save" => SettingValue::Bool(false),
+            "custom_provider_wizard" => SettingValue::Bool(false),
             "toolset.perplexity_web_search.enabled" => SettingValue::Bool(false),
             "toolset.web_search_source.xai" => SettingValue::Enum("xai"),
             "toolset.web_search_source.codex" => SettingValue::Enum("native"),
@@ -3197,6 +3414,7 @@ fn defaults_round_trip_through_registry() {
             "features.web_fetch" => SettingValue::Bool(false),
             "toolset.web_fetch.allow_local" => SettingValue::Bool(false),
             "features.two_pass_compaction" => SettingValue::Bool(false),
+            "features.context_management.experimental_mode" => SettingValue::Bool(false),
             "features.non_git_warning" => SettingValue::Bool(false),
             "features.remember_mode" => SettingValue::Bool(false),
             "doom_loop_recovery.enabled" => SettingValue::Bool(true),
@@ -3206,6 +3424,7 @@ fn defaults_round_trip_through_registry() {
             "suggestions.enabled" => SettingValue::Bool(false),
             "suggestions.ai_enabled" => SettingValue::Bool(false),
             "sandbox.auto_allow_bash" => SettingValue::Bool(false),
+            "sandbox.profile" => SettingValue::Bool(false),
             "tools.respect_gitignore" => SettingValue::Bool(false),
             "recap_model" => SettingValue::String(String::new()),
             "memory_model" => SettingValue::String(String::new()),
@@ -3215,8 +3434,6 @@ fn defaults_round_trip_through_registry() {
             "scroll_lines" => SettingValue::Int(3),
             "invert_scroll" => SettingValue::Bool(false),
             "display_refresh_auto_cadence" => SettingValue::Bool(false),
-            "antigravity_subagents" => SettingValue::Bool(false),
-            "antigravity_skip_permissions" => SettingValue::Bool(true),
             "coding_data_sharing" => SettingValue::Enum("opt-out"),
             "default_selected_permission" => SettingValue::Enum("always_allow_all_sessions"),
             "hunk_tracker_mode" => SettingValue::Enum("agent_only"),
@@ -3228,6 +3445,9 @@ fn defaults_round_trip_through_registry() {
             "auto_update" => SettingValue::Bool(true),
             "fork_secondary_model" => SettingValue::String(String::new()),
             "show_thinking_blocks" => SettingValue::Bool(true),
+            "codex_persistent_mode" => SettingValue::Bool(false),
+            "codex_guardian_review" => SettingValue::Bool(false),
+            "stream_tool_calls" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
             "group_tool_verbs" => SettingValue::Bool(true),
             "collapsed_edit_blocks" => SettingValue::Bool(false),
@@ -3303,6 +3523,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetTimestamps(_))
             | SettingsKeyOutcome::Action(Action::SetTimeline(_))
             | SettingsKeyOutcome::Action(Action::SetPageFlipOnSend(_))
+            | SettingsKeyOutcome::Action(Action::SetDashboardPreview(_))
             | SettingsKeyOutcome::Action(Action::SetConfirmBeforeRewind(_))
             | SettingsKeyOutcome::Action(Action::SetCombineQueuedPrompts(_))
             | SettingsKeyOutcome::Action(Action::SetSimpleMode(_))
@@ -3310,7 +3531,10 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetMultilineMode(_))
             | SettingsKeyOutcome::Action(Action::SetVimMode(_))
             | SettingsKeyOutcome::Action(Action::SetRememberToolApprovals(_))
+            | SettingsKeyOutcome::Action(Action::SetCodexPersistentMode(_))
+            | SettingsKeyOutcome::Action(Action::SetCodexGuardianReview(_))
             | SettingsKeyOutcome::Action(Action::SetAskUserQuestionTimeoutEnabled(_))
+            | SettingsKeyOutcome::Action(Action::SetSubagentModelInheritance(_))
             | SettingsKeyOutcome::Action(Action::SetPerplexityWebSearch(_))
             | SettingsKeyOutcome::Action(Action::SetShowTips(_))
             | SettingsKeyOutcome::Action(Action::SetAutoUpdate(_))
@@ -3322,8 +3546,6 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
-            | SettingsKeyOutcome::Action(Action::SetAntigravitySubagents(_))
-            | SettingsKeyOutcome::Action(Action::SetAntigravitySkipPermissions(_))
             | SettingsKeyOutcome::Action(Action::SetXSearchEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetVoiceKeybindEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetEnterSteers(_))
@@ -3350,10 +3572,6 @@ fn setting_value_variants_are_distinct() {
     assert_ne!(e, i);
     assert_ne!(s, i);
 }
-
-// ---------------------------------------------------------------------------
-// KeyEventKind filtering
-// ---------------------------------------------------------------------------
 
 /// Release events are dropped (kitty-keyboard protocol parity).
 #[test]
@@ -3421,10 +3639,6 @@ fn repeat_j_navigation_is_processed() {
         _ => panic!("expected setting row after Repeat j"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// d-key reset-to-default
-// ---------------------------------------------------------------------------
 
 /// `d` dispatches `Action::OpenResetConfirm` on the focused row.
 #[test]
@@ -3504,10 +3718,6 @@ fn d_key_on_header_row_is_unchanged() {
         "d on header row must be Unchanged, got: {outcome:?}",
     );
 }
-
-// ---------------------------------------------------------------------------
-// Mouse hit-rect edge cases
-// ---------------------------------------------------------------------------
 
 /// Click with empty `row_rects` (partial render) is a no-op.
 #[test]
@@ -4159,10 +4369,6 @@ fn pr5_multiline_mode_renders_under_editor_category() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// permission_mode (security-relevant Enum, no preview)
-// ---------------------------------------------------------------------------
-
 /// `permission_mode` lives under the `Agent` section.
 #[test]
 fn pr6_permission_mode_renders_under_agent_category() {
@@ -4438,41 +4644,6 @@ fn pr6_picker_seeds_choices_idx_from_pager_snapshot_yolo_true() {
     }
 }
 
-/// Exactly 4 canonical choices: {ask, auto, always-approve, default}.
-#[test]
-fn pr6_permission_mode_choices_use_canonical_strings() {
-    let reg = SettingsRegistry::defaults();
-    let meta = reg.find("permission_mode").unwrap();
-    let canonicals: Vec<&str> = match &meta.kind {
-        SettingKind::Enum { choices, .. } => choices.iter().map(|c| c.canonical).collect(),
-        _ => panic!("permission_mode must be Enum"),
-    };
-    assert_eq!(
-        canonicals.len(),
-        4,
-        "permission_mode catalog must be exactly {{ask, auto, always-approve, default}} — adding a \
-         choice requires updating action_for_enum_commit, apply_setting_rollback, \
-         PermissionModeKind, AND load_permission_mode (PR 11 contract)",
-    );
-    assert!(
-        canonicals.contains(&"auto"),
-        "permission_mode must include 'auto' canonical (auto permission mode feature)"
-    );
-    assert!(
-        canonicals.contains(&"ask"),
-        "permission_mode must include 'ask' canonical (shell schema)"
-    );
-    assert!(
-        canonicals.contains(&"always-approve"),
-        "permission_mode must include 'always-approve' canonical (shell schema)"
-    );
-    assert!(
-        canonicals.contains(&"default"),
-        "permission_mode must include 'default' canonical (PR 11 — agent's \
-         default permission behavior)"
-    );
-}
-
 /// Search "yolo" finds exactly `permission_mode`.
 #[test]
 fn pr6_search_yolo_matches_permission_mode() {
@@ -4590,10 +4761,6 @@ fn pr6_mouse_click_on_permission_mode_indicator_opens_picker_in_one_click() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// permission_mode 3-state tests (default/ask/always-approve)
-// ---------------------------------------------------------------------------
 
 /// Picking "Default" dispatches `SetPermissionMode(Default)`.
 #[test]
@@ -6246,10 +6413,6 @@ fn pr9_search_privacy_matches_coding_data_sharing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Mouse path tests for coding_data_sharing
-// ---------------------------------------------------------------------------
-
 /// First click on unselected row only selects.
 #[test]
 fn pr9_mouse_click_on_unselected_coding_data_sharing_row_only_selects() {
@@ -6511,10 +6674,6 @@ fn default_selected_permission_picker_esc_does_not_dispatch_action() {
         "Esc must return to Browse"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Mouse path tests for default_selected_permission
-// ---------------------------------------------------------------------------
 
 /// First click on unselected row only selects.
 #[test]
@@ -7522,10 +7681,6 @@ fn mouse_click_on_hunk_tracker_mode_indicator_opens_picker_in_one_click() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// voice_stt_language (SHELL Enum, Editor)
-// ---------------------------------------------------------------------------
-
 /// Enter on the voice_stt_language row opens the picker seeded at the
 /// default `en`.
 #[test]
@@ -7624,10 +7779,6 @@ fn mouse_click_on_voice_stt_language_indicator_opens_picker_in_one_click() {
         _ => panic!("value click on voice_stt_language must enter PickingEnum"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// CLI batch: show_tips, auto_update (SHELL Bool, restart_required)
-// ---------------------------------------------------------------------------
 
 /// Space-toggle on `show_tips` dispatches typed setter.
 #[test]
@@ -7742,10 +7893,6 @@ fn pr13_cli_batch_settings_are_discoverable_via_search() {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// fork_secondary_model (DynamicEnum, restart_required: false)
-// ---------------------------------------------------------------------------
 
 /// `fork_secondary_model` lives under Models.
 #[test]
@@ -8614,97 +8761,6 @@ fn display_refresh_auto_cadence_defaults_roundtrip_via_current_value_for() {
     ui_on.display_refresh.auto_cadence_enabled = Some(true);
     let value = current_value_for("display_refresh_auto_cadence", &ui_on, &pager)
         .expect("current_value_for(display_refresh_auto_cadence) must resolve");
-    assert_eq!(value, SettingValue::Bool(true));
-}
-
-// ---------------------------------------------------------------------------
-// antigravity_subagents — SHELL-owned Bool (Agent, default false, row gated
-// on the Antigravity CLI presence static — make_state() turns the gate on)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn antigravity_subagents_space_dispatches_typed_setter() {
-    let mut s = make_state();
-    navigate_to(&mut s, "antigravity_subagents");
-    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
-    assert_set_bool_action(outcome, "antigravity_subagents", true);
-}
-
-#[test]
-fn antigravity_subagents_enter_dispatches_typed_setter() {
-    // Seed on so Enter toggles off.
-    xai_grok_pager::app::set_antigravity_cli_present_for_test(true);
-    let mut ui = UiConfig::default();
-    ui.antigravity_subagents = Some(true);
-    let mut s = SettingsModalState::new(
-        Arc::new(SettingsRegistry::defaults()),
-        ui,
-        PagerLocalSnapshot {
-            auto_mode_gate: true,
-            ..PagerLocalSnapshot::default()
-        },
-    );
-    navigate_to(&mut s, "antigravity_subagents");
-    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
-    assert_set_bool_action(outcome, "antigravity_subagents", false);
-}
-
-#[test]
-fn antigravity_subagents_mouse_click_two_stage_toggles() {
-    let mut s = make_state();
-    synth_rects(&mut s);
-    let row_y = row_idx_for(&s, "antigravity_subagents") as u16;
-    let outcome = handle_settings_mouse(
-        &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        10,
-        row_y,
-    );
-    assert!(
-        matches!(outcome, SettingsKeyOutcome::Changed),
-        "first body-click should only select, got {outcome:?}"
-    );
-    let outcome = handle_settings_mouse(
-        &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        10,
-        row_y,
-    );
-    assert_set_bool_action(outcome, "antigravity_subagents", true);
-}
-
-#[test]
-fn antigravity_subagents_meta_agent_shell_restart() {
-    let reg = SettingsRegistry::defaults();
-    let meta = reg
-        .find("antigravity_subagents")
-        .expect("antigravity_subagents registered");
-    assert_eq!(meta.category, SettingCategory::Agent);
-    assert_eq!(meta.owner, SettingOwner::Shell);
-    assert!(meta.restart_required);
-    assert!(!meta.hidden_in_minimal);
-    assert_eq!(meta.label, "Antigravity subagents");
-    match &meta.kind {
-        SettingKind::Bool { default } => {
-            assert!(!default, "antigravity_subagents must default OFF")
-        }
-        other => panic!("expected Bool kind for antigravity_subagents, got {other:?}"),
-    }
-}
-
-#[test]
-fn antigravity_subagents_defaults_roundtrip_via_current_value_for() {
-    use xai_grok_pager::settings::current_value_for;
-    let ui = UiConfig::default();
-    let pager = PagerLocalSnapshot::default();
-    let value = current_value_for("antigravity_subagents", &ui, &pager)
-        .expect("current_value_for(antigravity_subagents) must resolve");
-    assert_eq!(value, SettingValue::Bool(false));
-
-    let mut ui_on = UiConfig::default();
-    ui_on.antigravity_subagents = Some(true);
-    let value = current_value_for("antigravity_subagents", &ui_on, &pager)
-        .expect("current_value_for(antigravity_subagents) must resolve");
     assert_eq!(value, SettingValue::Bool(true));
 }
 

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use agent_client_protocol as acp;
 use clap::ValueEnum;
+use xai_tty_utils::cli_eprintln as eprintln;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {

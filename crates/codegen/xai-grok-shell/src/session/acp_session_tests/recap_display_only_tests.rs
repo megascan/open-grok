@@ -768,10 +768,9 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
     );
 }
 
-/// Recap wire shape: main-turn tools + `prompt_cache_key` = session id, so the
-/// request rides the parent turn's prefix cache instead of cold-prefilling.
+/// A recap projects visible text and cannot invoke the parent's tools.
 #[tokio::test(flavor = "current_thread")]
-async fn recap_request_rides_parent_prompt_cache() {
+async fn recap_request_uses_bounded_text_without_tools() {
     use xai_grok_test_support::MockInferenceServer;
 
     let local = tokio::task::LocalSet::new();
@@ -781,8 +780,7 @@ async fn recap_request_rides_parent_prompt_cache() {
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
-            // Register a real tool so the "recap sends the main turn's tools"
-            // assertion is non-vacuous.
+            // Register a real tool so the exclusion assertion is non-vacuous.
             *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
 
             let server = MockInferenceServer::start().await.unwrap();
@@ -792,9 +790,15 @@ async fn recap_request_rides_parent_prompt_cache() {
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
             actor.chat_state_handle.update_sampling_config(cfg);
 
+            // Exceed even the maximum configurable per-user-message limit.
+            let user_message = format!(
+                "explain the borrow checker {} END-OF-USER",
+                "x".repeat(200_000)
+            );
+            let settings = crate::util::config::resolve_session_recap_settings_from_disk();
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("you are a coding agent"),
-                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::user(user_message.clone()),
                 ConversationItem::assistant("it enforces shared-xor-mutable"),
             ]);
 
@@ -820,30 +824,32 @@ async fn recap_request_rides_parent_prompt_cache() {
             );
 
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
-            assert_eq!(
-                body["prompt_cache_key"].as_str(),
-                Some(actor.session_info.id.to_string().as_str()),
-                "prompt_cache_key must be the parent session id for sticky routing"
+            assert!(body["prompt_cache_key"].is_null());
+            assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
+            let reply = "Agent: it enforces shared-xor-mutable";
+            let user_budget = settings
+                .user_message_max_chars
+                .min(settings.transcript_max_chars - reply.len() - 2 - "User: ".len());
+            let transcript = format!(
+                "User: {}…\n\n{reply}",
+                &user_message[..user_budget - '…'.len_utf8()]
             );
-            let main_turn_specs = actor.turn_base_tool_specs(
-                &actor.prepare_tool_definitions().await,
-                xai_grok_sampling_types::ModelProvider::Xai,
-            );
-            assert!(!main_turn_specs.is_empty(), "test env must expose tools");
-            let tools = body["tools"].as_array().expect("tools must be present");
-            assert_eq!(
-                tools.len(),
-                main_turn_specs.len(),
-                "recap must send exactly the main turn's tool specs"
+            assert!(transcript.len() <= settings.transcript_max_chars);
+            let expected = main_turn_input(vec![
+                ConversationItem::system(crate::session::helpers::session_recap::RECAP_SYSTEM),
+                ConversationItem::user(transcript),
+            ]);
+            assert!(
+                body["input"].as_array() == Some(&expected),
+                "recap must send the bounded visible transcript and its own instruction only"
             );
         })
         .await;
 }
 
-/// Hosted tools serialize into the token prefix on the Responses path, so a recap in a backend-search session must send the main turn's hosted
-/// tools or its prefix diverges and cold-misses the cache.
+/// Recaps do not inherit hosted or client-side tools from the main turn.
 #[tokio::test(flavor = "current_thread")]
-async fn recap_request_sends_hosted_tools_under_backend_search() {
+async fn recap_request_excludes_hosted_tools_under_backend_search() {
     use xai_grok_sampling_types::HostedTool;
     use xai_grok_test_support::MockInferenceServer;
 
@@ -895,29 +901,7 @@ async fn recap_request_sends_hosted_tools_under_backend_search() {
                 .find(|r| r.path.contains("responses"))
                 .expect("a responses request must be recorded");
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
-            let tools = body["tools"].as_array().expect("tools must be present");
-
-            assert!(
-                tools
-                    .iter()
-                    .any(|t| t["type"].as_str() == Some("web_search")),
-                "recap must send the main turn's hosted tools: {tools:?}"
-            );
-            // Function tools must still match the main turn's specs exactly.
-            let main_turn_specs = actor.turn_base_tool_specs(
-                &actor.prepare_tool_definitions().await,
-                xai_grok_sampling_types::ModelProvider::Xai,
-            );
-            assert!(!main_turn_specs.is_empty(), "test env must expose tools");
-            let function_tools = tools
-                .iter()
-                .filter(|t| t["type"].as_str() == Some("function"))
-                .count();
-            assert_eq!(
-                function_tools,
-                main_turn_specs.len(),
-                "hosted tools augment, not replace, the main turn's function tools"
-            );
+            assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
         })
         .await;
 }
@@ -1024,8 +1008,12 @@ async fn turn_summary_generate_persists_and_broadcasts() {
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![
-                ConversationItem::system("you are a coding agent"),
+                ConversationItem::system("private parent system prompt"),
+                ConversationItem::user("old prompt secret"),
+                ConversationItem::assistant("old answer secret"),
                 ConversationItem::user("fix the flaky parser test"),
+                ConversationItem::tool_result("call", "private tool output"),
+                ConversationItem::system_reminder("private reminder"),
                 ConversationItem::assistant("patched the race and re-ran the suite"),
             ]);
 
@@ -1046,6 +1034,19 @@ async fn turn_summary_generate_persists_and_broadcasts() {
                 actor.turn_summary_task.borrow().is_none(),
                 "slot must clear when generation finishes"
             );
+
+            let requests = server.requests();
+            let request = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("turn summary must use Responses");
+            let body = request.body.as_ref().expect("summary request body");
+            assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
+            let wire = body.to_string();
+            assert!(wire.contains("fix the flaky parser test"));
+            assert!(wire.contains("patched the race"));
+            assert!(!wire.contains("secret") && !wire.contains("private"));
 
             let mut found_persist = false;
             while let Ok(msg) = prx.try_recv() {
@@ -1094,10 +1095,9 @@ async fn turn_summary_generate_persists_and_broadcasts() {
         .await;
 }
 
-/// A recap must serialize the main turn's *effective* hosted tools, so an active per-turn cutoff
-/// reaches the recap's `x_search` entry rather than an unbounded tool.
+/// Even per-turn hosted-tool overrides do not add tools to recap requests.
 #[tokio::test(flavor = "current_thread")]
-async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
+async fn recap_does_not_send_per_turn_hosted_tools() {
     use xai_grok_sampling_types::{HostedTool, SearchDateBound, ToolOverrides, XSearchOptions};
     use xai_grok_test_support::MockInferenceServer;
 
@@ -1160,16 +1160,7 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
                 .find(|r| r.path.contains("responses"))
                 .expect("a responses request must be recorded");
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
-            let tools = body["tools"].as_array().expect("tools must be present");
-            let x_search = tools
-                .iter()
-                .find(|t| t["type"].as_str() == Some("x_search"))
-                .expect("recap must send the x_search hosted tool");
-            assert_eq!(
-                x_search["to_date"].as_str(),
-                Some("2024-03-15"),
-                "recap must serialize the per-turn override's cutoff, not the unbounded seed: {x_search:?}"
-            );
+            assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
         })
         .await;
 }
@@ -1284,7 +1275,7 @@ async fn side_question_request_rides_parent_prompt_cache() {
         .await;
 }
 
-/// Recap and `/btw` must replay the parent conversation verbatim and append one instruction. The cache key buys nothing if the prefix moved.
+/// `/btw` retains the parent prefix while recap sends only visible transcript text.
 #[tokio::test(flavor = "current_thread")]
 async fn auxiliary_calls_keep_the_main_turn_prefix() {
     use xai_grok_test_support::MockInferenceServer;
@@ -1305,7 +1296,8 @@ async fn auxiliary_calls_keep_the_main_turn_prefix() {
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
             actor.chat_state_handle.update_sampling_config(cfg);
 
-            // The Responses backend keeps reasoning, so it belongs in the prefix both calls have to reproduce.
+            // The Responses backend keeps reasoning in the side-question prefix,
+            // but recap must not expose it in the transcript.
             let parent = vec![
                 ConversationItem::system("you are a coding agent"),
                 ConversationItem::user("explain the borrow checker"),
@@ -1337,7 +1329,20 @@ async fn auxiliary_calls_keep_the_main_turn_prefix() {
                 .find(|r| r.path.contains("responses"))
                 .and_then(|r| r.body.as_ref())
                 .expect("recap body must be JSON");
-            assert_rides_parent_prefix(recap_body, parent, "recap");
+            let expected = main_turn_input(vec![
+                ConversationItem::system(crate::session::helpers::session_recap::RECAP_SYSTEM),
+                ConversationItem::user(
+                    "User: explain the borrow checker\n\nAgent: it enforces shared-xor-mutable",
+                ),
+            ]);
+            assert_eq!(
+                recap_body["input"].as_array(),
+                Some(&expected),
+                "recap must project only visible user and assistant text"
+            );
+            assert!(recap_body["tools"].as_array().is_none_or(Vec::is_empty));
+            assert!(recap_body["prompt_cache_key"].is_null());
+            assert_eq!(recap_body["model"], "test");
         })
         .await;
 }

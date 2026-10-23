@@ -26,12 +26,29 @@ pub struct CustomModelRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
+    /// Override the Codex Responses transport; omission inherits the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
+    /// Codex Responses tool capabilities; an empty list explicitly disables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_supported_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
     /// Persist only when the user typed one. Prefer [`Self::env_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Credential header: `bearer` or `x_api_key`.
+    ///
+    /// Written by the custom-provider wizard from the chosen wire format, and by
+    /// any hand-written `[model.*]` table. Left unset for built-in providers,
+    /// whose identity already fixes the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<String>,
 }
 
 /// List/mutation record. Never includes `api_key`.
@@ -48,9 +65,20 @@ pub struct CustomModelPublicRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_supported_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
+    /// Resolved credential header for this row, never the credential itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<String>,
     pub has_api_key: bool,
 }
 
@@ -70,15 +98,34 @@ pub fn normalize_custom_model(
     record.api_backend = trim_opt(record.api_backend);
     record.env_key = trim_opt(record.env_key);
     record.api_key = trim_opt(record.api_key);
+    record.auth_scheme = trim_opt(record.auth_scheme);
+    if let Some(raw) = record.auth_scheme.as_deref() {
+        // Reject a typo here rather than letting it silently fall back to a
+        // bearer token against a server that wants `x-api-key`.
+        parse_auth_scheme(raw)?;
+    }
 
     validate_model_key(&record.key)?;
     validate_model_id(&record.model)?;
+    if record.max_context_window == Some(0) || record.auto_compact_token_limit == Some(0) {
+        bail!("max_context_window and auto_compact_token_limit must be greater than 0");
+    }
     if record.context_window == Some(0) {
         bail!("context_window must be greater than 0");
     }
 
     if let Some(raw) = record.provider.as_deref() {
         record.provider = Some(parse_provider(raw)?.as_str().to_owned());
+    }
+    if record.max_context_window.is_some()
+        && record
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider != "codex")
+    {
+        bail!(
+            "max_context_window is a Codex raw-context override; use context_window for this provider"
+        );
     }
     if let Some(raw) = record.api_backend.as_deref() {
         record.api_backend = Some(api_backend_as_str(parse_api_backend(raw)?).to_owned());
@@ -132,8 +179,18 @@ impl CustomModelRecord {
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
             context_window: self.context_window,
+
+            max_context_window: self.max_context_window,
+
+            auto_compact_token_limit: self.auto_compact_token_limit,
             api_backend: self.api_backend.clone(),
+            use_responses_lite: self.use_responses_lite,
+            experimental_supported_tools: self.experimental_supported_tools.clone(),
             env_key: self.env_key.clone(),
+            auth_scheme: self
+                .resolved_auth_scheme()
+                .map(auth_scheme_as_str)
+                .map(str::to_owned),
             has_api_key: has_secret(&self.api_key),
         }
     }
@@ -156,8 +213,31 @@ impl CustomModelRecord {
                 TomlValue::Integer(i64::try_from(context_window).unwrap_or(i64::MAX)),
             );
         }
+        for (key, value) in [
+            ("max_context_window", self.max_context_window),
+            ("auto_compact_token_limit", self.auto_compact_token_limit),
+        ] {
+            if let Some(value) = value {
+                table.insert(
+                    key.into(),
+                    TomlValue::Integer(value.min(i64::MAX as u64) as i64),
+                );
+            }
+        }
         if let Some(api_backend) = &self.api_backend {
             table.insert("api_backend".into(), TomlValue::String(api_backend.clone()));
+        }
+        if let Some(use_responses_lite) = self.use_responses_lite {
+            table.insert(
+                "use_responses_lite".into(),
+                TomlValue::Boolean(use_responses_lite),
+            );
+        }
+        if let Some(tools) = &self.experimental_supported_tools {
+            table.insert(
+                "experimental_supported_tools".into(),
+                TomlValue::Array(tools.iter().cloned().map(TomlValue::String).collect()),
+            );
         }
         if let Some(env_key) = &self.env_key {
             table.insert("env_key".into(), TomlValue::String(env_key.clone()));
@@ -165,7 +245,43 @@ impl CustomModelRecord {
         if let Some(api_key) = &self.api_key {
             table.insert("api_key".into(), TomlValue::String(api_key.clone()));
         }
+        if let Some(scheme) = self.resolved_auth_scheme() {
+            table.insert(
+                "auth_scheme".into(),
+                TomlValue::String(auth_scheme_as_str(scheme).to_owned()),
+            );
+        }
         table
+    }
+
+    /// The credential header this row should carry.
+    ///
+    /// An explicit `auth_scheme` always wins. Otherwise only a user endpoint
+    /// speaking Anthropic Messages is assumed to be a native Anthropic server
+    /// (`x-api-key`); an OpenAI-compatible server keeps the historical bearer
+    /// default, which is also what a gateway or proxy expects.
+    pub fn resolved_auth_scheme(&self) -> Option<xai_grok_sampler::AuthScheme> {
+        if let Some(raw) = self.auth_scheme.as_deref() {
+            return parse_auth_scheme(raw).ok();
+        }
+        // Only a row that explicitly declares `provider = "custom"` is a user
+        // endpoint. A row without `provider` keeps the built-in default (xAI),
+        // so deriving a header for it would silently change first-party auth.
+        let is_user_endpoint = self
+            .provider
+            .as_deref()
+            .and_then(|raw| parse_provider(raw).ok())
+            == Some(ModelProvider::Custom);
+        if is_user_endpoint {
+            match self.api_backend.as_deref() {
+                Some("messages") => return Some(xai_grok_sampler::AuthScheme::XApiKey),
+                Some("google_ai_studio" | "ai_studio" | "gemini" | "google") => {
+                    return Some(xai_grok_sampler::AuthScheme::XGoogApiKey);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     pub fn to_override(&self) -> ConfigModelOverride {
@@ -178,12 +294,19 @@ impl CustomModelRecord {
                 .and_then(|raw| parse_provider(raw).ok()),
             base_url: self.base_url.clone(),
             context_window: self.context_window,
+
+            max_context_window: self.max_context_window,
+
+            auto_compact_token_limit: self.auto_compact_token_limit,
             api_backend: self
                 .api_backend
                 .as_deref()
                 .and_then(|raw| parse_api_backend(raw).ok()),
+            use_responses_lite: self.use_responses_lite,
+            experimental_supported_tools: self.experimental_supported_tools.clone(),
             env_key: self.env_key.clone().map(EnvKeys::single),
             api_key: self.api_key.clone(),
+            auth_scheme: self.resolved_auth_scheme(),
             ..ConfigModelOverride::default()
         }
     }
@@ -197,12 +320,19 @@ pub fn override_to_public(key: &str, model: &ConfigModelOverride) -> CustomModel
         provider: model.provider.map(ModelProvider::as_str).map(str::to_owned),
         base_url: model.base_url.clone(),
         context_window: model.context_window,
+
+        max_context_window: model.max_context_window,
+
+        auto_compact_token_limit: model.auto_compact_token_limit,
         api_backend: model.api_backend.map(api_backend_as_str).map(str::to_owned),
+        use_responses_lite: model.use_responses_lite,
+        experimental_supported_tools: model.experimental_supported_tools.clone(),
         env_key: model
             .env_key
             .as_ref()
             .and_then(EnvKeys::primary)
             .map(str::to_owned),
+        auth_scheme: model.auth_scheme.map(auth_scheme_as_str).map(str::to_owned),
         has_api_key: has_secret(&model.api_key),
     }
 }
@@ -261,10 +391,34 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
             Ok(ModelProvider::Gemini)
         }
         "openrouter" | "open_router" | "open-router" => Ok(ModelProvider::OpenRouter),
+        "custom" | "custom_endpoint" | "custom endpoint" | "byo" | "byok" => {
+            Ok(ModelProvider::Custom)
+        }
         other => bail!(
             "invalid provider `{other}`; expected xai, codex, kimi, fireworks, \
-             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, or openrouter"
+             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, openrouter, \
+             or custom"
         ),
+    }
+}
+
+/// Parse the `auth_scheme` config value (`bearer`, `x_api_key`, or `x_goog_api_key`).
+fn parse_auth_scheme(raw: &str) -> Result<xai_grok_sampler::AuthScheme> {
+    serde_json::from_value::<xai_grok_sampler::AuthScheme>(serde_json::Value::String(
+        raw.trim().to_owned(),
+    ))
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "invalid auth_scheme `{raw}`; expected bearer, x_api_key, or x_goog_api_key"
+        )
+    })
+}
+
+fn auth_scheme_as_str(scheme: xai_grok_sampler::AuthScheme) -> &'static str {
+    match scheme {
+        xai_grok_sampler::AuthScheme::Bearer => "bearer",
+        xai_grok_sampler::AuthScheme::XApiKey => "x_api_key",
+        xai_grok_sampler::AuthScheme::XGoogApiKey => "x_goog_api_key",
     }
 }
 
@@ -273,8 +427,9 @@ fn parse_api_backend(raw: &str) -> Result<ApiBackend> {
         "chat_completions" => Ok(ApiBackend::ChatCompletions),
         "responses" => Ok(ApiBackend::Responses),
         "messages" => Ok(ApiBackend::Messages),
+        "google_ai_studio" | "ai_studio" | "gemini" | "google" => Ok(ApiBackend::GoogleAiStudio),
         other => bail!(
-            "invalid api_backend `{other}`; expected chat_completions, responses, or messages"
+            "invalid api_backend `{other}`; expected chat_completions, responses, messages, or google_ai_studio"
         ),
     }
 }
@@ -284,6 +439,7 @@ fn api_backend_as_str(backend: ApiBackend) -> &'static str {
         ApiBackend::ChatCompletions => "chat_completions",
         ApiBackend::Responses => "responses",
         ApiBackend::Messages => "messages",
+        ApiBackend::GoogleAiStudio => "google_ai_studio",
     }
 }
 
@@ -450,6 +606,107 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_is_accepted_and_canonicalized() {
+        for raw in [
+            "custom",
+            "custom_endpoint",
+            "custom endpoint",
+            "byo",
+            "byok",
+        ] {
+            let (got, _) = normalize_custom_model(CustomModelRecord {
+                provider: Some(raw.to_owned()),
+                ..record("localhost-11434:qwen3", "qwen3:latest")
+            })
+            .unwrap();
+            assert_eq!(got.provider.as_deref(), Some("custom"), "for `{raw}`");
+        }
+        let err = normalize_custom_model(CustomModelRecord {
+            provider: Some("teleprompter".into()),
+            ..record("k", "m")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("or custom"), "{err}");
+    }
+
+    /// A user endpoint speaking Anthropic Messages is assumed native and gets
+    /// `x-api-key`; OpenAI-compatible endpoints and every built-in provider keep
+    /// the bearer default, and an explicit value always wins.
+    #[test]
+    fn auth_scheme_is_derived_only_for_a_custom_messages_endpoint() {
+        let cases = [
+            (Some("custom"), Some("messages"), Some("x_api_key")),
+            (Some("custom"), Some("responses"), None),
+            (Some("custom"), Some("chat_completions"), None),
+            (Some("custom"), None, None),
+            (Some("zai"), Some("messages"), None),
+            (None, Some("messages"), None),
+        ];
+        for (provider, api_backend, expected) in cases {
+            let (got, _) = normalize_custom_model(CustomModelRecord {
+                provider: provider.map(str::to_owned),
+                api_backend: api_backend.map(str::to_owned),
+                ..record("k-m", "model-id")
+            })
+            .unwrap();
+            assert_eq!(
+                got.to_public().auth_scheme.as_deref(),
+                expected,
+                "provider={provider:?} api_backend={api_backend:?}"
+            );
+        }
+        let explicit = CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("messages".into()),
+            auth_scheme: Some("bearer".into()),
+            ..record("proxy-gateway:claude", "claude-x")
+        };
+        assert_eq!(
+            explicit.resolved_auth_scheme(),
+            Some(xai_grok_sampler::AuthScheme::Bearer)
+        );
+        let json = serde_json::to_value(explicit.to_public()).unwrap();
+        assert_eq!(json.get("auth_scheme"), Some(&serde_json::json!("bearer")));
+    }
+
+    #[test]
+    fn auth_scheme_lands_in_toml_the_override_and_the_public_record() {
+        let (record, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("messages".into()),
+            base_url: Some("https://gateway.example.com/anthropic".into()),
+            api_key: Some("sk-ant-user".into()),
+            ..record("gateway.example.com:claude-x", "claude-x")
+        })
+        .unwrap();
+        let table = record.to_toml_table();
+        assert_eq!(
+            table.get("auth_scheme").and_then(TomlValue::as_str),
+            Some("x_api_key")
+        );
+        assert_eq!(
+            record.to_override().auth_scheme,
+            Some(xai_grok_sampler::AuthScheme::XApiKey)
+        );
+        let public = override_to_public("gateway.example.com:claude-x", &record.to_override());
+        assert_eq!(public.auth_scheme.as_deref(), Some("x_api_key"));
+        assert!(public.has_api_key);
+    }
+
+    #[test]
+    fn a_misspelled_auth_scheme_is_rejected_rather_than_ignored() {
+        let err = normalize_custom_model(CustomModelRecord {
+            auth_scheme: Some("x-api-key".into()),
+            ..record("k", "m")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid auth_scheme"), "{err}");
+        assert!(err.contains("x_api_key"), "{err}");
+    }
+
+    #[test]
     fn public_record_flags_stored_api_key_without_echoing_it() {
         let record = CustomModelRecord {
             api_key: Some("sk-secret".into()),
@@ -460,5 +717,95 @@ mod tests {
         let json = serde_json::to_value(&public).unwrap();
         assert!(json.get("api_key").is_none());
         assert_eq!(json.get("has_api_key"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn codex_experimental_metadata_round_trips_through_the_custom_model_api() {
+        for (use_responses_lite, tools) in [
+            (true, vec!["send_user_message_async", "future_tool"]),
+            (false, Vec::new()),
+        ] {
+            let input = serde_json::json!({
+                "key": "openai:api-test-model",
+                "model": "advertised-api-test-model",
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "api_backend": "responses",
+                "api_key": "test-api-secret",
+                "use_responses_lite": use_responses_lite,
+                "experimental_supported_tools": tools,
+            });
+            let (record, warning) =
+                normalize_custom_model(serde_json::from_value(input).unwrap()).unwrap();
+            assert!(warning.is_none());
+            assert_eq!(record.provider.as_deref(), Some("codex"));
+            let parsed: ConfigModelOverride =
+                TomlValue::Table(record.to_toml_table()).try_into().unwrap();
+            assert_eq!(parsed.use_responses_lite, Some(use_responses_lite));
+            assert_eq!(
+                parsed.experimental_supported_tools,
+                Some(tools.iter().map(|tool| (*tool).to_owned()).collect())
+            );
+            assert_eq!(
+                record.to_override().experimental_supported_tools,
+                parsed.experimental_supported_tools
+            );
+            assert_eq!(
+                record.to_override().use_responses_lite,
+                parsed.use_responses_lite
+            );
+            let public = override_to_public(&record.key, &parsed);
+            assert_eq!(public, record.to_public());
+            let json = serde_json::to_value(public).unwrap();
+            assert_eq!(json["use_responses_lite"], use_responses_lite);
+            assert_eq!(
+                json["experimental_supported_tools"],
+                serde_json::json!(tools)
+            );
+            assert_eq!(json["has_api_key"], true);
+            assert!(json.get("api_key").is_none());
+            assert!(!json.to_string().contains("test-api-secret"));
+        }
+    }
+
+    #[test]
+    fn omitted_codex_experimental_metadata_remains_unspecified() {
+        let record: CustomModelRecord = serde_json::from_value(serde_json::json!({
+            "key": "openai:api-test-model", "model": "advertised-api-test-model",
+        }))
+        .unwrap();
+        let model_override = record.to_override();
+        assert_eq!(model_override.use_responses_lite, None);
+        assert_eq!(model_override.experimental_supported_tools, None);
+        let public =
+            serde_json::to_value(override_to_public(&record.key, &model_override)).unwrap();
+        let table = record.to_toml_table();
+        for field in ["use_responses_lite", "experimental_supported_tools"] {
+            assert!(public.get(field).is_none());
+            assert!(!table.contains_key(field));
+        }
+    }
+
+    #[test]
+    fn google_ai_studio_api_backend_and_auth_scheme_in_custom_models() {
+        let (record, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("google_ai_studio".into()),
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta".into()),
+            api_key: Some("AIzaSyTestKey".into()),
+            ..record("gemini-custom", "gemini-2.5-flash")
+        })
+        .unwrap();
+        assert_eq!(
+            record.to_override().api_backend,
+            Some(ApiBackend::GoogleAiStudio)
+        );
+        assert_eq!(
+            record.to_override().auth_scheme,
+            Some(xai_grok_sampler::AuthScheme::XGoogApiKey)
+        );
+        let public = override_to_public("gemini-custom", &record.to_override());
+        assert_eq!(public.api_backend.as_deref(), Some("google_ai_studio"));
+        assert_eq!(public.auth_scheme.as_deref(), Some("x_goog_api_key"));
     }
 }

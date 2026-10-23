@@ -148,7 +148,7 @@ fn extract_reasoning_text(raw: &serde_json::Value) -> Option<String> {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let reader = BufReader::new(File::open(&args.input)?);
+    let reader = BufReader::new(xai_file_utils::session_file::open(&args.input)?);
     let mut writer = BufWriter::new(File::create(&args.output)?);
 
     let mut converted = 0usize;
@@ -396,6 +396,30 @@ mod tests {
         let v0_result = serde_json::from_str::<ChatRequestMessage>(bad);
         assert!(v1_result.is_err());
         assert!(v0_result.is_err());
+    }
+
+    #[test]
+    fn gzip_chat_history_can_be_downgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("chat_history.jsonl");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(
+                b"{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}\n",
+            )
+            .unwrap();
+        std::fs::write(&input_path, encoder.finish().unwrap()).unwrap();
+
+        let reader = BufReader::new(xai_file_utils::session_file::open(&input_path).unwrap());
+        let mut pending = Vec::new();
+        let messages: Vec<_> = reader
+            .lines()
+            .map(|line| convert_line(&line.unwrap(), &mut pending).unwrap().unwrap())
+            .collect();
+        assert_eq!(messages.len(), 1);
+        let message = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(message["role"], "user");
+        assert_eq!(message["content"], "hello");
     }
 
     #[test]

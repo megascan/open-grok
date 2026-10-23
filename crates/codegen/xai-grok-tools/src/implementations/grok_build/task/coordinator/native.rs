@@ -42,18 +42,22 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 team_scope_id: team.to_owned(),
                 agent_id: record.agent_id.clone(),
             };
-            let messages = record
-                .mailbox
-                .iter()
-                .filter(|message| {
-                    message.team_scope_id == team
-                        && message.to_agent_id == record.agent_id
-                        && message.native.is_some()
-                })
-                .take(128)
-                .cloned()
-                .collect();
-            self.mailboxes.insert(mailbox_key, messages);
+            let mailbox = self.mailboxes.entry(mailbox_key).or_default();
+            for message in record.mailbox.iter().filter(|message| {
+                message.team_scope_id == team
+                    && message.to_agent_id == record.agent_id
+                    && message.native.is_some()
+            }) {
+                if mailbox.len() >= 128 {
+                    break;
+                }
+                if !mailbox
+                    .iter()
+                    .any(|existing| existing.message_id == message.message_id)
+                {
+                    mailbox.push_back(message.clone());
+                }
+            }
             self.native_names
                 .insert(key.clone(), record.agent_id.clone());
             self.native_records.insert(key, record);
@@ -374,6 +378,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         id: target.clone(),
                         parent_session_id: identity.team_scope_id.clone(),
                         parent_prompt_id: None,
+                        tool_call_id: None,
                         prompt: String::new(),
                         description: record.task_name.clone(),
                         subagent_type: record.agent_type.clone(),
@@ -400,6 +405,21 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             });
         if let Some(reusable) = reusable {
             if message.kind.triggers_turn() {
+                let key = MailboxKey {
+                    team_scope_id: identity.team_scope_id.clone(),
+                    agent_id: target.clone(),
+                };
+                if self.mailbox_barriers.contains(&key)
+                    || self
+                        .mailboxes
+                        .get(&key)
+                        .is_some_and(|mailbox| mailbox.iter().any(|entry| entry.native.is_none()))
+                {
+                    return Err(
+                        "Agent mailbox delivery is still being settled; retry the follow-up"
+                            .to_owned(),
+                    );
+                }
                 if reusable.runtime_overrides.native_agent.is_none() {
                     return Err(
                         "Only named native agents can be reused with followup_task".to_owned()
@@ -433,6 +453,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 self.handle_spawn(SubagentSpawnRequest {
                     request: Box::new(resumed),
                     result_tx,
+                    admission_reservation: None,
                 });
                 if !self.pending.contains_key(&new_target)
                     && !self.active.contains_key(&new_target)
@@ -492,10 +513,13 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             AgentMessageDeliveryStatus::Queued
         };
         if delivered && let Some(waiter) = self.mailbox_waiters.remove(&key) {
-            let _ = waiter.respond_to.send(WaitAgentMessagesOutput {
-                messages: Vec::new(),
-                timed_out: false,
-            });
+            let _ = waiter.respond_to.send(
+                WaitAgentMessagesOutput {
+                    messages: Vec::new(),
+                    timed_out: false,
+                }
+                .into(),
+            );
         }
         self.runner.on_agent_message(&message, status);
         self.record_native_activity(key, author);
@@ -528,6 +552,20 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 },
                 native.task_name.clone(),
             );
+            let key = MailboxKey {
+                team_scope_id: request.parent_session_id.clone(),
+                agent_id: request.id.clone(),
+            };
+            if self.mailbox_barriers.contains(&key) {
+                self.pending_native_completions.insert(key, request.clone());
+                return;
+            }
+            self.finish_native_completion(request);
+        }
+    }
+
+    pub(super) fn finish_native_completion(&mut self, request: &SubagentRequest) {
+        if let Some(native) = &request.runtime_overrides.native_agent {
             if self
                 .completed
                 .get(&request.id)
@@ -542,6 +580,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     agent_id: request.id.clone(),
                 };
                 let messages = self.mailboxes.remove(&mailbox_key).unwrap_or_default();
+                let (ordinary, messages): (VecDeque<_>, VecDeque<_>) = messages
+                    .into_iter()
+                    .partition(|message| message.native.is_none());
+                if !ordinary.is_empty() {
+                    self.mailboxes.insert(mailbox_key, ordinary);
+                }
                 if let Some(source) = &request.resume_from {
                     self.native_names.insert(name_key.clone(), source.clone());
                     if let Some(record) = self.native_records.get_mut(&name_key) {
@@ -579,9 +623,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 agent_id: request.id.clone(),
             };
             let followup = self.mailboxes.get_mut(&key).and_then(|mailbox| {
-                let index = mailbox
-                    .iter()
-                    .rposition(|message| message.kind.triggers_turn())?;
+                let index = mailbox.iter().rposition(|message| {
+                    message.native.is_some() && message.kind.triggers_turn()
+                })?;
                 mailbox.remove(index)
             });
             if let Some(message) = followup {

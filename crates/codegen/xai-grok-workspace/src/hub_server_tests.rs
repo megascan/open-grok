@@ -3,6 +3,8 @@ use crate::capability::CapabilityMode;
 use crate::handle::tests::{
     background_capable_cfg, make_confining_handle, make_handle, start_background_sleep,
 };
+use crate::workspace_ops::WorkspaceRpc;
+use std::sync::Arc;
 use xai_grok_tools::implementations::grok_build::scheduler::types::{
     ScheduledTask, SchedulerState,
 };
@@ -109,6 +111,52 @@ async fn dispatch_unknown_method_returns_unknown_method_error() {
         }
         other => panic!("expected UnknownMethod, got {other:?}"),
     }
+}
+#[tokio::test]
+async fn handle_evict_unbind_does_not_unmount() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let handle = make_handle();
+    handle
+        .create_session_with_cwd("evict-conv", None)
+        .expect("create");
+    handle
+        .session("evict-conv")
+        .expect("session")
+        .set_path_virtualization(
+            crate::path_virtualization::PathVirtualization::try_from_session_root(
+                "/workspace/evict-conv",
+            )
+            .expect("valid"),
+        );
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let unbinds = Arc::new(AtomicUsize::new(0));
+    let mounts_c = mounts.clone();
+    let unbinds_c = unbinds.clone();
+    handle.set_bind_mount_hook(
+        crate::path_virtualization::BindMountHook::probe_then_mount(
+            |_| false,
+            move |_| {
+                mounts_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .with_on_unbind(move |_, _| {
+            unbinds_c.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    WorkspaceRpcHandler::new(handle)
+        .handle_evict(ToolServerEvictParams {
+            session_id: SessionId::new("evict-conv").unwrap(),
+            reason: "test".into(),
+            grace_period_ms: 50,
+        })
+        .await;
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        0,
+        "evict/prune must not mount or unmount"
+    );
+    assert_eq!(unbinds.load(Ordering::SeqCst), 1);
 }
 /// A hub evict runs the two-phase drain then settles into terminal
 /// ShuttingDown (not a lingering Draining) for an evicted workspace.
@@ -348,6 +396,68 @@ async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
         "next_fire_at must be RFC3339: {}",
         loop_task.next_fire_at
     );
+}
+#[tokio::test]
+async fn delete_scheduled_task_rpc_reports_honestly() {
+    use xai_grok_workspace_types::rpc::workspace::DeleteScheduledTaskResponse;
+    let handle = make_handle();
+    let cfg = background_capable_cfg();
+    let session = handle
+        .create_session_with_config(
+            "del-rpc",
+            None,
+            Some(cfg.clone()),
+            CapabilityMode::All,
+            None,
+            false,
+        )
+        .expect("create background-capable session");
+    session.set_bind_tool_config_fingerprint(serde_json::to_value(&cfg).ok());
+    seed_scheduled_task(session.toolset().as_ref(), "loop-del-1").await;
+    let handler = WorkspaceRpcHandler::new(handle.clone());
+    async fn delete(
+        handler: &WorkspaceRpcHandler,
+        task_id: &str,
+    ) -> Result<DeleteScheduledTaskResponse, WorkspaceError> {
+        handler
+            .dispatch(
+                "workspace.delete_scheduled_task",
+                serde_json::json!({"session_id": "del-rpc", "task_id": task_id}),
+                Some("del-rpc"),
+            )
+            .await
+            .map(|value| serde_json::from_value(value).expect("decode delete response"))
+    }
+    let missing = delete(&handler, "no-such-loop").await.expect("unknown id");
+    assert_eq!(missing.task_id, "no-such-loop");
+    assert!(!missing.deleted, "an unknown id must report false");
+    let live = delete(&handler, "loop-del-1").await;
+    let err = live.expect_err("a live loop must error until the durable gate is satisfied");
+    assert!(
+        err.to_string().contains("durab"),
+        "expected the durability refusal, got: {err}"
+    );
+    let snap_value = handler
+        .dispatch(
+            "workspace.tasks_snapshot",
+            serde_json::json!({"session_id": "del-rpc"}),
+            Some("del-rpc"),
+        )
+        .await
+        .expect("tasks_snapshot after refusal");
+    let snap: TasksSnapshotResponse = serde_json::from_value(snap_value).expect("decode snapshot");
+    assert_eq!(
+        snap.scheduled_tasks.len(),
+        1,
+        "a refused delete must leave the loop scheduled"
+    );
+}
+async fn seed_scheduled_task(toolset: &FinalizedToolset, id: &str) {
+    let mut resources = toolset.resources.lock().await;
+    let state = resources.get_or_default::<State<SchedulerState>>();
+    let mut task = ScheduledTask::new(300, "check CI".into(), true, false);
+    task.id = id.into();
+    state.tasks.push(task);
 }
 /// `workspace.kill_task`: kills a running BG task and reports not_found for
 /// unknown ids; after kill the task leaves `tasks_snapshot`.
@@ -1345,36 +1455,6 @@ async fn handle_hook_before_turn_sets_turn_state() {
     );
 }
 #[tokio::test]
-async fn handle_hook_after_turn_does_not_panic() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle.clone());
-    handle.activity_tracker().turn_started("main", 1);
-    let payload = turn_hook::AfterTurnPayload {
-        turn_number: 1,
-        outcome: turn_hook::TurnHookOutcome::Completed,
-        duration_ms: 500,
-        tool_call_count: 3,
-        model_id: "grok-3".to_string(),
-        written_repo_paths: Vec::new(),
-        cancellation_category: None,
-        cancellation_context: None,
-    };
-    let frame = HookFrame {
-        session_id: SessionId::new("main").unwrap(),
-        tool_id: None,
-        call_id: None,
-        hook_id: None,
-        event: HookEvent::Custom {
-            kind: turn_hook::AFTER_TURN_KIND.to_string(),
-            payload: serde_json::to_value(&payload).unwrap(),
-        },
-        trace_context: None,
-    };
-    handler
-        .handle_hook(SessionId::new("main").unwrap(), frame)
-        .await;
-}
-#[tokio::test]
 async fn handle_hook_malformed_payload_does_not_panic() {
     let handle = make_handle();
     let handler = WorkspaceRpcHandler::new(handle);
@@ -1487,6 +1567,344 @@ use crate::workspace_ops::{GetFilesRes, PutFilesRes};
 fn test_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(data))
+}
+async fn session_image_handler() -> (WorkspaceRpcHandler, tempfile::TempDir) {
+    use xai_grok_tools::types::resources::SessionFolder;
+    let handle = make_handle();
+    let folder = tempfile::tempdir().unwrap();
+    handle
+        .session("main")
+        .unwrap()
+        .toolset()
+        .resources
+        .lock()
+        .await
+        .insert(SessionFolder(folder.path().to_path_buf()));
+    (WorkspaceRpcHandler::new(handle), folder)
+}
+fn directory_entries(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut entries = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+#[tokio::test]
+async fn dispatch_store_session_image_preserves_binary_in_bound_folder() {
+    use base64::Engine;
+    use xai_grok_workspace_types::rpc::fs::{StoreSessionImageReq, StoreSessionImageRes};
+    let (handler, folder) = session_image_handler().await;
+    let root = handler.workspace.root_cwd().unwrap();
+    std::fs::write(root.join("keep.txt"), b"untouched").unwrap();
+    let before = directory_entries(&root);
+    let bytes = b"\x89PNG\r\n\x1a\n\0\xff\x80binary";
+    let mut paths = Vec::new();
+    for extension in ["png", "jpg", "webp", "gif"] {
+        let request = StoreSessionImageReq {
+            content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            extension: extension.to_owned(),
+        };
+        let params = serde_json::to_value(&request).unwrap();
+        let round_trip: StoreSessionImageReq = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(params, serde_json::to_value(round_trip).unwrap());
+        let value = handler
+            .dispatch(StoreSessionImageReq::METHOD, params, Some("main"))
+            .await
+            .unwrap();
+        let response: StoreSessionImageRes = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(value, serde_json::to_value(&response).unwrap());
+        let path = std::path::PathBuf::from(response.file_path);
+        assert!(path.is_absolute());
+        assert_eq!(
+            Some(dunce::canonicalize(folder.path()).unwrap().as_path()),
+            path.parent()
+        );
+        assert_eq!(Some(std::ffi::OsStr::new(extension)), path.extension());
+        uuid::Uuid::parse_str(path.file_stem().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(bytes.as_slice(), std::fs::read(&path).unwrap());
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    assert_eq!(4, paths.len());
+    assert_eq!(
+        paths,
+        directory_entries(&dunce::canonicalize(folder.path()).unwrap())
+    );
+    assert_eq!(before, directory_entries(&root));
+    assert_eq!(
+        b"untouched",
+        std::fs::read(root.join("keep.txt")).unwrap().as_slice()
+    );
+}
+#[tokio::test]
+async fn dispatch_store_session_image_requires_bound_session() {
+    let (handler, folder) = session_image_handler().await;
+    let root = handler.workspace.root_cwd().unwrap();
+    let before = directory_entries(&root);
+    for (bound_session, expected) in [
+        (
+            None,
+            "hub error: store_session_image requires a bound session",
+        ),
+        (Some("not-bound"), "session not found: not-bound"),
+    ] {
+        let error = handler
+            .dispatch(
+                "workspace.store_session_image",
+                serde_json::json!({
+                    "content_base64": "AA==",
+                    "extension": "png",
+                    "session_id": "main"
+                }),
+                bound_session,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expected, error.to_string());
+    }
+    assert!(directory_entries(folder.path()).is_empty());
+    assert_eq!(before, directory_entries(&root));
+}
+#[tokio::test]
+async fn dispatch_store_session_image_rejects_invalid_input_without_writing() {
+    let (handler, folder) = session_image_handler().await;
+    let root = handler.workspace.root_cwd().unwrap();
+    let before = directory_entries(&root);
+    for extension in ["", "../png", "png/../../escape", ".jpg", "svg", "PNG"] {
+        let error = handler
+            .dispatch(
+                "workspace.store_session_image",
+                serde_json::json!({"content_base64": "AA==", "extension": extension}),
+                Some("main"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            "hub error: store_session_image extension must be jpg, png, webp, or gif",
+            error.to_string()
+        );
+    }
+    let error = handler
+        .dispatch(
+            "workspace.store_session_image",
+            serde_json::json!({"content_base64": "!!!!", "extension": "png"}),
+            Some("main"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        "hub error: invalid session image base64: Invalid symbol 33, offset 0.",
+        error.to_string()
+    );
+    assert!(directory_entries(folder.path()).is_empty());
+    assert_eq!(before, directory_entries(&root));
+}
+#[tokio::test]
+async fn dispatch_store_session_image_enforces_size_limit_without_writing() {
+    use base64::Engine;
+    use xai_grok_workspace_types::rpc::fs::{
+        MAX_SESSION_IMAGE_BASE64_BYTES, MAX_SESSION_IMAGE_BYTES,
+    };
+    let (handler, folder) = session_image_handler().await;
+    let root = handler.workspace.root_cwd().unwrap();
+    let before = directory_entries(&root);
+    for content_base64 in [
+        "!".repeat(MAX_SESSION_IMAGE_BASE64_BYTES + 1),
+        base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_SESSION_IMAGE_BYTES + 1]),
+    ] {
+        let error = handler
+            .dispatch(
+                "workspace.store_session_image",
+                serde_json::json!({"content_base64": content_base64, "extension": "png"}),
+                Some("main"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("hub error: session image exceeds {MAX_SESSION_IMAGE_BYTES} byte limit"),
+            error.to_string()
+        );
+        assert!(directory_entries(folder.path()).is_empty());
+        assert_eq!(before, directory_entries(&root));
+    }
+}
+#[tokio::test]
+async fn dispatch_store_session_image_accepts_exact_size_limit() {
+    use base64::Engine;
+    use xai_grok_workspace_types::rpc::fs::{MAX_SESSION_IMAGE_BYTES, StoreSessionImageRes};
+    let (handler, folder) = session_image_handler().await;
+    let bytes = vec![0xff; MAX_SESSION_IMAGE_BYTES];
+    let value = handler
+        .dispatch(
+            "workspace.store_session_image",
+            serde_json::json!({
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                "extension": "png",
+            }),
+            Some("main"),
+        )
+        .await
+        .unwrap();
+    let response: StoreSessionImageRes = serde_json::from_value(value).unwrap();
+    let path = std::path::PathBuf::from(response.file_path);
+    assert_eq!(bytes, std::fs::read(&path).unwrap());
+    assert_eq!(vec![path], directory_entries(folder.path()));
+}
+#[tokio::test]
+async fn dispatch_store_session_image_reports_write_failure() {
+    use xai_grok_tools::types::resources::SessionFolder;
+    let (handler, folder) = session_image_handler().await;
+    let root = handler.workspace.root_cwd().unwrap();
+    let before = directory_entries(&root);
+    let not_a_directory = folder.path().join("file");
+    std::fs::write(&not_a_directory, b"preserve").unwrap();
+    handler
+        .workspace
+        .session("main")
+        .unwrap()
+        .toolset()
+        .resources
+        .lock()
+        .await
+        .insert(SessionFolder(not_a_directory.clone()));
+    let error = handler
+        .dispatch(
+            "workspace.store_session_image",
+            serde_json::json!({"content_base64": "AA==", "extension": "png"}),
+            Some("main"),
+        )
+        .await
+        .unwrap_err();
+    match error {
+        WorkspaceError::HubError(message) => {
+            assert!(
+                message.starts_with("create session image temporary file:"),
+                "{message}"
+            );
+        }
+        other => panic!("expected image write failure, got {other:?}"),
+    }
+    assert_eq!(
+        b"preserve",
+        std::fs::read(&not_a_directory).unwrap().as_slice()
+    );
+    assert_eq!(vec![not_a_directory], directory_entries(folder.path()));
+    assert_eq!(before, directory_entries(&root));
+}
+/// `workspace.client_fs_write_file` dispatches under the bound session with camelCase params and a camelCase response.
+/// Sync `block_on` under the env lock: the dispatch reads `WORKSPACE_CLIENT_FS_QUERIES`, which `write_file_behind_client_fs_gate` sets.
+#[test]
+fn dispatch_client_fs_write_file_round_trips_through_envelope() {
+    use base64::Engine;
+    use xai_grok_workspace_types::rpc::fs::{ClientFsWriteFileReq, ClientFsWriteFileRes};
+    let _env = crate::LockedTestEnv::lock();
+    let _unset = crate::TestEnvGuard::unset("WORKSPACE_CLIENT_FS_QUERIES");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let handler = rt.block_on(async { WorkspaceRpcHandler::new(make_handle()) });
+    let root = handler.workspace.root_cwd().unwrap();
+    let bytes = b"\x00\xff\xfe binary \x00";
+    let params = serde_json::json!({
+        "path": "out/blob.bin",
+        "uploadId": "rt-1",
+        "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "offset": 0,
+        "finalize": true,
+    });
+    let round_trip: ClientFsWriteFileReq = serde_json::from_value(params.clone()).unwrap();
+    assert!(round_trip.create_dirs && !round_trip.overwrite);
+    let value = rt
+        .block_on(handler.dispatch(ClientFsWriteFileReq::METHOD, params, Some("main")))
+        .unwrap();
+    let response: ClientFsWriteFileRes = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(value, serde_json::to_value(&response).unwrap());
+    assert_eq!(response.size, bytes.len() as u64);
+    assert_eq!(response.hash.as_deref(), Some(test_sha256(bytes).as_str()));
+    assert_eq!(
+        response.file_path.as_deref(),
+        Some(root.join("out/blob.bin").to_str().unwrap())
+    );
+    assert_eq!(
+        value.get("filePath"),
+        Some(&serde_json::json!(response.file_path))
+    );
+    assert_eq!(std::fs::read(root.join("out/blob.bin")).unwrap(), bytes);
+    let error = rt
+        .block_on(
+            handler
+                .dispatch(
+                    ClientFsWriteFileReq::METHOD,
+                    serde_json::json!({
+                "path": "unbound.bin", "uploadId": "rt-2", "contentBase64": "AA==", "offset": 0, "finalize": true
+            }),
+                    None,
+                ),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "hub error: client_fs_write_file requires a bound session"
+    );
+    assert!(!root.join("unbound.bin").exists());
+}
+/// `WORKSPACE_CLIENT_FS_QUERIES=0` refuses the write like the reads, before params are parsed or anything is staged.
+/// Sync `block_on` so the env lock is not held across `.await`.
+#[test]
+fn write_file_behind_client_fs_gate() {
+    use xai_grok_workspace_types::rpc::fs::{ClientFsReadFileReq, ClientFsWriteFileReq};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let handler = rt.block_on(async { WorkspaceRpcHandler::new(make_handle()) });
+    let root = handler.workspace.root_cwd().unwrap();
+    let params = serde_json::json!({
+        "path": "gated.bin", "uploadId": "gate", "contentBase64": "AA==", "offset": 0, "finalize": true
+    });
+    let read_params = serde_json::json!({ "path": "gated.bin", "encoding": "base64" });
+    let (write_err, read_err) = {
+        let _env = crate::LockedTestEnv::lock()
+            .set("WORKSPACE_CLIENT_FS_QUERIES", std::path::Path::new("0"));
+        rt.block_on(async {
+            let write_err = handler
+                .dispatch(ClientFsWriteFileReq::METHOD, params.clone(), Some("main"))
+                .await
+                .unwrap_err();
+            let read_err = handler
+                .dispatch(ClientFsReadFileReq::METHOD, read_params, Some("main"))
+                .await
+                .unwrap_err();
+            (write_err, read_err)
+        })
+    };
+    assert_eq!(
+        write_err.to_string(),
+        "hub error: client fs queries disabled on this workspace"
+    );
+    assert_eq!(write_err.to_string(), read_err.to_string());
+    assert!(!root.join("gated.bin").exists());
+    assert!(
+        directory_entries(&root)
+            .iter()
+            .all(|p| !p.to_string_lossy().contains("grok-upload")),
+        "nothing staged while gated"
+    );
+    assert_eq!(
+        handler
+            .workspace
+            .session("main")
+            .unwrap()
+            .staged_uploads()
+            .len(),
+        0
+    );
+    let _env = crate::LockedTestEnv::lock();
+    let _unset = crate::TestEnvGuard::unset("WORKSPACE_CLIENT_FS_QUERIES");
+    rt.block_on(async {
+        handler
+            .dispatch(ClientFsWriteFileReq::METHOD, params, Some("main"))
+            .await
+            .unwrap();
+    });
+    assert_eq!(std::fs::read(root.join("gated.bin")).unwrap(), b"\x00");
 }
 #[tokio::test]
 async fn dispatch_put_files_writes_and_returns_hash() {
@@ -1659,24 +2077,6 @@ async fn dispatch_resolve_file_references_uses_bound_session_base() {
     let arr = result.as_array().expect("results array");
     assert_eq!(arr[0]["exists"], serde_json::Value::Bool(true));
     assert_eq!(arr[0]["content"], serde_json::json!("rebased"));
-}
-#[tokio::test]
-async fn handle_hook_pause_resume_are_noops() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle);
-    for event in [HookEvent::Pause, HookEvent::Resume] {
-        let frame = HookFrame {
-            session_id: SessionId::new("main").unwrap(),
-            tool_id: None,
-            call_id: None,
-            hook_id: None,
-            event,
-            trace_context: None,
-        };
-        handler
-            .handle_hook(SessionId::new("main").unwrap(), frame)
-            .await;
-    }
 }
 #[tokio::test]
 async fn dispatch_put_files_rejects_absolute_outside_root() {
@@ -2173,6 +2573,7 @@ async fn dispatch_knows_every_typed_method() {
         <GitMetadataReq as WorkspaceRpc>::METHOD,
         <PutFilesReq as WorkspaceRpc>::METHOD,
         <GetFilesReq as WorkspaceRpc>::METHOD,
+        <StoreSessionImageReq as WorkspaceRpc>::METHOD,
         <FsListReq as WorkspaceRpc>::METHOD,
         <FsExistsReq as WorkspaceRpc>::METHOD,
         <FsReadFileReq as WorkspaceRpc>::METHOD,
@@ -2204,6 +2605,9 @@ async fn dispatch_knows_every_typed_method() {
         <ApplyWorktreeRequest as WorkspaceRpc>::METHOD,
         <WorktreeListReq as WorkspaceRpc>::METHOD,
         <WorktreeShowReq as WorkspaceRpc>::METHOD,
+        <WorktreeDetachReq as WorkspaceRpc>::METHOD,
+        <WorktreeSalvageReq as WorkspaceRpc>::METHOD,
+        <WorktreeCleanArtifactsReq as WorkspaceRpc>::METHOD,
         <WorktreeDbPathReq as WorkspaceRpc>::METHOD,
         <WorktreeDbStatsReq as WorkspaceRpc>::METHOD,
         <PrepareWorktreeFromWorktreeReq as WorkspaceRpc>::METHOD,
@@ -2363,4 +2767,69 @@ async fn presence_note_is_inert_while_dark() {
         None,
         "dark default: the note must not withhold idle"
     );
+}
+#[tokio::test]
+async fn worktree_management_routes_reject_invalid_params_without_execution() {
+    use crate::workspace_ops::{WorktreeCleanArtifactsReq, WorktreeDetachReq, WorktreeSalvageReq};
+
+    let handler = WorkspaceRpcHandler::new(make_handle());
+    for method in [
+        WorktreeDetachReq::METHOD,
+        WorktreeSalvageReq::METHOD,
+        WorktreeCleanArtifactsReq::METHOD,
+    ] {
+        let result = handler.dispatch(method, serde_json::json!({}), None).await;
+        assert!(
+            matches!(&result, Err(WorkspaceError::HubError(message)) if message.contains("invalid params") && message.contains(method)),
+            "management method must reach typed validation: {result:?}"
+        );
+    }
+}
+#[tokio::test]
+async fn handle_hook_after_turn_does_not_panic() {
+    let handle = make_handle();
+    let handler = WorkspaceRpcHandler::new(handle.clone());
+    handle.activity_tracker().turn_started("main", 1);
+    let payload = turn_hook::AfterTurnPayload {
+        turn_number: 1,
+        outcome: turn_hook::TurnHookOutcome::Completed,
+        duration_ms: 500,
+        tool_call_count: 3,
+        model_id: "grok-3".to_string(),
+        written_repo_paths: Vec::new(),
+        cancellation_category: None,
+        cancellation_context: None,
+    };
+    let frame = HookFrame {
+        session_id: SessionId::new("main").unwrap(),
+        tool_id: None,
+        call_id: None,
+        hook_id: None,
+        event: HookEvent::Custom {
+            kind: turn_hook::AFTER_TURN_KIND.to_string(),
+            payload: serde_json::to_value(&payload).unwrap(),
+        },
+        trace_context: None,
+    };
+    handler
+        .handle_hook(SessionId::new("main").unwrap(), frame)
+        .await;
+}
+#[tokio::test]
+async fn handle_hook_pause_resume_are_noops() {
+    let handle = make_handle();
+    let handler = WorkspaceRpcHandler::new(handle);
+    for event in [HookEvent::Pause, HookEvent::Resume] {
+        let frame = HookFrame {
+            session_id: SessionId::new("main").unwrap(),
+            tool_id: None,
+            call_id: None,
+            hook_id: None,
+            event,
+            trace_context: None,
+        };
+        handler
+            .handle_hook(SessionId::new("main").unwrap(), frame)
+            .await;
+    }
 }

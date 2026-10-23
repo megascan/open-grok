@@ -18,6 +18,164 @@ fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> G
 }
 
 #[test]
+fn login_snapshots_cover_rotation_privacy_and_logout_without_secrets() {
+    use base64::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new(dir.path(), GrokComConfig::default());
+    let mut changes = manager.login_changes();
+    assert_eq!(changes.snapshot().login, Login::SignedOut);
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let token = format!(
+        "{}.{}.secret-signature",
+        enc.encode(r#"{"alg":"RS256"}"#),
+        enc.encode(r#"{"sub":"account-a"}"#)
+    );
+    manager.hot_swap(GrokAuth {
+        key: token.clone(),
+        ..GrokAuth::test_default()
+    });
+    let first = changes.snapshot();
+    assert_eq!(first.login, Login::Account("account-a".into()));
+    assert_eq!(first.generation, 1);
+    assert!(!format!("{first:?}").contains("secret-signature"));
+    manager.with_inner_write(|inner| inner.as_mut().unwrap().coding_data_retention_opt_out = true);
+    assert_eq!(changes.snapshot().generation, 2);
+    manager.hot_swap(GrokAuth {
+        key: "different-secret".into(),
+        ..GrokAuth::test_default()
+    });
+    let rotated = changes.snapshot();
+    assert_eq!(rotated.login, Login::Opaque);
+    assert_eq!(rotated.generation, 3);
+    manager.clear_in_memory();
+    let signed_out = changes.snapshot();
+    assert_eq!(signed_out.login, Login::SignedOut);
+    assert_eq!(signed_out.generation, 4);
+    AuthManager::publish_login_if_newer(&manager.login_changes, first);
+    assert_eq!(changes.snapshot(), signed_out);
+}
+
+#[tokio::test]
+async fn privacy_cache_update_waits_for_auth_lock_and_preserves_other_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let auth = GrokAuth {
+        key: "account-a".into(),
+        email: Some("a@example.test".into()),
+        ..GrokAuth::test_default()
+    };
+    manager.persist_and_swap(auth.clone());
+    let mut map = read_auth_json(&manager.path).unwrap();
+    map.insert(
+        "other-provider".into(),
+        GrokAuth {
+            key: "other".into(),
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json(&manager.path, &map).unwrap();
+    let guard = manager
+        .try_lock_auth_file_async(StdDuration::from_secs(1))
+        .await
+        .unwrap();
+    let task_manager = manager.clone();
+    let mut task =
+        tokio::spawn(async move { task_manager.save_privacy_if_current(&auth, true).await });
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(100), &mut task)
+            .await
+            .is_err()
+    );
+    drop(guard);
+    assert!(
+        tokio::time::timeout(StdDuration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert!(manager.current().unwrap().coding_data_retention_opt_out);
+    let disk = read_auth_json(&manager.path).unwrap();
+    assert!(
+        lookup_auth(&disk, &manager.scope)
+            .unwrap()
+            .coding_data_retention_opt_out
+    );
+    assert_eq!(disk.get("other-provider").unwrap().key, "other");
+}
+
+#[tokio::test]
+async fn privacy_cache_update_does_not_overwrite_a_switched_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new(dir.path(), GrokComConfig::default());
+    let original = GrokAuth {
+        key: "account-a".into(),
+        ..GrokAuth::test_default()
+    };
+    let replacement = GrokAuth {
+        key: "account-b".into(),
+        ..GrokAuth::test_default()
+    };
+    manager.persist_and_swap(original.clone());
+    manager.hot_swap(replacement.clone());
+    assert!(
+        !manager
+            .save_privacy_if_current(&original, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !lookup_auth(&read_auth_json(&manager.path).unwrap(), &manager.scope)
+            .unwrap()
+            .coding_data_retention_opt_out
+    );
+    manager.persist_and_swap(replacement.clone());
+    manager.hot_swap(original.clone());
+    assert!(
+        !manager
+            .save_privacy_if_current(&original, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        lookup_auth(&read_auth_json(&manager.path).unwrap(), &manager.scope)
+            .unwrap()
+            .key,
+        replacement.key
+    );
+    assert!(!manager.current().unwrap().coding_data_retention_opt_out);
+}
+
+#[tokio::test]
+async fn refresh_adopts_fresh_disk_token_without_waiting_for_file_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new(directory.path(), GrokComConfig::default()));
+    manager.persist_and_swap(GrokAuth {
+        key: "sibling-fresh".into(),
+        ..make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now())
+    });
+    manager.hot_swap(GrokAuth {
+        key: "expired".into(),
+        ..make_auth(
+            Some(Utc::now() - Duration::hours(1)),
+            Utc::now() - Duration::hours(2),
+        )
+    });
+    let _guard = manager
+        .try_lock_auth_file_async(StdDuration::from_secs(1))
+        .await
+        .unwrap();
+    let auth = tokio::time::timeout(
+        StdDuration::from_millis(500),
+        manager.refresh_chain(TokenType::ExternalBinary, RefreshReason::PreRequest),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(auth.key, "sibling-fresh");
+}
+
+#[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());
     assert!(is_expired(&auth));
@@ -2880,6 +3038,7 @@ fn apply_user_info_enrichment_preserves_token_fields() {
         user_blocked_reason: None,
         team_blocked_reasons: None,
         coding_data_retention_opt_out: None,
+        can_administer_team: None,
         subscription_tier: None,
     };
 

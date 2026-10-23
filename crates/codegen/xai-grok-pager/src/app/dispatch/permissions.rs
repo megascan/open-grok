@@ -6,10 +6,6 @@ use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use agent_client_protocol as acp;
 
-// ---------------------------------------------------------------------------
-// Permission dispatch
-// ---------------------------------------------------------------------------
-
 use crate::views::permission_view::{McpScope, PermissionFocus, PermissionViewState};
 use xai_grok_workspace::permission::{BashCommandSelectedTerms, McpScopeSelection};
 
@@ -50,6 +46,14 @@ pub(super) fn build_selection_meta(
     edited: Option<EditedPattern>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let obj = |v: serde_json::Value| v.as_object().cloned();
+
+    if crate::app::sandbox_permission::is_sandbox(&perm.request.request) {
+        return Some(crate::app::sandbox_permission::decision(
+            &perm.request.request,
+            option_id,
+            &perm.options,
+        ));
+    }
 
     if let Some(scope) = perm
         .mcp_scope
@@ -134,6 +138,23 @@ pub(super) fn dispatch_permission_select(
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    if let Some(perm) = agent.permission_queue.front()
+        && crate::app::sandbox_permission::is_sandbox(&perm.request.request)
+    {
+        if !perm.options.iter().any(|o| o.option_id == option_id) {
+            return vec![];
+        }
+        if option_id.0.as_ref() != "sandbox:deny"
+            && (agent.terminal_size_stale
+                || perm.sandbox_visible_area != Some(agent.pane_areas.prompt)
+                || !crate::views::permission_view::sandbox_card_fits(perm, agent.pane_areas.prompt))
+        {
+            agent.show_toast(
+                "Expand the terminal to view the full sandbox request before approving",
+            );
+            return vec![];
+        }
+    }
     let Some(perm) = agent.permission_queue.pop_front() else {
         return vec![];
     };
@@ -142,8 +163,8 @@ pub(super) fn dispatch_permission_select(
 
     // Detect the "enable always-approve mode" id BEFORE moving option_id
     // into the response. Cheap str compare on the `Arc<str>` interior.
-    let enable_always_approve =
-        option_id.0.as_ref() == xai_grok_workspace::permission::ENABLE_ALWAYS_APPROVE_OPTION_ID;
+    let enable_always_approve = !crate::app::sandbox_permission::is_sandbox(&perm.request.request)
+        && option_id.0.as_ref() == xai_grok_workspace::permission::ENABLE_ALWAYS_APPROVE_OPTION_ID;
 
     // Remember the user's choice (by option kind) so the next prompt's cursor
     // sticks to it. Skip the two options that aren't per-prompt choices:
@@ -152,7 +173,8 @@ pub(super) fn dispatch_permission_select(
     //  - "allow all edits during this session" is edit-scoped (kind
     //    `AllowAlways`) — letting it stick would steer an unrelated later
     //    prompt onto its "always allow this command" row, escalating scope.
-    let steers_next_cursor = !enable_always_approve
+    let steers_next_cursor = !crate::app::sandbox_permission::is_sandbox(&perm.request.request)
+        && !enable_always_approve
         && option_id.0.as_ref() != xai_grok_workspace::permission::ALLOW_EDITS_SESSION_OPTION_ID;
     if steers_next_cursor
         && let Some(kind) = perm
@@ -235,7 +257,16 @@ pub(super) fn dispatch_permission_followup(app: &mut AppView, text: String) -> V
     };
 
     // Include followup message in meta.
-    let meta = if !text.trim().is_empty() {
+    let meta = if crate::app::sandbox_permission::is_sandbox(&perm.request.request) {
+        let decision = if text.trim().is_empty() {
+            serde_json::json!({"outcome":"reject"})
+        } else {
+            serde_json::json!({"outcome":"reject", "followup_message":text})
+        };
+        serde_json::json!({"sandbox_decision":decision})
+            .as_object()
+            .cloned()
+    } else if !text.trim().is_empty() {
         serde_json::json!({
             "followup_message": text,
         })

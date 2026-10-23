@@ -231,6 +231,9 @@ fn grok_computer_toolset() -> ToolServerConfig {
         (&grok_build::GrepTool).into(),
         (&grok_build::KillTerminalCommandTool).into(),
         (&grok_build::GetTerminalCommandOutputTool).into(),
+        (&grok_build::SchedulerCreateTool).into(),
+        (&grok_build::SchedulerDeleteTool).into(),
+        (&grok_build::SchedulerListTool).into(),
     ];
     ToolServerConfig {
         tools,
@@ -288,6 +291,21 @@ pub fn toolset_for_preset(preset: &str) -> Option<ToolServerConfig> {
         .or_else(|| registered_toolset_preset(&normalized))
 }
 fn default_grok_build_toolset() -> ToolServerConfig {
+    grok_build_core_toolset_with(true, true)
+}
+fn default_agent_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(true)
+}
+fn general_purpose_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(false)
+}
+fn grok_build_core_toolset(include_workflow: bool) -> ToolServerConfig {
+    grok_build_core_toolset_with(include_workflow, false)
+}
+fn grok_build_core_toolset_with(
+    include_workflow: bool,
+    include_send_feedback: bool,
+) -> ToolServerConfig {
     let mut tools = vec![
         bash_tool_config(),
         (&grok_build::ReadFileTool).into(),
@@ -309,8 +327,13 @@ fn default_grok_build_toolset() -> ToolServerConfig {
         (&search_tool::SearchTool).into(),
         (&use_tool::UseTool).into(),
         (&grok_build::UpdateGoalTool).into(),
-        (&grok_build::WorkflowTool).into(),
     ];
+    if include_workflow {
+        tools.push((&grok_build::WorkflowTool).into());
+    }
+    if include_send_feedback {
+        tools.push((&grok_build::SendFeedbackTool).into());
+    }
     tools.extend(collaboration_tool_configs());
     tools.extend(session_collaboration_tool_configs());
     ToolServerConfig {
@@ -776,7 +799,7 @@ pub struct AgentDefinition {
     pub(crate) builtin_name: Option<BuiltinAgentName>,
     #[serde(default = "default_prompt_mode")]
     pub prompt_mode: PromptMode,
-    #[serde(default = "default_grok_build_toolset")]
+    #[serde(default = "default_agent_toolset")]
     pub tool_config: ToolServerConfig,
     /// Runtime capability mode that constrains which tool kinds the agent
     /// can use. Applied during subagent spawn in `handle_subagent_request`
@@ -863,8 +886,8 @@ pub struct AgentDefinition {
     #[serde(skip)]
     pub system_prompt: TemplateOverride,
     /// First-user-message template selector. `Default` (the default) lets
-    /// the shell layer build the legacy `<user_info>` + `<git_status>`
-    /// prefix; `Custom` uses a caller-supplied template string.
+    /// the shell layer build the legacy `<user_info>` prefix; `Custom`
+    /// uses a caller-supplied template string.
     #[serde(default)]
     pub user_message_template: UserMessageTemplate,
     /// Where this definition was loaded from, optional if built in agent definition
@@ -1400,7 +1423,7 @@ impl AgentDefinition {
     fn scope_from_path(path: &Path) -> AgentScope {
         let path_str = path.to_string_lossy();
         let grok = xai_grok_config::user_grok_home();
-        let home = dirs::home_dir();
+        let home = xai_dirs::home_dir();
         for (dir, scope) in crate::discovery::user_agent_dirs(home.as_deref(), grok.as_deref()) {
             if path.starts_with(&dir) {
                 return scope;
@@ -1505,6 +1528,13 @@ impl AgentDefinition {
             }
         }
     }
+    /// True for a client-supplied inline profile: no built-in, plugin, or on-disk provenance.
+    pub fn is_inline_profile(&self) -> bool {
+        self.builtin_name.is_none()
+            && self.plugin_name.is_none()
+            && self.source_path.is_none()
+            && self.scope == AgentScope::BuiltIn
+    }
     pub fn include_browser_verification(&self) -> bool {
         matches!(
             self.builtin_name,
@@ -1526,7 +1556,7 @@ impl AgentDefinition {
             plugin_name: None,
             builtin_name: None,
             prompt_mode: PromptMode::Extend,
-            tool_config: default_grok_build_toolset(),
+            tool_config: default_agent_toolset(),
             capability_mode: None,
             permission_mode: PermissionMode::Default,
             skills: vec![],
@@ -1560,10 +1590,13 @@ impl AgentDefinition {
         }
     }
     pub fn default_grok_build() -> Self {
-        Self::base(
-            BuiltinAgentName::GrokBuild,
-            "Grok Build agent for software engineering tasks.",
-        )
+        Self {
+            tool_config: default_grok_build_toolset(),
+            ..Self::base(
+                BuiltinAgentName::GrokBuild,
+                "Grok Build agent for software engineering tasks.",
+            )
+        }
     }
     /// Grok Build Concise agent definition — concise output format for SFT/RL.
     pub fn grok_build_concise() -> Self {
@@ -1629,6 +1662,7 @@ impl AgentDefinition {
             description: xai_tool_types::GENERAL_PURPOSE_SUBAGENT
                 .description
                 .to_string(),
+            tool_config: general_purpose_toolset(),
             prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
             ..Self::base(BuiltinAgentName::GeneralPurpose, "")
         }
@@ -1832,6 +1866,84 @@ mod tests {
         assert!(explore.tools.len() < plan.tools.len());
         assert!(plan.tools.len() < gb.tools.len());
     }
+    fn feedback_tool_id() -> String {
+        ToolConfig::from(&grok_build::SendFeedbackTool).id
+    }
+    fn contains_feedback(config: &ToolServerConfig) -> bool {
+        let id = feedback_tool_id();
+        config.tools.iter().any(|tool| tool.id == id)
+    }
+    #[test]
+    fn send_feedback_exposure_is_grok_build_only() {
+        use strum::IntoEnumIterator;
+        let presets = all_toolset_presets();
+        for (name, config) in &presets {
+            let expected = name == "grok-build";
+            let count = config
+                .tools
+                .iter()
+                .filter(|tool| tool.id == feedback_tool_id())
+                .count();
+            assert_eq!(
+                count,
+                usize::from(expected),
+                "preset `{name}` has the wrong send_feedback exposure"
+            );
+        }
+        for builtin in BuiltinAgentName::iter() {
+            let expected = match builtin {
+                BuiltinAgentName::GrokBuild => true,
+                BuiltinAgentName::GrokBuildConcise
+                | BuiltinAgentName::GrokBuildPlan
+                | BuiltinAgentName::GrokBuildPlanNoSubagents
+                | BuiltinAgentName::GrokBuildAskUser
+                | BuiltinAgentName::Codex
+                | BuiltinAgentName::Opencode
+                | BuiltinAgentName::GeneralPurpose
+                | BuiltinAgentName::Explore
+                | BuiltinAgentName::Plan
+                | BuiltinAgentName::BrowserUse
+                | BuiltinAgentName::GrokBuildOrchestrator => false,
+            };
+            assert_eq!(
+                contains_feedback(&builtin.definition().tool_config),
+                expected,
+                "builtin `{builtin}` has the wrong send_feedback exposure"
+            );
+        }
+        for (name, config) in [
+            ("core", grok_build_core_toolset(true)),
+            ("general-purpose", general_purpose_toolset()),
+        ] {
+            assert!(
+                !contains_feedback(&config),
+                "toolset `{name}` leaked send_feedback"
+            );
+        }
+        let workspace = workspace_grok_build_toolset();
+        assert_eq!(
+            workspace
+                .tools
+                .iter()
+                .filter(|tool| tool.id == feedback_tool_id())
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn defaulted_agent_definitions_omit_send_feedback() {
+        let builtins = AgentDefinition::builtin_defaults("external", "External definition");
+        assert!(!contains_feedback(&builtins.tool_config));
+        assert!(!contains_feedback(
+            &AgentDefinition::browser_use().tool_config
+        ));
+        let serde_default: AgentDefinition = serde_json::from_value(serde_json::json!({
+            "name": "external",
+            "description": "External definition"
+        }))
+        .unwrap();
+        assert!(!contains_feedback(&serde_default.tool_config));
+    }
     fn grok_computer_exclusive_ids() -> Vec<String> {
         #[allow(unused_mut)]
         let mut ids: Vec<String> = vec![
@@ -1891,6 +2003,44 @@ mod tests {
                 assert!(t.name_override.is_none(), "tool `{}` must not rename", t.id);
             }
         }
+    }
+    #[test]
+    fn grok_computer_includes_scheduler_lifecycle_tools() {
+        let config = toolset_for_preset("grok-computer").unwrap();
+        for scheduled_tool in [
+            ToolConfig::from(&grok_build::SchedulerCreateTool),
+            ToolConfig::from(&grok_build::SchedulerDeleteTool),
+            ToolConfig::from(&grok_build::SchedulerListTool),
+        ] {
+            assert_eq!(
+                config
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.id == scheduled_tool.id)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn general_purpose_preserves_core_tools_except_workflow_and_feedback() {
+        let feedback_id = feedback_tool_id();
+        let expected: Vec<_> = default_grok_build_toolset()
+            .tools
+            .into_iter()
+            .filter(|tool| {
+                !grok_build::workflow::is_workflow_tool(tool.kind, &tool.id)
+                    && tool.id != feedback_id
+            })
+            .map(|tool| tool.id)
+            .collect();
+        let actual: Vec<_> = AgentDefinition::general_purpose()
+            .tool_config
+            .tools
+            .into_iter()
+            .map(|tool| tool.id)
+            .collect();
+        assert_eq!(actual, expected);
     }
     /// The grok-computer preset must ship a full-file write tool (legacy
     /// `write_file` parity) — the same OpenCode `write` tool the grok-build
@@ -2537,6 +2687,22 @@ description: Test default tool config
     #[test]
     fn test_model_override_default_is_inherit() {
         assert_eq!(ModelOverride::default(), ModelOverride::Inherit);
+    }
+    #[test]
+    fn is_inline_profile_only_for_client_supplied_definitions() {
+        let inline = AgentDefinition::from_json(&serde_json::json!({
+            "name": "custom-profile",
+            "description": "A custom profile",
+        }))
+        .unwrap();
+        assert!(inline.is_inline_profile());
+        assert!(!AgentDefinition::grok_build_plan().is_inline_profile());
+        let mut project = inline.clone();
+        project.scope = AgentScope::Project;
+        assert!(!project.is_inline_profile());
+        let mut on_disk = inline.clone();
+        on_disk.source_path = Some(std::path::PathBuf::from("/tmp/custom.md"));
+        assert!(!on_disk.is_inline_profile());
     }
     #[test]
     fn test_model_override_serde_inherit() {

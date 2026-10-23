@@ -2369,15 +2369,18 @@ fn spawn_client_handler(
         let _ = event_tx.send(ServerEvent::Disconnected(client_id)).await;
     });
 }
-async fn run_client_session(
+async fn run_client_session<S>(
     client_id: ClientId,
-    stream: LeaderStream,
+    stream: S,
     server_rx: AsyncReceiver<ClientOutbound>,
     event_tx: AsyncSender<ServerEvent>,
     cancel: CancellationToken,
     mut ready_rx: watch::Receiver<bool>,
     control_state: LeaderServerControlState,
-) -> Result<(), ProtocolError> {
+) -> Result<(), ProtocolError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut reader, mut writer) = tokio::io::split(stream);
     let msg: ClientMessage =
         match tokio::time::timeout(REGISTRATION_TIMEOUT, read_message(&mut reader)).await {
@@ -2473,34 +2476,36 @@ async fn run_client_session(
         ))
         .await;
     info!(client_id = client_id.0, client_type = %client_type, ?mode, yolo_mode = capabilities.yolo_mode, client_version = ?capabilities.client_version, "Client registered");
-    loop {
-        tokio::select! {
-            biased;
+    'session: loop {
+        // read_message uses read_exact, which can consume part of a frame before
+        // yielding. Keep that future alive while outbound messages are written;
+        // recreating it after an outbound message would lose the partial frame.
+        let msg_result = {
+            let read = read_message::<_, ClientMessage>(&mut reader);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
 
-            _ = cancel.cancelled() => {
-                drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
-                break;
-            }
+                    _ = cancel.cancelled() => {
+                        drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
+                        break 'session;
+                    }
 
-            Ok(msg) = server_rx.recv() => {
-                if write_outbound(&mut writer, &msg).await.is_err() {
-                    break;
+                    Ok(msg) = server_rx.recv() => {
+                        if write_outbound(&mut writer, &msg).await.is_err() {
+                            break 'session;
+                        }
+                    }
+
+                    result = &mut read => break result,
                 }
             }
+        };
 
-            msg_result = read_message::<_, ClientMessage>(&mut reader) => {
-                match handle_client_inbound_message(
-                    msg_result,
-                    client_id,
-                    &event_tx,
-                    &mut writer,
-                )
-                .await?
-                {
-                    ClientSessionAction::Continue => {}
-                    ClientSessionAction::Break => break,
-                }
-            }
+        match handle_client_inbound_message(msg_result, client_id, &event_tx, &mut writer).await? {
+            ClientSessionAction::Continue => {}
+            ClientSessionAction::Break => break,
         }
     }
     Ok(())
@@ -2686,6 +2691,9 @@ pub async fn spawn_leader_server(socket_path: PathBuf) -> Result<ServerHandle, S
         control_state,
     })
 }
+#[cfg(test)]
+#[path = "server_partial_frame_tests.rs"]
+mod partial_frame_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

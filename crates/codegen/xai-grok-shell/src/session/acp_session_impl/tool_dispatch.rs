@@ -8,14 +8,82 @@ use super::*;
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
 const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// Read the model-facing command parameter, respecting a configured alias.
+/// Ambiguous input is left unnamed rather than associating the wrong command
+/// with a sandbox hold; the tool's own parser remains authoritative.
+fn sandbox_command(
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+    args: &serde_json::Value,
+) -> Option<String> {
+    use xai_grok_tools::types::tool::ToolKind;
+    let names = toolset.template_param_names();
+    let name = names
+        .get(&ToolKind::Execute)
+        .and_then(|params| params.get("command"))
+        .map(String::as_str)
+        .unwrap_or("command");
+    if name != "command" && args.get(name).is_some() && args.get("command").is_some() {
+        return None;
+    }
+    args.get(name)
+        .or_else(|| args.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
 ///
 /// Agent sessions always use local workspace ops (in-process toolset).
+/// Production dispatch builds the origin itself and calls [`dispatch_observed`].
+#[cfg(test)]
 pub(super) async fn dispatch_tool(
     workspace_ops: &xai_grok_workspace::WorkspaceOps,
     prepared: &PreparedToolCall,
     session_id: &str,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    if let Some(metadata) = &prepared.mcp_request_meta {
+        if let xai_grok_workspace::WorkspaceOps::Local { handle } = workspace_ops {
+            use futures::StreamExt;
+            let session = handle.session(session_id).ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "session_not_found",
+                    "workspace session not found",
+                )
+            })?;
+            let mut extensions = xai_tool_runtime::TypedExtensions::new();
+            extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
+            if let Some(binding) = &prepared.mcp_binding {
+                extensions.insert(binding.clone());
+            }
+            let call_id: &str =
+                if xai_grok_sampling_types::conversation::decode_codex_function_call_id(
+                    &prepared.call_id,
+                )
+                .is_some()
+                {
+                    &prepared.call_id
+                } else {
+                    &prepared.tool_call_id.0
+                };
+            let mut stream = session.toolset().call_streaming_with_extensions(
+                &prepared.tool_name,
+                prepared.parsed_args.clone(),
+                call_id,
+                None,
+                None,
+                extensions,
+            );
+            while let Some(item) = stream.next().await {
+                if let xai_tool_runtime::ToolStreamItem::Terminal(result) = item {
+                    return result;
+                }
+            }
+            return Err(xai_tool_runtime::ToolError::custom(
+                "stream_no_terminal",
+                "MCP dispatch ended without a result",
+            ));
+        }
+    }
     tracing::debug!(
         tool = %prepared.tool_name,
         call_id = %prepared.tool_call_id.0,
@@ -23,20 +91,94 @@ pub(super) async fn dispatch_tool(
         mode = "local",
         "dispatch_tool"
     );
+    let origin = crate::session::telemetry::model_origin(
+        &prepared.invocation_id,
+        session_id,
+        None,
+        prepared.model_id.as_deref(),
+        &prepared.tool_id,
+        prepared.tool_version.as_deref(),
+    );
+    dispatch_observed(
+        workspace_ops,
+        prepared,
+        session_id,
+        origin,
+        xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn dispatch_observed(
+    workspace_ops: &xai_grok_workspace::WorkspaceOps,
+    prepared: &PreparedToolCall,
+    session_id: &str,
+    origin: xai_grok_tools::types::tool_call_origin::ToolCallOrigin,
+    slot: xai_grok_tools::types::source_summary::SourceSummarySlot,
+    sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
+    delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
+    mailbox_receipt_slot: Option<
+        xai_grok_tools::implementations::grok_build::task::types::MailboxReceiptSlot,
+    >,
+) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    let mut ctx = xai_tool_runtime::ToolCallContext::new(
+        xai_tool_protocol::ToolCallId::new(prepared.tool_call_id.0.as_ref())
+            .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7()),
+    );
+    ctx.insert(origin);
+    ctx.insert(slot);
+    if let Some(binding) = &prepared.mcp_binding {
+        ctx.insert(binding.clone());
+    }
+    if let Some(slot) = mailbox_receipt_slot {
+        ctx.insert(slot);
+    }
+    if let Some(plan_file) = &prepared.plan_file {
+        ctx.insert(plan_file.clone());
+    }
+    if let Some(scope) = delivery_scope {
+        ctx.insert(scope);
+    }
+    if let xai_grok_workspace::WorkspaceOps::Local { handle } = workspace_ops {
+        let session = handle.session(session_id).ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom("session_not_found", "workspace session not found")
+        })?;
+        let toolset = session.toolset();
+        if toolset.tool_kind_map().get(&prepared.tool_name)
+            == Some(&xai_grok_tools::types::tool::ToolKind::Execute)
+        {
+            use futures::StreamExt;
+            let name = prepared.tool_name.clone();
+            let args = prepared.execution_arguments().clone();
+            let command = sandbox_command(&toolset, &args);
+            let stream = workspace_ops.run_sandbox_shell_call(
+                session_id,
+                prepared.tool_call_id.0.to_string(),
+                command,
+                sandbox_transport,
+                move || toolset.call_streaming_with_context(&name, args.clone(), ctx.clone()),
+            );
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                if let xai_tool_runtime::ToolStreamItem::Terminal(result) = item {
+                    return result;
+                }
+            }
+            return Err(xai_tool_runtime::ToolError::custom(
+                "stream_no_terminal",
+                "sandbox dispatch ended without a result",
+            ));
+        }
+    }
     workspace_ops
-        .call_tool(
+        .call_tool_with_context(
             &prepared.tool_name,
-            prepared.parsed_args.clone(),
-            if xai_grok_sampling_types::conversation::decode_codex_function_call_id(
-                &prepared.call_id,
-            )
-            .is_some()
-            {
-                &prepared.call_id
-            } else {
-                &prepared.tool_call_id.0
-            },
+            prepared.execution_arguments().clone(),
             Some(session_id),
+            ctx,
         )
         .await
 }
@@ -50,6 +192,8 @@ pub(super) async fn dispatch_code_mode_nested_tool_streaming<F, Fut>(
     session_id: &str,
     cancellation_token: &tokio_util::sync::CancellationToken,
     progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
+    sandbox_transport: Option<Arc<dyn xai_grok_workspace::permission::PermissionHookTransport>>,
+    delivery_scope: Option<xai_grok_tools::notification::BackgroundDeliveryScope>,
     on_progress: F,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError>
 where
@@ -70,7 +214,25 @@ where
     };
     let Some(toolset) = streaming else {
         // Proxy workspaces have no client-side progress stream to observe.
-        return dispatch_tool(workspace_ops, prepared, session_id).await;
+        let origin = crate::session::telemetry::model_origin(
+            &prepared.invocation_id,
+            session_id,
+            None,
+            prepared.model_id.as_deref(),
+            &prepared.tool_id,
+            prepared.tool_version.as_deref(),
+        );
+        return dispatch_observed(
+            workspace_ops,
+            prepared,
+            session_id,
+            origin,
+            xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
+            sandbox_transport,
+            delivery_scope,
+            None,
+        )
+        .await;
     };
     tracing::debug!(
         tool = %prepared.tool_name,
@@ -79,16 +241,50 @@ where
         mode = "local_streaming",
         "dispatch_code_mode_nested_tool_streaming"
     );
-    let stream = toolset.call_streaming_with_cancellation_and_viewer_context(
-        &prepared.tool_name,
-        prepared.parsed_args.clone(),
-        &prepared.tool_call_id.0,
-        None,
-        Some(cancellation_token.clone()),
-        Some(xai_tool_runtime::WorkspaceViewerContext {
-            stream_tool_progress: true,
-        }),
-    );
+    let mut extensions = xai_tool_runtime::TypedExtensions::new();
+    if let Some(binding) = &prepared.mcp_binding {
+        extensions.insert(binding.clone());
+    }
+    if let Some(plan_file) = &prepared.plan_file {
+        extensions.insert(plan_file.clone());
+    }
+    if let Some(scope) = delivery_scope {
+        extensions.insert(scope);
+    }
+    extensions.insert(xai_tool_runtime::WorkspaceViewerContext {
+        stream_tool_progress: true,
+    });
+    if let Some(metadata) = &prepared.mcp_request_meta {
+        extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
+    }
+    let execute = toolset.tool_kind_map().get(&prepared.tool_name)
+        == Some(&xai_grok_tools::types::tool::ToolKind::Execute);
+    let name = prepared.tool_name.clone();
+    let args = prepared.parsed_args.clone();
+    let call_id = prepared.tool_call_id.0.to_string();
+    let command = sandbox_command(&toolset, &args);
+    let cancellation = cancellation_token.clone();
+    let dispatch = move || {
+        toolset.call_streaming_with_extensions(
+            &name,
+            args.clone(),
+            &call_id,
+            None,
+            Some(cancellation.clone()),
+            extensions.clone(),
+        )
+    };
+    let stream = if execute {
+        workspace_ops.run_sandbox_shell_call(
+            session_id,
+            prepared.tool_call_id.0.to_string(),
+            command,
+            sandbox_transport,
+            dispatch,
+        )
+    } else {
+        dispatch()
+    };
     drain_code_mode_nested_tool_stream(stream, prepared, progress, on_progress).await
 }
 
@@ -191,8 +387,57 @@ fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 ///
 /// `target_directory` is deliberately omitted — a directory listing isn't an
 /// edit and must not bucket into a file lock.
-pub(super) fn lock_path_for_args(args: &serde_json::Value) -> Option<&str> {
-    str_arg(args, &["file_path", "path", "target_file"])
+pub(super) fn lock_path_for_args(args: &serde_json::Value, cwd: &Path) -> Option<String> {
+    xai_grok_tools::util::lock_path::lock_path_for_args(args, cwd)
+}
+
+pub(super) fn lock_path_for_prepared(
+    prepared: &PreparedToolCall,
+    cwd: &Path,
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+) -> Option<String> {
+    let args = prepared.authored_arguments();
+    if let Some(param) = toolset.lock_path_client_param(&prepared.tool_name) {
+        xai_grok_tools::util::lock_path::lock_path_for_keys(args, &[param.as_str()], cwd)
+    } else {
+        lock_path_for_args(args, cwd)
+    }
+}
+
+#[cfg(test)]
+mod canonical_lock_tests {
+    use super::*;
+
+    #[test]
+    fn relative_and_absolute_paths_share_a_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = dunce::canonicalize(directory.path()).unwrap();
+        let relative = serde_json::json!({"file_path": "nested/../new.txt"});
+        let absolute = serde_json::json!({"path": canonical.join("new.txt")});
+        assert_eq!(
+            lock_path_for_args(&relative, directory.path()),
+            lock_path_for_args(&absolute, directory.path())
+        );
+    }
+
+    #[test]
+    fn resolved_model_identity_requires_catalog_opt_in() {
+        assert!(!should_show_resolved_model(
+            "grok-build",
+            "checkpoint",
+            false
+        ));
+        assert!(should_show_resolved_model(
+            "custom-model",
+            "checkpoint",
+            true
+        ));
+        assert!(!should_show_resolved_model(
+            "checkpoint",
+            "checkpoint",
+            true
+        ));
+    }
 }
 
 /// Pull the path a read/list tool targets and classify it against the store.
@@ -256,8 +501,12 @@ pub(super) fn backend_tool_call_status(result: Option<&serde_json::Value>) -> ac
 }
 
 /// Temporary gate: only expose resolved model ID to the user for these models.
-pub(super) fn should_show_resolved_model(requested: &str, resolved: &str) -> bool {
-    requested != resolved && super::acp_types::is_coding_model_slug(requested)
+pub(super) fn should_show_resolved_model(
+    requested: &str,
+    resolved: &str,
+    show_checkpoint_identity: bool,
+) -> bool {
+    show_checkpoint_identity && requested != resolved
 }
 
 /// Resolve the shell name for the system prompt `Shell:` field.
@@ -362,6 +611,7 @@ impl SessionActor {
         let tool_input = ToolInput::Bash(BashToolInput {
             command: command.clone(),
             timeout: None,
+            block_until_ms: None,
             description: title_command.clone().into_owned(),
             is_background: false,
         });
@@ -579,15 +829,26 @@ mod tests {
 
     fn nested_prepared_call() -> PreparedToolCall {
         PreparedToolCall {
+            mcp_binding: None,
+            plan_file: None,
+            mcp_request_meta: None,
             call_id: "model-call-1".to_string(),
             tool_call_id: acp::ToolCallId::from("acp-call-1"),
             tool_name: "read_file".to_string(),
             raw_arguments: "{}".to_string(),
+            mcp_file: None,
             parsed_args: serde_json::json!({}),
-            model_id: String::new(),
+            model_id: None,
+            invocation_id: "model-call-1".to_string(),
+            tool_id: "read_file".to_string(),
+            tool_version: None,
             concatenated_json_count: 0,
+            coercion_note: None,
             dispatch_target_name: None,
             is_read_only: true,
+            is_edit: false,
+            rewriting_hook: None,
+            additional_context: Vec::new(),
         }
     }
 
@@ -605,6 +866,8 @@ mod tests {
             "no-such-session",
             &tokio_util::sync::CancellationToken::new(),
             &progress_sink,
+            None,
+            None,
             |_| async {},
         )
         .await
@@ -630,6 +893,8 @@ mod tests {
             "no-such-session",
             &cancellation_token,
             &progress_sink,
+            None,
+            None,
             |_| async {},
         )
         .await

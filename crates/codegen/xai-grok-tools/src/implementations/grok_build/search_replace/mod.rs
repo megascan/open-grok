@@ -30,7 +30,7 @@ use crate::util::truncate_str_with_marker;
 use crate::{notification::types::ToolNotificationHandle, register_resource};
 use helpers::{
     NormalizedMatchResult, build_edit_details, find_normalized_match_positions,
-    replace_normalized_matches, replace_using_positions,
+    overlapping_match_positions, replace_normalized_matches, replace_using_positions,
 };
 pub(crate) const CONTEXT_LINES: usize = 3;
 /// Internal version discriminant for search_replace.
@@ -161,7 +161,8 @@ pub(crate) async fn run_search_replace(
         .get::<xai_tool_runtime::BehaviorVersion>()
         .map(|v| v.0.clone());
     let tool_call_id = ctx.call_id.as_str().to_owned();
-    let (cwd, display_cwd, fs, notification_handle, hints_enabled);
+    let plan_file = ctx.extensions.get::<crate::types::resources::PlanFile>();
+    let (cwd, display_cwd, mut fs, notification_handle, hints_enabled);
     {
         let res = resources.lock().await;
         cwd = match cwd_override {
@@ -174,20 +175,31 @@ pub(crate) async fn run_search_replace(
         hints_enabled = res.get::<PathNotFoundHints>().is_some_and(|h| h.0);
     }
     let resolved = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
-    let path = match crate::util::fs::try_canonicalize(&resolved).await {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match crate::util::try_resolve_unicode_filename(&resolved).await {
-                Some(m) => m.resolved_path,
-                None => resolved,
-            }
+    let policy_path = resolved.clone();
+    let path = if let Some(plan) = &plan_file {
+        if let Err(error) = plan.check_path(&resolved) {
+            return Ok(SearchReplaceOutput::InvalidInput(format!(
+                "Invalid plan file target: {error}"
+            )));
         }
-        Err(_) => resolved,
+        fs = plan.filesystem();
+        plan.path().to_path_buf()
+    } else {
+        match crate::util::fs::try_canonicalize(&resolved).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match crate::util::try_resolve_unicode_filename(&resolved).await {
+                    Some(m) => m.resolved_path,
+                    None => resolved,
+                }
+            }
+            Err(_) => resolved,
+        }
     };
     if let Some(err) = validate_path_length(&input.file_path) {
         return Ok(err);
     }
-    if path.is_dir() {
+    if plan_file.is_none() && path.is_dir() {
         return Ok(SearchReplaceOutput::InvalidInput(
             "File path is a directory".to_owned(),
         ));
@@ -230,10 +242,12 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
             empty_old_string_does_not_override,
+            plan_file.is_some(),
         )
         .await?
     } else {
@@ -244,11 +258,13 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
             is_legacy,
             include_user_edit_hint,
+            plan_file.is_some(),
         )
         .await?
     };
@@ -299,10 +315,12 @@ async fn handle_new_file_creation(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
     empty_old_string_does_not_override: bool,
+    constrained_plan: bool,
 ) -> Result<SearchReplaceOutput, xai_tool_runtime::ToolError> {
     let file_exists = match fs.read_file(path).await {
         Ok(bytes) => !bytes.is_empty(),
@@ -326,7 +344,22 @@ async fn handle_new_file_creation(
             old_string_name
         )));
     }
-    if let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
+    let is_memory_write = if constrained_plan {
+        false
+    } else {
+        match crate::types::memory_v2::write_memory_v2_file(
+            &resources,
+            policy_path,
+            input.new_string.as_bytes(),
+        )
+        .await
+        {
+            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+            Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+        }
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::NotFound) => {
                 let display_dcwd = display_cwd_or_cwd(cwd, display_cwd);
@@ -527,11 +560,13 @@ async fn handle_replacement(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
     is_legacy: bool,
     include_user_edit_hint: bool,
+    constrained_plan: bool,
 ) -> Result<SearchReplaceOutput, xai_tool_runtime::ToolError> {
     let bytes = match fs.read_file(path).await {
         Ok(bytes) => bytes,
@@ -572,17 +607,32 @@ async fn handle_replacement(
             return Ok(output);
         }
     };
-    let old_text = String::from_utf8_lossy(&bytes).into_owned();
+    let old_text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(SearchReplaceOutput::InvalidInput(format!(
+                "Error: {} is not valid UTF-8; no changes were made.",
+                input.file_path
+            )));
+        }
+    };
     let has_crlf = old_text.contains("\r\n");
     let match_text: std::borrow::Cow<'_, str> = if has_crlf {
         std::borrow::Cow::Owned(old_text.replace("\r\n", "\n"))
     } else {
         std::borrow::Cow::Borrowed(&old_text)
     };
-    let mut positions: Vec<usize> = match_text
-        .match_indices(&input.old_string)
-        .map(|(index, _)| index)
-        .collect();
+    let mut positions: Vec<usize> =
+        overlapping_match_positions(&match_text, &input.old_string).collect();
+    if positions
+        .windows(2)
+        .any(|pair| pair[1] - pair[0] < input.old_string.len())
+    {
+        let name = TemplateRenderer::resolve(&resources, "${{ params.edit.old_string }}").await?;
+        return Ok(SearchReplaceOutput::MultipleMatchesFound(format!(
+            "The string to replace has overlapping matches. Provide a more specific {name}; overlapping matches cannot be replaced safely."
+        )));
+    }
     let mut used_normalized_fallback = false;
     if positions.is_empty() {
         let fallback_enabled = {
@@ -712,7 +762,22 @@ async fn handle_replacement(
     } else {
         new_text.clone()
     };
-    if let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
+    let is_memory_write = if constrained_plan {
+        false
+    } else {
+        match crate::types::memory_v2::write_memory_v2_file(
+            &resources,
+            policy_path,
+            write_text.as_bytes(),
+        )
+        .await
+        {
+            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+            Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+        }
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::AlreadyExists) => SearchReplaceOutput::InvalidInput(format!(
                 "Error: cannot write {}. A component of the path already exists as a file where a directory is expected.",
@@ -780,6 +845,9 @@ impl crate::types::tool_metadata::ToolMetadata for SearchReplaceTool {
     }
     fn tool_namespace(&self) -> ToolNamespace {
         ToolNamespace::GrokBuild
+    }
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("file_path")
     }
     fn description_template(&self) -> &str {
         DESCRIPTION_FULL
@@ -930,6 +998,64 @@ mod tests {
             replace_all: false,
         }
     }
+    #[tokio::test]
+    async fn overlapping_matches_refused_even_with_replace_all() {
+        for (text, pattern) in [("aaa", "aa"), ("ééé", "éé"), ("🙂🙂🙂", "🙂🙂")] {
+            for replace_all in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("test.txt");
+                std::fs::write(&path, text).unwrap();
+                let mut resources = test_resources(tmp.path());
+                resources.insert(Params(SearchReplaceParams {
+                    skip_read_before_edit: true,
+                    ..Default::default()
+                }));
+                let mut input = make_input("test.txt", pattern, "replacement");
+                input.replace_all = replace_all;
+                let result = xai_tool_runtime::Tool::run(
+                    &SearchReplaceTool,
+                    test_ctx(resources.into_shared()),
+                    input,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(result, SearchReplaceOutput::MultipleMatchesFound(_)),
+                    "{result:?}"
+                );
+                assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_normalized_matches_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "“a”a”").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(Params(SearchReplaceParams {
+            skip_read_before_edit: true,
+            unicode_normalized_fallback: true,
+            ..Default::default()
+        }));
+        let mut input = make_input("test.txt", "\"a\"a\"", "replacement");
+        // "“a”a”" normalizes to '"a"a"'; look for '"a"' twice.
+        input.old_string = "\"a\"".to_string();
+        input.replace_all = true;
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            test_ctx(resources.into_shared()),
+            input,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, SearchReplaceOutput::MultipleMatchesFound(_)),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "“a”a”");
+    }
     fn description_renderer() -> TemplateRenderer {
         let edit_params = std::collections::HashMap::from([
             ("old_string".to_string(), "old_string".to_string()),
@@ -1038,6 +1164,88 @@ mod tests {
             }
             other => panic!("Expected EditsApplied, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_non_utf8_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let invalid = b"\xff hello\n";
+        std::fs::write(tmp.path().join("test.txt"), invalid).unwrap();
+        let (handle, mut rx) = ToolNotificationHandle::channel();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(NotificationHandle(handle));
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            test_ctx(resources.into_shared()),
+            make_input("test.txt", "hello", "HELLO"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, SearchReplaceOutput::InvalidInput(ref msg) if msg.contains("UTF-8")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(tmp.path().join("test.txt")).unwrap(), invalid);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_capability_restricts_search_replace_and_rejects_symlink_swap() {
+        use crate::computer::types::AsyncFileSystem;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(tmp.path()).unwrap();
+        let plan_path = cwd.join("plan.md");
+        let outside = cwd.join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        let plan = LocalFs.open_plan_file(&plan_path).await.unwrap();
+        let shared = test_resources(&cwd).into_shared();
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "", "one\n"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "one", "two"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        assert_eq!(std::fs::read(&plan_path).unwrap(), b"two\n");
+
+        let mut ctx = test_ctx(shared.clone());
+        ctx.extensions.insert(plan.clone());
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("outside.txt", "outside", "changed"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SearchReplaceOutput::InvalidInput(_)));
+        std::fs::remove_file(&plan_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &plan_path).unwrap();
+        let mut ctx = test_ctx(shared);
+        ctx.extensions.insert(plan);
+        let result = xai_tool_runtime::Tool::run(
+            &SearchReplaceTool,
+            ctx,
+            make_input("plan.md", "", "changed"),
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(result, SearchReplaceOutput::EditsApplied(_)));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
     }
     #[tokio::test]
     async fn new_file_creation() {

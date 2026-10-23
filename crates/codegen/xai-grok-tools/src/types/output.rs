@@ -188,25 +188,7 @@ pub enum ListDirOutput {
     /// Generic / unclassified error
     Error(String),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepLineMatch {
-    pub line_number: usize,
-    pub content: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepFileMatch {
-    pub path: String,
-    pub matches: Vec<GrepLineMatch>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepSearchOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    pub match_count: usize,
-    #[serde(default)]
-    pub file_matches: Vec<GrepFileMatch>,
-}
+pub use xai_tool_types::{GrepFileMatch, GrepLineMatch, GrepSearchOutput};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FileContent {
     /// content here is the model friendly output which will always be present since even
@@ -493,18 +475,7 @@ pub struct BackgroundTaskStarted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct WebSearchOutput {
-    pub query: String,
-    pub content: String,
-    pub citations: Vec<String>,
-    pub allowed_domains: Option<Vec<String>>,
-    /// When set, `to_prompt_format()` returns this text directly instead of
-    /// wrapping `content` with the default header. Used by the compat adapter
-    /// to produce the exact `Title: / Content: / ---` schema.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub pre_formatted: Option<String>,
-}
+pub use xai_tool_types::WebSearchOutput;
 #[derive(Debug, Clone)]
 pub struct WebFetchSourceArtifact {
     /// Session artifact containing the complete converted response.
@@ -662,6 +633,17 @@ pub enum ToolOutput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
+    ProposeMission(crate::implementations::grok_build::mission::ProposeMissionOutput),
+    StartMissionRun(crate::implementations::grok_build::mission::StartMissionRunOutput),
+    DismissHandoffItems(crate::implementations::grok_build::mission::DismissHandoffItemsOutput),
+    InspectMissionReadiness(
+        crate::implementations::grok_build::mission::InspectMissionReadinessOutput,
+    ),
+    EndFeatureRun(crate::implementations::grok_build::mission::EndFeatureRunOutput),
+    #[serde(alias = "SendAgentMessage")]
+    SendSubagentMessage(
+        crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput,
+    ),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -765,10 +747,14 @@ impl ToolOutput {
             ToolOutput::ApplyPatch(ApplyPatchOutput::Success { .. }) => false,
             ToolOutput::ApplyPatch(_) => true,
             ToolOutput::CodexGrepFiles(CodexGrepFilesOutput::Error(_)) => true,
+            ToolOutput::SendSubagentMessage(output) => matches!(
+                output.disposition(),
+                crate::implementations::grok_build::SendSubagentMessageDisposition::Rejected
+            ),
             ToolOutput::Todo(
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
-            ToolOutput::GrepSearch(g) => g.exit_code > 1,
+            ToolOutput::GrepSearch(g) => g.exit_code != 0 && g.exit_code != 1,
             _ => false,
         }
     }
@@ -841,7 +827,21 @@ impl ToolOutput {
             },
             ToolOutput::Bash(bash_output) => bash_output.output_for_prompt.clone(),
             ToolOutput::GrepSearch(grep_search_output) => {
-                String::from_utf8_lossy(&grep_search_output.stdout).into_owned()
+                let stdout = String::from_utf8_lossy(&grep_search_output.stdout);
+                let stderr = String::from_utf8_lossy(&grep_search_output.stderr);
+                if grep_search_output.exit_code != 0
+                    && grep_search_output.exit_code != 1
+                    && !stderr.is_empty()
+                    && !stdout.contains(stderr.as_ref())
+                {
+                    if stdout.is_empty() {
+                        stderr.into_owned()
+                    } else {
+                        format!("{stdout}\n{stderr}")
+                    }
+                } else {
+                    stdout.into_owned()
+                }
             }
             ToolOutput::Todo(todo_output) => match todo_output {
                 TodoWriteOutput::TodosUpdated(success) => success.summary_for_prompt.to_owned(),
@@ -976,15 +976,6 @@ impl ToolOutput {
             }) => {
                 let ask = &tool_hints.ask_user;
                 let exit = &tool_hints.exit_plan;
-                let task_hint = if tool_hints.task.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n     You can use the {} tool with subagent_type=\"explore\" to \
-                         parallelize codebase exploration without filling your context window.",
-                        tool_hints.task
-                    )
-                };
                 let plan_status = match plan_file_seed {
                     PlanFileSeedStatus::Empty => {
                         format!(
@@ -1014,7 +1005,7 @@ impl ToolOutput {
                     "{message}\n\n\
                      {plan_status}\n\n\
                      In plan mode, you should:\n\
-                     1. Thoroughly explore the codebase to understand existing patterns{task_hint}\n\
+                     1. Thoroughly explore the codebase to understand existing patterns\n\
                      2. Identify similar features, codebase architecture, and understand trade-offs\n\
                      3. Use {ask} if you need to clarify the approach\n\
                      4. Design a concrete implementation strategy\n\
@@ -1073,6 +1064,16 @@ impl ToolOutput {
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
             ToolOutput::Workflow(o) => o.message.clone(),
+            ToolOutput::ProposeMission(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::StartMissionRun(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::DismissHandoffItems(o) => {
+                serde_json::to_string_pretty(o).unwrap_or_default()
+            }
+            ToolOutput::InspectMissionReadiness(o) => {
+                serde_json::to_string_pretty(o).unwrap_or_default()
+            }
+            ToolOutput::EndFeatureRun(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::SendSubagentMessage(output) => output.to_string(),
             ToolOutput::ListAgents(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::AgentMessageSend(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::ListSessions(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
@@ -1375,12 +1376,10 @@ impl xai_tool_runtime::ToolOutput for BashOutput {
         })
     }
 }
-impl xai_tool_runtime::ToolOutput for GrepSearchOutput {}
 impl xai_tool_runtime::ToolOutput for ReadFileOutput {}
 impl xai_tool_runtime::ToolOutput for ListDirOutput {}
 impl xai_tool_runtime::ToolOutput for SearchReplaceOutput {}
 impl xai_tool_runtime::ToolOutput for TodoWriteOutput {}
-impl xai_tool_runtime::ToolOutput for WebSearchOutput {}
 impl xai_tool_runtime::ToolOutput for WebRunOutput {}
 impl xai_tool_runtime::ToolOutput for WebFetchOutput {}
 impl xai_tool_runtime::ToolOutput for SkillOutput {}
@@ -1413,6 +1412,47 @@ mod tests {
     use serde_json::json;
     use xai_tool_types::KillTaskResult;
     use xai_tool_types::TaskOutputResult;
+    #[test]
+    fn legacy_send_agent_message_output_envelope_deserializes() {
+        use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput;
+        let output: ToolOutput = serde_json::from_value(json!({
+            "type": "SendAgentMessage",
+            "outcome": "channel_closed",
+        }))
+        .expect("legacy output envelope remains replayable");
+        assert_eq!(
+            serde_json::to_value(&output).unwrap()["type"],
+            "SendSubagentMessage"
+        );
+        assert!(matches!(
+            output,
+            ToolOutput::SendSubagentMessage(SendSubagentMessageOutput::ChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn active_message_errors_only_report_confirmed_rejections() {
+        use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput;
+        for (output, expected_error) in [
+            (
+                SendSubagentMessageOutput::Accepted {
+                    message_id: "message".into(),
+                },
+                false,
+            ),
+            (SendSubagentMessageOutput::AdmissionUncertain, false),
+            (SendSubagentMessageOutput::NotFoundOrNotOwned, true),
+            (SendSubagentMessageOutput::NotActiveOrFinalizing, true),
+            (SendSubagentMessageOutput::NotAcceptedBeforeDeadline, true),
+            (SendSubagentMessageOutput::ChannelClosed, true),
+        ] {
+            assert_eq!(
+                ToolOutput::SendSubagentMessage(output).is_error(),
+                expected_error
+            );
+        }
+    }
+
     /// Serialize a ToolOutput to JSON value
     fn to_json(output: ToolOutput) -> serde_json::Value {
         serde_json::to_value(&output).unwrap()
@@ -2231,8 +2271,8 @@ mod tests {
             "resume_from hint with correct ID"
         );
         assert!(
-            rendered.contains("subagent_type: explore"),
-            "subagent_type visible"
+            !rendered.contains("subagent_type"),
+            "completion text must not advertise subagent_type"
         );
         assert!(
             rendered.contains("<subagent_result>"),
@@ -2380,10 +2420,10 @@ mod tests {
         });
         let prompt = output.to_prompt_format();
         assert!(
-            prompt.contains("task tool with subagent_type"),
-            "should include subagent guidance when task tool is set"
+            !prompt.contains("subagent_type"),
+            "plan prompt must not advertise subagent_type even when task tool is set"
         );
-        assert!(prompt.contains("parallelize codebase exploration"));
+        assert!(!prompt.contains("parallelize codebase exploration"));
     }
     #[test]
     fn enter_plan_mode_prompt_format_with_custom_tool_names() {

@@ -2,8 +2,7 @@ use super::*;
 use crate::test_util::GrokHomeFixture;
 use clap::Parser;
 
-/// In-memory `Summary` via serde: every field without `#[serde(default)]`
-/// must be present, and a struct literal would break on each new field.
+/// Builds a `Summary` through serde: every field without `#[serde(default)]` must be present, and a struct literal would break on each new field.
 fn summary(id: &str, title: Option<&str>, manual: bool) -> Summary {
     serde_json::from_value(serde_json::json!({
         "info": { "id": id, "cwd": "/ws" },
@@ -38,9 +37,48 @@ fn single_match_is_case_insensitive_and_trimmed() {
     assert_eq!(id_of(select_by_title("  FIX login bug ", &s).unwrap()), "a");
 }
 
-/// The contract is a simple lowercase comparison: accented letters match
-/// across case, but one-to-many case folds do not (`to_lowercase` maps
-/// U+00DF to itself, so "STRASSE" never equals a stored "straße").
+#[test]
+fn title_selection_normalizes_separators_without_reordering_words() {
+    let sessions = [summary("a", Some("Fix login_bug"), false)];
+    assert_eq!(
+        id_of(select_by_title("FIX-login bug", &sessions).unwrap()),
+        "a"
+    );
+    assert!(
+        select_by_title("login fix bug", &sessions)
+            .unwrap()
+            .is_none()
+    );
+    assert!(select_by_title("--", &sessions).unwrap().is_none());
+}
+
+#[test]
+fn ambiguity_and_suggestions_show_newest_first_with_dates() {
+    let mut older = summary("old", Some("Fix-login_bug"), false);
+    older.updated_at = "2026-01-01T00:00:00Z".parse().unwrap();
+    let mut newer = summary("new", Some("Fix login bug"), false);
+    newer.updated_at = "2026-03-01T00:00:00Z".parse().unwrap();
+    let unrelated = summary("unrelated", Some("Other work"), false);
+    let sessions = [older, unrelated, newer];
+    let ambiguity = select_by_title("fix login bug", &sessions)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        ambiguity.find("\n  new  ").unwrap() < ambiguity.find("\n  old  ").unwrap(),
+        "{ambiguity}"
+    );
+    assert!(ambiguity.contains("2026-03-01"));
+    let suggestions = title_miss_with_suggestions("fxi logn bug", &sessions);
+    assert!(
+        suggestions.find("\n  new  ").unwrap() < suggestions.find("\n  old  ").unwrap(),
+        "{suggestions}"
+    );
+    assert!(suggestions.contains("2026-03-01"));
+    assert!(!suggestions.contains("unrelated"));
+}
+
+/// The contract is a simple lowercase comparison: accented letters match across case, but one-to-many case folds do not.
+/// `to_lowercase` maps U+00DF to itself, so "STRASSE" never equals a stored "straße".
 #[test]
 fn non_ascii_case_matching_contract() {
     let s = [summary("a", Some("Café Löschen"), false)];
@@ -51,8 +89,6 @@ fn non_ascii_case_matching_contract() {
 
 #[test]
 fn duplicate_auto_titles_error_lists_ids_with_escaped_titles() {
-    // A title with a newline would corrupt the one-match-per-line listing if
-    // rendered raw.
     let s = [
         summary("id-a", Some("Dup\nTitle"), false),
         summary("id-b", Some("Dup\nTitle"), false),
@@ -76,6 +112,18 @@ fn sole_manual_rename_wins_among_duplicates() {
         summary("auto2", Some("Dup"), false),
     ];
     assert_eq!(id_of(select_by_title("dup", &s).unwrap()), "man1");
+}
+
+#[test]
+fn pulled_sole_manual_summary_wins_among_duplicate_autos() {
+    let pulled = summary("pulled-hop", Some("Dup"), true);
+    assert_eq!(pulled.manual_title_opt().as_deref(), Some("Dup"));
+    let s = [
+        summary("auto1", Some("Dup"), false),
+        pulled,
+        summary("auto2", Some("Dup"), false),
+    ];
+    assert_eq!(id_of(select_by_title("dup", &s).unwrap()), "pulled-hop");
 }
 
 #[test]
@@ -108,9 +156,131 @@ fn title_miss_hint_escapes_arg_and_suggests_search() {
     );
 }
 
-/// The worktree defer drops the local zero-match context; the failure
-/// message restores it only for a threaded deferred-miss target. A resolved
-/// legacy non-UUID id (no threaded miss) must not get a false no-match hint.
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn missing_title_stops_before_remote_or_worktree_restore() {
+    use crate::app::session_startup::{
+        MaterializeCtx, SessionStartupIntent, materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "local-id",
+        serde_json::json!({"generated_title": "Fix login bug"}),
+    );
+    for has_worktree in [false, true] {
+        for restore_code in [false, true] {
+            let ctx = MaterializeCtx {
+                has_worktree,
+                allow_remote_restore: true,
+                restore_code,
+                ..pinned_local_ctx()
+            };
+            let err = materialize_startup_for_cwd(
+                ctx,
+                SessionStartupIntent::Resume {
+                    session_id: Some("fix logn bug".into()),
+                    most_recent_for_cwd: false,
+                },
+                &cwd,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no session id or title matched"), "{err}");
+            assert!(err.contains("Fix login bug"), "{err}");
+            assert!(!err.contains("remote") && !err.contains("sign in"), "{err}");
+        }
+    }
+}
+
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn title_with_path_separators_is_resolved_as_title() {
+    use crate::app::session_startup::{
+        MaterializeCtx, MaterializedStartup, SessionStartupIntent, TitleResolution,
+        materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "local-id",
+        serde_json::json!({"generated_title": "Fix login bug"}),
+    );
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("Fix/login-bug".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, MaterializedStartup::Resume { session_id, .. } if session_id == "local-id")
+    );
+    assert!(
+        matches!(presandbox_resume_target("Fix/login-bug", Some(&cwd), RecentSessionSelection::Interactive).unwrap(), PinnedResumeTarget::Title { id, .. } if id == "local-id")
+    );
+}
+
+#[serial_test::serial(OPENGROK_HOME)]
+#[tokio::test]
+async fn title_selection_fails_closed_when_a_local_summary_is_malformed() {
+    use crate::app::session_startup::{
+        MaterializeCtx, SessionStartupIntent, TitleResolution, materialize_startup_for_cwd,
+    };
+    let mut fx = GrokHomeFixture::new();
+    let cwd = fx.cwd_str();
+    fx.write_summary(
+        &cwd,
+        "valid",
+        serde_json::json!({"generated_title": "Target title"}),
+    );
+    fx.write_summary(&cwd, "broken", serde_json::json!({}));
+    let path = xai_grok_shell::util::grok_home::grok_home()
+        .join("sessions")
+        .join(xai_grok_shell::util::grok_home::encode_cwd_dirname(&cwd))
+        .join("broken")
+        .join("summary.json");
+    std::fs::write(path, b"{malformed").unwrap();
+    assert!(
+        presandbox_resume_target(
+            "target title",
+            Some(&cwd),
+            RecentSessionSelection::Interactive
+        )
+        .is_err()
+    );
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("target title".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an incomplete listing cannot establish a unique title"
+    );
+}
+
+/// Deferring to the worktree restore loses the fact that no local session matched.
+/// The failure message re-adds the no-match hint only when the missed title was threaded through as `Some`.
+/// A resolved legacy non-UUID id threads `None` and must not get a false no-match hint.
 #[test]
 fn worktree_failure_message_hint_follows_threaded_provenance() {
     let msg = worktree_resume_failure_message(Some("typo title"), "restore failed");
@@ -165,9 +335,39 @@ fn pin_title_resume_finds_saved_profile_and_conflicts() {
     }
 }
 
-/// Regression: a non-UUID remote id with a restored local child pins to the
-/// child, so the peek reads the child's profile instead of an exact same-id
-/// session in another cwd.
+#[serial_test::serial(OPENGROK_HOME)]
+#[test]
+fn headless_title_pin_is_caller_aware() {
+    let mut fx = GrokHomeFixture::new();
+    let cwd_str = fx.cwd_str();
+    let id = "abababab-1111-2222-3333-444444444444";
+    fx.write_summary(
+        &cwd_str,
+        id,
+        serde_json::json!({
+            "generated_title": "Batch Run",
+            "session_kind": "headless",
+        }),
+    );
+
+    let mut interactive =
+        crate::app::cli::PagerArgs::try_parse_from(["grok", "-r", "batch run"]).unwrap();
+    interactive
+        .pin_local_resume_target_for_cwd(Some(&cwd_str))
+        .unwrap();
+    assert_eq!(interactive.session_to_resume(), Some("batch run"));
+
+    let mut headless =
+        crate::app::cli::PagerArgs::try_parse_from(["grok", "-p", "next", "-r", "batch run"])
+            .unwrap();
+    headless
+        .pin_local_resume_target_for_cwd(Some(&cwd_str))
+        .unwrap();
+    assert_eq!(headless.session_to_resume(), Some(id));
+}
+
+/// Regression: a non-UUID remote id with a restored local child pins to the child.
+/// The peek then reads the child's profile instead of an exact same-id session in another cwd.
 #[serial_test::serial(OPENGROK_HOME)]
 #[test]
 fn pin_prefers_restored_child_over_same_id_in_other_cwd() {
@@ -221,8 +421,6 @@ async fn materialization_consumes_pinned_id_after_concurrent_rename() {
         .unwrap();
     assert_eq!(args.session_to_resume(), Some(pinned));
 
-    // Concurrent rename/create after the pin: the pinned session loses the
-    // title and a decoy gains it.
     fx.write_summary(
         &cwd_str,
         pinned,
@@ -245,8 +443,7 @@ async fn materialization_consumes_pinned_id_after_concurrent_rename() {
     }
 }
 
-/// Local-only ctx carrying the composition root's pin outcome
-/// (`resume_target_pinned` maps to `PinnedPreSandbox` in production).
+/// A local-only ctx with the pin already recorded: in production `resume_target_pinned` maps to `PinnedPreSandbox`.
 fn pinned_local_ctx() -> crate::app::session_startup::MaterializeCtx {
     crate::app::session_startup::MaterializeCtx {
         has_worktree: false,
@@ -254,6 +451,7 @@ fn pinned_local_ctx() -> crate::app::session_startup::MaterializeCtx {
         chat_mode: false,
         title_resolution: crate::app::session_startup::TitleResolution::PinnedPreSandbox,
         restore_code: false,
+        recent_session_selection: crate::app::session_startup::RecentSessionSelection::Interactive,
         restore_progress_on_stdout: false,
     }
 }
@@ -322,8 +520,6 @@ async fn pinned_no_match_does_not_retry_title_after_sandbox() {
         msg.contains("no session id or title matched"),
         "must not resume the late title match: {msg}"
     );
-    // Contrast: an unpinned caller (no pre-sandbox pin ran) may still select
-    // the title — the gate, not the data, decides.
     let allowed_ctx = MaterializeCtx {
         title_resolution: TitleResolution::Allowed,
         ..pinned_local_ctx()
@@ -376,12 +572,8 @@ async fn pinned_non_uuid_id_is_not_reinterpreted_as_title() {
 }
 
 /// Regression: a legacy id duplicated across cwd dirs is ambiguous to the
-/// session listings (`RelocationView::select` drops multi-path journal-less
-/// ids before the cwd filter), so its title never reaches selection: the pin
-/// stays unresolved, the profile peek finds nothing, and materialization
-/// fails closed with the hint instead of resuming under an unverified
-/// profile. The carried-profile path for unique ids is pinned by
-/// `pin_title_resume_finds_saved_profile_and_conflicts`.
+/// session listings. A title lookup must fail closed rather than resume under
+/// an unverified profile when an ambiguous candidate was omitted.
 #[serial_test::serial(OPENGROK_HOME)]
 #[tokio::test]
 async fn duplicate_legacy_id_is_not_title_addressable() {
@@ -406,25 +598,29 @@ async fn duplicate_legacy_id_is_not_title_addressable() {
 
     let mut args =
         crate::app::cli::PagerArgs::try_parse_from(["grok", "-r", "locked down"]).unwrap();
-    args.pin_local_resume_target_for_cwd(Some(&cwd_str))
-        .unwrap();
-    assert!(args.resume_target_pinned);
-    assert_eq!(args.session_to_resume(), Some("locked down"));
-    assert!(args.saved_resume_profile_for_cwd(Some(&cwd_str)).is_none());
+    assert!(
+        args.pin_local_resume_target_for_cwd(Some(&cwd_str))
+            .is_err()
+    );
 
     use crate::app::session_startup::{
-        MaterializeCtx, TitleResolution, materialize_startup_for_cwd,
+        MaterializeCtx, SessionStartupIntent, TitleResolution, materialize_startup_for_cwd,
     };
-    let ctx = MaterializeCtx::from_pager_args(&args);
-    assert_eq!(ctx.title_resolution, TitleResolution::PinnedPreSandbox);
-
-    let intent = args.session_startup_intent().unwrap();
-    let msg = materialize_startup_for_cwd(pinned_local_ctx(), intent, &cwd_str)
-        .await
-        .unwrap_err()
-        .to_string();
+    let ctx = MaterializeCtx {
+        title_resolution: TitleResolution::Allowed,
+        ..pinned_local_ctx()
+    };
+    let result = materialize_startup_for_cwd(
+        ctx,
+        SessionStartupIntent::Resume {
+            session_id: Some("locked down".into()),
+            most_recent_for_cwd: false,
+        },
+        &cwd_str,
+    )
+    .await;
     assert!(
-        msg.contains("no session id or title matched"),
-        "duplicate-id session must fail closed, not resume: {msg}"
+        result.is_err(),
+        "duplicate IDs must make title selection fail closed"
     );
 }

@@ -241,9 +241,13 @@ pub struct HookInfo {
     pub timeout_ms: u64,
     /// Source directory of the hook definition file.
     pub source_dir: String,
-    /// Whether this hook is disabled via ~/.opengrok/disabled-hooks.
+    /// Whether dispatch skips this hook: `enabled = false`, listed in ~/.opengrok/disabled-hooks, or kept off by `allow_managed_hooks_only`.
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub removable: bool,
 }
 
 /// Response for `x.ai/hooks/list`.
@@ -748,6 +752,8 @@ mod tests {
             timeout_ms: 5000,
             source_dir: "/home/user/.opengrok/hooks".into(),
             disabled: false,
+            pinned: false,
+            removable: true,
         };
         let json = serde_json::to_string(&hook).unwrap();
         assert!(json.contains("handlerType"));
@@ -756,6 +762,23 @@ mod tests {
         // Verify roundtrip.
         let parsed: HookInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(hook, parsed);
+    }
+
+    #[test]
+    fn older_hook_info_defaults_to_unpinned_and_not_removable() {
+        let hook: HookInfo = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "event": "pre_tool_use",
+            "handlerType": "command",
+            "matcher": null,
+            "command": "check.sh",
+            "url": null,
+            "timeoutMs": 5000,
+            "sourceDir": "/tmp/hooks"
+        }))
+        .unwrap();
+        assert!(!hook.pinned);
+        assert!(!hook.removable);
     }
 
     #[test]

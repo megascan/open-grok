@@ -17,6 +17,7 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 use crate::session::signals::SessionSignals;
 use crate::session::storage::relocation::{RelocationError, RelocationView};
 use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
+use crate::session::visibility::ClassifiedSessionKind;
 use crate::tools::todo::TodoState;
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
@@ -79,8 +80,42 @@ pub fn sanitize_rename_title(title: &str) -> Cow<'_, str> {
     }
 }
 
-/// Sanitize then cap. `None` when the result is blank. Overlong titles are
-/// truncated (ingest/pull defense); the ext rename path rejects instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedRenameTitle {
+    Manual(String),
+    ResetToAuto,
+}
+
+/// Applies the shared `x.ai/session/rename` title boundary.
+pub fn validate_rename_title(
+    title: &str,
+    reset_to_auto: bool,
+) -> Result<ValidatedRenameTitle, acp::Error> {
+    if reset_to_auto {
+        if !sanitize_rename_title(title).is_empty() {
+            return Err(
+                acp::Error::invalid_request().data("title must be empty when resetToAuto is set")
+            );
+        }
+        return Ok(ValidatedRenameTitle::ResetToAuto);
+    }
+    if title.len() > MAX_TITLE_BYTES {
+        return Err(acp::Error::invalid_request().data("title too large"));
+    }
+    let title = sanitize_rename_title(title).into_owned();
+    if title.is_empty() {
+        return Err(acp::Error::invalid_request().data("title must not be blank"));
+    }
+    if title.chars().count() > MAX_TITLE_SCALARS {
+        return Err(acp::Error::invalid_request().data(format!(
+            "title too long (max {MAX_TITLE_SCALARS} characters after removing control characters)"
+        )));
+    }
+    Ok(ValidatedRenameTitle::Manual(title))
+}
+
+/// Sanitize then cap. `None` when the result is blank.
+/// Overlong titles are truncated (ingest/pull defense); the ext rename path rejects instead.
 pub fn sanitize_and_cap_title(title: &str) -> Option<String> {
     let cleaned = sanitize_rename_title(title);
     if cleaned.is_empty() {
@@ -213,6 +248,7 @@ mod feedback_tests {
             },
             model_id: Some("grok-3-fast".into()),
             resolved_model_id: Some("grok-4.5".into()),
+            reasoning_effort: Some("high".into()),
             ..Default::default()
         }
     }
@@ -382,11 +418,10 @@ pub enum PersistenceMsg {
         /// boundary bit so xAI-only exports cannot resume after Codex content
         /// has entered the session.
         provider: ModelProvider,
-        /// The active agent definition name (e.g. `"grok-build"`).
-        /// Persisted in `summary.agent_name` so session resume doesn't depend
-        /// on the mutable model catalog.
-        agent_name: Option<String>,
+        /// The active agent, persisted so session resume doesn't depend on the mutable model catalog.
+        agent: PersistedAgent,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        context_window: Option<Option<std::num::NonZeroU64>>,
         /// When present, model identity and provider transport are committed
         /// in the same summary patch so cold resume cannot observe a torn pair.
         resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
@@ -399,6 +434,11 @@ pub enum PersistenceMsg {
     /// model. Codex-backed subagents use this to close and persist the parent
     /// tree's cumulative xAI export boundary.
     ObserveProvider(ModelProvider),
+    /// Close the export boundary for an external agent and acknowledge only
+    /// after its marker has been written. Callers must abort on any error.
+    CloseXaiExportAndAck {
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Bind an idle Codex-backed title client's existing OAuth resolver after
     /// a session that started logged out adopts its first identity. This is
     /// runtime-only state; model and endpoint selection stay unchanged.
@@ -429,11 +469,12 @@ pub enum PersistenceMsg {
         next_trace_turn: u64,
         request_id: Option<String>,
     },
-    /// Persist a snapshot of the session signals.
     Signals(SessionSignals),
-    /// Persist announcement tracking state (MCP + skill announcement dedup).
+    UsageTurn {
+        turn_number: u32,
+        live: crate::session::usage_file::UsageSummary,
+    },
     AnnouncementState(crate::session::announcement_state::AnnouncementState),
-    /// Persist goal mode orchestration state.
     GoalModeState(crate::session::goal_tracker::GoalOrchestration),
     DeleteGoalModeState {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -472,6 +513,8 @@ pub enum PersistenceMsg {
     /// Routed back through the persistence channel so the storage write
     /// stays sequential with other summary.json mutations.
     GeneratedTitle(String),
+    RegenerateTitle(String),
+    LastRecap(Option<String>),
     /// Manual `/rename` title. Rides this FIFO channel so the resulting
     /// `SetTitle` cannot race a `GeneratedTitle` `SetTitle` out-of-band.
     ManualTitleRenamed(String),
@@ -720,7 +763,9 @@ pub fn resolve_local_session_any_cwd(session_id: &str) -> Option<String> {
         .flatten()
 }
 
-pub(crate) fn resolve_local_session_any_cwd_result(session_id: &str) -> io::Result<Option<String>> {
+/// Resolve across workspaces while preserving incomplete-scan and relocation errors.
+/// Callers deciding whether to restore remotely must not treat an error as a miss.
+pub fn resolve_local_session_any_cwd_result(session_id: &str) -> io::Result<Option<String>> {
     resolve_local_session_any_cwd_in_root(session_id, &grok_home().join("sessions"))
         .map_err(io::Error::other)
 }
@@ -770,6 +815,10 @@ fn session_exists_in_root(session_id: &str, sessions_root: &Path) -> bool {
         .is_ok_and(|path| path.is_some())
 }
 
+pub(crate) fn title_is_manual_in_dir(session_dir: &Path) -> bool {
+    read_summary_from_dir(session_dir).is_ok_and(|summary| summary.title_is_manual)
+}
+
 /// Find and read a session summary given only its ID (scans all CWD directories).
 pub(crate) fn find_summary_by_session_id(session_id: &str) -> Option<Summary> {
     find_summary_by_session_id_in_root(session_id, &grok_home().join("sessions"))
@@ -798,15 +847,65 @@ fn read_summary_from_dir(session_dir: &Path) -> RelocationResult<Summary> {
     serde_json::from_slice(&bytes).map_err(|source| RelocationError::Json { path, source })
 }
 
-/// The most recently updated local session summary for `cwd` (by
-/// `last_active_at` else `updated_at`), or `None` if there are no local sessions
-/// for that cwd. Sync and local-only — suitable for the startup path that must
-/// resolve the sandbox profile before the (irreversible) OS sandbox is applied.
+/// Dir index plus on-demand summary reads.
+/// Search classifies only the FTS hits it walks.
+/// Loading every `summary.json` on each query is too expensive at the ~12K-session scale already called out for recent listing.
+pub(crate) struct SessionKindIndex {
+    view: RelocationView,
+}
+
+impl SessionKindIndex {
+    pub(crate) fn load() -> io::Result<Self> {
+        Self::load_in_root(&grok_home().join("sessions"))
+    }
+
+    pub(crate) fn load_in_root(sessions_root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            view: storage_view(sessions_root).map_err(io::Error::other)?,
+        })
+    }
+
+    pub(crate) fn kind(&self, session_id: &str) -> ClassifiedSessionKind {
+        match self.view.find_persisted_session_dir(session_id) {
+            Ok(Some(dir)) => match read_summary_from_dir(&dir) {
+                Ok(summary) if summary.is_headless() => ClassifiedSessionKind::Headless,
+                Ok(_) => ClassifiedSessionKind::Interactive,
+                Err(_) => ClassifiedSessionKind::Unknown,
+            },
+            Ok(None) | Err(_) => ClassifiedSessionKind::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentSessionSelection {
+    Interactive,
+    Any,
+}
+
+impl RecentSessionSelection {
+    pub fn from_headless_policy(policy: crate::session::visibility::HeadlessPolicy) -> Self {
+        match policy {
+            crate::session::visibility::HeadlessPolicy::Exclude => Self::Interactive,
+            crate::session::visibility::HeadlessPolicy::Only
+            | crate::session::visibility::HeadlessPolicy::Include => Self::Any,
+        }
+    }
+
+    pub fn admits(self, summary: &Summary) -> bool {
+        match self {
+            Self::Interactive => !summary.is_headless(),
+            Self::Any => true,
+        }
+    }
+}
+
 fn most_recent_local_summary_for_cwd_in_root(cwd: &str, sessions_root: &Path) -> Option<Summary> {
     most_recent_local_summary_for_cwd_in_view(
         cwd,
         &storage_view(sessions_root).ok()?,
         read_summary_from_dir,
+        RecentSessionSelection::Interactive,
     )
     .ok()
     .flatten()
@@ -816,18 +915,22 @@ fn most_recent_local_summary_for_cwd_in_view(
     cwd: &str,
     view: &RelocationView,
     read_summary: SummaryReader,
+    selection: RecentSessionSelection,
 ) -> RelocationResult<Option<Summary>> {
     let mut best: Option<Summary> = None;
     for session_dir in view.session_dirs(Some(cwd))? {
         let summary = match read_summary(&session_dir) {
             Ok(summary) => summary,
             Err(RelocationError::Json { .. }) => continue,
-            Err(RelocationError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Err(RelocationError::Io { path, source, .. }) => {
+                if source.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %source, "skipping unreadable session summary");
+                }
                 continue;
             }
             Err(error) => return Err(error),
         };
-        if summary.is_hidden() {
+        if summary.is_hidden() || !selection.admits(&summary) {
             continue;
         }
         if best.as_ref().is_none_or(|current| {
@@ -842,49 +945,57 @@ fn most_recent_local_summary_for_cwd_in_view(
     Ok(best)
 }
 
-/// Sync, local-only session summaries for `cwd` (hidden sessions filtered).
-/// For startup paths that must resolve a resume target before the
-/// irreversible OS sandbox is applied; async callers use [`list_summaries`].
 ///
-/// Listing failures propagate so pre-sandbox callers can fail closed;
-/// individual unreadable summaries are skipped, matching the async path's
-/// tolerance for a single corrupt file.
-pub fn local_summaries_for_cwd_sync(cwd: &str) -> io::Result<Vec<Summary>> {
-    local_summaries_for_cwd_sync_in_root(cwd, &grok_home().join("sessions"))
+pub fn local_summaries_for_cwd_sync(
+    cwd: &str,
+    selection: RecentSessionSelection,
+) -> io::Result<Vec<Summary>> {
+    local_summaries_for_cwd_sync_in_root(cwd, selection, &grok_home().join("sessions"))
 }
 
 fn local_summaries_for_cwd_sync_in_root(
     cwd: &str,
+    selection: RecentSessionSelection,
     sessions_root: &Path,
 ) -> io::Result<Vec<Summary>> {
     let view = storage_view(sessions_root).map_err(io::Error::other)?;
-    let dirs = view.session_dirs(Some(cwd)).map_err(io::Error::other)?;
+    let (dirs, complete) = view
+        .listing_dirs_with_completeness(Some(cwd), &Default::default())
+        .map_err(io::Error::other)?;
+    if !complete || view.has_journals() {
+        return Err(io::Error::other("local session discovery is incomplete"));
+    }
     Ok(dirs
         .iter()
-        .filter_map(|dir| read_summary_from_dir(dir).ok())
-        .filter(|s| !s.is_hidden())
+        .map(|dir| read_summary_from_dir(dir).map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|summary| !summary.is_hidden() && selection.admits(summary))
         .collect())
 }
 
-/// Best-effort lookup of the sandbox profile persisted with a session that is
-/// about to be resumed, used at startup to restore the session's profile before
-/// the (irreversible) OS sandbox is applied.
 ///
-/// - `session_id`: the explicit id from `--resume <id>` / `--load <id>` /
-///   `-s <id>`. Resolved directly across all cwds, then — for a remote id that
-///   was restored into a local child — via that child's `parent_session_id`.
-/// - `cwd`: the current working directory. Used to resolve a remote id to its
-///   local child, and as the lookup key for `-c` / `--continue` and bare
-///   `--resume` (most-recent-for-cwd).
 ///
-/// Returns `None` when not resuming, the session isn't found locally, or it has
-/// no persisted profile (sessions created before this was tracked) — callers
-/// then fall back to the normal config/CLI resolution.
 pub fn resumed_session_sandbox_profile(
     session_id: Option<&str>,
     cwd: Option<&str>,
 ) -> Option<String> {
     resumed_session_sandbox_profile_in_root(session_id, cwd, &grok_home().join("sessions"))
+}
+
+pub fn resolve_recent_session_sandbox_profile(
+    cwd: Option<&str>,
+    selection: RecentSessionSelection,
+) -> Option<String> {
+    most_recent_local_summary_for_cwd_in_view(
+        cwd?,
+        &storage_view(&grok_home().join("sessions")).ok()?,
+        read_summary_from_dir,
+        selection,
+    )
+    .ok()
+    .flatten()
+    .and_then(|summary| summary.sandbox_profile)
 }
 
 fn resumed_session_sandbox_profile_in_root(
@@ -915,9 +1026,9 @@ fn resumed_session_sandbox_profile_in_root(
     None
 }
 
-/// Owner-only session dir + `<encoded-cwd>` shield, for writers that bypass
-/// a storage adapter's `init_session` (e.g. chat-kind sessions).
-pub(crate) fn ensure_owner_only_session_dir(info: &Info) -> std::io::Result<PathBuf> {
+/// Owner-only and durable session dir for writers that bypass `init_session` (chat-kind, pre-init fork stamp).
+/// A later occupied `init_session` will not re-sync the encoded-cwd direntry.
+pub fn ensure_owner_only_session_dir(info: &Info) -> std::io::Result<PathBuf> {
     ensure_owner_only_session_dir_in(&grok_home(), info)
 }
 
@@ -926,15 +1037,104 @@ pub(crate) fn ensure_owner_only_session_dir_in(
     grok_home: &Path,
     info: &Info,
 ) -> std::io::Result<PathBuf> {
-    let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd);
+    ensure_owner_only_session_dir_in_with(
+        grok_home,
+        info,
+        crate::session::storage::sync_dir_durable,
+        crate::session::storage::sync_file_durable,
+    )
+}
+
+fn ensure_owner_only_session_dir_in_with(
+    grok_home: &Path,
+    info: &Info,
+    sync_dir: impl Fn(&Path) -> std::io::Result<()>,
+    sync_file: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     let dir = session_dir_in(grok_home, info);
-    crate::util::grok_home::create_dir_all_owner_only(&dir)?;
+    crate::session::storage::create_dir_all_durable_with(
+        &dir,
+        |dir| {
+            if let Ok(cwd_dir) =
+                crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd)
+            {
+                crate::session::storage::sync_cwd_marker_if_present_with(&cwd_dir, &sync_file)?;
+            }
+            crate::util::grok_home::create_dir_all_owner_only(dir)
+        },
+        sync_dir,
+    )?;
     Ok(dir)
 }
 
 /// `session_dir` with an injectable grok home (pure path computation).
 pub(crate) fn session_dir_in(grok_home: &Path, info: &Info) -> PathBuf {
     crate::util::grok_home::sessions_cwd_dir_in(grok_home, &info.cwd).join(info.id.to_string())
+}
+
+/// Atomically reserve a new root session directory against fork and other
+/// session creators. Existing directories are never adopted by session/new.
+pub(crate) fn reserve_new_session_dir_in(grok_home: &Path, info: &Info) -> io::Result<PathBuf> {
+    let id = info.id.to_string();
+    let mut components = Path::new(&id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session ID",
+        ));
+    }
+    let cwd_dir = crate::util::grok_home::sessions_cwd_dir_in(grok_home, &info.cwd);
+    crate::session::storage::create_dir_all_durable(&cwd_dir, |_| {
+        crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd)?;
+        crate::session::storage::sync_cwd_marker_if_present(&cwd_dir)
+    })?;
+    let path = cwd_dir.join(&id);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path)?;
+    if let Err(error) = crate::session::storage::sync_dir_durable(&cwd_dir) {
+        let _ = std::fs::remove_dir(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+pub(crate) struct NewSessionReservation(Option<PathBuf>);
+
+impl NewSessionReservation {
+    pub(crate) fn reserve(grok_home: &Path, info: &Info) -> io::Result<Self> {
+        reserve_new_session_dir_in(grok_home, info).map(|path| Self(Some(path)))
+    }
+
+    fn into_empty_dir_guard(mut self) -> EmptySessionDirGuard {
+        EmptySessionDirGuard(self.0.take().expect("reservation is live"))
+    }
+}
+
+impl Drop for NewSessionReservation {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0
+            && !path.join("summary.json").exists()
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EmptySessionDirGuard(PathBuf);
+
+impl Drop for EmptySessionDirGuard {
+    fn drop(&mut self) {
+        // Chat sessions can persist assets here; only remove an empty directory.
+        let _ = std::fs::remove_dir(&self.0);
+    }
 }
 
 /// Get file path for storing a large prompt.
@@ -970,6 +1170,88 @@ pub struct PendingCwdSwitchReminder {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_project_instructions: Option<String>,
+}
+
+/// The session's selected agent, persisted so resume doesn't re-derive it from the mutable model catalog.
+#[derive(Debug, Clone)]
+pub enum PersistedAgent {
+    /// Rebuilt from the catalog, plugin, or on-disk source by name on restore.
+    Named(String),
+    /// A client-supplied definition with no other provenance to rebuild from, so its full definition is carried.
+    Inline(Box<xai_grok_agent::AgentDefinition>),
+}
+
+impl PersistedAgent {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            PersistedAgent::Named(name) => name,
+            PersistedAgent::Inline(def) => &def.name,
+        }
+    }
+
+    pub(crate) fn inline_definition(&self) -> Option<&xai_grok_agent::AgentDefinition> {
+        match self {
+            PersistedAgent::Named(_) => None,
+            PersistedAgent::Inline(def) => Some(def),
+        }
+    }
+}
+
+impl From<&xai_grok_agent::AgentDefinition> for PersistedAgent {
+    fn from(def: &xai_grok_agent::AgentDefinition) -> Self {
+        if def.is_inline_profile() {
+            PersistedAgent::Inline(Box::new(def.clone()))
+        } else {
+            PersistedAgent::Named(def.name.clone())
+        }
+    }
+}
+
+/// Serializes as the legacy `agent_name`/`agent_profile` summary keys; a malformed or name-mismatched profile is dropped so the pair can never load as an inconsistent selection.
+#[derive(Debug, Clone, Default)]
+pub struct PersistedAgentSelection {
+    selected: Option<PersistedAgent>,
+}
+
+impl serde::Serialize for PersistedAgentSelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match &self.selected {
+            None => {}
+            Some(PersistedAgent::Named(name)) => map.serialize_entry("agent_name", name)?,
+            Some(PersistedAgent::Inline(def)) => {
+                map.serialize_entry("agent_name", &def.name)?;
+                map.serialize_entry("agent_profile", &def.to_json_value())?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedAgentSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            agent_name: Option<String>,
+            #[serde(default)]
+            agent_profile: Option<serde_json::Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let selected = match raw.agent_name {
+            None => None,
+            Some(name) => {
+                let inline = raw
+                    .agent_profile
+                    .and_then(|value| xai_grok_agent::AgentDefinition::from_json(&value).ok())
+                    .filter(|def| def.name == name)
+                    .map(|def| PersistedAgent::Inline(Box::new(def)));
+                Some(inline.unwrap_or(PersistedAgent::Named(name)))
+            }
+        };
+        Ok(PersistedAgentSelection { selected })
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1088,22 +1370,23 @@ pub struct Summary {
     /// Human-readable label for the worktree directory (e.g. "nuke-v-tables").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_label: Option<String>,
-    /// The agent definition name that was active when the session was last saved.
-    /// Used during session resume to avoid re-deriving from the (mutable) model
-    /// catalog — if the model is removed or its `agent_type` changes between
-    /// sessions, this persisted value ensures the correct harness is restored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
-    /// The OS sandbox profile this session ran under (e.g. "workspace",
-    /// "strict", "off", or a custom name). Persisted so a resumed session is
-    /// restored to the same profile instead of silently falling back to the
-    /// config default — which would otherwise break commands that worked before
-    /// (a stricter profile denies filesystem/network the session relied on).
+    /// The agent active when the session was last saved, persisted so resume doesn't re-derive it from the mutable model catalog.
+    #[serde(flatten)]
+    pub agent: PersistedAgentSelection,
+    /// Persisted so a resumed session is restored to the same profile instead of silently falling back to the config default.
+    /// A fallback would break commands that worked before (a stricter profile denies filesystem/network the session relied on).
     /// `None` for sessions created before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(
+        default,
+        rename = "context_window",
+        alias = "context_window_selection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window_selection: Option<std::num::NonZeroU64>,
     /// Ultra-short summary of the most recent successful turn, shown as the
     /// dashboard row's secondary line (via the roster for non-attached
     /// clients). Displayed until replaced by the next successful turn (or
@@ -1113,6 +1396,8 @@ pub struct Summary {
     /// Prompt id of the turn `last_turn_summary` describes (provenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_summary_prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recap: Option<String>,
     /// Stable prompt-cache identity for this session. Providers that key
     /// server-side prefix caching on a session id (Codex `prompt_cache_key`
     /// and session-affinity headers; xAI `x-grok-session-id` fallback) reuse
@@ -1161,13 +1446,41 @@ pub(crate) fn cache_affinity_from_session_dir(dir: &Path) -> Option<String> {
         .restore_cache_affinity_id()
 }
 
+pub(crate) const WORKTREE_SESSION_KIND: &str = "worktree";
+
 impl Summary {
+    /// Re-asserting the current agent's name is a no-op: a model or reasoning-effort switch carries only
+    /// the (built) name, and persisting that built definition would double-expand an inline agent on
+    /// reload, so a same-name update must preserve the existing selection. Any other selection replaces it.
+    pub(crate) fn set_agent(&mut self, agent: PersistedAgent) {
+        let reasserts_current = matches!(&agent, PersistedAgent::Named(name)
+            if self.agent_name() == Some(name.as_str()));
+        if !reasserts_current {
+            self.agent.selected = Some(agent);
+        }
+    }
+
+    pub(crate) fn agent_name(&self) -> Option<&str> {
+        self.agent.selected.as_ref().map(PersistedAgent::name)
+    }
+
+    pub(crate) fn agent_profile(&self) -> Option<&xai_grok_agent::AgentDefinition> {
+        self.agent
+            .selected
+            .as_ref()
+            .and_then(PersistedAgent::inline_definition)
+    }
+
+    pub(crate) fn persisted_agent(&self) -> Option<&PersistedAgent> {
+        self.agent.selected.as_ref()
+    }
+
     pub(crate) fn new(info: &Info, model_id: acp::ModelId) -> std::io::Result<Self> {
         let git_metadata =
             xai_grok_workspace::session::git::resolve_persisted_session_git_metadata_sync(
                 std::path::Path::new(&info.cwd),
             );
-        Ok(Self {
+        let mut summary = Self {
             info: info.clone(),
             cwd_generation: 0,
             previous_cwd: None,
@@ -1203,14 +1516,29 @@ impl Summary {
             last_active_at: None,
             generated_title: None,
             title_is_manual: false,
-            worktree_label: crate::session::worktree::lookup_worktree_label(&info.cwd),
-            agent_name: None,
+            worktree_label: None,
+            agent: PersistedAgentSelection::default(),
             sandbox_profile: None,
             reasoning_effort: None,
+            context_window_selection: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
+            last_recap: None,
             cache_affinity_id: nonempty_cache_affinity(Some(info.id.0.as_ref())),
-        })
+        };
+        if let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd) {
+            summary.stamp_worktree_identity(&identity);
+        }
+        Ok(summary)
+    }
+
+    pub(crate) fn stamp_worktree_identity(
+        &mut self,
+        identity: &crate::session::worktree::WorktreeIdentity,
+    ) {
+        self.session_kind = Some(WORKTREE_SESSION_KIND.to_string());
+        self.worktree_label = Some(identity.label.clone());
+        self.source_workspace_dir = identity.source_workspace_dir.clone();
     }
 
     /// Persisted prompt-cache identity, if this summary recorded one.
@@ -1243,6 +1571,10 @@ impl Summary {
                 .as_deref()
                 .is_some_and(|k| k.starts_with("subagent")),
         )
+    }
+
+    pub fn is_headless(&self) -> bool {
+        self.session_kind.as_deref() == Some(crate::session::visibility::SESSION_KIND_HEADLESS)
     }
 
     /// Preferred display title: `generated_title` if non-empty, else `session_summary`.
@@ -1482,6 +1814,17 @@ mod is_hidden_tests {
         assert!(summary.ever_used_codex);
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("ever_used_codex"));
+    }
+
+    #[test]
+    fn external_agent_closes_the_shared_boundary_without_a_sampler_provider() {
+        let boundary = ProviderBoundary::default();
+        let export_guard = boundary.clone();
+        assert!(boundary.close_xai_export());
+        assert!(!export_guard.allows_xai_export());
+        assert!(!boundary.close_xai_export());
+        assert!(!boundary.observe(ModelProvider::Xai));
+        assert!(!export_guard.allows_xai_export());
     }
 
     #[test]
@@ -1831,6 +2174,31 @@ mod generated_title_tests {
     }
 
     #[test]
+    fn title_is_manual_in_dir_requires_a_readable_typed_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let summary_path = directory.path().join("summary.json");
+        assert!(!title_is_manual_in_dir(directory.path()));
+        std::fs::write(&summary_path, b"not json").unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+        std::fs::write(&summary_path, br#"{"title_is_manual":true}"#).unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+
+        let mut summary = Summary::new(
+            &Info {
+                id: acp::SessionId::new("test"),
+                cwd: "/tmp".into(),
+            },
+            default_model_id(),
+        )
+        .unwrap();
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+        summary.title_is_manual = true;
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert!(title_is_manual_in_dir(directory.path()));
+    }
+
+    #[test]
     fn title_is_manual_defaults_false_and_skips_when_unset() {
         // Old summary.json without the field: default false, so pre-existing
         // renames show no border title until renamed again.
@@ -1902,13 +2270,28 @@ mod generated_title_tests {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderBoundary {
     ever_used_codex: Arc<AtomicBool>,
+    parent: Option<Arc<AtomicBool>>,
+    _empty_dir_guard: Option<Arc<EmptySessionDirGuard>>,
+    ephemeral: bool,
 }
 
 impl ProviderBoundary {
     pub(crate) fn new(ever_used_codex: bool) -> Self {
         Self {
             ever_used_codex: Arc::new(AtomicBool::new(ever_used_codex)),
+            parent: None,
+            _empty_dir_guard: None,
+            ephemeral: false,
         }
+    }
+
+    pub(crate) fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    fn with_parent(mut self, parent: &Self) -> Self {
+        self.parent = Some(parent.ever_used_codex.clone());
+        self
     }
 
     /// Observe a provider and return true only when it first closes the xAI
@@ -1918,15 +2301,26 @@ impl ProviderBoundary {
     /// Keeping the decision on the profile avoids growing another
     /// provider-specific boolean as providers are added.
     pub(crate) fn observe(&self, provider: ModelProvider) -> bool {
-        !provider.profile().allows_xai_services()
-            && self
-                .ever_used_codex
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        !provider.profile().allows_xai_services() && self.close_xai_export()
+    }
+
+    /// External agents are not sampler providers, but their content must
+    /// close the same cumulative boundary immediately.
+    pub(crate) fn close_xai_export(&self) -> bool {
+        if let Some(parent) = &self.parent {
+            parent.store(true, Ordering::Release);
+        }
+        self.ever_used_codex
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub(crate) fn ever_used_codex(&self) -> bool {
         self.ever_used_codex.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.load(Ordering::Acquire))
     }
 
     pub(crate) fn allows_xai_export(&self) -> bool {
@@ -1998,7 +2392,10 @@ impl PersistenceHandle {
 
     pub(crate) fn noop_for_provider(provider: ModelProvider) -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let provider_boundary = ProviderBoundary::default();
+        let provider_boundary = ProviderBoundary {
+            ephemeral: true,
+            ..ProviderBoundary::default()
+        };
         provider_boundary.observe(provider);
         Self {
             tx,
@@ -2006,6 +2403,16 @@ impl PersistenceHandle {
             noop: true,
             disk_full_rx: watch::channel(false).1,
         }
+    }
+
+    pub(crate) fn noop_for_provider_with_reservation(
+        provider: ModelProvider,
+        reservation: NewSessionReservation,
+    ) -> Self {
+        let mut handle = Self::noop_for_provider(provider);
+        handle.provider_boundary._empty_dir_guard =
+            Some(Arc::new(reservation.into_empty_dir_guard()));
+        handle
     }
 
     pub fn is_noop(&self) -> bool {
@@ -2100,6 +2507,10 @@ struct SessionPersistence {
     relay_sync: Option<crate::relay::RelaySync>,
     /// Session title generation lifecycle.
     summary: crate::session::summary::SummaryGenerator,
+    /// The title route was explicitly selected locally by the user.
+    summary_cross_provider_allowed: bool,
+    /// `Some(None)` means this child has no available parent persistence sink.
+    parent_export: Option<Option<mpsc::UnboundedSender<PersistenceMsg>>>,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
     /// Client gateway for `SessionSummaryGenerated` notifications. Used to
     /// announce an auto-generated title only once it has actually been adopted
@@ -2109,6 +2520,11 @@ struct SessionPersistence {
     gateway: Option<GatewaySender>,
     disk_full_tx: watch::Sender<bool>,
     disk_full_notified: bool,
+    dirty_files: crate::session::storage::SessionFileSet,
+    pending_write_error: Option<io::Error>,
+    last_usage_live: Option<crate::session::usage_file::UsageSummary>,
+    last_usage_turn: Option<u32>,
+    last_incoming_turn: Option<u32>,
 }
 
 impl SessionPersistence {
@@ -2221,7 +2637,28 @@ impl SessionPersistence {
             .append_update_commit_aware(&self.info, update)
             .await;
         self.observe_append_update(&result);
+        match &result {
+            Ok(()) | Err(crate::session::storage::AppendUpdateError::Committed(_)) => {
+                self.dirty_files.updates = true;
+            }
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                self.note_write_failure(error);
+            }
+        }
         result
+    }
+
+    fn note_write_failure(&mut self, error: &io::Error) {
+        if self.pending_write_error.is_none() {
+            self.pending_write_error = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+    }
+
+    fn take_pending_write_error(&mut self) -> io::Result<()> {
+        match self.pending_write_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn observe_io<T>(&mut self, result: &io::Result<T>) {
@@ -2241,6 +2678,20 @@ impl SessionPersistence {
             Err(
                 crate::session::storage::AppendUpdateError::NotCommitted(error)
                 | crate::session::storage::AppendUpdateError::Committed(error),
+            ) if is_disk_full_io_error(error) => self.mark_disk_full(),
+            Err(_) => {}
+        }
+    }
+
+    fn observe_append_chat(
+        &mut self,
+        result: &Result<(), crate::session::storage::AppendChatError>,
+    ) {
+        match result {
+            Ok(()) => self.clear_disk_full(),
+            Err(
+                crate::session::storage::AppendChatError::NotCommitted(error)
+                | crate::session::storage::AppendChatError::Committed(error),
             ) if is_disk_full_io_error(error) => self.mark_disk_full(),
             Err(_) => {}
         }
@@ -2391,6 +2842,7 @@ impl SessionPersistence {
     /// Restore uncommitted failures; sync committed records before returning errors.
     async fn drain_pending(&mut self) -> Result<(), crate::session::storage::AppendUpdateError> {
         if let Some(notification) = self.pending_notification.take() {
+            let had_prior_latch = self.pending_write_error.is_some();
             let result = self
                 .write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
                 .await;
@@ -2404,6 +2856,9 @@ impl SessionPersistence {
                 }
                 PendingAppendOutcome::NotCommittedErr(notification, error) => {
                     self.pending_notification = Some(notification);
+                    if !had_prior_latch {
+                        self.pending_write_error = None;
+                    }
                     return Err(crate::session::storage::AppendUpdateError::NotCommitted(
                         error,
                     ));
@@ -2417,12 +2872,23 @@ impl SessionPersistence {
         &mut self,
         update: SessionUpdate,
     ) -> Result<(), crate::session::storage::AppendUpdateError> {
-        self.drain_pending().await?;
+        match self.drain_pending().await {
+            Ok(()) => {}
+            Err(crate::session::storage::AppendUpdateError::Committed(_)) => {}
+            Err(error) => return Err(error),
+        }
         let result = self
             .storage
             .append_update_durable_commit_aware(&self.info, &update)
             .await;
         self.observe_append_update(&result);
+        match &result {
+            Ok(()) => {}
+            Err(crate::session::storage::AppendUpdateError::Committed(_)) => {
+                self.dirty_files.updates = true;
+            }
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(_)) => {}
+        }
         match (&update, &result) {
             (SessionUpdate::Acp(notification), Ok(()))
             | (
@@ -2437,10 +2903,14 @@ impl SessionPersistence {
     /// Flush any pending merged ACP notification to disk and remote sync.
     /// A no-op drain must not clear the disk-full latch.
     async fn flush_pending(&mut self) -> io::Result<()> {
-        let result = self
-            .drain_pending()
-            .await
-            .map_err(crate::session::storage::AppendUpdateError::into_io_error);
+        let result = match self.drain_pending().await {
+            Ok(()) => Ok(()),
+            Err(crate::session::storage::AppendUpdateError::Committed(error)) => {
+                tracing::warn!(%error, "failed to write pending update");
+                Ok(())
+            }
+            Err(error) => Err(error.into_io_error()),
+        };
         if let Err(error) = &result {
             tracing::warn!(%error, "failed to write pending update");
         }
@@ -2459,20 +2929,105 @@ impl SessionPersistence {
 
     /// Flush pending writes and sync all session files to disk.
     /// Called before CopyFile to ensure all data is persisted.
-    async fn flush_and_sync(&mut self) {
-        let _ = self.flush_pending().await;
-        if let Err(e) = self.storage.sync_session_files(&self.info).await {
-            tracing::warn!(?e, "Failed to sync session files to disk");
+    async fn flush_and_sync(&mut self) -> io::Result<()> {
+        let flushed = self.flush_pending().await;
+        let prior_write = self.take_pending_write_error();
+        let synced = self.sync_files_and_clear(self.dirty_files).await;
+        flushed.and(prior_write).and(synced)
+    }
+
+    async fn flush_and_sync_all(&mut self) -> io::Result<()> {
+        let flushed = self.flush_pending().await;
+        let synced = self
+            .sync_files_and_clear(crate::session::storage::SessionFileSet::ALL)
+            .await;
+        flushed.and(synced)
+    }
+
+    async fn sync_files_and_clear(
+        &mut self,
+        files: crate::session::storage::SessionFileSet,
+    ) -> io::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let synced = self
+            .storage
+            .sync_session_files_selected(&self.info, files)
+            .await;
+        match &synced {
+            Ok(()) => self.dirty_files = Default::default(),
+            Err(error) => tracing::warn!(?error, "Failed to sync session files to disk"),
+        }
+        synced
+    }
+
+    fn announce_adopted_title(&self, title: String) {
+        // Announce to clients only now that the title is
+        // adopted, so a title rejected for racing a manual
+        // `/rename` never overwrites the client's title.
+        crate::session::summary::notify_client(&self.gateway, &self.info, &title);
+        if self.provider_boundary.allows_xai_export()
+            && let Some(sync) = &self.remote_sync
+        {
+            sync.set_title(title.clone());
+        }
+        if self.provider_boundary.allows_xai_export()
+            && let Some(reg) = self.registry_title_sync.as_ref()
+            && !reg.suppress_for_zdr
+        {
+            let client = reg.client.clone();
+            let provider_boundary = self.provider_boundary.clone();
+            let sid = self.info.id.to_string();
+            let value = title;
+            tokio::spawn(async move {
+                if !provider_boundary.allows_xai_export() {
+                    return;
+                }
+                let req = crate::agent::session_registry_client::UpdateRequest {
+                    summary: Some(value),
+                    first_prompt: None,
+                    last_turn_number: None,
+                    repo_head_at_end: None,
+                    restorable_turn_number: None,
+                };
+                if let Err(error) = client.update(&sid, &req).await {
+                    tracing::warn!(
+                        error = %error,
+                        session_id = %sid,
+                        "session registry summary sync failed after title generation"
+                    );
+                }
+            });
         }
     }
 
     async fn run(mut self) {
-        // Persistence traffic counts as worktree activity; debounced so
-        // long-resident sessions (leader/remote, active for days without a
-        // re-open) stay out of gc expiry without per-message DB writes.
         // The constructors fire the t=0 touch, so this starts at now().
         let mut last_worktree_touch = std::time::Instant::now();
-        while let Some(msg) = self.rx.recv().await {
+        let mut history_dirty = false;
+        loop {
+            let message = if history_dirty {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), self.rx.recv()).await
+                {
+                    Ok(message) => message,
+                    Err(_) => {
+                        if self.flush_pending().await.is_ok()
+                            && let Err(error) = self.storage.compress_history(&self.info).await
+                        {
+                            tracing::warn!(%error, "failed to gzip idle thread history");
+                        }
+                        history_dirty = false;
+                        continue;
+                    }
+                }
+            } else {
+                self.rx.recv().await
+            };
+            let Some(msg) = message else {
+                break;
+            };
+            history_dirty = true;
             if last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL {
                 last_worktree_touch = std::time::Instant::now();
                 // Detached on purpose: opportunistic refresh, no ordering need.
@@ -2486,7 +3041,7 @@ impl SessionPersistence {
                     let _ = self.flush_pending().await;
                 }
                 PersistenceMsg::FlushAndAck { respond_to } => {
-                    let result = self.flush_pending().await;
+                    let result = self.flush_and_sync().await;
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::ProbeWritable { respond_to } => {
@@ -2521,16 +3076,29 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to } => {
                     let result = self.handle_durable_append(update).await;
-                    let _ = respond_to.send(result);
+                    if let Err(Err(error)) = respond_to.send(result) {
+                        tracing::warn!(%error, "failed to write durable update");
+                    }
                 }
                 PersistenceMsg::Chat(chat_msg) => {
                     let result = self
                         .storage
-                        .append_chat_message(&self.info, &chat_msg)
+                        .append_chat_message_commit_aware(&self.info, &chat_msg)
                         .await;
-                    self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to write chat message");
+                    self.observe_append_chat(&result);
+                    match &result {
+                        Ok(()) => self.dirty_files.chat = true,
+                        Err(crate::session::storage::AppendChatError::Committed(error)) => {
+                            tracing::warn!(
+                                %error,
+                                "failed to write chat bookkeeping after append"
+                            );
+                            self.dirty_files.chat = true;
+                        }
+                        Err(crate::session::storage::AppendChatError::NotCommitted(error)) => {
+                            tracing::warn!(%error, "failed to write chat message");
+                            self.note_write_failure(error);
+                        }
                     }
                 }
                 PersistenceMsg::AppendCwdSwitchAndAck { item, respond_to } => {
@@ -2562,8 +3130,8 @@ impl SessionPersistence {
                         .replace_chat_history(&self.info, &messages)
                         .await;
                     self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to replace chat history");
+                    if let Err(error) = result {
+                        tracing::warn!(?error, "failed to replace chat history");
                     }
                 }
                 PersistenceMsg::ReplaceChatHistoryForStripAndAck {
@@ -2578,32 +3146,34 @@ impl SessionPersistence {
                     )
                     .await;
                     self.observe_io(&result);
-                    if let Err(e) = &result {
-                        tracing::warn!(?e, "image-strip history rewrite failed");
+                    if let Err(error) = &result {
+                        tracing::warn!(?error, "image-strip history rewrite failed");
                     }
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
                     provider,
-                    agent_name,
+                    agent,
                     reasoning_effort,
+                    context_window,
                     resolved_tool_policy,
                 } => {
                     self.current_provider = provider;
                     self.observe_provider(provider).await;
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_current_model_and_agent(
                             &self.info,
                             &model_id,
-                            agent_name.as_deref(),
+                            Some(&agent),
                             reasoning_effort,
+                            context_window,
                             resolved_tool_policy,
                         )
                         .await
                     {
-                        tracing::warn!(?e, "failed to update current model");
+                        tracing::warn!(?error, "failed to update current model");
                     }
                     if self.provider_boundary.allows_xai_export()
                         && let Some(sync) = &self.remote_sync
@@ -2612,39 +3182,73 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::PreviousTurnModel(previous_model) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_previous_turn_model(&self.info, previous_model)
                         .await
                     {
-                        tracing::warn!(?e, "failed to update previous-turn model metadata");
+                        tracing::warn!(?error, "failed to update previous-turn model metadata");
                     }
                 }
                 PersistenceMsg::ObserveProvider(provider) => {
                     self.observe_provider(provider).await;
                 }
+                PersistenceMsg::CloseXaiExportAndAck { respond_to } => {
+                    self.provider_boundary.close_xai_export();
+                    self.remote_sync.take();
+                    self.relay_sync.take();
+                    self.registry_title_sync.take();
+                    let mut result = self.storage.mark_ever_used_codex(&self.info).await;
+                    if result.is_ok()
+                        && let Some(parent) = &self.parent_export
+                    {
+                        result = match parent {
+                            Some(parent) => {
+                                let (parent_respond_to, response) = tokio::sync::oneshot::channel();
+                                if parent
+                                    .send(PersistenceMsg::CloseXaiExportAndAck {
+                                        respond_to: parent_respond_to,
+                                    })
+                                    .is_err()
+                                {
+                                    Err(io::Error::other("parent persistence is unavailable"))
+                                } else {
+                                    response.await.unwrap_or_else(|_| {
+                                        Err(io::Error::other(
+                                            "parent persistence acknowledgement was lost",
+                                        ))
+                                    })
+                                }
+                            }
+                            None => Err(io::Error::other("parent persistence is unavailable")),
+                        };
+                    }
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::RefreshCodexSummaryAuth { bearer_resolver } => {
                     self.summary.refresh_codex_bearer_resolver(bearer_resolver);
                 }
                 PersistenceMsg::PlanState(state) => {
-                    if let Err(e) = self.storage.write_plan_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write plan state");
+                    if let Err(error) = self.storage.write_plan_state(&self.info, &state).await {
+                        tracing::warn!(?error, "failed to write plan state");
                     }
                 }
                 PersistenceMsg::PlanModeState(state) => {
-                    if let Err(e) = self.storage.write_plan_mode_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write plan mode state");
+                    if let Err(error) = self.storage.write_plan_mode_state(&self.info, &state).await
+                    {
+                        tracing::warn!(?error, "failed to write plan mode state");
                     }
                 }
                 PersistenceMsg::GoalModeState(state) => {
-                    if let Err(e) = self.storage.write_goal_mode_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write goal mode state");
+                    if let Err(error) = self.storage.write_goal_mode_state(&self.info, &state).await
+                    {
+                        tracing::warn!(?error, "failed to write goal mode state");
                     }
                 }
                 PersistenceMsg::DeleteGoalModeState { respond_to } => {
                     let result = self.storage.delete_goal_mode_state(&self.info).await;
-                    if let Err(e) = &result {
-                        tracing::warn!(?e, "failed to delete goal mode state");
+                    if let Err(error) = &result {
+                        tracing::warn!(?error, "failed to delete goal mode state");
                     }
                     let _ = respond_to.send(result);
                 }
@@ -2671,12 +3275,12 @@ impl SessionPersistence {
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::DeleteWorkflowRunState(run_id) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .delete_workflow_run_state(&self.info, &run_id)
                         .await
                     {
-                        tracing::warn!(%run_id, ?e, "failed to delete workflow run state");
+                        tracing::warn!(%run_id, ?error, "failed to delete workflow run state");
                     }
                 }
                 PersistenceMsg::ContentChunk(content_chunks) => {
@@ -2689,8 +3293,36 @@ impl SessionPersistence {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if self.summary.provider() == self.current_provider {
-                        self.summary.update(content_part);
+                    let summary_provider = self.summary.provider();
+                    if summary_provider == self.current_provider
+                        || self.summary_cross_provider_allowed
+                    {
+                        // Before sending content to an explicitly selected
+                        // non-xAI helper, close and persist the export boundary.
+                        let boundary_ready = if self.summary.is_idle()
+                            && !content_part.trim().is_empty()
+                            && !summary_provider.profile().allows_xai_services()
+                        {
+                            self.provider_boundary.observe(summary_provider);
+                            self.remote_sync.take();
+                            self.relay_sync.take();
+                            self.registry_title_sync.take();
+                            match self.storage.mark_ever_used_codex(&self.info).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        ?error,
+                                        "failed to persist title provider boundary"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if boundary_ready {
+                            self.summary.update(content_part);
+                        }
                     } else {
                         tracing::debug!(
                             active_provider = ?self.current_provider,
@@ -2705,6 +3337,22 @@ impl SessionPersistence {
                         &self.info.cwd,
                     );
                 }
+                PersistenceMsg::LastRecap(recap) => {
+                    if let Err(error) = self.storage.set_last_recap(&self.info, recap).await {
+                        tracing::warn!(%error, "failed to persist last recap");
+                    }
+                }
+                PersistenceMsg::RegenerateTitle(title) => {
+                    match self
+                        .storage
+                        .regenerate_generated_title(&self.info, title.clone())
+                        .await
+                    {
+                        Ok(true) => self.announce_adopted_title(title),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(%error, "failed to persist refreshed title"),
+                    }
+                }
                 PersistenceMsg::GeneratedTitle(title) => {
                     // Auto-generated titles must never overwrite a title the
                     // user set via `/rename`. `set_generated_title_if_absent`
@@ -2717,57 +3365,14 @@ impl SessionPersistence {
                         .set_generated_title_if_absent(&self.info, title.clone())
                         .await
                     {
-                        Ok(true) => {
-                            // Announce to clients only now that the title is
-                            // adopted, so a title rejected for racing a manual
-                            // `/rename` never overwrites the client's title.
-                            crate::session::summary::notify_client(
-                                &self.gateway,
-                                &self.info,
-                                &title,
-                            );
-                            if self.provider_boundary.allows_xai_export()
-                                && let Some(sync) = &self.remote_sync
-                            {
-                                sync.set_title(title.clone());
-                            }
-                            if self.provider_boundary.allows_xai_export()
-                                && let Some(reg) = self.registry_title_sync.as_ref()
-                                && !reg.suppress_for_zdr
-                            {
-                                let client = reg.client.clone();
-                                let provider_boundary = self.provider_boundary.clone();
-                                let sid = self.info.id.to_string();
-                                let t = title;
-                                tokio::spawn(async move {
-                                    if !provider_boundary.allows_xai_export() {
-                                        return;
-                                    }
-                                    let req =
-                                        crate::agent::session_registry_client::UpdateRequest {
-                                            summary: Some(t),
-                                            first_prompt: None,
-                                            last_turn_number: None,
-                                            repo_head_at_end: None,
-                                            restorable_turn_number: None,
-                                        };
-                                    if let Err(e) = client.update(&sid, &req).await {
-                                        tracing::warn!(
-                                            error = %e,
-                                            session_id = %sid,
-                                            "session registry summary sync failed after title generation"
-                                        );
-                                    }
-                                });
-                            }
-                        }
+                        Ok(true) => self.announce_adopted_title(title),
                         Ok(false) => {
                             tracing::debug!(
                                 "session already has a title on disk; discarding generated title"
                             );
                         }
-                        Err(e) => {
-                            tracing::warn!(?e, "failed to persist generated session title");
+                        Err(error) => {
+                            tracing::warn!(?error, "failed to persist generated session title");
                         }
                     }
                 }
@@ -2787,128 +3392,137 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::LastTurnSummary(summary) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .set_last_turn_summary(&self.info, summary)
                         .await
                     {
-                        tracing::warn!(?e, "failed to persist last turn summary");
+                        tracing::warn!(?error, "failed to persist last turn summary");
                     }
                 }
                 PersistenceMsg::RewindPoint(point) => {
                     let result = self.storage.append_rewind_point(&self.info, &point).await;
                     self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to write rewind point");
+                    match result {
+                        Ok(()) => self.dirty_files.rewind_points = true,
+                        Err(error) => {
+                            tracing::warn!(?error, "failed to write rewind point");
+                            self.note_write_failure(&error);
+                        }
                     }
                 }
                 PersistenceMsg::TruncateRewindPoints { from_index } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .truncate_rewind_points_from(&self.info, from_index)
                         .await
                     {
-                        tracing::warn!(?e, from_index, "failed to truncate rewind points");
+                        tracing::warn!(?error, from_index, "failed to truncate rewind points");
                     }
                 }
                 PersistenceMsg::MergeRewindPointsFrom { target_index } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .merge_rewind_points_from(&self.info, target_index)
                         .await
                     {
-                        tracing::warn!(?e, target_index, "failed to merge rewind points");
+                        tracing::warn!(?error, target_index, "failed to merge rewind points");
                     }
                 }
                 PersistenceMsg::CollectionId(collection_id) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_collection_id(&self.info, &collection_id)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write collection id");
+                        tracing::warn!(?error, "failed to write collection id");
                     }
                 }
                 PersistenceMsg::NextTraceTurn {
                     next_trace_turn,
                     request_id,
                 } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_next_trace_turn(&self.info, next_trace_turn, request_id.as_deref())
                         .await
                     {
-                        tracing::warn!(?e, "failed to write next trace turn");
+                        tracing::warn!(?error, "failed to write next trace turn");
                     }
                 }
                 PersistenceMsg::Signals(signals) => {
-                    if let Err(e) = self.storage.write_signals(&self.info, &signals).await {
-                        tracing::warn!(?e, "failed to write session signals");
+                    if let Err(error) = self.storage.write_signals(&self.info, &signals).await {
+                        tracing::warn!(?error, "failed to write session signals");
+                    }
+                }
+                PersistenceMsg::UsageTurn { turn_number, live } => {
+                    if let Err(error) = self.persist_usage_turn(turn_number, &live).await {
+                        tracing::warn!(?error, turn_number, "failed to write session usage");
                     }
                 }
                 PersistenceMsg::AnnouncementState(state) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_announcement_state(&self.info, &state)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write announcement state");
+                        tracing::warn!(?error, "failed to write announcement state");
                     }
                 }
                 PersistenceMsg::Feedback(entry) => {
-                    if let Err(e) = self.storage.append_feedback(&self.info, &entry).await {
-                        tracing::warn!(?e, "failed to write feedback entry");
+                    if let Err(error) = self.storage.append_feedback(&self.info, &entry).await {
+                        tracing::warn!(?error, "failed to write feedback entry");
                     }
                 }
                 PersistenceMsg::Btw(entry) => {
-                    if let Err(e) = self.storage.append_btw(&self.info, &entry).await {
-                        tracing::warn!(?e, "failed to write btw entry");
+                    if let Err(error) = self.storage.append_btw(&self.info, &entry).await {
+                        tracing::warn!(?error, "failed to write btw entry");
                     }
                 }
                 PersistenceMsg::GitHead { commit, branch } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_git_head(&self.info, commit, branch)
                         .await
                     {
-                        tracing::warn!(?e, "failed to persist git HEAD");
+                        tracing::warn!(?error, "failed to persist git HEAD");
                     }
                 }
                 PersistenceMsg::CompactionCheckpoint(checkpoint) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_checkpoint(&self.info, &checkpoint)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction checkpoint file");
+                        tracing::warn!(?error, "failed to write compaction checkpoint file");
                     }
                 }
                 PersistenceMsg::CompactionRequest(request) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_request(&self.info, &request)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction request artifact");
+                        tracing::warn!(?error, "failed to write compaction request artifact");
                     }
                 }
                 PersistenceMsg::RecapRequest(request) => {
-                    if let Err(e) = self.storage.write_recap_request(&self.info, &request).await {
-                        tracing::warn!(?e, "failed to write recap request artifact");
+                    if let Err(error) = self.storage.write_recap_request(&self.info, &request).await
+                    {
+                        tracing::warn!(?error, "failed to write recap request artifact");
                     }
                 }
                 PersistenceMsg::CompactionSegment(segment) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_segment(&self.info, &segment)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction segment");
+                        tracing::warn!(?error, "failed to write compaction segment");
                     }
                 }
                 PersistenceMsg::CopyFile { one_shot } => {
-                    // Flush pending writes and sync all session files to disk before copying.
-                    self.flush_and_sync().await;
+                    let _ = self.flush_and_sync_all().await;
 
                     let result = self.copy_session_dir_to_memory().await;
                     let _ = one_shot.send(result);
@@ -2916,8 +3530,12 @@ impl SessionPersistence {
             }
         }
 
-        // Drain the merge buffer on channel close.
-        let _ = self.flush_pending().await;
+        // Drain before compressing; never publish a stale detached snapshot.
+        if self.flush_pending().await.is_ok()
+            && let Err(error) = self.storage.compress_history(&self.info).await
+        {
+            tracing::warn!(%error, "failed to gzip closed thread history");
+        }
     }
 
     async fn copy_session_dir_to_memory(&self) -> anyhow::Result<SessionStateCopy> {
@@ -2929,7 +3547,7 @@ impl SessionPersistence {
                 return Ok(SessionStateCopy { files });
             }
 
-            collect_session_files_recursive(&session_dir, &session_dir, &mut files);
+            collect_session_files_recursive(&session_dir, &session_dir, &mut files)?;
             collect_mcp_stderr_logs(&mut files);
 
             Ok(SessionStateCopy { files })
@@ -2938,17 +3556,46 @@ impl SessionPersistence {
     }
 }
 
+impl SessionPersistence {
+    async fn persist_usage_turn(
+        &mut self,
+        turn_number: u32,
+        live: &crate::session::usage_file::UsageSummary,
+    ) -> io::Result<()> {
+        let (incoming, written) = self
+            .storage
+            .record_usage_turn(
+                &self.info,
+                turn_number,
+                Utc::now().to_rfc3339(),
+                live,
+                self.last_usage_live.as_ref(),
+                (self.last_incoming_turn, self.last_usage_turn),
+            )
+            .await?;
+        self.last_usage_live = Some(live.clone());
+        self.last_incoming_turn = incoming;
+        self.last_usage_turn = written;
+        Ok(())
+    }
+}
+
+#[path = "persistence_archive_logs.rs"]
+mod archive_logs;
+
 /// Collect MCP server stderr logs from `~/.opengrok/logs/mcp/` for inclusion in the session archive.
 fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
     let mcp_log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
     let Ok(entries) = std::fs::read_dir(&mcp_log_dir) else {
         return;
     };
+    let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(&mcp_log_dir);
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file()
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
             && path.extension().is_some_and(|ext| ext == "log")
-            && let Ok(data) = std::fs::read(&path)
+            && let Ok(Some(file)) = artifacts.open_non_artifact(&path)
+            && let Ok(data) = archive_logs::read_log_for_archive(file)
             && !data.is_empty()
         {
             let name = format!(
@@ -2986,19 +3633,41 @@ fn backfill_updates_to_sync(
     backfilled
 }
 
-fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<CopiedSessionFile>) {
+fn collect_session_files_recursive(
+    base: &Path,
+    dir: &Path,
+    files: &mut Vec<CopiedSessionFile>,
+) -> io::Result<()> {
+    let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(base);
+    collect_session_files_recursive_with_artifacts(base, dir, files, &artifacts)?;
+    archive_logs::collect_terminal_logs(base, files, &artifacts);
+    Ok(())
+}
+
+fn collect_session_files_recursive_with_artifacts(
+    base: &Path,
+    dir: &Path,
+    files: &mut Vec<CopiedSessionFile>,
+    artifacts: &xai_grok_feedback::FeedbackDraftArtifactSet,
+) -> io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             tracing::warn!(?dir, ?e, "Failed to read directory during session copy");
-            return;
+            return Err(e);
         }
     };
 
     for entry in entries.flatten() {
+        if xai_grok_feedback::is_feedback_draft_artifact_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
-        if path.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
             let rel_path = match path.strip_prefix(base) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -3006,9 +3675,18 @@ fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<Copi
             let Some(name) = rel_path.to_str() else {
                 continue;
             };
-            let data = match std::fs::read(&path) {
-                Ok(c) => c,
+            let Ok(Some(file)) = artifacts.open_non_artifact(&path) else {
+                continue;
+            };
+            let data = match archive_logs::read_session_file_for_archive(file, &path) {
+                Ok(data) => data,
                 Err(e) => {
+                    if matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("chat_history.jsonl" | "updates.jsonl")
+                    ) {
+                        return Err(e);
+                    }
                     tracing::warn!(?e, "Failed to read session file during copy");
                     continue;
                 }
@@ -3017,10 +3695,11 @@ fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<Copi
                 name: name.to_string(),
                 data,
             });
-        } else if path.is_dir() {
-            collect_session_files_recursive(base, &path, files);
+        } else if file_type.is_dir() && path != base.join(archive_logs::TERMINAL_DIR) {
+            collect_session_files_recursive_with_artifacts(base, &path, files, artifacts)?;
         }
     }
+    Ok(())
 }
 
 fn init_remote_sync(
@@ -3205,21 +3884,109 @@ async fn initialize_provider_boundary(
 
 pub(crate) async fn new(
     info: &Info,
+    reservation: NewSessionReservation,
     model_id: acp::ModelId,
+    current_provider: ModelProvider,
     sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
     relay_sync: Option<crate::relay::RelaySync>,
     gateway: Option<GatewaySender>,
     session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
 ) -> io::Result<PersistenceHandle> {
-    let root_dir = grok_home();
+    new_with_reserved_root(
+        grok_home(),
+        info,
+        reservation,
+        model_id,
+        current_provider,
+        sampling_client,
+        summary_cross_provider_allowed,
+        storage_mode,
+        auth_manager,
+        relay_sync,
+        gateway,
+        session_summary_model,
+        registry_title_sync,
+        session_kind,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn new_with_root(
+    root_dir: PathBuf,
+    info: &Info,
+    model_id: acp::ModelId,
+    current_provider: ModelProvider,
+    sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    session_summary_model: String,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
+) -> io::Result<PersistenceHandle> {
+    let reservation = NewSessionReservation::reserve(&root_dir, info)?;
+    new_with_reserved_root(
+        root_dir,
+        info,
+        reservation,
+        model_id,
+        current_provider,
+        sampling_client,
+        summary_cross_provider_allowed,
+        storage_mode,
+        auth_manager,
+        relay_sync,
+        gateway,
+        session_summary_model,
+        registry_title_sync,
+        session_kind,
+    )
+    .await
+}
+
+async fn new_with_reserved_root(
+    root_dir: PathBuf,
+    info: &Info,
+    reservation: NewSessionReservation,
+    model_id: acp::ModelId,
+    current_provider: ModelProvider,
+    sampling_client: OaiCompatClient,
+    summary_cross_provider_allowed: bool,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    session_summary_model: String,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
+) -> io::Result<PersistenceHandle> {
+    if reservation.0.as_deref() != Some(session_dir_in(&root_dir, info).as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session reservation does not match target",
+        ));
+    }
+    let _reservation = reservation;
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
 
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
     touch_worktree_for_session(info).await;
+
+    if summary.session_kind.is_none()
+        && let Some(kind) = session_kind
+    {
+        storage.set_session_kind_if_absent(info, kind).await?;
+        summary = storage.load_summary(info).await?;
+    }
 
     // Update model if different
     if summary.current_model_id != model_id {
@@ -3228,7 +3995,6 @@ pub(crate) async fn new(
     }
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
     let provider_boundary =
         initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
             .await?;
@@ -3267,10 +4033,17 @@ pub(crate) async fn new(
                     persistence_tx: summary_tx,
                 },
             ),
+            summary_cross_provider_allowed,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3296,15 +4069,61 @@ pub(crate) async fn new_with_explicit_dir(
     sampling_client: OaiCompatClient,
     session_summary_model: String,
 ) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_inner(
+        info,
+        target_dir,
+        model_id,
+        sampling_client,
+        session_summary_model,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_with_explicit_dir_and_parent(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    session_summary_model: String,
+    parent_boundary: ProviderBoundary,
+    parent_persistence_tx: Option<mpsc::UnboundedSender<PersistenceMsg>>,
+) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_inner(
+        info,
+        target_dir,
+        model_id,
+        sampling_client,
+        session_summary_model,
+        Some((parent_boundary, parent_persistence_tx)),
+    )
+    .await
+}
+
+async fn new_with_explicit_dir_inner(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    session_summary_model: String,
+    parent: Option<(
+        ProviderBoundary,
+        Option<mpsc::UnboundedSender<PersistenceMsg>>,
+    )>,
+) -> io::Result<PersistenceHandle> {
     let summary_path = target_dir.join("summary.json");
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_explicit_session_dir(target_dir));
 
-    // Initialize session in storage (creates summary.json, etc.)
     let mut summary = storage.init_session(info, model_id.clone()).await?;
     touch_worktree_for_session(info).await;
-    if summary.session_kind.is_none() {
+    if summary
+        .session_kind
+        .as_deref()
+        .is_none_or(|kind| kind == WORKTREE_SESSION_KIND)
+    {
         summary.session_kind = Some("subagent".to_string());
+        summary.source_workspace_dir = None;
     }
     let summary_json = serde_json::to_vec_pretty(&summary)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -3317,9 +4136,16 @@ pub(crate) async fn new_with_explicit_dir(
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let current_provider = sampling_client.provider();
-    let provider_boundary =
+    let mut provider_boundary =
         initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
             .await?;
+    let parent_export = parent.and_then(|(parent_boundary, tx)| {
+        provider_boundary = provider_boundary.clone().with_parent(&parent_boundary);
+        (!parent_boundary.is_ephemeral()).then_some(tx)
+    });
+    if !provider_boundary.allows_xai_export() && !summary.ever_used_codex {
+        storage.mark_ever_used_codex(info).await?;
+    }
 
     let (handle, rx, summary_tx, disk_full_tx) = actor_channel(provider_boundary.clone());
     let info_clone = info.clone();
@@ -3342,10 +4168,17 @@ pub(crate) async fn new_with_explicit_dir(
                     persistence_tx: summary_tx,
                 },
             ),
+            summary_cross_provider_allowed: false,
+            parent_export,
             registry_title_sync: None,
             gateway: None,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3401,6 +4234,7 @@ async fn pull_on_miss(
 #[expect(dead_code, reason = "wired when session restore flow calls load")]
 pub(crate) async fn load(
     info: &Info,
+    current_provider: ModelProvider,
     sampling_client: OaiCompatClient,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
@@ -3438,7 +4272,6 @@ pub(crate) async fn load(
     };
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
     let provider_boundary = initialize_provider_boundary(
         storage.as_ref(),
         &loaded_info,
@@ -3485,10 +4318,17 @@ pub(crate) async fn load(
             created_fresh: false,
             relay_sync,
             summary: summary_gen,
+            summary_cross_provider_allowed: false,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3501,16 +4341,55 @@ pub(crate) async fn load(
 /// Use this for memory-efficient session loading when replaying updates.
 pub(crate) async fn load_light(
     info: &Info,
-    sampling_client: OaiCompatClient,
+    route_for_summary: impl FnOnce(
+        &Summary,
+    ) -> io::Result<(
+        ModelProvider,
+        Option<ModelProvider>,
+        OaiCompatClient,
+        String,
+        bool,
+    )>,
     storage_mode: StorageMode,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
     backend: Option<&crate::remote::BackendClient>,
     relay_sync: Option<crate::relay::RelaySync>,
     gateway: Option<GatewaySender>,
-    session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
-    let root_dir = grok_home();
+    load_light_with_root(
+        grok_home(),
+        info,
+        route_for_summary,
+        storage_mode,
+        auth_manager,
+        backend,
+        relay_sync,
+        gateway,
+        registry_title_sync,
+    )
+    .await
+}
+
+async fn load_light_with_root(
+    root_dir: PathBuf,
+    info: &Info,
+    route_for_summary: impl FnOnce(
+        &Summary,
+    ) -> io::Result<(
+        ModelProvider,
+        Option<ModelProvider>,
+        OaiCompatClient,
+        String,
+        bool,
+    )>,
+    storage_mode: StorageMode,
+    auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    backend: Option<&crate::remote::BackendClient>,
+    relay_sync: Option<crate::relay::RelaySync>,
+    gateway: Option<GatewaySender>,
+    registry_title_sync: Option<RegistryGeneratedTitleSync>,
+) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -3545,7 +4424,22 @@ pub(crate) async fn load_light(
     };
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let current_provider = sampling_client.provider();
+    let (
+        current_provider,
+        persisted_provider,
+        sampling_client,
+        session_summary_model,
+        summary_cross_provider_allowed,
+    ) = route_for_summary(&persisted_info.summary)?;
+    // A legacy summary may lack the monotonic marker. Preserve the persisted
+    // route's boundary even when the caller selects a different startup model;
+    // an unknown persisted route is insufficient provenance for export.
+    if !persisted_provider.is_some_and(|provider| provider.profile().allows_xai_services())
+        && !persisted_info.summary.ever_used_codex
+    {
+        storage.mark_ever_used_codex(&loaded_info).await?;
+        persisted_info.summary.ever_used_codex = true;
+    }
     let provider_boundary = initialize_provider_boundary(
         storage.as_ref(),
         &loaded_info,
@@ -3592,10 +4486,17 @@ pub(crate) async fn load_light(
             created_fresh: false,
             relay_sync,
             summary: summary_gen,
+            summary_cross_provider_allowed,
+            parent_export: None,
             registry_title_sync,
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3610,14 +4511,36 @@ fn recover_session_relocations_in(root: &Path) -> crate::session::storage::reloc
 }
 
 pub async fn list_summaries(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
+    list_summaries_with_completeness(cwd)
+        .await
+        .map(|(summaries, _)| summaries)
+}
+
+/// Mutations and exports must not interpret a partial listing as a unique
+/// match or a missing session.
+pub async fn list_summaries_for_mutation(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
+    let (summaries, complete) = list_summaries_with_completeness(cwd).await?;
+    if !complete {
+        return Err(io::Error::other("local session discovery is incomplete"));
+    }
+    Ok(summaries)
+}
+
+pub(crate) async fn list_summaries_with_completeness(
+    cwd: Option<&str>,
+) -> io::Result<(Vec<Summary>, bool)> {
     let root_dir = crate::util::grok_home::grok_home();
     let recovery_root = root_dir.clone();
-    tokio::task::spawn_blocking(move || recover_session_relocations_in(&recovery_root))
+    let excluded = tokio::task::spawn_blocking(move || {
+        crate::session::storage::relocation::RelocationStorage::new(recovery_root)
+            .recover_all_for_listing()
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    JsonlStorageAdapter::with_root(root_dir)
+        .list_sessions_with_completeness(cwd, excluded)
         .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
-    storage.list_sessions(cwd).await
 }
 
 /// Failure modes of [`delete_session_history`].
@@ -3689,7 +4612,7 @@ pub async fn delete_session_history(
     // Resolve the local session info, scoping to cwd if provided. A
     // remote-only session won't be found here — that's fine, the remote
     // delete (if applicable) still runs.
-    let summaries = list_summaries(cwd)
+    let summaries = list_summaries_for_mutation(cwd)
         .await
         .map_err(DeleteSessionError::List)?;
     let local_info = summaries
@@ -3834,21 +4757,22 @@ mod delete_session_history_tests {
 pub async fn list_recent_summaries(limit: usize) -> io::Result<Vec<Summary>> {
     let root_dir = crate::util::grok_home::grok_home();
     let recovery_root = root_dir.clone();
-    tokio::task::spawn_blocking(move || recover_session_relocations_in(&recovery_root))
+    let excluded = tokio::task::spawn_blocking(move || {
+        crate::session::storage::relocation::RelocationStorage::new(recovery_root)
+            .recover_all_for_listing()
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    JsonlStorageAdapter::with_root(root_dir)
+        .list_sessions_recent_with_exclusions(limit, excluded)
         .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
-    let storage = JsonlStorageAdapter::with_root(root_dir);
-    storage.list_sessions_recent(limit).await
 }
 
 // Session folder TTL cleanup
 
 /// Guard ensuring session cleanup runs at most once per process.
 static CLEANUP_SESSIONS_ONCE: std::sync::Once = std::sync::Once::new();
-
-/// Default TTL for stale session files (30 days).
-const DEFAULT_CLEANUP_TTL_DAYS: u32 = 30;
 
 /// Walk `~/.opengrok/sessions/` and delete files with mtime older than `ttl_days`.
 /// Removes empty session directories after file cleanup.
@@ -3859,7 +4783,9 @@ const DEFAULT_CLEANUP_TTL_DAYS: u32 = 30;
 /// never competes with the agent's single-threaded `LocalSet`.
 pub(crate) fn cleanup_stale_sessions(skip_session_dir: Option<&Path>) {
     CLEANUP_SESSIONS_ONCE.call_once(|| {
-        let ttl_days = resolve_cleanup_ttl_days();
+        let Some(ttl_days) = resolve_cleanup_ttl_days() else {
+            return;
+        };
         let root = grok_home();
         if let Err(error) = recover_session_relocations_in(&root) {
             tracing::error!(%error, "session relocation recovery failed before TTL cleanup");
@@ -3902,20 +4828,94 @@ pub(crate) fn cleanup_stale_sessions(skip_session_dir: Option<&Path>) {
     });
 }
 
-/// Resolve TTL from config.toml `[storage] cleanup_ttl_days`, falling back to 30.
-fn resolve_cleanup_ttl_days() -> u32 {
-    // Try to load config and read [storage] section
-    if let Ok(layers) = crate::config::ConfigLayers::load() {
-        let effective = layers.effective_config_disk_only();
-        if let Some(storage) = effective.get("storage")
-            && let Some(ttl) = storage.get("cleanup_ttl_days")
-            && let Some(days) = ttl.as_integer()
-            && days > 0
-        {
-            return days as u32;
+pub(crate) fn session_sweep_done() -> bool {
+    CLEANUP_SESSIONS_ONCE.is_completed()
+}
+
+/// Bumps `summary.json`'s mtime so `session_last_activity` sees the attach that is about to
+/// read this dir. Must run synchronously before the sweep is spawned: the sweep's live-dir
+/// exclusion only covers one dir in one process, and neither `load_light` nor `init_session`
+/// rewrites the summary. A dir without a summary (fresh `session/new`, stub) has nothing to bump.
+pub(crate) fn mark_session_live(session_dir: &Path) {
+    let summary = session_dir.join("summary.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&summary) else {
+        return;
+    };
+    if !metadata.file_type().is_file() {
+        return;
+    }
+    // Write access is required for `set_modified` on Windows; nothing is written
+    let touched = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&summary)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(
+            target: "xai_grok_shell::session::persistence",
+            file = %summary.display(),
+            %error,
+            "SESSION_MARK_LIVE_ERROR"
+        );
+    }
+}
+
+/// Config load failure is `None` (no sweep), not a fallback TTL.
+fn resolve_cleanup_ttl_days() -> Option<u32> {
+    match crate::config::ConfigLayers::load() {
+        Ok(layers) => {
+            let ttl = cleanup_ttl_days_from_effective(&layers.effective_config_disk_only());
+            if ttl.is_none() {
+                tracing::info!(
+                    target: "xai_grok_shell::session::persistence",
+                    "SESSION_CLEANUP_SKIPPED: no positive [storage] cleanup_ttl_days"
+                );
+            }
+            ttl
+        }
+        Err(error) => {
+            tracing::info!(
+                target: "xai_grok_shell::session::persistence",
+                %error,
+                "SESSION_CLEANUP_SKIPPED: config load failed"
+            );
+            None
         }
     }
-    DEFAULT_CLEANUP_TTL_DAYS
+}
+
+fn cleanup_ttl_days_from_effective(effective: &toml::Value) -> Option<u32> {
+    effective
+        .get("storage")
+        .and_then(|storage| storage.get("cleanup_ttl_days"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|days| u32::try_from(days).ok())
+        .filter(|&days| days > 0)
+}
+
+#[cfg(test)]
+mod cleanup_ttl_tests {
+    use super::cleanup_ttl_days_from_effective;
+
+    fn storage_ttl(value: toml::Value) -> toml::Value {
+        let mut storage = toml::map::Map::new();
+        storage.insert("cleanup_ttl_days".to_string(), value);
+        let mut root = toml::map::Map::new();
+        root.insert("storage".to_string(), toml::Value::Table(storage));
+        toml::Value::Table(root)
+    }
+
+    #[test]
+    fn cleanup_ttl_days_from_effective_requires_a_positive_integer() {
+        let empty = toml::Value::Table(toml::map::Map::new());
+        for (cfg, expected) in [
+            (empty, None),
+            (storage_ttl(toml::Value::Integer(0)), None),
+            (storage_ttl(toml::Value::Integer(-1)), None),
+            (storage_ttl(toml::Value::Integer(30)), Some(30)),
+        ] {
+            assert_eq!(expected, cleanup_ttl_days_from_effective(&cfg), "{cfg}");
+        }
+    }
 }
 
 #[derive(Default)]
@@ -4112,12 +5112,12 @@ mod agent_name_persistence_tests {
             default_model_id(),
         )
         .unwrap();
-        summary.agent_name = Some("cursor".into());
+        summary.set_agent(PersistedAgent::Named("cursor".into()));
 
         let json = serde_json::to_string(&summary).unwrap();
         let deserialized: Summary = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.agent_name.as_deref(), Some("cursor"));
+        assert_eq!(deserialized.agent_name(), Some("cursor"));
     }
 
     #[test]
@@ -4135,7 +5135,7 @@ mod agent_name_persistence_tests {
         }"#;
         let summary: Summary = serde_json::from_str(json).unwrap();
         assert!(
-            summary.agent_name.is_none(),
+            summary.agent_name().is_none(),
             "old summaries without agent_name should deserialize as None"
         );
     }
@@ -4167,7 +5167,7 @@ mod agent_name_persistence_tests {
             default_model_id(),
         )
         .unwrap();
-        summary.agent_name = Some("cursor".into());
+        summary.set_agent(PersistedAgent::Named("cursor".into()));
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("agent_name"));
         assert!(json.contains("cursor"));
@@ -4190,12 +5190,12 @@ mod agent_name_persistence_tests {
                 default_model_id(),
             )
             .unwrap();
-            summary.agent_name = Some(name.into());
+            summary.set_agent(PersistedAgent::Named(name.into()));
 
             let json = serde_json::to_string(&summary).unwrap();
             let deserialized: Summary = serde_json::from_str(&json).unwrap();
             assert_eq!(
-                deserialized.agent_name.as_deref(),
+                deserialized.agent_name(),
                 Some(name),
                 "round-trip failed for agent_name={name}"
             );
@@ -4218,7 +5218,7 @@ mod agent_name_persistence_tests {
             "head_branch": "main"
         }"#;
         let summary: Summary = serde_json::from_str(json).unwrap();
-        assert_eq!(summary.agent_name.as_deref(), Some("cursor"));
+        assert_eq!(summary.agent_name(), Some("cursor"));
         assert_eq!(summary.current_model_id.0.as_ref(), "cursor-model");
         assert_eq!(summary.generated_title.as_deref(), Some("Fix editor mode"));
     }
@@ -4237,7 +5237,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -4245,6 +5245,107 @@ mod collect_session_files_tests {
         assert_eq!(files[0].data, b"line1\nline2");
         assert_eq!(files[1].name, "summary.json");
         assert_eq!(files[1].data, b"{}");
+    }
+
+    #[test]
+    fn trims_oversized_terminal_logs_to_both_ends_but_never_caps_other_files() {
+        let dir = TempDir::new().unwrap();
+        let cap = archive_logs::MAX_ARCHIVED_LOG_BYTES as usize;
+        fs::create_dir(dir.path().join("terminal")).unwrap();
+        fs::create_dir(dir.path().join("images")).unwrap();
+        let big_log = [vec![b'h'; cap], vec![b't'; cap]].concat();
+        fs::write(dir.path().join("terminal/big.log"), &big_log).unwrap();
+        fs::write(dir.path().join("terminal/small.log"), b"ok").unwrap();
+        for name in ["images/big.png", "chat_history.jsonl"] {
+            fs::File::create(dir.path().join(name))
+                .unwrap()
+                .set_len(cap as u64 + 1)
+                .unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let sizes: Vec<_> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.data.len()))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                ("chat_history.jsonl", cap + 1),
+                ("images/big.png", cap + 1),
+                ("terminal/big.log", cap + archive_logs::TRIM_MARKER.len()),
+                ("terminal/small.log", 2),
+            ]
+        );
+        let trimmed = &files[2].data;
+        assert!(trimmed.starts_with(&vec![b'h'; cap / 2]));
+        assert!(trimmed.ends_with(&vec![b't'; cap / 2]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_a_symlinked_terminal_dir() {
+        let dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        fs::write(elsewhere.path().join("outside.log"), b"not session data").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("terminal")).unwrap();
+        fs::write(dir.path().join("summary.json"), b"{}").unwrap();
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["summary.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excludes_draft_hardlinks_and_symlinked_files_from_archives() {
+        let dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let draft = dir.path().join("feedback_drafts.json");
+        fs::write(&draft, b"private draft").unwrap();
+        fs::hard_link(&draft, dir.path().join("innocent.json")).unwrap();
+        fs::create_dir(dir.path().join("terminal")).unwrap();
+        fs::hard_link(&draft, dir.path().join("terminal/copy.log")).unwrap();
+        fs::write(elsewhere.path().join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("outside"), dir.path().join("link"))
+            .unwrap();
+        fs::write(dir.path().join("summary.json"), b"{}").unwrap();
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "summary.json");
+    }
+
+    #[test]
+    fn admits_newest_terminal_logs_until_the_copy_budget_is_spent() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = TempDir::new().unwrap();
+        let terminal = dir.path().join("terminal");
+        fs::create_dir(&terminal).unwrap();
+        let per_log = archive_logs::MAX_ARCHIVED_LOG_BYTES;
+        let fits = (archive_logs::MAX_ARCHIVED_TERMINAL_BYTES / per_log) as usize;
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for i in 0..=fits {
+            let log = fs::File::create(terminal.join(format!("{i:02}.log"))).unwrap();
+            log.set_len(per_log).unwrap();
+            log.set_modified(t0 + Duration::from_secs(i as u64))
+                .unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
+
+        let mut names: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
+        names.sort_unstable();
+        let newest: Vec<_> = (1..=fits).map(|i| format!("terminal/{i:02}.log")).collect();
+        assert_eq!(names, newest, "the oldest log is the one left out");
     }
 
     #[test]
@@ -4257,7 +5358,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 3);
@@ -4276,7 +5377,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("top.txt"), b"top").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -4290,7 +5391,7 @@ mod collect_session_files_tests {
         let missing = dir.path().join("does_not_exist");
 
         let mut files = Vec::new();
-        collect_session_files_recursive(&missing, &missing, &mut files);
+        collect_session_files_recursive(&missing, &missing, &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -4300,7 +5401,7 @@ mod collect_session_files_tests {
         let dir = TempDir::new().unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -4312,7 +5413,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("file.txt"), b"data").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "file.txt");
@@ -4467,9 +5568,9 @@ mod find_summary_by_session_id_tests {
 #[cfg(test)]
 mod resumed_sandbox_profile_tests {
     use super::{
-        RelocationError, RelocationView, most_recent_local_summary_for_cwd_in_root,
-        most_recent_local_summary_for_cwd_in_view, read_summary_from_dir,
-        resumed_session_sandbox_profile_in_root,
+        RecentSessionSelection, RelocationError, RelocationView,
+        most_recent_local_summary_for_cwd_in_root, most_recent_local_summary_for_cwd_in_view,
+        read_summary_from_dir, resumed_session_sandbox_profile_in_root,
     };
     use std::{fs, io};
     use tempfile::TempDir;
@@ -4686,24 +5787,29 @@ mod resumed_sandbox_profile_tests {
         );
         let view = RelocationView::load_for_sessions_root(&root).unwrap();
 
-        let picked = most_recent_local_summary_for_cwd_in_view(cwd, &view, |session_dir| {
-            if session_dir.ends_with("removed") {
-                Err(RelocationError::Io {
-                    operation: "read",
-                    path: session_dir.join("summary.json"),
-                    source: io::Error::new(io::ErrorKind::NotFound, "injected"),
-                })
-            } else {
-                read_summary_from_dir(session_dir)
-            }
-        })
+        let picked = most_recent_local_summary_for_cwd_in_view(
+            cwd,
+            &view,
+            |session_dir| {
+                if session_dir.ends_with("removed") {
+                    Err(RelocationError::Io {
+                        operation: "read",
+                        path: session_dir.join("summary.json"),
+                        source: io::Error::new(io::ErrorKind::NotFound, "injected"),
+                    })
+                } else {
+                    read_summary_from_dir(session_dir)
+                }
+            },
+            RecentSessionSelection::Interactive,
+        )
         .unwrap()
         .unwrap();
         assert_eq!(picked.info.id.0.as_ref(), "valid");
     }
 
     #[test]
-    fn most_recent_cwd_propagates_non_not_found_io_errors() {
+    fn most_recent_cwd_skips_unreadable_summary() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("sessions");
         let cwd = "/work/proj";
@@ -4727,23 +5833,25 @@ mod resumed_sandbox_profile_tests {
         );
         let view = RelocationView::load_for_sessions_root(&root).unwrap();
 
-        let error = most_recent_local_summary_for_cwd_in_view(cwd, &view, |session_dir| {
-            if session_dir.ends_with("unreadable-newer") {
-                Err(RelocationError::Io {
-                    operation: "read",
-                    path: session_dir.join("summary.json"),
-                    source: io::Error::new(io::ErrorKind::PermissionDenied, "injected"),
-                })
-            } else {
-                read_summary_from_dir(session_dir)
-            }
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            RelocationError::Io { source, .. }
-                if source.kind() == io::ErrorKind::PermissionDenied
-        ));
+        let picked = most_recent_local_summary_for_cwd_in_view(
+            cwd,
+            &view,
+            |session_dir| {
+                if session_dir.ends_with("unreadable-newer") {
+                    Err(RelocationError::Io {
+                        operation: "read",
+                        path: session_dir.join("summary.json"),
+                        source: io::Error::new(io::ErrorKind::PermissionDenied, "injected"),
+                    })
+                } else {
+                    read_summary_from_dir(session_dir)
+                }
+            },
+            RecentSessionSelection::Interactive,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(picked.info.id.0.as_ref(), "older");
     }
 
     #[test]
@@ -4832,6 +5940,62 @@ mod resumed_sandbox_profile_tests {
 }
 
 #[cfg(test)]
+mod exact_title_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn title_discovery_rejects_corrupt_and_ambiguous_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let cwd = "/project/title";
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join("good");
+        std::fs::create_dir_all(&dir).unwrap();
+        let summary = Summary::new(
+            &Info {
+                id: acp::SessionId::new("good"),
+                cwd: cwd.into(),
+            },
+            acp::ModelId::new("test"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root)
+                .unwrap()
+                .len(),
+            1
+        );
+        let bad = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("summary.json"), b"{").unwrap();
+        assert!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root).is_err()
+        );
+        std::fs::remove_dir_all(&bad).unwrap();
+        let duplicate = root
+            .join(crate::util::grok_home::encode_cwd_dirname("/elsewhere"))
+            .join("good");
+        std::fs::create_dir_all(&duplicate).unwrap();
+        std::fs::write(
+            duplicate.join("summary.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            local_summaries_for_cwd_sync_in_root(cwd, RecentSessionSelection::Any, &root).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod session_exists_for_cwd_tests {
     use super::{
         resolve_local_session_any_cwd_in_root, session_exists_for_cwd_in_root,
@@ -4839,6 +6003,24 @@ mod session_exists_for_cwd_tests {
     };
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn any_cwd_resolution_reports_duplicate_ids_instead_of_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        for cwd in ["/project/a", "/project/b"] {
+            let dir = root
+                .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+                .join("same-id");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("summary.json"), b"{}").unwrap();
+        }
+        assert!(resolve_local_session_any_cwd_in_root("same-id", &root).is_err());
+        assert_eq!(
+            resolve_local_session_any_cwd_in_root("missing", &root).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn returns_true_when_session_exists_under_matching_cwd() {

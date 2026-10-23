@@ -9,13 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use super::StorageAdapter;
 use super::search_content::{
-    UpsertOutcome, build_session_doc, collect_all_indexable_content_single_pass,
-    should_skip_session, upsert_unless_unchanged,
+    UpsertOutcome, build_session_doc, collect_all_indexable_content_bounded, should_skip_session,
+    upsert_unless_unchanged,
 };
 use super::search_db::{
     HealAwareLogCounter, log_bootstrap_timeout, log_session_index_failure, search_db_path,
@@ -480,6 +479,39 @@ impl SharedIndex {
     }
 }
 
+/// Limit both running and waiting Tokio tasks, including completed tasks that
+/// have not yet been joined. Session metadata remains in the input iterator.
+struct BoundedIndexTasks {
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl BoundedIndexTasks {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+
+    async fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if self.tasks.len() >= BOOTSTRAP_MAX_CONCURRENT.max(1) {
+            self.join_one().await;
+        }
+        self.tasks.spawn(task);
+    }
+
+    async fn join_one(&mut self) {
+        if let Some(Err(e)) = self.tasks.join_next().await {
+            tracing::warn!(error = %e, "session indexing task panicked");
+        }
+    }
+
+    async fn drain(&mut self) {
+        while !self.tasks.is_empty() {
+            self.join_one().await;
+        }
+    }
+}
+
 async fn reindex_all(
     root_dir: &Path,
     storage: &dyn StorageAdapter,
@@ -525,14 +557,12 @@ async fn reindex_all(
         "session search bootstrap starting"
     );
 
-    let semaphore = Arc::new(Semaphore::new(BOOTSTRAP_MAX_CONCURRENT.max(1)));
     let root = root_dir.to_path_buf();
     let shared = SharedIndex::new();
 
-    let mut join_set = tokio::task::JoinSet::new();
+    let mut tasks = BoundedIndexTasks::new();
 
     for (summary, updates_path) in sessions {
-        let semaphore = semaphore.clone();
         let progress = progress.clone();
         let root = root.clone();
         let shared = shared.clone();
@@ -540,12 +570,7 @@ async fn reindex_all(
         let per_session_timeout = BOOTSTRAP_PER_SESSION_TIMEOUT;
         let max_file_size = BOOTSTRAP_MAX_FILE_SIZE;
 
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore is never closed");
-
+        let task = async move {
             // A successor owns the index. These upserts are idempotent,
             // not fenced; stopping just avoids contending with it.
             if claim_lost.load(Ordering::Acquire) {
@@ -587,11 +612,24 @@ async fn reindex_all(
             match tokio::time::timeout(per_session_timeout, async move {
                 let (content, bytes_read) = if let Some(path) = updates_path {
                     match tokio::task::spawn_blocking(move || {
-                        collect_all_indexable_content_single_pass(&path)
+                        collect_all_indexable_content_bounded(&path, max_file_size)
                     })
                     .await
                     {
-                        Ok(Ok(result)) => result,
+                        Ok(Ok(Some(result))) => result,
+                        Ok(Ok(None)) => {
+                            // The gzip transcript exceeded the decoded limit.
+                            // Preserve any fuller existing row, as for the
+                            // cheap on-disk size check above.
+                            let doc = build_session_doc(&summary, String::new());
+                            let db_path = search_db_path(&root);
+                            tokio::task::spawn_blocking(move || {
+                                shared.with(&db_path, |index| index.insert_doc_if_absent(&doc))
+                            })
+                            .await
+                            .map_err(io::Error::other)??;
+                            return Ok(UpsertOutcome::TooLarge);
+                        }
                         Ok(Err(e)) => return Err(e),
                         Err(e) => return Err(io::Error::other(e)),
                     }
@@ -623,6 +661,10 @@ async fn reindex_all(
                         progress.unchanged.fetch_add(1, Ordering::Relaxed);
                         progress.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
                     }
+                    UpsertOutcome::TooLarge => {
+                        progress.skipped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     UpsertOutcome::NoContent => {}
                 },
                 Ok(Err(e)) => {
@@ -642,14 +684,11 @@ async fn reindex_all(
                 }
             }
             progress.indexed.fetch_add(1, Ordering::Relaxed);
-        });
+        };
+        tasks.spawn(task).await;
     }
 
-    while let Some(result) = join_set.join_next().await {
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "session indexing task panicked");
-        }
-    }
+    tasks.drain().await;
 
     if claim_lost.load(Ordering::Acquire) {
         tracing::warn!("bootstrap claim lost; abandoning reindex without a completion marker");

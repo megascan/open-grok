@@ -6,6 +6,7 @@
     dead_code
 )]
 mod flags;
+pub mod sandbox;
 pub use flags::*;
 mod memory;
 pub use memory::*;
@@ -13,6 +14,8 @@ mod mcp;
 pub use mcp::*;
 mod permission;
 pub use permission::*;
+mod registry;
+pub use registry::*;
 mod pool;
 pub use pool::*;
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,20 @@ pub struct DoomLoopRecoverySettings {
     /// (honored in 512..=4096, otherwise 4096; absent ⇒ client default 1024).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_tokens: Option<u32>,
+}
+/// Shared shape of the `[long_reasoning_reminder]` TOML table and the remote `long_reasoning_reminder` object; unset fields fall through per field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LongReasoningReminderSettings {
+    /// Mid-turn reminder to reason briefly after a long hidden-reasoning call; default off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Reasoning tokens in one model call that count as a long step; absent uses the client default (1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u32>,
+    /// Model calls to wait after the long step before the reminder is injected; absent uses the client default (1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<u32>,
 }
 /// Per-kind age policy for auto-GC: seconds or never.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +458,41 @@ where
         },
     }
 }
+pub fn deserialize_tolerant<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let Some(value) =
+        Option::<serde_json::Value>::deserialize(deserializer)?.filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    match serde_json::from_value::<T>(value) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                setting = std::any::type_name::<T>(),
+                "ignoring malformed remote setting; falling through to local defaults"
+            );
+            Ok(None)
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConsentGate {
+    pub id: String,
+    #[serde(default)]
+    pub version: Option<i32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub accept_label: Option<String>,
+}
+
 /// Remote settings fetched from cli-chat-proxy `GET /v1/settings`.
 ///
 /// All fields are `Option` with `#[serde(default)]` so that:
@@ -449,6 +501,12 @@ where
 /// - Callers can distinguish "server said false" from "server didn't say"
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteSettings {
+    /// Per-command sandbox rollout, parsed tolerantly without changing legacy profiles.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_config::sandbox_mode::optional_sandbox_mode"
+    )]
+    pub sandbox_mode: Option<xai_grok_config::sandbox_mode::SandboxMode>,
     /// When `Some(true)`, the server recommends enabling leader mode.
     /// Used as a fallback when the user hasn't set `[cli] use_leader` locally.
     #[serde(default)]
@@ -476,6 +534,9 @@ pub struct RemoteSettings {
     /// Enable the experimental memory system remotely.
     #[serde(default)]
     pub memory_enabled: Option<bool>,
+    /// Isolated memory-v2 remote gates. Local `[memory_v2]` still wins.
+    #[serde(default)]
+    pub memory_v2: Option<memory::MemoryV2Settings>,
     #[serde(default)]
     pub memory_search_max_results: Option<u32>,
     #[serde(default)]
@@ -820,6 +881,12 @@ pub struct RemoteSettings {
     /// is set in config.toml. Absent → default (**disabled** — ships dark).
     #[serde(default)]
     pub subagent_worktree_snapshot_enabled: Option<bool>,
+    /// Remote fallback for `[features] subagent_model_inheritance`; absent or null means off.
+    #[serde(default)]
+    pub subagent_model_inheritance_enabled: Option<bool>,
+    /// Remote `long_reasoning_reminder` object; see [`LongReasoningReminderSettings`].
+    #[serde(default, deserialize_with = "deserialize_tolerant")]
+    pub long_reasoning_reminder: Option<LongReasoningReminderSettings>,
     /// `image_gen` / `/imagine`. `None` → env / `[features]` / default on.
     #[serde(default)]
     pub image_gen_enabled: Option<bool>,
@@ -949,9 +1016,7 @@ pub struct RemoteSettings {
     /// file into one row (expand for the diffs). `None` defers to local
     /// config / env / default (`false`); `Some(false)` is a remote kill
     /// switch. Resolved via `resolve_collapsed_edit_blocks` (requirements >
-    /// env > user > managed > remote > default false). Explicit pager.toml
-    /// `[scrollback.blocks.edit]` shape keys override the flag's fold shape
-    /// client-side; merging always follows the flag.
+    /// env > user > managed > remote > default false).
     #[serde(default)]
     pub collapsed_edit_blocks: Option<bool>,
     /// Display-refresh probe + auto-cadence. See [`DisplayRefreshSettings`].
@@ -964,6 +1029,12 @@ pub struct RemoteSettings {
     /// layer in `resolve_auto_permission_mode_enabled` (client default ON).
     #[serde(default)]
     pub auto_mode: Option<serde_json::Value>,
+    /// Remote defaults for bounded recap generation.
+    #[serde(default)]
+    pub session_recap_config: Option<serde_json::Value>,
+    /// Remote defaults for bounded turn summaries.
+    #[serde(default)]
+    pub turn_summary_config: Option<serde_json::Value>,
     /// Soft default permission mode (`"ask"` / `"auto"` / `"always-approve"` /
     /// `"default"`). Used only when no effective TOML permission key is set.
     #[serde(default)]
@@ -1080,6 +1151,34 @@ pub struct RemoteSettings {
     /// Stats poll interval in seconds when set.
     #[serde(default)]
     pub jemalloc_heap_profile_poll_interval_secs: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_bool_tolerant")]
+    pub turn_transient_retry: Option<bool>,
+    #[serde(default)]
+    pub active_agent_messages_enabled: Option<bool>,
+    #[serde(default)]
+    pub subagent_rate_limit_max_attempts: Option<u32>,
+    // Kept for the fork's VCS-status system prompt (upstream removed this with
+    // its repo-status prefix; the fork keeps `resolve_repo_status_in_system_prompt`).
+    #[serde(default)]
+    pub repo_status_in_system_prompt: Option<bool>,
+    #[serde(default)]
+    pub feedback_trace_card_enabled: Option<bool>,
+    #[serde(default, alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
+    #[serde(default)]
+    pub title_refresh: Option<bool>,
+    #[serde(default)]
+    pub prompt_suggestions: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_tolerant")]
+    pub consent_gate: Option<ConsentGate>,
+    #[serde(default)]
+    pub subagents_sampling_limit: Option<u32>,
+    #[serde(default)]
+    pub max_parallel_image_gen_calls: Option<u32>,
+    #[serde(default)]
+    pub max_parallel_video_gen_calls: Option<u32>,
+    #[serde(default)]
+    pub workspace_dashboard_enabled: Option<bool>,
 }
 impl RemoteSettings {
     /// Denylist check for an optional imagine tool. Returns `true` when the
@@ -1229,6 +1328,50 @@ pub struct GoalRoleModel {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_settings_turn_transient_retry_malformed_value_does_not_poison_siblings() {
+        let text: RemoteSettings =
+            serde_json::from_str(r#"{"turn_transient_retry": "false", "leader_mode": true}"#)
+                .unwrap();
+        assert_eq!(
+            text.turn_transient_retry, None,
+            "malformed value drops to None"
+        );
+        assert_eq!(text.leader_mode, Some(true), "siblings survive");
+    }
+    #[test]
+    fn remote_settings_turn_transient_retry_round_trip_and_default_absent() {
+        let text: RemoteSettings =
+            serde_json::from_str(r#"{"turn_transient_retry": false}"#).unwrap();
+        assert_eq!(text.turn_transient_retry, Some(false));
+        let round_trip: RemoteSettings =
+            serde_json::from_str(&serde_json::to_string(&text).unwrap()).unwrap();
+        assert_eq!(round_trip.turn_transient_retry, Some(false));
+        let absent: RemoteSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.turn_transient_retry, None);
+    }
+    #[test]
+    fn remote_settings_consent_gate_round_trip() {
+        let json = r#"{
+            "consent_gate": {
+                "id": "tos-2026-08",
+                "version": 3,
+                "title": "Updated terms",
+                "body": "Review our [Terms of Service](https://x.ai/legal/tos) before continuing.",
+                "accept_label": "Accept and continue"
+            }
+        }"#;
+        let settings: RemoteSettings = serde_json::from_str(json).unwrap();
+        let gate = settings.consent_gate.expect("gate present");
+        assert_eq!(gate.id, "tos-2026-08");
+        assert_eq!(gate.version, Some(3));
+        assert!(
+            gate.body
+                .as_deref()
+                .is_some_and(|bytes| bytes.contains("https://x.ai/legal/tos"))
+        );
+    }
+
     use super::*;
     #[test]
     fn worktree_auto_gc_partial_object_and_round_trip() {

@@ -66,27 +66,6 @@ fn stop_cron_from_scheduled(
     }
 }
 
-const STOP_FEEDBACK_TEXT_MAX: usize = 10_000;
-
-fn format_stop_feedback(blocks: &[dispatcher::StopBlock], additional_context: &[String]) -> String {
-    use std::fmt::Write as _;
-    let clip = |text: &str| event::clip_text(text, STOP_FEEDBACK_TEXT_MAX);
-    let mut feedback = String::new();
-    if !blocks.is_empty() {
-        feedback.push_str("Stop hook feedback:\n");
-        for block in blocks {
-            let _ = writeln!(feedback, "- {}", clip(&block.reason));
-        }
-    }
-    for context in additional_context {
-        if !feedback.is_empty() {
-            feedback.push('\n');
-        }
-        feedback.push_str(&clip(context));
-    }
-    feedback
-}
-
 /// Downgrade `Blocked` to `Success` for the observe-only session-end fire: the
 /// decision is discarded, so scrollback and telemetry must not report a block.
 pub(super) fn demote_ignored_blocks(
@@ -100,11 +79,13 @@ pub(super) fn demote_ignored_blocks(
                 hook_name,
                 elapsed,
                 http_info,
+                system_message,
                 ..
             } => HookRunResult::Success {
                 hook_name,
                 elapsed,
                 http_info,
+                system_message,
             },
             other => other,
         })
@@ -237,7 +218,7 @@ impl SessionActor {
         } else {
             let (background_tasks, session_crons) = self.stop_gate_work_snapshot().await;
             event::HookPayload::Stop {
-                reason: "end_turn".to_string(),
+                reason: event::END_TURN_STOP_REASON.to_string(),
                 stop_hook_active,
                 last_assistant_message,
                 background_tasks: Some(background_tasks),
@@ -360,7 +341,7 @@ impl SessionActor {
         self.announce_keep_working(&result.blocks, &result.additional_context)
             .await;
         StopGateDecision::KeepWorking {
-            feedback: format_stop_feedback(&result.blocks, &result.additional_context),
+            feedback: result.feedback(),
         }
     }
 
@@ -380,6 +361,7 @@ impl SessionActor {
             .await;
             xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
                 hook_name: block.hook_name.clone(),
+                cause: xai_grok_telemetry::events::HookBlockCause::StopBlocked,
             });
         }
         if blocks.is_empty() {
@@ -470,15 +452,28 @@ mod stop_gate_snapshot_tests {
             reason: reason.into(),
         };
         assert_eq!(
-            format_stop_feedback(&[block("first"), block("second")], &[]),
+            dispatcher::StopDispatchResult {
+                blocks: vec![block("first"), block("second")],
+                ..Default::default()
+            }
+            .feedback(),
             "Stop hook feedback:\n- first\n- second\n"
         );
         assert_eq!(
-            format_stop_feedback(&[block("fix tests")], &["note".to_string()]),
+            dispatcher::StopDispatchResult {
+                blocks: vec![block("fix tests")],
+                additional_context: vec!["note".to_string()],
+                ..Default::default()
+            }
+            .feedback(),
             "Stop hook feedback:\n- fix tests\n\nnote"
         );
         assert_eq!(
-            format_stop_feedback(&[], &["only context".to_string()]),
+            dispatcher::StopDispatchResult {
+                additional_context: vec!["only context".to_string()],
+                ..Default::default()
+            }
+            .feedback(),
             "only context"
         );
     }
@@ -508,12 +503,14 @@ mod stop_gate_snapshot_tests {
                 detail: "blocked stop: run the tests".into(),
                 elapsed: std::time::Duration::from_millis(5),
                 http_info: None,
+                system_message: Some("hook status".into()),
             },
             HookRunResult::Failed {
                 hook_name: "broken".into(),
                 error: "exit code 1".into(),
                 elapsed: std::time::Duration::from_millis(3),
                 http_info: None,
+                system_message: None,
             },
             HookRunResult::Skipped {
                 hook_name: "disabled".into(),
@@ -527,5 +524,9 @@ mod stop_gate_snapshot_tests {
         );
         assert!(matches!(&results[1], HookRunResult::Failed { .. }));
         assert!(matches!(&results[2], HookRunResult::Skipped { .. }));
+        assert!(matches!(
+            &results[0],
+            HookRunResult::Success { system_message: Some(message), .. } if message == "hook status"
+        ));
     }
 }

@@ -1,11 +1,8 @@
 //! Compile-time guard for minimal mode's resize strategy (design K6 / risk #2).
 //!
-//! The terminal owns committed history, so minimal must use only the built-in
-//! `autoresize` / `set_viewport_height` and must NEVER call the inline crate's
-//! RIS-rerender helpers or `emit_to_scrollback` — those re-emit history the
-//! terminal already has, double-printing (or, with ED3, wiping) committed
-//! scrollback. This test fails loudly if such a call ever sneaks into the
-//! minimal module.
+//! Minimal reprints history from scrollback entries through the commit renderer.
+//! It must not use the inline crate's string-history resize helpers, which
+//! would replay stale or hard-wrapped text.
 
 /// The forbidden inline-crate helpers. Scanned against the minimal sources via
 /// `include_str!` (this guard file is intentionally not scanned, since it names
@@ -29,6 +26,7 @@ fn minimal_never_uses_ris_rerender_or_emit_to_scrollback() {
         ("overlay.rs", include_str!("overlay.rs")),
         ("panel.rs", include_str!("panel.rs")),
         ("plan.rs", include_str!("plan.rs")),
+        ("reprint.rs", include_str!("reprint.rs")),
         ("todo.rs", include_str!("todo.rs")),
         ("welcome.rs", include_str!("welcome.rs")),
     ];
@@ -36,9 +34,7 @@ fn minimal_never_uses_ris_rerender_or_emit_to_scrollback() {
         for needle in FORBIDDEN {
             assert!(
                 !src.contains(needle),
-                "minimal/{name} references forbidden resize helper `{needle}` — it would \
-                 double-print committed scrollback (design K6 / risk #2); use the built-in \
-                 autoresize / set_viewport_height instead"
+                "minimal/{name} references forbidden resize helper `{needle}`; reprint history from scrollback entries instead"
             );
         }
     }

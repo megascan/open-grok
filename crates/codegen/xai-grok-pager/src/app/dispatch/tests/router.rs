@@ -1,5 +1,29 @@
 //! Tests for the action router, model switching, slash commands, and other cross-cutting dispatch behavior.
 use super::*;
+
+#[test]
+fn plugin_partial_failure_keeps_error_and_reloads_successes() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, ModalMessage};
+    use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus, PluginsAction};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = Some(acp::SessionId::new("plugin-session"));
+    agent.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
+    let outcome = ActionOutcome {
+        status: OutcomeStatus::InternalError,
+        message: "first: updated\nsecond: update failed".into(),
+        requires_reload: true,
+        requires_restart: false,
+    };
+    let effects = crate::app::dispatch::router::dispatch_action_result(&mut app, id, Ok(outcome));
+    assert!(
+        matches!(effects.as_slice(), [Effect::PluginsAction { agent_id, action: PluginsAction::Reload, .. }] if *agent_id == id)
+    );
+    assert!(
+        matches!(app.agents[&id].extensions_modal.as_ref().unwrap().modal_message.as_ref(), Some(ModalMessage::Error(message)) if message.contains("update failed"))
+    );
+}
 #[test]
 fn auth_copy_dispatch_preserves_all_delivery_states() {
     for delivery in [
@@ -61,52 +85,64 @@ fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     }
 }
 #[test]
-fn external_prompt_editor_refuses_nonminimal_and_owned_input() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "full TUI must refuse");
-    app.screen_mode = crate::app::ScreenMode::Minimal;
-    app.agents.get_mut(&id).unwrap().active_pane = ActivePane::Scrollback;
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(
-        matches!(
-            app.pending_editor,
-            Some(crate::app::external_editor::PendingEditorRequest::PromptDraft { .. })
-        ),
-        "minimal's logical composer remains authoritative after Tab/Vim focus"
-    );
-    app.pending_editor = None;
-    app.agents.get_mut(&id).unwrap().cancel_turn_view =
-        Some(crate::views::modal::CancelTurnViewState {
-            active_idx: 0,
-            running_count: 1,
-        });
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "modal owner must refuse");
-    assert_eq!(app.agents[&id].prompt.text(), "draft");
-    app.agents.get_mut(&id).unwrap().cancel_turn_view = None;
-    app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::EditingQueued {
-        id: 1,
-        original: "queued".to_owned(),
-        server_id: None,
-        kind: crate::app::agent::QueueEntryKind::Prompt,
-    };
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "queue edit must refuse");
-    assert_eq!(app.agents[&id].prompt.text(), "draft");
-    app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::Normal;
-    app.agents.get_mut(&id).unwrap().prompt.set_text("/");
-    let models = app.agents[&id].session.models.clone();
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .prompt
-        .refresh_slash(&models);
-    assert!(app.agents[&id].prompt.any_dropdown_open());
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "dropdown owner must refuse");
+fn external_prompt_editor_allows_both_screen_modes_and_refuses_owned_input() {
+    for screen_mode in [
+        crate::app::ScreenMode::Fullscreen,
+        crate::app::ScreenMode::Minimal,
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.screen_mode = screen_mode;
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .prompt
+            .set_screen_mode(screen_mode);
+        app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
+        for pane in [ActivePane::Prompt, ActivePane::Scrollback] {
+            app.agents.get_mut(&id).unwrap().active_pane = pane;
+            let _ = dispatch(Action::EditPromptExternal, &mut app);
+            assert!(
+                matches!(
+                    app.pending_editor.take(),
+                    Some(crate::app::external_editor::PendingEditorRequest::PromptDraft {
+                        agent_id,
+                        original_text,
+                    }) if agent_id == id && original_text == "draft"
+                ),
+                "the composer remains editable in {screen_mode:?} with {pane:?} focused"
+            );
+        }
+        app.agents.get_mut(&id).unwrap().cancel_turn_view =
+            Some(crate::views::modal::CancelTurnViewState {
+                active_idx: 0,
+                running_count: 1,
+            });
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "modal owner must refuse");
+        assert_eq!(app.agents[&id].prompt.text(), "draft");
+        app.agents.get_mut(&id).unwrap().cancel_turn_view = None;
+        app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::EditingQueued {
+            id: 1,
+            original: "queued".to_owned(),
+            server_id: None,
+            kind: crate::app::agent::QueueEntryKind::Prompt,
+        };
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "queue edit must refuse");
+        assert_eq!(app.agents[&id].prompt.text(), "draft");
+        app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::Normal;
+        app.agents.get_mut(&id).unwrap().prompt.set_text("/");
+        let models = app.agents[&id].session.models.clone();
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .prompt
+            .refresh_slash(&models);
+        assert!(app.agents[&id].prompt.any_dropdown_open());
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "dropdown owner must refuse");
+    }
 }
 #[test]
 fn external_prompt_editor_refuses_elements_with_visible_message() {
@@ -178,11 +214,13 @@ fn external_prompt_editor_refuses_voice_and_pending_paste_with_visible_messages(
         VoiceState::Recording {
             hold: false,
             target: VoiceTarget::Agent(AgentId(0)),
-            interim: Some("partial".to_owned()),
+            partial: crate::app::app_view::Partial::Shown("partial".to_owned()),
+            route: None,
         },
         VoiceState::Stopping {
             target: VoiceTarget::Agent(AgentId(0)),
-            interim: Some("partial".to_owned()),
+            partial: crate::app::app_view::Partial::Shown("partial".to_owned()),
+            route: None,
         },
     ] {
         let mut app = test_app_with_agent();
@@ -244,7 +282,9 @@ fn deferred_paste_completion_after_refused_editor_does_not_implicitly_send_witho
             ctx: crate::app::actions::ClipboardPasteContext {
                 target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                     agent_id: id,
+                    binding_epoch: app.agents[&id].session_binding_epoch,
                     images_dir: None,
+                    feedback_tool_call_id: None,
                 },
                 source: crate::app::actions::ClipboardPasteSource::ClipboardKey {
                     text: crate::app::actions::ClipboardTextRead::Success(Some(
@@ -356,7 +396,14 @@ fn send_feedback_clears_active_ephemeral_tip() {
         &mut std::collections::HashMap::new(),
     );
     assert!(agent.ephemeral_tip.is_active());
-    let _ = dispatch(Action::SendFeedback("it broke".into()), &mut app);
+    let _ = dispatch(
+        Action::SendFeedback {
+            text: "it broke".into(),
+            images: Default::default(),
+            trace: None,
+        },
+        &mut app,
+    );
     assert!(
         !app.agents.get(&id).unwrap().ephemeral_tip.is_active(),
         "feedback submit must clear the tip"
@@ -551,7 +598,7 @@ fn mark_turn_finished_clears_start_and_stamps_active() {
     let agent = app.agents.get_mut(&id).unwrap();
     agent.turn_started_at = Some(std::time::Instant::now());
     agent.last_active_at = None;
-    agent.mark_turn_finished();
+    agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Completed);
     assert!(
         agent.turn_started_at.is_none(),
         "turn_started_at must be cleared"
@@ -1174,8 +1221,8 @@ fn slash_hooks_opens_modal() {
 fn acp_bootstrap_command_appears_in_autocomplete() {
     let mut app = test_app();
     app.bootstrap_acp_commands = vec![acp::AvailableCommand::new(
-        "flush".to_string(),
-        "Flush memory".to_string(),
+        "goal".to_string(),
+        "Run a goal".to_string(),
     )];
     dispatch(Action::NewSession, &mut app);
     let id = AgentId(0);
@@ -1193,7 +1240,7 @@ fn acp_bootstrap_command_appears_in_autocomplete() {
         .unwrap()
         .prompt
         .textarea
-        .insert_str("/flu");
+        .insert_str("/goa");
     app.agents
         .get_mut(&id)
         .unwrap()
@@ -1202,7 +1249,7 @@ fn acp_bootstrap_command_appears_in_autocomplete() {
     let snap = app.agents[&id].prompt.slash_snapshot();
     assert!(snap.open, "dropdown should be open");
     assert!(
-        snap.matches.iter().any(|r| r.display == "/flush"),
+        snap.matches.iter().any(|r| r.display == "/goal"),
         "bootstrap ACP command should appear in matches, got: {:?}",
         snap.matches.iter().map(|r| &r.display).collect::<Vec<_>>()
     );
@@ -1211,8 +1258,8 @@ fn acp_bootstrap_command_appears_in_autocomplete() {
 fn acp_bootstrap_command_executes_as_passthrough() {
     let mut app = test_app();
     app.bootstrap_acp_commands = vec![acp::AvailableCommand::new(
-        "flush".to_string(),
-        "Flush memory".to_string(),
+        "goal".to_string(),
+        "Run a goal".to_string(),
     )];
     dispatch(Action::NewSession, &mut app);
     let id = AgentId(0);
@@ -1225,10 +1272,10 @@ fn acp_bootstrap_command_executes_as_passthrough() {
             &agent.session.models,
         );
     }
-    let effects = dispatch(Action::SendPrompt("/flush".into()), &mut app);
+    let effects = dispatch(Action::SendPrompt("/goal".into()), &mut app);
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "/flush"),
+        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "/goal"),
         "ACP command should passthrough, got: {effects:?}"
     );
 }
@@ -2016,8 +2063,11 @@ fn pr13_each_setter_writes_to_its_own_mirror() {
 /// registry test alone can't see `AgentView::new`'s constant.
 #[test]
 fn pager_registry_default_matches_agent_view_new_initializer() {
-    use crate::settings::{SettingKind, SettingOwner, SettingsRegistry};
+    use crate::settings::{
+        SettingKind, SettingOwner, SettingsRegistry, current_value_for, default_value_for,
+    };
     let app = test_app_with_agent();
+    let pager_snapshot = crate::app::dispatch::settings::ui::build_pager_snapshot(&app);
     let agent = app
         .agents
         .get(&AgentId(0))
@@ -2061,6 +2111,35 @@ fn pager_registry_default_matches_agent_view_new_initializer() {
                          from the agent's default appearance config ({live}). Update one \
                          to match the other — ScrollConfig::default() is the source of \
                          truth.",
+                );
+            }
+            ("custom_models", SettingKind::Group { .. })
+            | ("custom_models.list", SettingKind::DynamicMultiSelect { .. }) => {
+                assert!(
+                    current_value_for(meta.key, &app.current_ui, &pager_snapshot).is_none(),
+                    "{} has no scalar runtime default",
+                    meta.key,
+                );
+            }
+            (
+                "custom_model_id"
+                | "custom_model_slug"
+                | "custom_model_name"
+                | "custom_model_provider"
+                | "custom_model_base_url"
+                | "custom_model_context_window"
+                | "custom_model_max_context_window"
+                | "custom_model_backend"
+                | "custom_model_env_key"
+                | "custom_model_save"
+                | "custom_provider_wizard",
+                _,
+            ) => {
+                assert_eq!(
+                    current_value_for(meta.key, &app.current_ui, &pager_snapshot),
+                    Some(default_value_for(meta)),
+                    "registry default for `{}` drifts from build_pager_snapshot's draft initializer",
+                    meta.key,
                 );
             }
             _ => {
@@ -2248,7 +2327,6 @@ fn build_rows_idle_anchor_is_frozen_last_active_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2264,7 +2342,6 @@ fn build_rows_idle_anchor_is_frozen_last_active_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2292,7 +2369,6 @@ fn build_rows_working_anchor_is_turn_started_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2325,7 +2401,6 @@ fn build_rows_fallback_anchor_is_frozen_when_last_active_at_is_none() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2334,7 +2409,6 @@ fn build_rows_fallback_anchor_is_frozen_when_last_active_at_is_none() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2400,7 +2474,6 @@ fn top_level_label_strips_control_characters() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2737,5 +2810,395 @@ fn toggle_scroll_log_flips_recorder_and_reports_path() {
     assert!(
         texts.iter().any(|t| t == "scroll log: off"),
         "disable must be confirmed, got {texts:?}"
+    );
+}
+
+#[test]
+fn context_window_change_holds_sends_and_applies_only_after_its_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("context-model");
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let mut meta = acp::Meta::new();
+    meta.insert("totalContextTokens".into(), serde_json::json!(256_000));
+    meta.insert(
+        "contextWindows".into(),
+        serde_json::json!([256_000, 500_000]),
+    );
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.available.insert(
+        model.clone(),
+        acp::ModelInfo::new(model.clone(), "Context model").meta(Some(meta)),
+    );
+    agent.session.models.current = Some(model.clone());
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let effects = dispatch(Action::SwitchContextWindow { window }, &mut app);
+    assert!(
+        matches!(effects.as_slice(), [Effect::SwitchContextWindow { window: selected, .. }] if *selected == window)
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    assert_eq!(
+        app.agents[&id].session.models.get_context_window(),
+        Some(256_000)
+    );
+    let blocked = dispatch(
+        Action::SwitchModel {
+            model_id: model.clone(),
+            effort: None,
+            service_tier: None,
+        },
+        &mut app,
+    );
+    assert!(blocked.is_empty());
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(!app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.get_context_window(),
+        Some(500_000)
+    );
+}
+
+#[test]
+fn stale_context_completion_does_not_clear_a_new_session_hold() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("old-model");
+    let old_session = acp::SessionId::new("old-session");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((old_session.clone(), model.clone(), window, 1));
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id: old_session,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.context_window_selection,
+        None
+    );
+}
+
+#[test]
+fn combined_model_window_switch_holds_sends_until_atomic_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let source = app.agents[&id].session.models.current.clone();
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let model = acp::ModelId::new("target-model");
+    let meta = serde_json::json!({"totalContextTokens": 256_000, "contextWindows": [256_000, 500_000], "supportsReasoningEffort": true});
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .models
+        .available
+        .insert(
+            model.clone(),
+            acp::ModelInfo::new(model.clone(), "Target").meta(meta.as_object().cloned()),
+        );
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let effort = Some(xai_grok_shell::sampling::types::ReasoningEffort::High);
+    let effects = dispatch(
+        Action::SwitchModelWithWindow {
+            model_id: model.clone(),
+            effort,
+            window,
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(effects.as_slice(), [Effect::SwitchModelWithWindow { model_id, effort: actual_effort, window: actual_window, .. }] if model_id == &model && *actual_effort == effort && *actual_window == window)
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    assert_eq!(app.agents[&id].session.models.current, source);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    dispatch(
+        Action::TaskComplete(TaskResult::ModelWindowSwitchComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model.clone(),
+            source_model_id: source,
+            effort,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(!agent.session.model_switch_pending);
+    assert_eq!(agent.session.models.current.as_ref(), Some(&model));
+    assert_eq!(agent.session.models.get_context_window(), Some(500_000));
+    assert_eq!(agent.session.models.reasoning_effort, effort);
+}
+
+#[test]
+fn failed_combined_model_window_switch_keeps_previous_state() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let source = app.agents[&id].session.models.current.clone();
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let target = acp::ModelId::new("target");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((session_id.clone(), target.clone(), window, 1));
+    dispatch(
+        Action::TaskComplete(TaskResult::ModelWindowSwitchComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id,
+            model_id: target,
+            source_model_id: source.clone(),
+            effort: None,
+            window,
+            result: Err(SwitchModelError::Other("failure".into())),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.agents[&id].session.models.current, source);
+    assert!(!app.agents[&id].session.model_switch_pending);
+    assert_eq!(
+        app.agents[&id].session.models.context_window_selection,
+        None
+    );
+}
+
+#[test]
+fn stale_same_session_context_completion_cannot_finish_new_request() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let model = acp::ModelId::new("context-model");
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.current = Some(model.clone());
+    agent.session.model_switch_pending = true;
+    agent.session.pending_context_switch = Some((session_id.clone(), model.clone(), window, 2));
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id: 1,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(agent.session.model_switch_pending);
+    assert_eq!(agent.session.pending_context_switch.as_ref().unwrap().3, 2);
+    assert_eq!(agent.session.models.context_window_selection, None);
+}
+
+#[test]
+fn context_switch_holds_normal_send_until_completion() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model = acp::ModelId::new("context-model");
+    let session_id = app.agents[&id].session.session_id.clone().unwrap();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.current = Some(model.clone());
+    agent.session.models.available.insert(model.clone(), acp::ModelInfo::new(model.clone(), "Context")
+        .meta(serde_json::json!({"totalContextTokens": 256_000, "contextWindows": [256_000, 500_000]}).as_object().cloned()));
+    let window = std::num::NonZeroU64::new(500_000).unwrap();
+    dispatch(Action::SwitchContextWindow { window }, &mut app);
+    let request_id = app.agents[&id]
+        .session
+        .pending_context_switch
+        .as_ref()
+        .unwrap()
+        .3;
+    let effects = dispatch(Action::SendPrompt("hello".into()), &mut app);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPrompt { .. }))
+    );
+    assert_eq!(app.agents[&id].session.queue_len(), 1);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ContextWindowComplete {
+            agent_id: id,
+            request_id,
+            session_id,
+            model_id: model,
+            effort: None,
+            window,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text == "hello"))
+    );
+}
+
+#[test]
+fn context_switch_holds_interject_and_both_send_now_paths() {
+    for action in [
+        Action::Interject {
+            text: "held".into(),
+            images: vec![],
+        },
+        Action::SendPromptNow {
+            text: "held".into(),
+            images: vec![],
+            image_notice: None,
+        },
+        Action::QueueInterjectShared {
+            id: "p1".into(),
+            expected_version: 1,
+            new_text: None,
+        },
+    ] {
+        let shared = matches!(&action, Action::QueueInterjectShared { .. });
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let sid = app.agents[&id].session.session_id.clone().unwrap();
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.model_switch_pending = true;
+        agent.session.pending_context_switch = Some((
+            sid,
+            acp::ModelId::new("model"),
+            std::num::NonZeroU64::new(500_000).unwrap(),
+            1,
+        ));
+        let effects = dispatch(action, &mut app);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendInterject { .. }
+                | Effect::SendPrompt { .. }
+                | Effect::QueueInterject { .. }
+        )));
+        assert_eq!(
+            app.agents[&id].session.queue_len(),
+            if shared { 0 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn skills_list_ignores_stale_session_and_fetch_and_shows_scan_errors() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
+    use xai_grok_shell::extensions::skills::{SkillScanError, SkillsListResponse};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = app.agents[&id].session.session_id.clone().unwrap();
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
+    let old = modal.next_skills_fetch();
+    let current = modal.next_skills_fetch();
+    app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
+    for (session_id, fetch) in [(sid.clone(), old), (acp::SessionId::new("old"), current)] {
+        dispatch(
+            Action::TaskComplete(TaskResult::SkillsListLoaded {
+                agent_id: id,
+                session_id,
+                fetch,
+                result: Err("stale".into()),
+            }),
+            &mut app,
+        );
+        assert!(matches!(
+            app.agents[&id]
+                .extensions_modal
+                .as_ref()
+                .unwrap()
+                .skills_data,
+            TabDataState::Loading
+        ));
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::SkillsListLoaded {
+            agent_id: id,
+            session_id: sid,
+            fetch: current,
+            result: Ok(SkillsListResponse {
+                skills: vec![],
+                scan_errors: vec![SkillScanError {
+                    path: "/locked".into(),
+                    message: "denied".into(),
+                }],
+            }),
+        }),
+        &mut app,
+    );
+    let modal = app.agents[&id].extensions_modal.as_ref().unwrap();
+    assert!(matches!(modal.skills_data, TabDataState::Loaded(_)));
+    assert_eq!(modal.skills_scan_errors[0].path, "/locked");
+}
+
+#[test]
+fn skills_toggle_finishing_after_reload_refetches_committed_state() {
+    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = app.agents[&id].session.session_id.clone().unwrap();
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
+    let toggle = modal.next_skills_fetch();
+    let newer_read = modal.next_skills_fetch();
+    app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SkillsToggleDone {
+            agent_id: id,
+            session_id: sid.clone(),
+            fetch: toggle,
+            result: Ok(Default::default()),
+        }),
+        &mut app,
+    );
+    let fetch = match effects.as_slice() {
+        [
+            Effect::FetchSkillsList {
+                session_id,
+                refresh: true,
+                fetch,
+                ..
+            },
+        ] if session_id == &sid => *fetch,
+        other => panic!("expected post-toggle refresh, got {other:?}"),
+    };
+    assert_ne!(fetch, newer_read);
+    assert_eq!(
+        app.agents[&id]
+            .extensions_modal
+            .as_ref()
+            .unwrap()
+            .skills_fetch,
+        fetch
     );
 }

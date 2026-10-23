@@ -122,6 +122,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         query_params: IndexMap::new(),
         env_http_headers: IndexMap::new(),
         context_window: 128_000,
+        max_request_bytes: None,
         // Axum mocks speak cleartext HTTP/1.1; keep the fallback path simple.
         force_http1: true,
         // Keep retries minimal so tests don't take forever.
@@ -141,6 +142,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         supports_backend_search: false,
         supports_standalone_web_search: false,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         codex_permissions: None,
@@ -373,6 +375,105 @@ async fn chat_stream_without_unused_chunk_metadata_completes_without_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_eof_without_finish_reason_retries_and_accepts_only_complete_response() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let events = if attempt == 0 {
+                    vec![
+                        text_chunk_event("partial", false),
+                        Event::default().data("[DONE]"),
+                    ]
+                } else {
+                    vec![
+                        text_chunk_event("complete", true),
+                        Event::default().data("[DONE]"),
+                    ]
+                };
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.submit(RequestId::from("chat-eof-retry"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SamplingEvent::Retrying { .. }))
+    );
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { response, .. }) if response.assistant_text() == "complete")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SamplingEvent::Completed { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_eof_after_output_respects_retry_only_before_output() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = vec![
+                    text_chunk_event("partial", false),
+                    Event::default().data("[DONE]"),
+                ];
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let policy = RetryPolicy {
+        retry_only_before_output: true,
+        ..RetryPolicy::default()
+    };
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        policy,
+        event_tx,
+    );
+    handle.submit(RequestId::from("chat-eof-no-retry"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::Retrying { .. } | SamplingEvent::Completed { .. }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kimi_chat_request_uses_provider_key_and_standard_function_tools() {
     use std::sync::Mutex;
 
@@ -527,9 +628,52 @@ async fn cancel_in_flight_request_terminates_task() {
     if let SamplingEvent::Failed { error, .. } = failed {
         assert!(error.message.contains("cancelled"));
     }
+    assert_eq!(handle.active_count().await, 0);
+    server.shutdown();
+}
 
-    // Wait briefly for the task to clean up.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_submit_and_collect_fails_the_request_without_calling_cancel() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let stream = stream::iter(vec![Ok::<_, std::convert::Infallible>(text_chunk_event(
+                "starting", false,
+            ))])
+            .chain(stream::pending());
+            Sse::new(stream)
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let cfg = test_config(server.base_url(), "test-model");
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+    let rid = RequestId::from("req-drop");
+    let collect = {
+        let handle = handle.clone();
+        let rid = rid.clone();
+        tokio::spawn(async move {
+            let _ = handle.submit_and_collect(rid, user_request("hi")).await;
+        })
+    };
+    let _ = await_event_matching(
+        &mut event_rx,
+        |e| matches!(e, SamplingEvent::FirstToken { .. }),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("first token");
+    collect.abort();
+    let failed = await_event_matching(
+        &mut event_rx,
+        |e| matches!(e, SamplingEvent::Failed { .. }),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("Failed event after the collect future is dropped");
+    if let SamplingEvent::Failed { error, .. } = failed {
+        assert!(error.message.contains("cancelled"));
+    }
     assert_eq!(handle.active_count().await, 0);
     server.shutdown();
 }
@@ -1205,6 +1349,134 @@ async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
         }
     }
     server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_api_key_async_user_message_uses_standard_responses_and_original_call_id() {
+    use std::sync::Mutex;
+
+    const TOOL_NAME: &str = "send_user_message_async";
+    const MODEL: &str = "advertised-api-test-model";
+    const CALL_ID: &str = "call-user-message";
+    const ARGUMENTS: &str = r#"{"message":"I am checking the implementation."}"#;
+    let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, serde_json::Value)>::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    let has_result = body["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == CALL_ID
+                    });
+                    captured.lock().unwrap().push((headers, body));
+                    let events = if has_result {
+                        sse::responses_api_reasoning_and_text_events(
+                            "The update was accepted; continue working.",
+                            "Implementation checked.",
+                            MODEL,
+                        )
+                    } else {
+                        sse::responses_api_reasoning_then_tool_call_events(
+                            "Send the user an update and continue working.",
+                            CALL_ID,
+                            TOOL_NAME,
+                            ARGUMENTS,
+                            MODEL,
+                        )
+                    };
+                    Sse::new(stream::iter(
+                        sse_events_to_axum(events)
+                            .into_iter()
+                            .map(Ok::<_, std::convert::Infallible>),
+                    ))
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let config = SamplerConfig {
+        provider: ModelProvider::Codex,
+        model: MODEL.into(),
+        experimental_supported_tools: vec![TOOL_NAME.into()],
+        use_responses_lite: false,
+        ..responses_config(server.base_url(), None)
+    };
+    assert!(config.api_key.is_some());
+    assert!(config.bearer_resolver.is_none());
+    assert!(config.supports_async_user_messages());
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+    let mut request = user_request("Check the implementation and keep me updated.");
+    request.tools.push(ToolSpec {
+        name: TOOL_NAME.into(),
+        description: Some("Send a user message and return immediately.".into()),
+        parameters: json!({
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+            "additionalProperties": false
+        }),
+    });
+    let (response, _) = handle
+        .submit_and_collect(RequestId::from("req-api-user-message"), request.clone())
+        .await
+        .expect("API-key route should receive the user-message function call");
+    let calls = &response.assistant().unwrap().tool_calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].call_id(), CALL_ID);
+    assert_eq!(calls[0].name, TOOL_NAME);
+    assert_eq!(calls[0].arguments.as_ref(), ARGUMENTS);
+    assert!(!calls[0].is_custom());
+
+    // The host acknowledges delivery immediately. A human reply, if any,
+    // arrives as a later user message rather than a deferred tool result.
+    request.items.extend(response.items);
+    request.items.push(ConversationItem::tool_result(
+        CALL_ID,
+        r#"{"accepted":true}"#,
+    ));
+    let (response, _) = handle
+        .submit_and_collect(RequestId::from("req-api-user-message-continue"), request)
+        .await
+        .expect("accepted message delivery should allow an immediate continuation");
+    assert_eq!(response.assistant_text(), "Implementation checked.");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for (headers, body) in captured.iter() {
+        assert_eq!(headers["authorization"], "Bearer test-key");
+        assert!(!headers.contains_key("chatgpt-account-id"));
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+        assert_eq!(body["model"], MODEL);
+        assert!(body.get("experimental_supported_tools").is_none());
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], TOOL_NAME);
+        assert_eq!(tools[0]["parameters"]["required"], json!(["message"]));
+        assert!(tools[0].get("async").is_none());
+        assert!(body["input"].as_array().unwrap().iter().all(|item| {
+            item["type"] != "additional_tools" && item["type"] != "custom_tool_call_output"
+        }));
+    }
+    let continuation = captured[1].1["input"].as_array().unwrap();
+    let calls: Vec<_> = continuation
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["call_id"], CALL_ID);
+    assert_eq!(calls[0]["name"], TOOL_NAME);
+    let outputs: Vec<_> = continuation
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["call_id"], CALL_ID);
+    assert_eq!(outputs[0]["output"], r#"{"accepted":true}"#);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2726,11 +2998,18 @@ async fn responses_doom_loop_signals_reach_completed_response() {
 async fn responses_confident_doom_loop_signal_resamples_once() {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_handler = Arc::clone(&counter);
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let bodies_handler = Arc::clone(&bodies);
     let app = Router::new().route(
         "/v1/responses",
-        post(move || {
+        post(move |body: String| {
             let counter = Arc::clone(&counter_handler);
+            let bodies = Arc::clone(&bodies_handler);
             async move {
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body).unwrap());
                 let attempt = counter.fetch_add(1, Ordering::SeqCst);
                 let events = if attempt == 0 {
                     sse::responses_api_doom_loop_terminal_only_events(
@@ -2754,24 +3033,118 @@ async fn responses_confident_doom_loop_signal_resamples_once() {
         }),
     );
     let server = MockServer::spawn(app).await;
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let handle = SamplerActor::spawn(
-        responses_config(server.base_url(), Some(DoomLoopRecoveryPolicy::default())),
-        RetryPolicy::default(),
-        event_tx,
-    );
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut config = responses_config(server.base_url(), Some(DoomLoopRecoveryPolicy::default()));
+    config.max_retries = Some(0);
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
 
-    let result = handle
-        .submit_and_collect(RequestId::from("req-doom-resample"), user_request("hi"))
+    let collected = handle
+        .submit_and_collect_with_metadata(RequestId::from("req-doom-resample"), user_request("hi"))
         .await;
     server.shutdown();
 
-    let (response, _metrics) = result.expect("recovery accepts the clean resample");
+    assert!(collected.terminal_event_queued);
+    assert_eq!(
+        collected.doom_loop_signals,
+        vec!["tail_repetition:8@thinking".to_string()],
+    );
+    assert_eq!(1, collected.doom_loop_recovery_attempts.len());
+    assert_eq!(
+        collected.doom_loop_recovery_attempts[0].triggers,
+        vec!["tail_repetition:8@thinking".to_string()]
+    );
+    let (response, _metrics) = collected
+        .result
+        .expect("recovery accepts the clean resample");
     assert_eq!(counter.load(Ordering::SeqCst), 2, "exactly one resample");
     assert_eq!(response.assistant_text(), "clean answer");
     assert!(
         response.doom_loop_signals.is_empty(),
         "the accepted response is the clean resample"
+    );
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(1)).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::DoomLoopSignals { triggers, .. }
+            if triggers == &["tail_repetition:8@thinking".to_string()]
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::Retrying {
+            doom_loop_triggers: Some(triggers),
+            ..
+        } if triggers == &["tail_repetition:8@thinking".to_string()]
+    )));
+
+    let bodies = bodies.lock().unwrap();
+    let retry_input = bodies[1]["input"].as_array().unwrap();
+    assert_eq!(retry_input.len(), 4);
+    assert_eq!(retry_input[1]["summary"][0]["text"], "loop loop loop");
+    assert_eq!(retry_input[2]["role"], "assistant");
+    assert_eq!(retry_input[2]["content"], "poisoned answer");
+    assert_eq!(retry_input[3]["role"], "user");
+    let reminder = retry_input[3]["content"]
+        .as_str()
+        .expect("the reminder is a text item");
+    assert!(
+        reminder.starts_with("<system_reminder>") && reminder.ends_with("</system_reminder>"),
+        "the retry closes with a synthetic system-reminder envelope: {reminder}"
+    );
+}
+
+/// A caller that opted into `retry_only_before_output` cannot retract text it already received.
+/// So a doomed turn that streamed output fails instead of resampling over the delivered prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_doom_loop_does_not_resample_after_output_when_retry_only_before_output() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = sse_events_to_axum(sse::responses_api_doom_loop_terminal_only_events(
+                    &["tail_repetition:8@thinking"],
+                    "loop loop loop",
+                    "poisoned answer",
+                    "test-model",
+                ));
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let retry_policy = RetryPolicy {
+        retry_only_before_output: true,
+        ..RetryPolicy::default()
+    };
+    let handle = SamplerActor::spawn(
+        responses_config(server.base_url(), Some(DoomLoopRecoveryPolicy::default())),
+        retry_policy,
+        event_tx,
+    );
+
+    let result = handle
+        .submit_and_collect(RequestId::from("req-doom-no-retract"), user_request("hi"))
+        .await;
+    server.shutdown();
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "no resample after output"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(xai_grok_sampling_types::SamplingError::DoomLoopDetected { .. })
+        ),
+        "the doomed turn is surfaced rather than resampled: {result:?}"
     );
 }
 

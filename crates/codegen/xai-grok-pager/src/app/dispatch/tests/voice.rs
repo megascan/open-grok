@@ -65,7 +65,8 @@ fn voice_final_appends_to_prompt_with_single_space() {
     let id = AgentId(0);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     let p = &mut app.agents.get_mut(&id).unwrap().prompt;
     p.set_text("hello");
@@ -89,7 +90,8 @@ fn voice_final_preserves_mid_text_cursor() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: Some("partial".into()),
+        partial: crate::app::app_view::Partial::Shown("partial".into()),
+        route: None,
     };
     let p = &mut app.agents.get_mut(&id).unwrap().prompt;
     p.set_text("hello world");
@@ -115,7 +117,8 @@ fn voice_final_into_empty_prompt_has_no_leading_space() {
     let id = AgentId(0);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -134,7 +137,8 @@ fn voice_final_replaces_whitespace_only_draft() {
     let id = AgentId(0);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     let p = &mut app.agents.get_mut(&id).unwrap().prompt;
     p.set_text("  \n");
@@ -154,7 +158,8 @@ fn voice_final_preserves_trailing_newline() {
     let id = AgentId(0);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.agents
         .get_mut(&id)
@@ -260,7 +265,8 @@ fn voice_interim_sets_then_error_clears_state() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -292,7 +298,8 @@ fn voice_error_hint_lands_in_bound_agent_scrollback() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -321,7 +328,8 @@ fn voice_error_hint_lands_in_bound_agent_scrollback() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     let before = app.agents.get(&id).unwrap().scrollback.len();
     crate::voice::handle_voice_event(
@@ -343,7 +351,8 @@ fn voice_error_hint_dropped_for_dashboard_dispatch() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardDispatch,
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     let before = app.agents.get(&AgentId(0)).unwrap().scrollback.len();
     crate::voice::handle_voice_event(
@@ -392,7 +401,8 @@ fn voice_interim_kept_on_stop_then_cleared_by_final() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: Some("partial".into()),
+        partial: crate::app::app_view::Partial::Shown("partial".into()),
+        route: None,
     };
 
     app.voice_stop_keeping_final();
@@ -430,7 +440,7 @@ fn voice_toggle_starts_and_stops() {
     assert!(app.voice_listening());
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 
     dispatch(Action::VoiceToggle, &mut app);
@@ -481,7 +491,7 @@ fn voice_toggle_starts_without_voice_mode_prereq() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 }
 
@@ -508,7 +518,7 @@ fn voice_mode_enable_starts_recording_and_stays_on() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 
     // `EnableVoiceMode` is start-only (not a toggle): running it again while
@@ -599,7 +609,8 @@ fn voice_toggle_can_always_stop_even_with_flag_disabled() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
     app.voice_mode_enabled = false;
     app.voice_ui_active = false;
@@ -627,7 +638,8 @@ fn voice_stop_stops_and_drops_pending_cold_start() {
     app.voice_state = VoiceState::Recording {
         hold: true,
         target: VoiceTarget::Agent(AgentId(0)),
-        interim: None,
+        partial: crate::app::app_view::Partial::None,
+        route: None,
     };
 
     dispatch(Action::VoiceStop, &mut app);
@@ -673,7 +685,8 @@ fn voice_stt_language_change_recycles_pipeline() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(AgentId(0)),
-        interim: Some("hola".to_string()),
+        partial: crate::app::app_view::Partial::Shown("hola".to_string()),
+        route: None,
     };
 
     let effects = dispatch(Action::SetVoiceSttLanguage("es".to_string()), &mut app);
@@ -797,7 +810,8 @@ fn voice_submit_includes_interim() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: Some("world".into()),
+        partial: crate::app::app_view::Partial::Shown("world".into()),
+        route: None,
     };
 
     let effects = dispatch(Action::SendPrompt("hello".into()), &mut app);
@@ -808,7 +822,7 @@ fn voice_submit_includes_interim() {
     assert!(!app.voice_listening());
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
 }
 
@@ -819,7 +833,8 @@ fn voice_submit_interim_only() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: Some("ghost only".into()),
+        partial: crate::app::app_view::Partial::Shown("ghost only".into()),
+        route: None,
     };
 
     let effects = dispatch(Action::SendPrompt(String::new()), &mut app);
@@ -838,7 +853,8 @@ fn voice_submit_follow_up_keeps_chip_literal() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: Some("dictated".into()),
+        partial: crate::app::app_view::Partial::Shown("dictated".into()),
+        route: None,
     };
 
     let effects = dispatch(Action::SubmitFollowUp("chip text".into()), &mut app);
@@ -848,4 +864,62 @@ fn voice_submit_follow_up_keeps_chip_literal() {
     assert_eq!(text, "chip text");
     assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "draft dictated");
     assert!(!app.voice_listening());
+}
+
+#[test]
+fn superseded_voice_events_cannot_change_the_new_capture() {
+    use xai_grok_voice::{TaggedVoiceEvent, VoiceEvent};
+    let mut app = test_app_with_agent();
+    let target = VoiceTarget::Agent(AgentId(0));
+    app.voice_begin_recording(target, false);
+    let old = app.voice_session;
+    app.voice_reset();
+    app.voice_begin_recording(target, false);
+    assert!(!crate::voice::handle_tagged_voice_event(
+        &mut app,
+        TaggedVoiceEvent {
+            session: old,
+            event: VoiceEvent::UtteranceFinal {
+                text: "stale".into()
+            }
+        },
+    ));
+    assert_eq!(app.agents[&AgentId(0)].prompt.text(), "");
+    assert!(app.voice_listening());
+}
+
+#[test]
+fn outstanding_clip_waits_for_its_final_and_blocks_new_capture() {
+    use xai_grok_voice::{VoiceEvent, VoiceRoute};
+    let mut app = test_app_with_agent();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    app.voice_cmd_tx = Some(tx);
+    app.voice_mode_enabled = true;
+    app.voice_begin_recording(VoiceTarget::Agent(AgentId(0)), false);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
+    ));
+    crate::voice::handle_voice_event(
+        &mut app,
+        VoiceEvent::CaptureStarted {
+            route: VoiceRoute::Clip,
+        },
+    );
+    dispatch(Action::VoiceToggle, &mut app);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+    ));
+    crate::voice::handle_voice_event(&mut app, VoiceEvent::Transcribing);
+    dispatch(Action::VoiceToggle, &mut app);
+    assert!(rx.try_recv().is_err());
+    crate::voice::handle_voice_event(
+        &mut app,
+        VoiceEvent::UtteranceFinal {
+            text: "ship it".into(),
+        },
+    );
+    assert_eq!(app.agents[&AgentId(0)].prompt.text(), "ship it");
+    assert!(!app.voice_state.blocks_new_capture());
 }

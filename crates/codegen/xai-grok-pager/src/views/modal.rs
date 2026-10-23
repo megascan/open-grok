@@ -205,6 +205,8 @@ pub enum ActiveModal {
     },
     /// Session picker (opened from /resume command or command palette).
     SessionPicker {
+        generation: u64,
+        detail_seq: u64,
         /// Unified picker state.
         state: crate::views::picker::PickerState,
         /// Fetched session entries (None = not yet loaded).
@@ -677,7 +679,7 @@ impl ActiveModal {
                 args_query,
                 ..
             } => match command.as_str() {
-                "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
+                "model" | "m" if !args_query.is_empty() => "Pick model options",
                 "model" | "m" => "Pick model",
                 "theme" | "t" => "Pick theme",
                 "login" => "Connect provider",

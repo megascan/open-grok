@@ -16,6 +16,7 @@
 //!   RPCs.
 use crate::computer::types::{AsyncFileSystem, TerminalBackend};
 use crate::notification::types::ToolNotificationHandle;
+pub use crate::sandbox_launch::SandboxLaunchHook;
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -608,6 +609,9 @@ impl GitignoreFilter {
             git_root,
         }
     }
+    pub(crate) fn is_logical_path_ignored(&self, path: &std::path::Path) -> bool {
+        crate::gitignore::is_ignored(&self.gitignore, path, Some(&self.git_root))
+    }
     /// Check whether a path is gitignored.
     ///
     /// For non-existent files (new file creation), canonicalizes the parent
@@ -692,6 +696,8 @@ impl ToolNameMapping {
 /// message that left the model stuck.
 #[derive(Debug, Clone, Default)]
 pub struct EnabledNativeToolNames(pub std::collections::HashSet<String>);
+#[derive(Debug, Clone, Default)]
+pub struct NativeToolClientNames(pub std::collections::HashMap<String, String>);
 impl EnabledNativeToolNames {
     /// Whether `name` is an enabled native (non-MCP) tool.
     pub fn contains(&self, name: &str) -> bool {
@@ -841,6 +847,92 @@ impl std::fmt::Debug for FileSystem {
         f.debug_struct("FileSystem").finish()
     }
 }
+/// A session's trusted storage root, pinned before any plan edit is admitted.
+#[derive(Clone, Debug)]
+pub struct PlanFileRoot {
+    pub(crate) logical: PathBuf,
+    pub(crate) canonical: PathBuf,
+    #[cfg(unix)]
+    pub(crate) directory: Arc<std::fs::File>,
+}
+impl PlanFileRoot {
+    /// Capture the configured root once at session setup. A configured root
+    /// may be a symlink; later swaps do not change the pinned directory.
+    pub fn capture(path: &std::path::Path) -> Result<Self, crate::computer::types::ComputerError> {
+        #[cfg(unix)]
+        {
+            crate::computer::local::file_system::capture_plan_root(path).map_err(Into::into)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(crate::computer::types::ComputerError::io_with_kind(
+                "safe plan-file writes are not supported on this platform",
+                std::io::ErrorKind::Unsupported,
+            ))
+        }
+    }
+}
+/// A capability for a single plan file, scoped to one tool invocation.
+/// Its filesystem never accepts a write or delete outside the pinned leaf.
+#[derive(Clone)]
+pub struct PlanFile {
+    path: PathBuf,
+    canonical_parent: PathBuf,
+    fs: Arc<dyn AsyncFileSystem>,
+}
+impl PlanFile {
+    pub(crate) fn new(
+        path: PathBuf,
+        canonical_parent: PathBuf,
+        fs: Arc<dyn AsyncFileSystem>,
+    ) -> Self {
+        Self {
+            path,
+            canonical_parent,
+            fs,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn filesystem(&self) -> Arc<dyn AsyncFileSystem> {
+        self.fs.clone()
+    }
+
+    /// Check an authored target before substituting the pinned path. Parent
+    /// aliases may resolve to the pinned directory, but never influence I/O.
+    pub fn check_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), crate::computer::types::ComputerError> {
+        if path == self.path {
+            return Ok(());
+        }
+        let matches = path.file_name() == self.path.file_name()
+            && path
+                .parent()
+                .and_then(|parent| dunce::canonicalize(parent).ok())
+                .is_some_and(|parent| parent == self.canonical_parent);
+        if matches {
+            Ok(())
+        } else {
+            Err(crate::computer::types::ComputerError::io_with_kind(
+                "target is outside the pinned plan file",
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        }
+    }
+}
+impl std::fmt::Debug for PlanFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
 /// Terminal backend abstraction.
 pub struct Terminal(pub Arc<dyn TerminalBackend>);
 /// Session ID that owns processes spawned by this session's tools.
@@ -909,6 +1001,19 @@ pub struct CompletionTracker {
 impl ResourceType for CompletionTracker {
     const ID: &'static str = "";
 }
+/// Identity of an MCP catalog observed before hooks and permission approval.
+/// This is an opaque, process-local call capability, not persisted or sent to
+/// the model. The MCP host validates it again at final dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCatalogBinding {
+    pub server: String,
+    pub tool: String,
+    pub pool_id: u64,
+    pub epoch: u64,
+    pub inherited: bool,
+    pub revision: u64,
+}
+
 /// Metadata for a single MCP resource, returned by [`McpResourceProvider::list_resources`].
 #[derive(Debug, Clone)]
 pub struct McpResourceInfo {

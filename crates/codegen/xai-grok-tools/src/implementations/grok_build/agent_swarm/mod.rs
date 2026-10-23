@@ -26,6 +26,7 @@ use crate::{
     implementations::grok_build::task::{
         MAX_SUBAGENT_DEPTH,
         backend::{SubagentBackend, SubagentBackendResource},
+        model_policy::TaskModelSelection,
         types::{
             CurrentPromptIdResource, ForegroundWaitKind, ModelOverrideProvenance,
             OrchestrationSteerSignal, SWARM_RATE_LIMIT_RETRY_BASE_MS, SessionIdResource,
@@ -310,6 +311,7 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
             foreground_wait,
             steer,
             registry,
+            notification_handle,
         ) = {
             let res = resources.lock().await;
             (
@@ -332,6 +334,8 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
                 res.get::<SubagentForegroundWait>().cloned(),
                 res.get::<OrchestrationSteerSignal>().cloned(),
                 res.get::<SwarmRegistry>().cloned().unwrap_or_default(),
+                res.get::<crate::types::resources::NotificationHandle>()
+                    .map(|h| h.0.clone()),
             )
         };
         if depth >= MAX_SUBAGENT_DEPTH {
@@ -370,6 +374,12 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
                         allowed.join(", "),
                         input.subagent_type
                     )));
+                }
+                SubagentValidateTypeOutcome::CoordinatorGone => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "validation_unavailable",
+                        "Cannot validate subagent type: the subagent coordinator has shut down. Retrying will not help.",
+                    ));
                 }
                 SubagentValidateTypeOutcome::ValidationUnavailable => {
                     return Err(xai_tool_runtime::ToolError::custom(
@@ -418,6 +428,24 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
         let description = input.description.clone();
         let expected_members = members.len() as u32;
         let slots = SharedMemberSlots::new(members.len());
+        // Hold the cohort until all admitted members have made their own
+        // generation-tagged starts visible, including members whose timeout
+        // drops their spawn waiter while the coordinator is still starting them.
+        let scope = ctx
+            .get::<crate::notification::BackgroundDeliveryScope>()
+            .map(|scope| (*scope).clone());
+        let lifecycle = notification_handle
+            .clone()
+            .map(|handle| {
+                handle
+                    .with_delivery_scope(scope.clone())
+                    .reserve_subagent_admission()
+            })
+            .transpose()
+            .map_err(|error| xai_tool_runtime::ToolError::custom("delivery_unavailable", error))?
+            .map(|reservation| Arc::new(reservation.admit(&format!("swarm:{swarm_id}"))));
+        let notification_handle =
+            notification_handle.map(|handle| handle.with_delivery_scope(scope.clone()));
         let context = SwarmRequestContext {
             swarm_id: swarm_id.clone(),
             description: description.clone(),
@@ -427,9 +455,12 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
             model: member_model,
             reasoning_effort,
             cancellation: swarm_cancellation.clone(),
+            notification_handle,
+            cohort: lifecycle.clone(),
         };
         let scheduler_slots = Arc::clone(&slots);
         let mut scheduler = tokio::spawn(async move {
+            let _lifecycle = lifecycle;
             run_scheduler(
                 backend.0.clone(),
                 members,
@@ -497,16 +528,19 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
             SwarmToolOutcome::Detached => {
                 let done = Arc::new(tokio::sync::Notify::new());
                 let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let detached = registry.insert(DetachedSwarm {
-                    swarm_id: swarm_id.clone(),
-                    description: description.clone(),
-                    parent_session_id: parent_session_id.clone(),
-                    expected_members,
-                    slots: Arc::clone(&slots),
-                    done: Arc::clone(&done),
-                    finished: Arc::clone(&finished),
-                    cancellation: swarm_cancellation,
-                });
+                let detached = registry.insert(
+                    DetachedSwarm {
+                        swarm_id: swarm_id.clone(),
+                        description: description.clone(),
+                        parent_session_id: parent_session_id.clone(),
+                        expected_members,
+                        slots: Arc::clone(&slots),
+                        done: Arc::clone(&done),
+                        finished: Arc::clone(&finished),
+                        cancellation: swarm_cancellation,
+                    },
+                    scope.as_ref(),
+                );
                 let registry_for_finish = registry.clone();
                 tokio::spawn(async move {
                     let results = match scheduler.await {
@@ -569,6 +603,8 @@ struct SwarmRequestContext {
     /// Root cancellation linked to this foreground tool invocation. Each
     /// member receives a child token so cancelling one member stays local.
     cancellation: CancellationToken,
+    notification_handle: Option<crate::notification::ToolNotificationHandle>,
+    cohort: Option<Arc<crate::notification::AdmittedSubagent>>,
 }
 
 fn validate_and_plan(input: &AgentSwarmToolInput) -> Result<Vec<PlannedMember>, String> {
@@ -708,6 +744,9 @@ async fn run_scheduler(
     let mut rate_limit_gate = RateLimitGate::new(tokio::time::Instant::now());
     let initial = initial_launch_count(members.len(), concurrency_cap);
     while next < initial {
+        if context.cancellation.is_cancelled() {
+            return shared_slots.snapshot().into_iter().flatten().collect();
+        }
         let agent_id = uuid::Uuid::now_v7().to_string();
         active.push(spawn_member(
             backend.clone(),
@@ -743,6 +782,9 @@ async fn run_scheduler(
         let recovery_sleep_until = recovery_deadline.unwrap_or(rate_limited_launch_at);
         tokio::select! {
             biased;
+            _ = context.cancellation.cancelled() => {
+                return shared_slots.snapshot().into_iter().flatten().collect();
+            }
             Some(event) = status_rx.recv() => {
                 match event {
                     SubagentStatusEvent::ProviderRequestStarted { subagent_id } => {
@@ -852,6 +894,7 @@ fn build_member_request(
         subagent_type: context.subagent_type,
         parent_session_id: context.parent_session_id,
         parent_prompt_id: context.parent_prompt_id,
+        tool_call_id: None,
         swarm: Some(SwarmMemberMeta {
             swarm_id: context.swarm_id,
             description: context.description,
@@ -868,7 +911,9 @@ fn build_member_request(
                 .is_none()
                 .then(|| context.model.clone())
                 .flatten(),
-            model_override_provenance: ModelOverrideProvenance::Tool,
+            model_override_provenance: ModelOverrideProvenance::Tool {
+                selection: TaskModelSelection::default(),
+            },
             reasoning_effort: context.reasoning_effort,
             persona: None,
             capability_mode: None,
@@ -903,18 +948,14 @@ async fn spawn_member(
     status_tx: Option<mpsc::UnboundedSender<SubagentStatusEvent>>,
     timeout: Option<Duration>,
 ) -> (String, MemberResult) {
-    let request = build_member_request(
-        member.clone(),
-        context,
-        expected_members,
-        agent_id.clone(),
-        status_tx,
-    );
-    let result = match timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, backend.spawn(request)).await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = backend.cancel(&agent_id).await;
+    let reservation = if let Some(handle) = context.notification_handle.as_ref() {
+        let scope = handle.child_delivery_scope();
+        let reservation = match handle
+            .with_delivery_scope(Some(scope.clone()))
+            .reserve_subagent_admission()
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 return (
                     agent_id.clone(),
                     MemberResult {
@@ -923,12 +964,61 @@ async fn spawn_member(
                         agent_id,
                         outcome: MemberOutcome::Failed,
                         mode: member.mode,
-                        body: "subagent timed out".to_string(),
+                        body: error,
                     },
                 );
             }
-        },
-        None => backend.spawn(request).await,
+        };
+        let cohort = context.cohort.clone();
+        tokio::spawn(async move {
+            if let Err(error) = scope.wait_bounded(Duration::from_secs(30)).await {
+                tracing::error!(%error, "swarm member admission delivery failed");
+                if let Some(cohort) = &cohort {
+                    cohort.report_delivery_failure(&error);
+                }
+            }
+            drop(cohort);
+        });
+        Some(reservation)
+    } else {
+        None
+    };
+    let cohort = context.cohort.clone();
+    let request = build_member_request(
+        member.clone(),
+        context,
+        expected_members,
+        agent_id.clone(),
+        status_tx,
+    );
+    let result = match timeout {
+        Some(timeout) => {
+            match tokio::time::timeout(timeout, backend.spawn_reserved(request, reservation)).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    if tokio::time::timeout(Duration::from_secs(30), backend.cancel(&agent_id))
+                        .await
+                        .is_err()
+                        && let Some(cohort) = &cohort
+                    {
+                        cohort.report_delivery_failure("timed out cancelling a swarm member");
+                    }
+                    return (
+                        agent_id.clone(),
+                        MemberResult {
+                            index: member.index,
+                            item: member.item,
+                            agent_id,
+                            outcome: MemberOutcome::Failed,
+                            mode: member.mode,
+                            body: "subagent timed out".to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        None => backend.spawn_reserved(request, reservation).await,
     };
     let member_result = match result {
         Ok(result) => member_result(
@@ -1135,6 +1225,8 @@ mod tests {
             model: None,
             reasoning_effort: None,
             cancellation: CancellationToken::new(),
+            notification_handle: None,
+            cohort: None,
         }
     }
 
@@ -1387,6 +1479,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stopped_coordinator_rejects_swarm_without_spawning() {
+        let backend = Arc::new(ImmediateBackend {
+            validation: Some(SubagentValidateTypeOutcome::CoordinatorGone),
+            ..Default::default()
+        });
+        let mut resources = Resources::new();
+        resources.insert(SubagentBackendResource(backend.clone()));
+        resources.insert(SessionIdResource("parent".to_string()));
+        let error = xai_tool_runtime::Tool::run(
+            &AgentSwarmTool,
+            test_ctx(resources.into_shared()),
+            input(
+                Some(vec!["first", "second"]),
+                None,
+                Some("Process {{item}}"),
+            ),
+        )
+        .await
+        .expect_err("stopped coordinator must fail validation");
+        assert!(error.to_string().contains("coordinator has shut down"));
+        assert!(error.to_string().contains("Retrying will not help"));
+        assert!(backend.requests.lock().unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn resume_only_swarm_ignores_unused_model_override() {
         let backend = Arc::new(ImmediateBackend::default());
@@ -1472,6 +1589,7 @@ mod tests {
     #[derive(Default)]
     struct ImmediateBackend {
         requests: Mutex<Vec<SubagentRequest>>,
+        validation: Option<SubagentValidateTypeOutcome>,
     }
 
     #[async_trait::async_trait]
@@ -1497,7 +1615,9 @@ mod tests {
             SubagentCancelOutcome::NotFound
         }
         async fn validate_type(&self, _: &str, _: &str) -> SubagentValidateTypeOutcome {
-            SubagentValidateTypeOutcome::Ok
+            self.validation
+                .clone()
+                .unwrap_or(SubagentValidateTypeOutcome::Ok)
         }
         async fn describe_subagent_type(
             &self,
@@ -1551,6 +1671,7 @@ mod tests {
     struct ControllableBackend {
         requests: Mutex<Vec<SubagentRequest>>,
         senders: Mutex<Vec<oneshot::Sender<SubagentResult>>>,
+        cancel_stalls: bool,
     }
 
     impl ControllableBackend {
@@ -1592,6 +1713,9 @@ mod tests {
             None
         }
         async fn cancel(&self, _: &str) -> SubagentCancelOutcome {
+            if self.cancel_stalls {
+                std::future::pending::<()>().await;
+            }
             SubagentCancelOutcome::NotFound
         }
         async fn validate_type(&self, _: &str, _: &str) -> SubagentValidateTypeOutcome {
@@ -1983,5 +2107,86 @@ mod tests {
                 .iter()
                 .all(|r| r.outcome == MemberOutcome::Completed)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_scheduler_does_not_launch_later_members() {
+        let backend = Arc::new(ControllableBackend::default());
+        let ctx = context();
+        let cancellation = ctx.cancellation.clone();
+        let slots = SharedMemberSlots::new(4);
+        let scheduler = tokio::spawn(run_scheduler(
+            backend.clone(),
+            item_members(4),
+            ctx,
+            Some(2),
+            None,
+            slots,
+        ));
+        for _ in 0..30 {
+            if backend.requests.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.requests.lock().unwrap().len(), 2);
+        cancellation.cancel();
+        scheduler.await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_member_cancellation_marks_cohort_terminal_as_failed() {
+        use crate::notification::{
+            BackgroundDeliveryScope, BridgeToolNotification, ToolNotificationHandle,
+        };
+        let backend = Arc::new(ControllableBackend {
+            cancel_stalls: true,
+            ..Default::default()
+        });
+        let (handle, mut rx) = ToolNotificationHandle::bridge_channel();
+        let scope = BackgroundDeliveryScope::new();
+        let cohort = Arc::new(
+            handle
+                .with_delivery_scope(Some(scope.clone()))
+                .reserve_subagent_admission()
+                .unwrap()
+                .admit("swarm:test"),
+        );
+        let BridgeToolNotification::SubagentAdmitted {
+            acknowledgement, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected admission")
+        };
+        acknowledgement.send(Ok(())).unwrap();
+        scope.wait().await.unwrap();
+        let ctx = SwarmRequestContext {
+            cohort: Some(cohort.clone()),
+            ..context()
+        };
+        let member = item_members(1).remove(0);
+        let task = tokio::spawn(spawn_member(
+            backend,
+            member,
+            ctx,
+            1,
+            "member".into(),
+            None,
+            Some(Duration::from_millis(1)),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let (_, result) = task.await.unwrap();
+        assert_eq!(result.outcome, MemberOutcome::Failed);
+        drop(cohort);
+        let BridgeToolNotification::SubagentAdmissionEnded { error, .. } = rx.recv().await.unwrap()
+        else {
+            panic!("expected terminal")
+        };
+        assert!(error.unwrap().contains("timed out cancelling"));
     }
 }

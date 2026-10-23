@@ -4,9 +4,21 @@ use crate::permission::types::EditPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_sandbox::command::protected::{FileOwner, HeldDir};
 use xai_grok_tools::util::grok_home::grok_home;
 
 const VALIDATED_MCP_SERVER_GRANTS_VERSION: i64 = 1;
+const MAX_DAEMON_STATE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// The trusted origin used for a folder's permission state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StateFileAccess {
+    Plain,
+    /// Read and write only daemon-owned paths held without following symlinks.
+    DaemonOwned {
+        grok_home: std::path::PathBuf,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -32,6 +44,8 @@ pub struct PermissionState {
     pub allowed_mcp_servers: HashSet<String>,
     /// Version proving server-wide grants were minted from validated qualified IDs.
     /// Missing or malformed markers are legacy; future integer versions are preserved.
+    pub disallowed_mcp_tools: HashSet<String>,
+    pub disallowed_web_fetch_domains: HashSet<String>,
     #[serde(
         default = "legacy_mcp_server_grants_version",
         deserialize_with = "deserialize_mcp_server_grants_version"
@@ -65,8 +79,18 @@ impl Default for PermissionState {
             allowed_web_fetch_domains: HashSet::new(),
             allowed_mcp_tools: HashSet::new(),
             allowed_mcp_servers: HashSet::new(),
+            disallowed_mcp_tools: HashSet::new(),
+            disallowed_web_fetch_domains: HashSet::new(),
             validated_mcp_server_grants_version: VALIDATED_MCP_SERVER_GRANTS_VERSION,
         }
+    }
+}
+
+impl PermissionState {
+    pub(crate) fn has_explicit_denials(&self) -> bool {
+        !self.disallowed_bash_commands.is_empty()
+            || !self.disallowed_mcp_tools.is_empty()
+            || !self.disallowed_web_fetch_domains.is_empty()
     }
 }
 
@@ -95,6 +119,8 @@ impl PermissionState {
             allowed_web_fetch_domains,
             allowed_mcp_tools,
             allowed_mcp_servers,
+            disallowed_mcp_tools,
+            disallowed_web_fetch_domains,
             validated_mcp_server_grants_version: _,
         } = other;
         self.allow_bash_execute |= allow_bash_execute;
@@ -106,6 +132,9 @@ impl PermissionState {
             .extend(allowed_web_fetch_domains);
         self.allowed_mcp_tools.extend(allowed_mcp_tools);
         self.allowed_mcp_servers.extend(allowed_mcp_servers);
+        self.disallowed_mcp_tools.extend(disallowed_mcp_tools);
+        self.disallowed_web_fetch_domains
+            .extend(disallowed_web_fetch_domains);
     }
 }
 
@@ -141,7 +170,15 @@ fn state_dir_for_cwd(cwd: &AbsPathBuf) -> std::path::PathBuf {
 /// grants saved by older builds in a subdirectory still load until the
 /// repo-root store exists, and the next persist carries them into it.
 fn legacy_state_dir(cwd: &AbsPathBuf, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let legacy = xai_grok_config::sessions_cwd_dir(cwd.as_str());
+    legacy_state_dir_in(&xai_grok_config::grok_home(), cwd, dir)
+}
+
+fn legacy_state_dir_in(
+    home: &std::path::Path,
+    cwd: &AbsPathBuf,
+    dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let legacy = xai_grok_config::sessions_cwd_dir_in(home, cwd.as_str());
     (legacy != dir).then_some(legacy)
 }
 
@@ -155,8 +192,16 @@ struct StoreDirs {
 }
 
 async fn resolve_store_dirs(cwd: &AbsPathBuf, ensure: bool) -> StoreDirs {
+    resolve_store_dirs_in(xai_grok_config::grok_home(), cwd, ensure).await
+}
+
+async fn resolve_store_dirs_in(
+    home: std::path::PathBuf,
+    cwd: &AbsPathBuf,
+    ensure: bool,
+) -> StoreDirs {
     let cwd = cwd.clone();
-    let fallback_dir = xai_grok_config::sessions_cwd_dir(cwd.as_str());
+    let fallback_dir = xai_grok_config::sessions_cwd_dir_in(&home, cwd.as_str());
     tokio::task::spawn_blocking(move || {
         // Resolve the scope root ONCE: discovery walks the filesystem, and the
         // store dir, its ensure fallback, and the legacy compare all derive
@@ -166,15 +211,15 @@ async fn resolve_store_dirs(cwd: &AbsPathBuf, ensure: bool) -> StoreDirs {
             // Canonical creator: tighten the sessions root this write may
             // create. Falls back to the computed path (persist_state_to_dir
             // re-creates it owner-only) so a failed ensure still gets a write.
-            xai_grok_config::ensure_sessions_cwd_dir(&root).unwrap_or_else(|e| {
+            xai_grok_config::ensure_sessions_cwd_dir_in(&home, &root).unwrap_or_else(|e| {
                 tracing::warn!(?e, "failed ensuring sessions cwd dir for permission state");
-                xai_grok_config::sessions_cwd_dir(&root)
+                xai_grok_config::sessions_cwd_dir_in(&home, &root)
             })
         } else {
-            xai_grok_config::sessions_cwd_dir(&root)
+            xai_grok_config::sessions_cwd_dir_in(&home, &root)
         };
         StoreDirs {
-            legacy_dir: legacy_state_dir(&cwd, &dir),
+            legacy_dir: legacy_state_dir_in(&home, &cwd, &dir),
             dir,
         }
     })
@@ -236,6 +281,56 @@ async fn try_load_state(path: &std::path::Path) -> Option<PermissionState> {
     .await
 }
 
+fn hold_daemon_dir(
+    home: &std::path::Path,
+    path: &std::path::Path,
+    create: bool,
+) -> std::io::Result<HeldDir> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "permission state has no parent",
+        )
+    })?;
+    HeldDir::open(home, dir, FileOwner::Daemon, create)
+}
+
+async fn try_load_daemon_owned_state(
+    home: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<PermissionState> {
+    let (home, path) = (home.to_path_buf(), path.to_path_buf());
+    let read = tokio::task::spawn_blocking(move || {
+        let text = hold_daemon_dir(&home, &path, false)?.read(
+            path.file_name().unwrap_or_default(),
+            MAX_DAEMON_STATE_FILE_BYTES,
+            FileOwner::Daemon,
+        )?;
+        let mut state: PermissionState = toml::from_str(&text)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // The same legacy-server-grant invalidation as the ordinary store;
+        // a daemon-owned read never silently revalidates an old server grant.
+        if state.validated_mcp_server_grants_version < VALIDATED_MCP_SERVER_GRANTS_VERSION {
+            state.allowed_mcp_servers.clear();
+            state.validated_mcp_server_grants_version = VALIDATED_MCP_SERVER_GRANTS_VERSION;
+        }
+        Ok::<_, std::io::Error>(state)
+    })
+    .await;
+    match read {
+        Ok(Ok(state)) => Some(state),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "daemon-owned permission state refused");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(?error, "daemon-owned permission read failed");
+            None
+        }
+    }
+}
+
 async fn load_state_from_dir(
     dir: &std::path::Path,
     client_identifier: Option<&str>,
@@ -292,6 +387,122 @@ pub(crate) async fn load_state_from_disk(
     load_state_with_fallback(&dirs.dir, dirs.legacy_dir.as_deref(), client_identifier).await
 }
 
+pub(crate) struct CachedStateStore {
+    dir: std::path::PathBuf,
+    legacy_dir: Option<std::path::PathBuf>,
+    client_identifier: Option<String>,
+    access: StateFileAccess,
+    last_sig: Option<(std::time::SystemTime, u64)>,
+}
+
+impl CachedStateStore {
+    pub(crate) async fn resolve_and_load(
+        cwd: &AbsPathBuf,
+        client_identifier: Option<&str>,
+    ) -> (Self, PermissionState) {
+        let dirs = resolve_store_dirs(cwd, false).await;
+        Self::open(dirs, client_identifier, StateFileAccess::Plain).await
+    }
+
+    pub(crate) async fn resolve_and_load_with(
+        cwd: &AbsPathBuf,
+        client_identifier: Option<&str>,
+        access: StateFileAccess,
+    ) -> (Self, PermissionState) {
+        let home = match &access {
+            StateFileAccess::Plain => xai_grok_config::grok_home(),
+            StateFileAccess::DaemonOwned { grok_home } => grok_home.clone(),
+        };
+        let dirs = resolve_store_dirs_in(home, cwd, false).await;
+        Self::open(dirs, client_identifier, access).await
+    }
+
+    async fn open(
+        dirs: StoreDirs,
+        client_identifier: Option<&str>,
+        access: StateFileAccess,
+    ) -> (Self, PermissionState) {
+        let mut store = Self {
+            dir: dirs.dir,
+            legacy_dir: dirs.legacy_dir,
+            client_identifier: client_identifier.map(str::to_owned),
+            access,
+            last_sig: None,
+        };
+        store.last_sig = store.current_sig().await;
+        let state = store.read().await;
+        (store, state)
+    }
+
+    async fn current_sig(&self) -> Option<(std::time::SystemTime, u64)> {
+        let path = state_file_path(&self.dir, self.client_identifier.as_deref());
+        let meta = match self.access {
+            StateFileAccess::Plain => tokio::fs::metadata(path).await.ok()?,
+            StateFileAccess::DaemonOwned { .. } => tokio::fs::symlink_metadata(path).await.ok()?,
+        };
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    async fn read(&self) -> PermissionState {
+        match &self.access {
+            StateFileAccess::Plain => {
+                load_state_with_fallback(
+                    &self.dir,
+                    self.legacy_dir.as_deref(),
+                    self.client_identifier.as_deref(),
+                )
+                .await
+            }
+            StateFileAccess::DaemonOwned { grok_home } => {
+                try_load_daemon_owned_state(grok_home, &state_file_path(&self.dir, None))
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    pub(crate) fn access(&self) -> &StateFileAccess {
+        &self.access
+    }
+
+    pub(crate) async fn persist(&self, cwd: &AbsPathBuf, state: &PermissionState) {
+        let StateFileAccess::DaemonOwned { grok_home } = &self.access else {
+            return persist_state(cwd, state, self.client_identifier.as_deref()).await;
+        };
+        let path = state_file_path(&self.dir, None);
+        let mut merged = state.clone();
+        if let Some(on_disk) = try_load_daemon_owned_state(grok_home, &path).await {
+            merged.merge_grants_from(on_disk);
+        }
+        let home = grok_home.clone();
+        let result = persist_state_to_path_with_writer(&path, &merged, move |path, contents| {
+            hold_daemon_dir(&home, path, true)?.replace(
+                path.file_name().unwrap_or_default(),
+                contents,
+                FileOwner::Daemon,
+            )
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(?error, "daemon-owned permission state not written");
+        }
+    }
+
+    pub(crate) async fn reload_if_changed(&mut self) -> Option<PermissionState> {
+        // Revalidate all held directories on every daemon read; a parent
+        // directory can change without changing the final file's metadata.
+        if matches!(self.access, StateFileAccess::DaemonOwned { .. }) {
+            return Some(self.read().await);
+        }
+        let sig = self.current_sig().await;
+        if sig == self.last_sig {
+            return None;
+        }
+        self.last_sig = sig;
+        Some(self.read().await)
+    }
+}
+
 async fn persist_state_to_path_with_writer<F>(
     path: &std::path::Path,
     state: &PermissionState,
@@ -315,7 +526,7 @@ async fn persist_state_to_dir(
 ) {
     let path = state_file_path(dir, client_identifier);
     let dir = dir.to_path_buf();
-    // Owner-only dir creation rides the writer's spawn_blocking: GROK_HOME may
+    // Owner-only dir creation rides the writer's spawn_blocking: OPENGROK_HOME may
     // sit on a slow filesystem, so no blocking fs work on the async worker.
     let result = persist_state_to_path_with_writer(&path, state, move |path, contents| {
         xai_grok_config::create_dir_all_owner_only(&dir)?;
@@ -406,6 +617,86 @@ pub async fn cleanup_stale_permission_state(max_age: std::time::Duration) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_store_revalidates_paths_and_refuses_linked_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let dir = home.join("sessions").join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut own = PermissionState::default();
+        own.allowed_web_fetch_domains.insert("own.example".into());
+        persist_state_to_dir(&dir, &own, None).await;
+        let mut planted = PermissionState::default();
+        planted
+            .allowed_web_fetch_domains
+            .insert("planted.example".into());
+        persist_state_to_dir(&outside, &planted, None).await;
+        let dirs = || StoreDirs {
+            dir: dir.clone(),
+            legacy_dir: Some(outside.clone()),
+        };
+        let access = StateFileAccess::DaemonOwned {
+            grok_home: home.clone(),
+        };
+        let (mut store, state) = CachedStateStore::open(dirs(), None, access).await;
+        assert_eq!(
+            state.allowed_web_fetch_domains,
+            own.allowed_web_fetch_domains
+        );
+
+        let name = state_file_path(&dir, None);
+        std::fs::remove_file(&name).unwrap();
+        std::os::unix::fs::symlink(state_file_path(&outside, None), &name).unwrap();
+        assert!(
+            store
+                .reload_if_changed()
+                .await
+                .unwrap()
+                .allowed_web_fetch_domains
+                .is_empty()
+        );
+        std::fs::remove_file(&name).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        assert!(
+            store
+                .reload_if_changed()
+                .await
+                .unwrap()
+                .allowed_web_fetch_domains
+                .is_empty()
+        );
+        let cwd = AbsPathBuf::new(dir.clone()).unwrap();
+        store.persist(&cwd, &own).await;
+        assert_eq!(
+            load_state_from_dir(&outside, None)
+                .await
+                .allowed_web_fetch_domains,
+            planted.allowed_web_fetch_domains
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_store_invalidates_unvalidated_server_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let dir = home.join("sessions").join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            state_file_path(&dir, None),
+            "allowed_mcp_servers = [\"legacy\"]\n",
+        )
+        .unwrap();
+        let state = try_load_daemon_owned_state(&home, &state_file_path(&dir, None))
+            .await
+            .unwrap();
+        assert!(state.allowed_mcp_servers.is_empty());
+    }
+
     // ── PermissionState serialization roundtrip tests ─────────────
 
     #[test]
@@ -455,6 +746,19 @@ mod tests {
         assert!(denied.contains("rm -rf"));
         assert!(denied.contains("git push --force"));
         assert_eq!(denied.len(), 2);
+    }
+
+    #[test]
+    fn missing_deny_fields_default_empty() {
+        let restored: PermissionState = toml::from_str(
+            r#"
+allowed_mcp_tools = ["linear__list"]
+"#,
+        )
+        .unwrap();
+        assert!(restored.allowed_mcp_tools.contains("linear__list"));
+        assert!(restored.disallowed_mcp_tools.is_empty());
+        assert!(restored.disallowed_web_fetch_domains.is_empty());
     }
 
     #[test]
@@ -1074,6 +1378,33 @@ allowed_mcp_servers = ["a"]
     /// A grant accepted at the repo root must be visible to a session started
     /// in a subdirectory of the same repository, and vice versa: both key the
     /// store to the repository root, not the exact cwd.
+    #[test]
+    fn merge_grants_unions_mcp_and_domain_denies_both_directions() {
+        let mut a = PermissionState::default();
+        a.disallowed_mcp_tools.insert("linear__delete".to_string());
+        a.disallowed_web_fetch_domains
+            .insert("tracker.example".to_string());
+
+        let mut b = PermissionState::default();
+        b.disallowed_mcp_tools.insert("notion__purge".to_string());
+        b.disallowed_web_fetch_domains
+            .insert("evil.example".to_string());
+
+        let mut a2 = a.clone();
+        a2.merge_grants_from(b.clone());
+        assert!(a2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(a2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(a2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(a2.disallowed_web_fetch_domains.contains("evil.example"));
+
+        let mut b2 = b;
+        b2.merge_grants_from(a);
+        assert!(b2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(b2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(b2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(b2.disallowed_web_fetch_domains.contains("evil.example"));
+    }
+
     #[test]
     fn scope_root_unifies_repo_subdirectories() {
         let tmp = tempfile::tempdir().unwrap();

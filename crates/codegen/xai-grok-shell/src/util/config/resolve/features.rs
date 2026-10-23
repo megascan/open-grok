@@ -1,6 +1,58 @@
 use crate::util::config::RemoteSettings;
 use toml::Value as TomlValue;
 
+pub(crate) fn resolve_repo_status_in_system_prompt(remote: Option<&RemoteSettings>) -> bool {
+    let user_config = crate::config::load_effective_config().ok();
+    let requirements = crate::config::load_merged_requirements();
+    let env = std::env::var("GROK_REPO_STATUS_IN_SYSTEM_PROMPT")
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        });
+    compose_repo_status_in_system_prompt(requirements.as_ref(), user_config.as_ref(), remote, env)
+}
+
+fn compose_repo_status_in_system_prompt(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    remote: Option<&RemoteSettings>,
+    env: Option<bool>,
+) -> bool {
+    // Precedence (matches the removed Feature::RepoStatusInSystemPrompt entry):
+    // requirements pin > env > config.toml > remote > default true.
+    let from_toml = |value: Option<&TomlValue>| -> Option<bool> {
+        value?
+            .get("features")?
+            .get("repo_status_in_system_prompt")?
+            .as_bool()
+    };
+    from_toml(requirements)
+        .or(env)
+        .or_else(|| from_toml(user))
+        .or_else(|| remote.and_then(|r| r.repo_status_in_system_prompt))
+        .unwrap_or(true)
+}
+
+pub(crate) fn resolve_turn_transient_retry(remote: Option<bool>) -> bool {
+    let config = crate::config::load_effective_config().ok();
+    let requirements = crate::config::load_merged_requirements();
+    let from_toml = |value: Option<&TomlValue>| {
+        value?
+            .get("features")?
+            .get("turn_transient_retry")?
+            .as_bool()
+    };
+    crate::agent::config::BoolFlag::env("OPENGROK_TRANSIENT_TURN_RETRY")
+        .requirement(from_toml(requirements.as_ref()))
+        .config(from_toml(config.as_ref()))
+        .feature_flag(remote)
+        .default(true)
+        .resolve()
+        .value
+}
+
 /// Resolve whether ZDR users are allowed to use the product.
 ///
 /// Precedence: requirements > env > config.toml > managed > remote settings > default (false).
@@ -78,6 +130,7 @@ fn remote_fetch_enabled_from_layers(layers: &crate::config::ConfigLayers) -> boo
         system_requirements,
         mdm_requirements,
         campaigns: _,
+        env_overlay: _,
     } = layers;
     [
         mdm_requirements.as_ref(),

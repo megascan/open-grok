@@ -388,3 +388,143 @@ fn test_single_pass_reports_bytes_read() {
         "bytes_read should be non-zero for non-empty file"
     );
 }
+
+#[test]
+fn incremental_prompts_preserve_rewind_markers_phantoms_and_bad_lines() {
+    use std::io::Write as _;
+
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    let user = |text: &str, index: Option<usize>| {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": text },
+        });
+        if let Some(index) = index {
+            update["_meta"] = serde_json::json!({"promptIndex": index});
+        }
+        acp_update(&update.to_string())
+    };
+    for line in [
+        user("legacy ", None),
+        user("café", None),
+        "{malformed".into(),
+        user("old", Some(1)),
+        xai_update(r#"{"sessionUpdate":"rewind_marker","target_prompt_index":1}"#),
+        user("phantom", None),
+        user("replacement", Some(1)),
+        user(" plus\nline", Some(1)),
+    ] {
+        writeln!(f, "{line}").unwrap();
+    }
+    // An invalid UTF-8 line is also a boundary, and must not discard later lines.
+    f.write_all(b"\xff\n").unwrap();
+    writeln!(f, "{}", user("final", Some(2))).unwrap();
+    writeln!(
+        f,
+        "{}",
+        acp_update(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply"}}"#
+        )
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    let (content, bytes) = collect_all_indexable_content_single_pass(f.path()).unwrap();
+    let expected = "legacy café\n\nreplacement plus\nline\n\nfinal\n\nreply\n\n";
+    assert_eq!(content, expected);
+    assert_eq!(bytes, f.as_file().metadata().unwrap().len());
+    let summary = test_summary("s", "/workspace", "title");
+    let doc = build_session_doc(&summary, content);
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"title\0");
+    hash.update(expected.as_bytes());
+    assert_eq!(doc.content_hash, hash.finalize().to_hex().to_string());
+}
+
+#[test]
+fn incremental_prompts_keep_utf8_boundary_at_search_cap() {
+    let text = format!("a{}", "é".repeat(100_001));
+    let update = serde_json::json!({
+        "sessionUpdate": "user_message_chunk",
+        "content": { "type": "text", "text": text },
+    });
+    let f = write_updates_jsonl(&[acp_update(&update.to_string())]);
+    let (content, _) = collect_all_indexable_content_single_pass(f.path()).unwrap();
+    let joined = format!("{}\n\n\n\n", update["content"]["text"].as_str().unwrap());
+    let mut start = joined.len() - SEARCH_CONTENT_CHAR_LIMIT;
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    assert_eq!(content, joined[start..]);
+    assert!(content.len() <= SEARCH_CONTENT_CHAR_LIMIT);
+}
+
+/// Optional allocation/work measurement; the file stays below the bootstrap
+/// size limit and contains almost exclusively non-user updates.
+#[test]
+#[ignore = "synthetic session-search resource measurement"]
+fn synthetic_non_user_transcript_event_storage() {
+    use std::io::Write as _;
+    use std::time::Instant;
+
+    const NON_USER_LINES: usize = 200_000;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    {
+        let mut writer = std::io::BufWriter::new(f.as_file_mut());
+        let first = acp_update(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first"}}"#,
+        );
+        let thought = acp_update(r#"{"sessionUpdate":"agent_thought_chunk"}"#);
+        let last = acp_update(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"last"}}"#,
+        );
+        writeln!(writer, "{first}").unwrap();
+        for _ in 0..NON_USER_LINES {
+            writeln!(writer, "{thought}").unwrap();
+        }
+        writeln!(writer, "{last}").unwrap();
+        writer.flush().unwrap();
+    }
+    assert!(f.as_file().metadata().unwrap().len() < 30 * 1024 * 1024);
+
+    // A direct capacity check makes the eliminated queue measurable without
+    // relying on allocator or wall-clock noise. This is the prior event shape.
+    let mut old_queue = Vec::new();
+    for _ in 0..NON_USER_LINES {
+        old_queue.push(PromptExtractEvent::NotUserMessage);
+    }
+    let old_queue_bytes = old_queue.capacity() * std::mem::size_of::<PromptExtractEvent>();
+    assert!(old_queue_bytes >= NON_USER_LINES * std::mem::size_of::<PromptExtractEvent>());
+
+    let mut accumulator = PromptAccumulator::default();
+    accumulator.push(PromptExtractEvent::user_text("first"));
+    accumulator.push(PromptExtractEvent::NotUserMessage);
+    let capacity_before = (
+        accumulator.prompts.capacity(),
+        accumulator.current.capacity(),
+    );
+    for _ in 0..NON_USER_LINES {
+        accumulator.push(PromptExtractEvent::NotUserMessage);
+    }
+    assert_eq!(
+        (
+            accumulator.prompts.capacity(),
+            accumulator.current.capacity()
+        ),
+        capacity_before,
+        "non-user events must not accumulate in the reducer"
+    );
+    drop(old_queue);
+
+    let started = Instant::now();
+    let (content, bytes) = collect_all_indexable_content_single_pass(f.path()).unwrap();
+    assert_eq!(content, "first\n\nlast\n\n\n\n");
+    assert_eq!(bytes, f.as_file().metadata().unwrap().len());
+    eprintln!(
+        "synthetic search: lines={}, input_bytes={}, prior_event_capacity_bytes={}, elapsed_ms={}",
+        NON_USER_LINES + 2,
+        bytes,
+        old_queue_bytes,
+        started.elapsed().as_millis()
+    );
+}

@@ -112,6 +112,12 @@ pub(crate) fn provider_items(
             insert_text: "openrouter".to_owned(),
             description: openrouter_description,
         },
+        ArgItem {
+            display: "Antigravity".to_owned(),
+            match_text: "antigravity google oauth acp".to_owned(),
+            insert_text: "antigravity".to_owned(),
+            description: "Connect a Google Antigravity account".to_owned(),
+        },
     ]
 }
 
@@ -123,6 +129,7 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
     match provider.as_str() {
         "xai" | "grok" => Ok(Action::Login),
         "codex" | "openai" | "chatgpt" => Ok(Action::LoginCodex),
+        "antigravity" => Ok(Action::LoginAntigravity),
         "kimi" | "moonshot" => Ok(Action::OpenKimiApiKeyEditor),
         "fireworks" => Ok(Action::OpenFireworksApiKeyEditor),
         "deepseek" | "deep-seek" | "deepseek-api" => Ok(Action::OpenDeepSeekApiKeyEditor),
@@ -136,7 +143,7 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
         }
         "openrouter" | "open-router" | "open_router" => Ok(Action::OpenOpenRouterApiKeyEditor),
         _ => Err(format!(
-            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, /login opencode-go, or /login openrouter",
+            "Unknown provider: {}. Use /login xai, /login codex, /login antigravity, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, /login opencode-go, or /login openrouter",
             args.trim()
         )),
     }
@@ -148,11 +155,11 @@ impl SlashCommand for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter"
+        "Connect xAI, OpenAI Codex, Antigravity, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter"
     }
 
     fn usage(&self) -> &str {
-        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]"
+        "/login [xai|codex|antigravity|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]"
     }
 
     fn takes_args(&self) -> bool {

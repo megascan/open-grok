@@ -12,6 +12,8 @@
 //! headers (proxy auth, OTel context, etc.)
 //! into [`SamplerConfig::extra_headers`] before constructing the client.
 
+mod sse_prefix;
+
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -20,6 +22,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
+use sse_prefix::strip_utf8_bom;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -28,7 +31,8 @@ use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodeModeTransport,
-    ConversationRequest, ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER,
+    ConversationRequest, ConversationResponse, CreateResponseWrapper,
+    DEFAULT_EXACT_REPETITION_MIN_TOKENS, DOOM_LOOP_CHECK_HEADER, EXACT_REPETITION_CHECK_HEADER,
     MessagesRequestWrapper, ModelProvider, NamedCustomToolOutputOccurrence,
     OriginalDetailCustomOutputImageOccurrence, ResponseModelMetadata, Result, SamplingError,
     SentCredential, build_messages_request, is_check_event, messages, parse_error_code, rs,
@@ -82,11 +86,6 @@ async fn acquire_provider_request_permit_from(
     )
 }
 
-/// Parse the `Retry-After` response header as delta-seconds.
-/// Our inference backends only emit integer seconds (never HTTP-date),
-/// so we only handle that form. HTTP-dates silently return `None` and
-/// the caller falls back to exponential backoff.
-/// Capped at 120s to prevent absurdly long sleeps from a misbehaving upstream.
 /// Deserialize a Responses API SSE event, with fallbacks for valid wire
 /// shapes that `async_openai` can't parse.
 ///
@@ -595,9 +594,53 @@ fn normalize_x_search_call(item: &mut serde_json::Value) {
     item.insert("input".to_owned(), serde_json::Value::String(input));
 }
 
+#[cfg(test)]
+#[test]
+fn codex_persistent_requires_runtime_opt_in_and_actual_async_tool() {
+    let mut metadata = xai_grok_sampling_types::CodexModelMetadata::default();
+    let tools = serde_json::json!({"tools":[{"type":"function","name":"send_user_message_async"}]});
+    assert!(codex_persistent_instructions(&tools, &metadata).is_none());
+    metadata.persistent_mode = true;
+    assert!(codex_persistent_instructions(&serde_json::json!({"tools":[]}), &metadata).is_none());
+    assert!(codex_persistent_instructions(&tools, &metadata).is_some());
+    metadata.model_messages.persistent_instructions =
+        Some("Ask{{ approval_request_channel }}".into());
+    assert_eq!(
+        codex_persistent_instructions(&tools, &metadata).as_deref(),
+        Some("Ask via functions.send_user_message_async")
+    );
+}
+
+fn codex_persistent_instructions(
+    body: &serde_json::Value,
+    metadata: &xai_grok_sampling_types::CodexModelMetadata,
+) -> Option<String> {
+    let async_tool_available = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("send_user_message_async")
+            })
+        });
+    if !metadata.persistent_mode || !async_tool_available {
+        return None;
+    }
+    let instructions = metadata.model_messages.persistent_instructions.as_deref().unwrap_or(
+        "Persistent work is active. Fulfill the user's request and continue useful, authorized follow-ups until its completion or stopping condition is reached. Use send_user_message_async for progress while work remains. Keep required unanswered questions pending, respect cancellation, and never expand the user's authorization. Send a final answer when no relevant follow-up remains."
+    );
+    Some(instructions.replace(
+        "{{ approval_request_channel }}",
+        " via functions.send_user_message_async",
+    ))
+}
+
 /// Apply Codex-only fields that async-openai 0.33.1 cannot represent.
 ///
-/// Max and Ultra are distinct local choices, but Codex accepts `max` for both.
+/// Max and Ultra remain distinct; Ultra uses a validated catalog effort.
 /// On live Codex v2 models, Ultra opts into proactive multi-agent delegation.
 /// The policy item exists only in this request body and is never persisted to chat.
 #[cfg(test)]
@@ -1285,6 +1328,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    codex_model: xai_grok_sampling_types::CodexModelMetadata,
     use_responses_lite: bool,
     codex_permissions: Option<crate::config::CodexPermissions>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
@@ -1504,6 +1548,17 @@ impl SamplingClient {
                     })?;
                     headers.insert(HeaderName::from_static("x-api-key"), header_value);
                 }
+                AuthScheme::XGoogApiKey => {
+                    let header_value = HeaderValue::from_str(api_key).map_err(|_| {
+                        tracing::debug!(
+                            "Invalid api_key: cannot be converted to a valid HTTP header"
+                        );
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP header",
+                        )
+                    })?;
+                    headers.insert(HeaderName::from_static("x-goog-api-key"), header_value);
+                }
                 AuthScheme::Bearer => {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
@@ -1600,6 +1655,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            codex_model: config.codex_model,
             use_responses_lite,
             codex_permissions: config.codex_permissions,
             reasoning_effort: config.reasoning_effort,
@@ -1677,12 +1733,18 @@ impl SamplingClient {
             if resolved.is_some() || resolver.fail_closed_on_missing() {
                 headers.remove(AUTHORIZATION);
                 headers.remove(HeaderName::from_static("x-api-key"));
+                headers.remove(HeaderName::from_static("x-goog-api-key"));
             }
             if let Some(resolved) = resolved {
                 match self.defaults.auth_scheme {
                     AuthScheme::XApiKey => {
                         if let Ok(value) = HeaderValue::from_str(&resolved.bearer) {
                             headers.insert(HeaderName::from_static("x-api-key"), value);
+                        }
+                    }
+                    AuthScheme::XGoogApiKey => {
+                        if let Ok(value) = HeaderValue::from_str(&resolved.bearer) {
+                            headers.insert(HeaderName::from_static("x-goog-api-key"), value);
                         }
                     }
                     AuthScheme::Bearer => {
@@ -1722,6 +1784,7 @@ impl SamplingClient {
             has_bearer_resolver = self.bearer_resolver.is_some(),
             has_authorization_header = headers.get(AUTHORIZATION).is_some(),
             has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
+            has_x_goog_api_key_header = headers.get(HeaderName::from_static("x-goog-api-key")).is_some(),
         );
         let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         if let Some(injector) = &self.header_injector {
@@ -1741,12 +1804,15 @@ impl SamplingClient {
     }
 
     /// Tail fragment of the credential in `headers` — `x-api-key`
-    /// (Messages-API scheme) or `Authorization` — per
+    /// (Messages-API scheme), `x-goog-api-key` (Google AI Studio), or `Authorization` — per
     /// [`crate::attribution::BEARER_SUFFIX_LEN`].
     fn sent_fragment_from_headers(headers: &HeaderMap, scheme: &AuthScheme) -> Option<String> {
         let raw = match scheme {
             AuthScheme::XApiKey => headers
                 .get(HeaderName::from_static("x-api-key"))
+                .and_then(|v| v.to_str().ok()),
+            AuthScheme::XGoogApiKey => headers
+                .get(HeaderName::from_static("x-goog-api-key"))
                 .and_then(|v| v.to_str().ok()),
             AuthScheme::Bearer => headers
                 .get(AUTHORIZATION)
@@ -1804,6 +1870,7 @@ impl SamplingClient {
         let auth_prefix = self.current_sent_bearer_suffix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
+            (AuthScheme::XGoogApiKey, Some(_)) => "x-goog-api-key",
             (AuthScheme::Bearer, Some(_)) => "bearer",
             (_, None) => "none",
         };
@@ -1848,6 +1915,25 @@ impl SamplingClient {
 
     fn endpoint(&self, path: &str) -> String {
         self.endpoint.url_for_path(path)
+    }
+
+    fn google_ai_studio_endpoint(&self, model: &str, stream: bool) -> String {
+        let action = if stream {
+            ":streamGenerateContent?alt=sse"
+        } else {
+            ":generateContent"
+        };
+        let base = self.base_url.trim_end_matches('/');
+        let base = base
+            .strip_suffix("/openai")
+            .unwrap_or(base)
+            .trim_end_matches('/');
+        let model_path = if model.starts_with("models/") {
+            format!("{model}{action}")
+        } else {
+            format!("models/{model}{action}")
+        };
+        format!("{base}/{model_path}")
     }
 
     async fn acquire_provider_request_permit(&self) -> Option<OwnedSemaphorePermit> {
@@ -1959,6 +2045,16 @@ impl SamplingClient {
             .then_some(self.defaults.reasoning_effort)
             .flatten()
             .map(|default| request.reasoning_effort.unwrap_or(default));
+        // These fields are OpenRouter's wire projection, not shared reasoning
+        // defaults. Clear them even on a reused or directly supplied request
+        // before any other provider sees the body. Model names and URLs do
+        // not grant gateway-specific wire capabilities.
+        if self.defaults.provider != ModelProvider::OpenRouter {
+            request.reasoning = None;
+            for message in &mut request.messages {
+                message.reasoning = None;
+            }
+        }
         self.provider_adapter.sanitize_chat_request(&mut request);
         if let Some(reasoning_effort) = fireworks_reasoning_effort {
             request.reasoning_effort = Some(reasoning_effort);
@@ -2041,6 +2137,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: payload.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: payload.x_grok_turn_idx.as_deref(),
+            transient_retry: payload.x_grok_transient_retry.as_deref(),
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
@@ -2106,6 +2203,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: payload.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: payload.x_grok_turn_idx.as_deref(),
+            transient_retry: payload.x_grok_transient_retry.as_deref(),
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
@@ -2182,20 +2280,7 @@ impl SamplingClient {
             });
         }
 
-        // Strip UTF-8 BOM if present: eventsource-stream 0.2.3 incorrectly slices BOM at byte 1 instead of 3.
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -2319,6 +2404,19 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions: None,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -2571,20 +2669,9 @@ impl SamplingClient {
             });
         }
 
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if first {
-                    first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
-        let mut event_stream = byte_stream.eventsource();
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
+        let event_stream = byte_stream.eventsource();
+        futures_util::pin_mut!(event_stream);
         let mut collector = CodexRemoteCompactionV2Collector::default();
         while let Some(event) = event_stream.next().await {
             let event =
@@ -2704,6 +2791,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -2728,10 +2816,25 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
+        let persistent_instructions =
+            codex_persistent_instructions(&request_body, &self.defaults.codex_model);
         self.provider_adapter.patch_responses_request(
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -2887,6 +2990,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -2917,10 +3021,25 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
+        let persistent_instructions =
+            codex_persistent_instructions(&request_body, &self.defaults.codex_model);
         self.provider_adapter.patch_responses_request(
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -2947,8 +3066,12 @@ impl SamplingClient {
         if let Some(policy) = self.defaults.doom_loop_recovery
             && self.provider_adapter.sends_doom_loop_opt_in()
         {
-            http_request =
-                http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
+            http_request = http_request
+                .header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string())
+                .header(
+                    EXACT_REPETITION_CHECK_HEADER,
+                    DEFAULT_EXACT_REPETITION_MIN_TOKENS.to_string(),
+                );
         }
         let http_request = self
             .apply_codex_turn_metadata_header(http_request, &request_body)
@@ -3018,20 +3141,7 @@ impl SamplingClient {
 
         let model_metadata = extract_model_metadata(response.headers());
 
-        // Strip UTF-8 BOM if present
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -3172,6 +3282,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -3290,6 +3401,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -3367,20 +3479,7 @@ impl SamplingClient {
 
         let model_metadata = extract_model_metadata(response.headers());
 
-        // Strip UTF-8 BOM if present
-        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-        let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
-            result.map(|bytes| {
-                if is_first {
-                    is_first = false;
-                    if bytes.starts_with(UTF8_BOM) {
-                        return bytes.slice(UTF8_BOM.len()..);
-                    }
-                }
-                bytes
-            })
-        });
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
 
         // Turn raw bytes into SSE events
         let event_stream = byte_stream.eventsource();
@@ -3417,6 +3516,141 @@ impl SamplingClient {
                                             error = %e,
                                             raw_data = %data,
                                             "Failed to deserialize MessageStreamEvent from stream"
+                                        );
+                                        SamplingError::Serialization(e)
+                                    },
+                                ),
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        *had_transport_error = true;
+                        Some(Err(SamplingError::EventStreamError(e.to_string())))
+                    }
+                };
+                std::future::ready(item)
+            })
+            .boxed();
+
+        Ok((events, model_metadata))
+    }
+
+    pub async fn create_google_ai_studio_stream(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<
+            'static,
+            Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>,
+        >,
+        Option<ResponseModelMetadata>,
+    )> {
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.defaults.model.clone());
+        let url = self.google_ai_studio_endpoint(&model, true);
+        let wire_req =
+            xai_grok_sampling_types::conversation::build_google_ai_studio_request(&request);
+
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(&url);
+
+        let http_request = builder
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+            .json(&wire_req);
+
+        let built_request = http_request.build().map_err(|e| {
+            tracing::error!("Failed to build HTTP request: {}", e);
+            SamplingError::Http(e)
+        })?;
+
+        tracing::debug!(
+            url = %built_request.url(),
+            method = %built_request.method(),
+            "Sending Google AI Studio stream request"
+        );
+        Self::log_request_headers(&built_request, "google_ai_studio");
+
+        let response = self.http.execute(built_request).await.map_err(|e| {
+            tracing::debug!("HTTP request failed: {}", e);
+            record_stream_request_failure(&e);
+            e
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::GoogleAiStudioStream,
+                    sent_bearer.as_deref(),
+                );
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {url}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
+            }
+            let model_metadata = extract_model_metadata(response.headers());
+            let retry_after_secs = extract_retry_after(response.headers());
+            let should_retry = extract_should_retry(response.headers());
+            let bytes = response.bytes().await?;
+            let message = user_facing_api_error_message(status, bytes.as_ref());
+            tracing::error!(
+                status = %status,
+                error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
+                model_id = %model,
+                "Google AI Studio API error"
+            );
+            return Err(SamplingError::Api {
+                status,
+                message,
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
+            });
+        }
+
+        let model_metadata = extract_model_metadata(response.headers());
+
+        let byte_stream = strip_utf8_bom(response.bytes_stream());
+
+        let event_stream = byte_stream.eventsource();
+
+        let events = event_stream
+            .scan(false, |had_transport_error, event_res| {
+                if *had_transport_error {
+                    return std::future::ready(None);
+                }
+                let item = match event_res {
+                    Ok(event) => {
+                        let data = &event.data;
+                        if data == "[DONE]" {
+                            return std::future::ready(None);
+                        }
+
+                        tracing::info!(
+                            target: crate::sampling_log::TARGET,
+                            event = "sse_chunk",
+                            backend = "google_ai_studio",
+                            data = %data,
+                        );
+
+                        if let Some(stream_error) = try_parse_stream_error(data) {
+                            Some(Err(stream_error))
+                        } else {
+                            Some(
+                                serde_json::from_str::<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>(data).map_err(
+                                    |e| {
+                                        tracing::error!(
+                                            error = %e,
+                                            raw_data = %data,
+                                            "Failed to deserialize GenerateContentResponse from stream"
                                         );
                                         SamplingError::Serialization(e)
                                     },
@@ -3621,6 +3855,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
@@ -3643,6 +3878,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
@@ -3673,6 +3909,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
@@ -3695,6 +3932,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
@@ -3726,6 +3964,7 @@ impl SamplingClient {
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         let messages_request = build_messages_request(&request);
@@ -3735,6 +3974,7 @@ impl SamplingClient {
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
 
         if let Some(trace) = trace {
@@ -3742,6 +3982,22 @@ impl SamplingClient {
         }
 
         self.create_message_stream(wrapper).await
+    }
+
+    /// Send a conversation request using the Google AI Studio API (streaming).
+    pub async fn conversation_stream_google_ai_studio(
+        &self,
+        mut request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<
+            'static,
+            Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>,
+        >,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
+        self.create_google_ai_studio_stream(request).await
     }
 
     /// Send a conversation request using the Anthropic Messages API (non-streaming).
@@ -3759,6 +4015,7 @@ impl SamplingClient {
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         let messages_request = build_messages_request(&request);
@@ -3768,6 +4025,7 @@ impl SamplingClient {
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
 
         if let Some(trace) = trace {
@@ -3782,8 +4040,18 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse> {
+        self.conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(300))
+            .await
+    }
+
+    /// [`Self::conversation_collect`] with a caller-chosen idle timeout, for short side calls (autocomplete, memory notes) that must give up fast.
+    pub async fn conversation_collect_with_idle_timeout(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+    ) -> Result<ConversationResponse> {
         let request_id = crate::types::RequestId::random();
-        let idle_timeout = std::time::Duration::from_secs(300);
+        let length_policy = request.length_policy;
         let result = match self.api_backend() {
             ApiBackend::ChatCompletions => {
                 let (raw, meta) = self.conversation_stream(request).await?;
@@ -3810,10 +4078,52 @@ impl SamplingClient {
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
             }
+            ApiBackend::GoogleAiStudio => {
+                let (raw, meta) = self.conversation_stream_google_ai_studio(request).await?;
+                let events =
+                    crate::stream::stream_google_ai_studio(raw, meta, request_id, idle_timeout);
+                crate::stream::collect_response(events).await
+            }
         };
-        result
+        let response = result
             .map(|(response, _metrics)| response)
-            .map_err(stream_collect_error)
+            .map_err(stream_collect_error)?;
+        apply_length_policy(length_policy, response)
+    }
+}
+
+/// Applies the request's [`xai_grok_sampling_types::LengthPolicy`] to a collected response.
+/// Fails a `Length` stop the policy rejects, logs the salvage breadcrumb otherwise.
+/// The single gate shared by `drive_l2` and the direct-collect path so the two cannot drift.
+pub(crate) fn apply_length_policy(
+    policy: xai_grok_sampling_types::LengthPolicy,
+    response: xai_grok_sampling_types::ConversationResponse,
+) -> Result<xai_grok_sampling_types::ConversationResponse> {
+    use xai_grok_sampling_types::LengthVerdict;
+    match policy.verdict(&response) {
+        LengthVerdict::Pass => Ok(response),
+        LengthVerdict::Fail => Err(SamplingError::MaxTokensTruncation),
+        LengthVerdict::Salvage => {
+            tracing::info!(
+                content_len = response
+                    .assistant()
+                    .map_or(0, |assistant| assistant.content.len()),
+                completion_tokens = response.usage.as_ref().map(|usage| usage.completion_tokens),
+                "salvaging Length-truncated response per LengthPolicy::CompletePartial"
+            );
+            Ok(response)
+        }
+        LengthVerdict::SalvageToolCalls => {
+            tracing::info!(
+                tool_calls = response.tool_calls().len(),
+                content_len = response
+                    .assistant()
+                    .map_or(0, |assistant| assistant.content.len()),
+                completion_tokens = response.usage.as_ref().map(|usage| usage.completion_tokens),
+                "completing Length-truncated response with completed tool calls"
+            );
+            Ok(response)
+        }
     }
 }
 
@@ -4085,6 +4395,7 @@ mod tests {
 
     fn minimal_config() -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: Some("test-key".to_string()),
             base_url: "https://example.test".to_string(),
             model: "test-model".to_string(),
@@ -4115,6 +4426,7 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,
@@ -4491,6 +4803,7 @@ mod tests {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -4514,6 +4827,11 @@ mod tests {
                 .and_then(|v| v.get("include_usage"))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+        assert!(
+            !obj.keys().any(|k| k.starts_with("x_grok_")),
+            "x_grok_* are header fields and must never serialize into the body: {:?}",
+            obj.keys().collect::<Vec<_>>()
         );
 
         assert!(
@@ -4675,6 +4993,58 @@ mod tests {
             .apply_defaults(unsupported_input)
             .expect("unsupported Fireworks defaults");
         assert_eq!(unsupported_request.reasoning_effort, None);
+    }
+
+    #[test]
+    fn openrouter_reasoning_wire_fields_are_provider_scoped() {
+        use xai_grok_sampling_types::ChatReasoningConfig;
+
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Kimi,
+            ModelProvider::Fireworks,
+            ModelProvider::DeepSeek,
+            ModelProvider::OpenCodeGo,
+            ModelProvider::Wafer,
+            ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
+            ModelProvider::OpenRouter,
+            ModelProvider::Custom,
+        ] {
+            let mut config = minimal_config();
+            config.provider = provider;
+            // Identical gateway-looking metadata must not determine policy.
+            config.model = "anthropic/claude-sonnet-4".to_owned();
+            config.base_url = "https://openrouter.ai/api/v1".to_owned();
+            let client = SamplingClient::new(config).expect("Chat Completions client");
+            let mut assistant = ChatRequestMessage::assistant(
+                "answer",
+                "anthropic/claude-sonnet-4",
+                Some("portable thoughts".to_owned()),
+            );
+            assistant.reasoning = Some("gateway thoughts".to_owned());
+            let mut request =
+                ChatCompletionRequest::new("anthropic/claude-sonnet-4", vec![assistant]);
+            request.reasoning = Some(ChatReasoningConfig::effort(ReasoningEffort::High));
+            let request = client.apply_defaults(request).expect("provider defaults");
+            let wire = serde_json::to_value(request).expect("serializes");
+            if provider == ModelProvider::OpenRouter {
+                assert_eq!(wire["reasoning"]["effort"], "high");
+                assert_eq!(wire["messages"][0]["reasoning"], "gateway thoughts");
+                assert!(wire["messages"][0].get("reasoning_content").is_none());
+            } else {
+                assert!(wire.get("reasoning").is_none(), "{provider:?}");
+                assert!(
+                    wire["messages"][0].get("reasoning").is_none(),
+                    "{provider:?}"
+                );
+                assert_eq!(
+                    wire["messages"][0]["reasoning_content"], "portable thoughts",
+                    "{provider:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4931,6 +5301,7 @@ mod tests {
             model_id: "model-1",
             session_id: "session-1",
             turn_idx: Some("7"),
+            transient_retry: Some("7"),
             agent_id: "agent-1",
             deployment_id: Some("deployment-1"),
             user_id: Some("user-1"),
@@ -4947,6 +5318,7 @@ mod tests {
             ("x-grok-model-override", "model-1"),
             ("x-grok-session-id", "session-1"),
             ("x-grok-turn-idx", "7"),
+            ("x-grok-transient-retry", "7"),
             ("x-grok-agent-id", "agent-1"),
             ("x-grok-deployment-id", "deployment-1"),
             ("x-grok-user-id", "user-1"),
@@ -4960,18 +5332,24 @@ mod tests {
             );
         }
 
-        let codex = headers
-            .apply_for_provider(http.post("https://example.test"), ModelProvider::Codex)
-            .build()
-            .expect("Codex request should build");
-        assert!(
-            codex
-                .headers()
-                .keys()
-                .all(|name| !name.as_str().starts_with("x-grok-")),
-            "Codex must not receive any x-grok tracking headers: {:?}",
-            codex.headers()
-        );
+        for registration in &crate::provider::PROVIDER_REGISTRY {
+            if registration.provider == ModelProvider::Xai {
+                continue;
+            }
+            let request = headers
+                .apply_for_provider(http.post("https://example.test"), registration.provider)
+                .build()
+                .expect("provider request should build");
+            assert!(
+                request
+                    .headers()
+                    .keys()
+                    .all(|name| !name.as_str().starts_with("x-grok-")),
+                "{:?} must not receive any x-grok tracking headers: {:?}",
+                registration.provider,
+                request.headers()
+            );
+        }
     }
 
     /// The ChatGPT Codex backend activates the per-conversation prompt cache
@@ -4989,6 +5367,7 @@ mod tests {
             model_id: "model-1",
             session_id: "session-1",
             turn_idx: Some("7"),
+            transient_retry: Some("7"),
             agent_id: "agent-1",
             deployment_id: None,
             user_id: None,
@@ -6787,5 +7166,52 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    #[test]
+    fn google_ai_studio_endpoint_formatting() {
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Gemini;
+        cfg.api_backend = ApiBackend::GoogleAiStudio;
+        cfg.auth_scheme = AuthScheme::XGoogApiKey;
+        cfg.base_url = "https://generativelanguage.googleapis.com/v1beta/openai".to_string();
+        let client = SamplingClient::new(cfg).unwrap();
+
+        assert_eq!(
+            client.google_ai_studio_endpoint("gemini-2.5-flash", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            client.google_ai_studio_endpoint("gemini-2.5-flash", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            client.google_ai_studio_endpoint("models/gemini-2.5-pro", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn google_ai_studio_auth_scheme_and_header() {
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Gemini;
+        cfg.api_backend = ApiBackend::GoogleAiStudio;
+        cfg.auth_scheme = AuthScheme::XGoogApiKey;
+        cfg.api_key = Some("test-goog-key-123".to_string());
+        cfg.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
+        let client = SamplingClient::new(cfg).unwrap();
+
+        let req = client.post("https://generativelanguage.googleapis.com/v1beta/test");
+        let built = req.builder.build().unwrap();
+        assert_eq!(
+            built.headers().get("x-goog-api-key").unwrap(),
+            "test-goog-key-123"
+        );
+        assert!(
+            built
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 }

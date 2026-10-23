@@ -14,10 +14,6 @@ use crate::app::app_view::{
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 
-// ---------------------------------------------------------------------------
-// Auth dispatch
-// ---------------------------------------------------------------------------
-
 /// Open the provider chooser for a bare `/login` without starting any auth
 /// flow. Startup and re-auth callers continue to dispatch concrete `Login`
 /// directly. The session-less dashboard reopens the shared slash provider
@@ -132,6 +128,24 @@ pub(super) fn dispatch_login_codex(app: &mut AppView) -> Vec<Effect> {
         agent_id,
         purpose: CodexLoginPurpose::Independent,
     }]
+}
+
+/// External account operations are initiated only by an explicit UI action.
+pub(super) fn dispatch_antigravity_auth(app: &mut AppView, logout: bool) -> Vec<Effect> {
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    };
+    app.show_toast(if logout {
+        "Signing out of Antigravity…"
+    } else {
+        "Starting Antigravity sign-in…"
+    });
+    if logout {
+        vec![Effect::LogoutAntigravity { agent_id }]
+    } else {
+        vec![Effect::LoginAntigravity { agent_id }]
+    }
 }
 
 /// Select and persist a visible model paired with a first-run provider.
@@ -892,7 +906,7 @@ pub(super) fn handle_auth_complete(
                         "Re-authenticated. Retrying\u{2026}".to_string(),
                     ));
                     agent.session.enqueue_in_flight_prompt_front(prompt);
-                    let drain = maybe_drain_queue(agent);
+                    let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
                     retry_effects.extend(drain.effects);
                     page_flips.push((agent.session.id, drain.page_flip_entry));
                 }

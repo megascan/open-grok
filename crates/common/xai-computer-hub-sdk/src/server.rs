@@ -184,8 +184,8 @@ pub trait ToolServerHandler: Send + Sync + 'static {
     /// `frame.tool_id` was set when the harness routed the hook to a
     /// specific tool (e.g. [`HookEvent::Cancel`] with the matching
     /// `tool_id`); `None` when the hook is session-wide (broadcast).
-    /// Implementations route by `frame.event` shape and may
-    /// abort in-flight calls correlated by `frame.call_id`.
+    /// For a [`HookEvent::Cancel`], the targeted calls' tokens are already cancelled when this runs.
+    /// Per-call cleanup belongs in the call's drop guard or its [`Cancellation`] handle.
     ///
     /// Default is a no-op so existing handlers do not need to opt in.
     /// Override to receive cancel / pause / resume / session-ended /
@@ -235,6 +235,8 @@ pub struct ToolServerBuilder {
     ws_ping_interval: Option<std::time::Duration>,
     ws_liveness_deadline: Option<std::time::Duration>,
     reconnect_backoff: Option<Arc<[std::time::Duration]>>,
+    reconnect_after_terminal_close_codes: Vec<u16>,
+    initial_connect_attempt_timeout: Option<std::time::Duration>,
     session_handler_resolver: Option<SessionHandlerResolver>,
     binary_version: Option<String>,
     image_capabilities: Vec<String>,
@@ -323,12 +325,29 @@ impl ToolServerBuilder {
     /// Connection knobs handed to [`HubConnection::connect`].
     /// `reconnect_attempt_reset_after` is left `None` so the SDK applies
     /// the 10 s production dwell — not zero, not "never".
+    pub fn reconnect_after_terminal_close_codes(
+        mut self,
+        codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let mut codes: Vec<u16> = codes.into_iter().collect();
+        codes.sort_unstable();
+        codes.dedup();
+        self.reconnect_after_terminal_close_codes = codes;
+        self
+    }
+    pub fn with_initial_connect_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.initial_connect_attempt_timeout = Some(timeout);
+        self
+    }
     pub(crate) fn connection_tuning(&self) -> ConnectionTuning {
         ConnectionTuning {
             ws_ping_interval: self.ws_ping_interval,
             ws_liveness_deadline: self.ws_liveness_deadline,
             reconnect_backoff: self.reconnect_backoff.clone(),
             reconnect_attempt_reset_after: None,
+            reconnect_after_terminal_close_codes: self.reconnect_after_terminal_close_codes.clone(),
+            initial_connect_attempt_timeout: self.initial_connect_attempt_timeout,
+            auth_refresh_poll: None,
         }
     }
 
@@ -911,7 +930,11 @@ impl ToolServer {
         }
 
         let (tx, rx) = mpsc::channel(SESSION_INBOX_BUFFER);
-        connection.demux().register_session_inbox(sid.clone(), tx);
+        // Full rebind: the dead loop's sender goes now, so the session holds
+        // only the live inbox.
+        let demux = connection.demux();
+        demux.unregister_session_inbox(&sid);
+        demux.register_session_inbox(sid.clone(), tx, None);
         // Tie the per-session admission semaphore to the session-loop
         // lifetime (created here, removed on unbind / loop exit) so a
         // straggler call cannot recreate a leaked entry after teardown.
@@ -2011,18 +2034,7 @@ async fn handle_notification(
         // cancel. Compiler-enforced exhaustiveness keeps new HookEvent
         // variants from silently skipping this dispatch.
         match &frame.event {
-            HookEvent::Cancel => {
-                crate::metrics::cancel_hook_received();
-                if let Some(call_id) = &frame.call_id {
-                    if cancels.cancel(call_id) {
-                        crate::metrics::cancel_applied();
-                    } else {
-                        crate::metrics::cancel_pending_tombstoned();
-                    }
-                } else {
-                    crate::metrics::cancel_no_target();
-                }
-            }
+            HookEvent::Cancel => apply_cancel(cancels, &frame),
             HookEvent::Pause
             | HookEvent::Resume
             | HookEvent::SessionEnded
@@ -2055,6 +2067,25 @@ async fn handle_notification(
         return;
     }
     debug!(?value, %session_id, method = %method, "tool-server received notification (no subscriber)");
+}
+
+/// Dispatch one of the three `Cancel` forms documented on [`HookEvent::Cancel`].
+fn apply_cancel(cancels: &CancelRegistry, frame: &HookFrame) {
+    crate::metrics::cancel_hook_received();
+    match (&frame.call_id, &frame.tool_id) {
+        (Some(call_id), _) => {
+            if cancels.cancel(call_id) {
+                crate::metrics::cancel_applied(1);
+            } else {
+                crate::metrics::cancel_pending_tombstoned();
+            }
+        }
+        (None, None) => match cancels.cancel_live() {
+            0 => crate::metrics::cancel_no_target(),
+            n => crate::metrics::cancel_applied(n),
+        },
+        (None, Some(_)) => crate::metrics::cancel_no_target(),
+    }
 }
 
 /// Execute one `tool_call_request`: parse id/params, admit via the

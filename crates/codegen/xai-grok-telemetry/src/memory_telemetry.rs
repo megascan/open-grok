@@ -4,6 +4,312 @@
 
 use serde::Serialize;
 
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMode {
+    #[default]
+    Legacy,
+    V2,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2Rollout {
+    Off,
+    RecordOnly,
+    Shadow,
+    #[default]
+    Active,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2CaptureStage {
+    #[default]
+    Queued,
+    Claimed,
+    Completed,
+    Noop,
+    Retry,
+    Failed,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2FailureClass {
+    #[default]
+    Disabled,
+    Storage,
+    Lease,
+    Model,
+    MalformedOutput,
+    EmptyOutput,
+    Timeout,
+    Convergence,
+    AccessPolicy,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2DreamDisposition {
+    Ineligible,
+    Ready,
+    Coalesced,
+    Busy,
+    Noop,
+    Shadow,
+    Committed,
+    Reconciled,
+    Retry,
+    #[default]
+    Failed,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2FlushOutcome {
+    #[default]
+    Success,
+    RetryableFailure,
+    TerminalFailure,
+    Timeout,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2TargetKind {
+    #[default]
+    Observation,
+    Topic,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2Component {
+    #[default]
+    Capture,
+    Flush,
+    Dream,
+    GarbageCollection,
+    Forget,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2ControlsPinned {
+    pub rollout: MemoryV2Rollout,
+    pub capture_enabled: bool,
+    pub automatic_dream_enabled: bool,
+    pub manual_dream_enabled: bool,
+    pub file_writes_enabled: bool,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct MemoryV2ModelUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// USD ticks (1e10 ticks = $1); `None` when unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_ticks: Option<i64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2CaptureLifecycle {
+    pub stage: MemoryV2CaptureStage,
+    pub from_turn: u32,
+    pub through_turn: u32,
+    pub attempt: u32,
+    pub observation_count: usize,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<MemoryV2FailureClass>,
+    #[serde(flatten)]
+    pub usage: MemoryV2ModelUsage,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2FlushResult {
+    pub outcome: MemoryV2FlushOutcome,
+    pub target_cursor: u32,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<MemoryV2FailureClass>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2DreamLifecycle {
+    pub disposition: MemoryV2DreamDisposition,
+    pub observation_count: usize,
+    pub topic_change_count: usize,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<MemoryV2FailureClass>,
+    #[serde(flatten)]
+    pub usage: MemoryV2ModelUsage,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2BatchDreamEndStatus {
+    #[default]
+    Drained,
+    Busy,
+    DefaultPlanPending,
+    Timeout,
+    Cancelled,
+    Model,
+    Storage,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2CatalogTier {
+    #[default]
+    Full,
+    ShortDescriptions,
+    TitlesOnly,
+    Partial,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2BatchDreamLimit {
+    CallsPerBatch,
+    RequestBytes,
+    Truncations,
+}
+
+/// `applied_count + no_change_count` is the value signal: notes that left the inbox settled.
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2BatchDreamEnded {
+    pub end_status: MemoryV2BatchDreamEndStatus,
+    pub batch_count: usize,
+    pub model_call_count: usize,
+    pub repair_count: usize,
+    /// Replies cut off at the output limit and answered with a shorter-plan request.
+    pub truncation_count: usize,
+    /// Model calls that were re-sent after a retryable sampling error.
+    pub sampling_retry_count: usize,
+    pub applied_count: usize,
+    pub no_change_count: usize,
+    pub deferred_count: usize,
+    /// Notes archived after repeated deferrals.
+    pub unplaceable_count: usize,
+    pub topic_change_count: usize,
+    pub catalog_topic_count: usize,
+    pub topic_bytes: u64,
+    pub largest_topic_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_tier: Option<MemoryV2CatalogTier>,
+    /// First per-batch limit hit during the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<MemoryV2BatchDreamLimit>,
+    pub latency_ms: u64,
+    #[serde(flatten)]
+    pub usage: MemoryV2ModelUsage,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2CarryoverOutcome {
+    #[default]
+    Imported,
+    Failed,
+}
+
+/// One legacy `MEMORY.md` carried into a v2 scope at session start. Counts
+/// only; no-op starts (no source, unchanged source) emit nothing.
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2CarryoverCompleted {
+    pub scope: MemoryV2Scope,
+    pub outcome: MemoryV2CarryoverOutcome,
+    pub topics_created: u32,
+    pub topics_appended: u32,
+    pub sections_skipped: u32,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2Scope {
+    #[default]
+    Global,
+    Workspace,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2GcCompleted {
+    pub archived_observations_removed: u64,
+    pub terminal_jobs_removed: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2Forgotten {
+    pub target_kind: MemoryV2TargetKind,
+    pub was_already_forgotten: bool,
+    pub tombstone_count: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2FailClosed {
+    pub component: MemoryV2Component,
+    pub reason: MemoryV2FailureClass,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySearchSource {
+    #[default]
+    Tool,
+    Injection,
+    CompactionRecovery,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySearchMode {
+    #[default]
+    FtsOnly,
+    Hybrid,
+    EmbeddingFallback,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySearchOutcome {
+    #[default]
+    Results,
+    Empty,
+    Error,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySearchErrorClass {
+    IndexOpen,
+    Fts,
+    Vector,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryInjectionOutcome {
+    #[default]
+    Results,
+    Empty,
+    Error,
+    Skipped,
+}
+
 #[derive(Serialize)]
 pub struct MemorySessionInit {
     pub session_id: String,
@@ -75,6 +381,7 @@ pub struct MemoryInjection {
     pub top_score: f64,
     pub configured_min_score: f64,
     pub injection_duration_ms: u64,
+    pub compact_index: bool,
 }
 
 #[derive(Serialize)]
@@ -115,4 +422,22 @@ pub struct MemorySessionSummary {
     pub dream_count: u64,
     pub dream_success_count: u64,
     pub dream_error_count: u64,
+    #[serde(default)]
+    pub memory_enabled: bool,
+    #[serde(default)]
+    pub memory_mode: MemoryMode,
+    #[serde(default)]
+    pub capture_prompt_tokens: u64,
+    #[serde(default)]
+    pub capture_completion_tokens: u64,
+    #[serde(default)]
+    pub capture_cost_usd_ticks: u64,
+    #[serde(default)]
+    pub dream_prompt_tokens: u64,
+    #[serde(default)]
+    pub dream_completion_tokens: u64,
+    #[serde(default)]
+    pub dream_cost_usd_ticks: u64,
+    #[serde(default)]
+    pub injected_bytes: u64,
 }

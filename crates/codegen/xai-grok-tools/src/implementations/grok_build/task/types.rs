@@ -24,9 +24,17 @@ use educe::Educe;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_tool_types::SubagentContextMode;
-use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
+use xai_tool_types::{
+    HandedOffSubagentState, SubagentCapabilityMode, SubagentIsolationMode, WaitMode,
+};
 
 use crate::register_resource;
+
+pub use super::active_message::{
+    ActiveAgentMessage, ActiveAgentMessageDelivery, ActiveAgentMessageOperation,
+    ActiveAgentMessageOutcome, ActiveAgentMessageRequest, MAX_ACTIVE_AGENT_MESSAGE_BYTES,
+    SubagentActiveMessageRequest,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SubagentOwner {
@@ -224,6 +232,8 @@ pub struct SubagentRequest {
     pub context: SubagentContextRequest,
     pub owner: SubagentOwner,
     pub cancel_token: CancellationToken,
+    /// Model tool call that issued this spawn; `None` for harness-internal spawns.
+    pub tool_call_id: Option<String>,
 }
 
 impl SubagentRequest {
@@ -438,6 +448,79 @@ pub struct WaitAgentMessagesOutput {
     pub timed_out: bool,
 }
 
+/// Runtime-only lease for a mailbox batch. Dropping it releases the batch;
+/// committing it removes the batch after its result enters the conversation.
+pub struct MailboxReceipt(Option<Box<dyn FnOnce(bool) + Send + 'static>>);
+
+impl MailboxReceipt {
+    #[doc(hidden)]
+    pub fn new(settle: impl FnOnce(bool) + Send + 'static) -> Self {
+        Self(Some(Box::new(settle)))
+    }
+
+    pub fn commit(mut self) {
+        if let Some(settle) = self.0.take() {
+            settle(true);
+        }
+    }
+}
+
+impl fmt::Debug for MailboxReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MailboxReceipt(..)")
+    }
+}
+
+impl Drop for MailboxReceipt {
+    fn drop(&mut self) {
+        if let Some(settle) = self.0.take() {
+            settle(false);
+        }
+    }
+}
+
+/// Per-invocation handoff, deliberately excluded from the serialized tool output.
+#[derive(Debug, Clone, Default)]
+pub struct MailboxReceiptSlot(Arc<std::sync::Mutex<Option<MailboxReceipt>>>);
+
+impl MailboxReceiptSlot {
+    pub fn put(&self, receipt: MailboxReceipt) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(receipt);
+    }
+
+    pub fn take(&self) -> Option<MailboxReceipt> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentMailboxDelivery {
+    pub output: WaitAgentMessagesOutput,
+    pub receipt: Option<MailboxReceipt>,
+}
+
+impl From<WaitAgentMessagesOutput> for AgentMailboxDelivery {
+    fn from(output: WaitAgentMessagesOutput) -> Self {
+        Self {
+            output,
+            receipt: None,
+        }
+    }
+}
+
+impl std::ops::Deref for AgentMailboxDelivery {
+    type Target = WaitAgentMessagesOutput;
+    fn deref(&self) -> &Self::Target {
+        &self.output
+    }
+}
+
 /// Spawn command envelope owned by the coordinator mailbox.
 #[derive(Educe)]
 #[educe(Debug)]
@@ -445,6 +528,8 @@ pub struct SubagentSpawnRequest {
     pub request: Box<SubagentRequest>,
     #[educe(Debug(ignore))]
     pub result_tx: oneshot::Sender<SubagentResult>,
+    /// Runtime-only, unique lifecycle receipt transferred with this command.
+    pub admission_reservation: Option<crate::notification::SubagentAdmissionReservation>,
 }
 
 impl std::ops::Deref for SubagentSpawnRequest {
@@ -465,6 +550,9 @@ impl SubagentSpawnRequest {
         build: impl FnOnce(&SubagentRequest) -> SubagentResult,
     ) -> Result<(), SubagentResult> {
         let result = build(&self.request);
+        if let Some(reservation) = self.admission_reservation {
+            reservation.reject();
+        }
         self.result_tx.send(result)
     }
 }
@@ -478,8 +566,10 @@ pub enum ModelOverrideProvenance {
     /// Internal harness, role, persona, or config resolution.
     #[default]
     Harness,
-    /// A model-facing `Task.model` argument.
-    Tool,
+    /// A model-facing task call, carrying the selection mode its tool schema advertised.
+    Tool {
+        selection: super::model_policy::TaskModelSelection,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -672,6 +762,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::Write,
                 ToolKind::Delete,
                 ToolKind::Move,
+                ToolKind::Feedback,
                 ToolKind::Plan,
                 ToolKind::MemorySearch,
                 ToolKind::MemoryGet,
@@ -717,6 +808,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::Write,
                 ToolKind::Delete,
                 ToolKind::Move,
+                ToolKind::Feedback,
                 ToolKind::Execute,
                 ToolKind::Plan,
                 ToolKind::MemorySearch,
@@ -766,6 +858,9 @@ pub struct SubagentResult {
     pub output_usage_incomplete: bool,
     /// Path to the isolated worktree if one was created.
     pub worktree_path: Option<String>,
+    /// Type the child actually ran as, after resume inheritance. Empty when the
+    /// coordinator did not stamp it.
+    pub subagent_type: String,
     /// Set when a blocking subagent exceeded its await budget and was
     /// auto-backgrounded: the child is still running (result via auto-wake /
     /// `get_command_or_subagent_output`), so the tool returns a `task_id` notice
@@ -790,6 +885,7 @@ impl Default for SubagentResult {
             total_tokens_used: 0,
             output_usage_incomplete: false,
             worktree_path: None,
+            subagent_type: String::new(),
             backgrounded: false,
         }
     }
@@ -851,7 +947,7 @@ pub struct AgentMailboxWaitRequest {
     pub identity: AgentMailboxIdentity,
     pub timeout_ms: u64,
     #[educe(Debug(ignore))]
-    pub respond_to: oneshot::Sender<WaitAgentMessagesOutput>,
+    pub respond_to: oneshot::Sender<AgentMailboxDelivery>,
 }
 
 #[derive(Educe)]
@@ -984,6 +1080,7 @@ pub struct SubagentCompletionSummary {
     pub subagent_id: String,
     pub subagent_type: String,
     pub description: String,
+    pub loop_task_id: Option<String>,
     pub success: bool,
     pub duration_ms: u64,
     pub tool_calls: u32,
@@ -1041,6 +1138,15 @@ pub struct SubagentOutstandingReply {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentOutstandingRequest {
+    pub parent_session_id: String,
+    pub prompt_id: String,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<SubagentOutstandingReply>,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentWaitPromptDrainedRequest {
     pub parent_session_id: String,
     pub prompt_id: String,
     #[educe(Debug(ignore))]
@@ -1127,6 +1233,23 @@ pub struct SubagentSpawnedRefsRequest {
     pub respond_to: oneshot::Sender<Vec<SpawnedSubagentRef>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandedOffForegroundSubagent {
+    pub subagent_id: String,
+    pub tool_call_id: String,
+    pub description: String,
+    pub state: HandedOffSubagentState,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentHandOffForegroundRequest {
+    pub parent_session_id: String,
+    pub prompt_id: String,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<Vec<HandedOffForegroundSubagent>>,
+}
+
 /// In-memory source data used by a runtime adapter to resume a child.
 #[derive(Debug, Clone)]
 pub struct SubagentResumeSource {
@@ -1162,8 +1285,8 @@ pub enum SubagentValidateTypeOutcome {
     NotAllowed {
         allowed: Vec<String>,
     },
-    /// Coordinator unreachable; distinct from `Unknown` (the type may be valid).
     ValidationUnavailable,
+    CoordinatorGone,
 }
 
 #[derive(Educe)]
@@ -1251,6 +1374,7 @@ pub struct SubagentDescribeRequest {
 /// Coordinator message enum. Kept exhaustive so every actor command is handled.
 pub enum SubagentEvent {
     Spawn(SubagentSpawnRequest),
+    SendActiveMessage(SubagentActiveMessageRequest),
     NativeAgent(NativeAgentRequest),
     Query(SubagentQueryRequest),
     ListAgents(AgentListRequest),
@@ -1274,11 +1398,13 @@ pub enum SubagentEvent {
         parent_session_id: String,
     },
     Outstanding(SubagentOutstandingRequest),
+    WaitPromptDrained(SubagentWaitPromptDrainedRequest),
     ClearUsageNotApplied(SubagentClearUsageNotAppliedRequest),
     MarkUsageNotApplied(SubagentMarkUsageNotAppliedRequest),
     RegistryCounts(SubagentRegistryCountsRequest),
     Inspect(SubagentInspectRequest),
     SpawnedRefs(SubagentSpawnedRefsRequest),
+    HandOffForeground(SubagentHandOffForegroundRequest),
     ValidateType(SubagentValidateTypeRequest),
     DescribeType(SubagentDescribeRequest),
     LoopUnitActive(SubagentLoopUnitActiveRequest),
@@ -1290,6 +1416,18 @@ pub enum SubagentEvent {
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct SubagentEventSender(#[educe(Debug(ignore))] pub mpsc::UnboundedSender<SubagentEvent>);
+
+impl SubagentEventSender {
+    pub fn send(&self, event: SubagentEvent) -> Result<(), mpsc::error::SendError<SubagentEvent>> {
+        self.0.send(event)
+    }
+}
+
+impl From<mpsc::UnboundedSender<SubagentEvent>> for SubagentEventSender {
+    fn from(tx: mpsc::UnboundedSender<SubagentEvent>) -> Self {
+        Self(tx)
+    }
+}
 
 register_resource!("grok_build", "SubagentEventSender", SubagentEventSender);
 
@@ -2102,6 +2240,7 @@ mod tests {
             subagent_id: "sub-1".into(),
             subagent_type: "general-purpose".into(),
             description: "test task".into(),
+            loop_task_id: None,
             success: true,
             duration_ms: 1500,
             tool_calls: 7,

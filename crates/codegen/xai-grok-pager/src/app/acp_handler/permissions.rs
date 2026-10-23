@@ -47,6 +47,7 @@ pub(super) fn handle_permission_request(
     //    `enqueue_permission` even in YOLO mode (won't pick
     //    `AllowAlways` by default).
     if agent.session.is_yolo()
+        && !crate::app::sandbox_permission::is_sandbox(&perm.request)
         && let Some(allow) = perm
             .request
             .options
@@ -61,7 +62,7 @@ pub(super) fn handle_permission_request(
                 )),
             )))
             .ok();
-        return false; // no redraw needed
+        return false;
     }
 
     // 3. Fire notification so the user notices the pending approval.
@@ -155,7 +156,7 @@ fn enqueue_permission(
     let subagent_label = resolve_subagent_label(agent, &perm.request.session_id);
 
     // 3. Build title and description from the tool call.
-    let (title, description, bash_command_raw) = build_permission_display(
+    let (mut title, mut description, mut bash_command_raw) = build_permission_display(
         &perm.request,
         bash_highlights.as_ref(),
         #[cfg(feature = "local-workspace")]
@@ -166,6 +167,12 @@ fn enqueue_permission(
         #[cfg(not(feature = "local-workspace"))]
         false,
     );
+
+    let sandbox = crate::app::sandbox_permission::is_sandbox(&perm.request);
+    if sandbox {
+        (title, description) = crate::app::sandbox_permission::display(&perm.request);
+        bash_command_raw = None;
+    }
 
     // 4. Assign a monotonic ID.
     let perm_id = agent.next_perm_req_id;
@@ -190,11 +197,19 @@ fn enqueue_permission(
     }
 
     // 6. Clone options before moving perm into the struct.
-    let options = perm.request.options.clone();
+    let options = if sandbox {
+        crate::app::sandbox_permission::options(&perm.request)
+    } else {
+        perm.request.options.clone()
+    };
 
     // 7. Cursor preselection (sticky last-used → configured default → the
     //    enable-always-approve row → index 0). See `permission_cursor`.
-    let active_idx = crate::appearance::permission_cursor::resolve_initial_cursor(&options);
+    let active_idx = if sandbox {
+        0
+    } else {
+        crate::appearance::permission_cursor::resolve_initial_cursor(&options)
+    };
 
     // 8. Queue the request FIFO (do NOT replace/cancel existing requests).
     agent.permission_queue.push_back(PermissionViewState {
@@ -203,16 +218,17 @@ fn enqueue_permission(
         focus: PermissionFocus::Options,
         options,
         active_idx,
-        bash_highlights,
+        bash_highlights: if sandbox { None } else { bash_highlights },
         bash_selection_count,
         bash_deny_selection_count,
         bash_command_raw,
-        mcp_scope,
+        mcp_scope: if sandbox { None } else { mcp_scope },
         title,
         description,
-        args_expanded: false,
+        args_expanded: sandbox,
         desc_scroll: 0,
         subagent_label,
+        sandbox_visible_area: None,
         options_area_height: 0,
         options_scroll_offset: 0,
     });
@@ -223,7 +239,7 @@ fn enqueue_permission(
     // turn ended". The same field powers the dashboard relative-time label.
     agent.last_active_at = Some(std::time::Instant::now());
 
-    true // needs redraw
+    true
 }
 
 /// Build a subagent provenance label for display.
@@ -258,14 +274,7 @@ fn resolve_subagent_label(agent: &AgentView, session_id: &acp::SessionId) -> Opt
     Some("Child session (untracked):".to_string())
 }
 
-/// Build title, description lines, and optional raw command for a permission request.
-///
-/// Deserializes `raw_input` into the shared [`BashToolInput`] from
-/// `xai-grok-tools` for typed access to `command` and `description`.
-/// Falls back to ACP-level `title`/`kind` fields when deserialization fails.
-///
-/// Returns `(title, description, bash_command_raw)`.
-fn build_permission_display(
+pub(super) fn build_permission_display(
     req: &acp::RequestPermissionRequest,
     bash_highlights: Option<&BashCommandHighlights>,
     session_local_workspace: bool,
@@ -276,11 +285,19 @@ fn build_permission_display(
         serde_json::from_value::<xai_grok_tools::implementations::BashToolInput>(v.clone()).ok()
     });
 
+    let ask = hook_ask(req);
+    let acp_title = req
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .map(|title| match &ask {
+            Some(ask) => ask.strip_prompt_header(title),
+            None => title,
+        });
+
     let raw_command = bash_input.as_ref().map(|b| b.command.clone()).or_else(|| {
-        req.tool_call
-            .fields
-            .title
-            .as_deref()
+        acp_title
             .and_then(|t| t.strip_prefix("Execute `"))
             .and_then(|t| t.strip_suffix('`'))
             .map(|s| s.to_string())
@@ -314,7 +331,7 @@ fn build_permission_display(
             .and_then(|v| v.as_str());
         if let Some(path) = file_path {
             format!("Allow Edit to {}?", path)
-        } else if let Some(ref t) = req.tool_call.fields.title {
+        } else if let Some(t) = acp_title {
             format!(
                 "Allow {}?",
                 xai_grok_workspace::permission::mcp_pretty_name_if_qualified(t)
@@ -322,7 +339,7 @@ fn build_permission_display(
         } else {
             "Allow Edit?".to_string()
         }
-    } else if let Some(ref t) = req.tool_call.fields.title {
+    } else if let Some(t) = acp_title {
         format!(
             "Allow {}?",
             xai_grok_workspace::permission::mcp_pretty_name_if_qualified(t)
@@ -337,7 +354,7 @@ fn build_permission_display(
     };
 
     let title = qualify_permission_title_for_local_workspace(title, session_local_workspace);
-    let description = permission_description_lines(req);
+    let description = permission_description_lines(req, ask.as_ref());
     let bash_cmd = if is_execute { raw_command } else { None };
     (title, description, bash_cmd)
 }
@@ -359,16 +376,30 @@ fn qualify_permission_title_for_local_workspace(
     format!("{title} (on your machine)")
 }
 
-/// Lines shown under the permission title: protected-edit note (if any), then
-/// MCP planned-argument lines (empty for bash/edit).
-fn permission_description_lines(req: &acp::RequestPermissionRequest) -> Vec<String> {
+fn permission_description_lines(
+    req: &acp::RequestPermissionRequest,
+    hook_ask: Option<&xai_grok_workspace::permission::HookAsk>,
+) -> Vec<String> {
     let mut lines = mcp_args_lines(req);
     if is_edit_permission(req)
         && let Some(desc) = protected_edit_description(req)
     {
         lines.insert(0, desc);
     }
+    if let Some(ask) = hook_ask {
+        lines.insert(0, ask.ask_line());
+    }
     lines
+}
+
+fn hook_ask(
+    req: &acp::RequestPermissionRequest,
+) -> Option<xai_grok_workspace::permission::HookAsk> {
+    let value = req
+        .meta
+        .as_ref()?
+        .get(xai_grok_workspace::permission::HOOK_ASK_META_KEY)?;
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn protected_edit_description(req: &acp::RequestPermissionRequest) -> Option<String> {
@@ -467,6 +498,9 @@ fn cli_is_idle_for_recap(agent: &crate::app::agent_view::AgentView) -> bool {
     use crate::app::agent::BgTaskStatus;
 
     if !agent.session.state.is_idle() {
+        return false;
+    }
+    if agent.running_wake_turn.is_some() {
         return false;
     }
     if agent.session.in_flight_prompt.is_some() || agent.has_held_user_queue() {

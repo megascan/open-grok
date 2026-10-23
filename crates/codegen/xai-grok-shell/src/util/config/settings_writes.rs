@@ -1,13 +1,17 @@
 use super::mcp::user_config_path;
 use super::persist::{
     atomic_write_string, lock_config_writes, read_to_string_or_empty, update_config,
+    update_config_and_then, update_config_fields,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
+use xai_grok_config::fs_atomic::BoundDest;
+use xai_grok_config_types::Feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalFeatureFlagSpec {
@@ -16,6 +20,10 @@ pub struct LocalFeatureFlagSpec {
 }
 
 pub const LOCAL_FEATURE_FLAG_SPECS: &[LocalFeatureFlagSpec] = &[
+    LocalFeatureFlagSpec {
+        key: "features.context_management.experimental_mode",
+        default: false,
+    },
     LocalFeatureFlagSpec {
         key: "memory.enabled",
         default: false,
@@ -78,6 +86,10 @@ pub const LOCAL_FEATURE_FLAG_SPECS: &[LocalFeatureFlagSpec] = &[
         default: false,
     },
     LocalFeatureFlagSpec {
+        key: "sandbox.profile",
+        default: false,
+    },
+    LocalFeatureFlagSpec {
         key: "sandbox.auto_allow_bash",
         default: false,
     },
@@ -98,6 +110,11 @@ fn read_nested_bool(root: &TomlValue, key: &str) -> Option<bool> {
     let value = key
         .split('.')
         .try_fold(root, |value, part| value.get(part))?;
+    if key == "sandbox.profile" {
+        return value
+            .as_str()
+            .map(|profile| !matches!(profile, "off" | "none"));
+    }
     if let Some(b) = value.as_bool() {
         return Some(b);
     }
@@ -166,7 +183,14 @@ fn set_nested_bool(root: &mut TomlValue, key: &str, value: bool) {
             current
                 .as_table_mut()
                 .expect("local feature flag parent must be a table")
-                .insert(part.to_string(), TomlValue::Boolean(value));
+                .insert(
+                    part.to_string(),
+                    if key == "sandbox.profile" {
+                        TomlValue::String(if value { "workspace" } else { "off" }.to_owned())
+                    } else {
+                        TomlValue::Boolean(value)
+                    },
+                );
             return;
         }
         let table = current
@@ -185,7 +209,7 @@ pub async fn set_local_feature_flag(key: &'static str, value: bool) -> Result<()
     if local_feature_flag_default(key).is_none() {
         anyhow::bail!("unsupported local feature flag `{key}`");
     }
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let path = user_config_path();
     let contents = read_to_string_or_empty(&path)?;
     let mut root = if contents.trim().is_empty() {
@@ -210,7 +234,10 @@ pub async fn set_local_feature_flag(key: &'static str, value: bool) -> Result<()
 // ---------------------------------------------------------------------------
 
 pub async fn set_perplexity_web_search_enabled(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.perplexity_web_search.enabled = value).await
+    update_config_fields(&["toolset.perplexity_web_search.enabled"], |cfg| {
+        cfg.perplexity_web_search.enabled = value
+    })
+    .await
 }
 
 /// Persist `[toolset.web_search_source].<target>` via `update_config`.
@@ -223,19 +250,14 @@ pub async fn set_web_search_source(
 
 /// Persist `[toolset.x_search].enabled` via `update_config`.
 pub async fn set_x_search_enabled(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.x_search.enabled = value).await
-}
-
-/// Persist `[antigravity].skip_permissions` via `update_config`. The runner
-/// resolves `unwrap_or(true)`, so `Some(false)` is the explicit opt-out that
-/// forces read-only agy subagents; `Some(true)` restores the full-access
-/// default. Read back by `load_antigravity_skip_permissions_sync`.
-pub async fn set_antigravity_skip_permissions(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.antigravity.skip_permissions = Some(value)).await
+    update_config_fields(&["toolset.x_search.enabled"], |cfg| {
+        cfg.x_search.enabled = value
+    })
+    .await
 }
 
 // Settings helpers — typed disk-write wrappers for each setting.
-// All route through `update_config` → `merge_section` → `save_config`.
+// Typed updates are applied as field changes to the raw config.
 // ---------------------------------------------------------------------------
 
 // Process-wide cache for `[ui].follow_up_behavior == "steer"`.
@@ -317,7 +339,7 @@ pub async fn follow_up_steer_enabled() -> bool {
 
 /// Persist `[ui].compact_mode` via `update_config`.
 pub async fn set_compact_mode(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.ui.compact_mode = value).await
+    update_config_fields(&["ui.compact_mode"], |cfg| cfg.ui.compact_mode = value).await
 }
 
 /// Persist `[ui].show_timestamps` via `update_config`. `UiConfig::show_timestamps`
@@ -340,6 +362,75 @@ pub async fn set_confirm_before_rewind(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.confirm_before_rewind = Some(value)).await
 }
 
+pub async fn set_dashboard_preview(value: bool) -> Result<()> {
+    rewrite_user_config_locked("dashboard preview", move |path| {
+        write_dashboard_preview(
+            path,
+            value,
+            crate::util::config::persist::atomic_write_follow_bound,
+        )
+    })
+    .await
+}
+
+pub(super) fn write_dashboard_preview(
+    path: &Path,
+    value: bool,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+) -> Result<()> {
+    rewrite_user_config_table(path, "dashboard preview", write, |root| {
+        let ui = root
+            .entry("ui".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .with_context(|| format!("{} [ui] must be a table", path.display()))?;
+        ui.insert("dashboard_preview".to_owned(), toml::Value::Boolean(value));
+        Ok(())
+    })
+}
+
+/// Run a raw-table rewrite of the user `config.toml` under the config write guard.
+/// For keys `update_config` cannot express (a deletion, or a table `save_config_locked` does not merge).
+async fn rewrite_user_config_locked(
+    what: &'static str,
+    rewrite: impl FnOnce(&Path) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    let guard = crate::util::config::persist::lock_config_writes()
+        .await
+        .map_err(|error| anyhow::anyhow!("lock config.toml to save {what}: {error}"))?;
+    guard
+        .run_blocking(move || rewrite(&crate::util::config::mcp::user_config_path()))
+        .await
+        .map_err(|error| anyhow::anyhow!("{what} persistence task failed: {error}"))?
+}
+
+/// Read `path`, hand its root table to `edit`, and publish the result with `write`; `what` names the setting in every error.
+fn rewrite_user_config_table(
+    path: &Path,
+    what: &str,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+    edit: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
+    let (destination, content) = crate::util::config::persist::read_follow_bound(path)
+        .map_err(|error| anyhow::anyhow!("read {} to save {what}: {error}", path.display()))?;
+    let mut document =
+        crate::util::config::persist::parse_existing_config_toml(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "parse {} to save {what}: {}",
+                path.display(),
+                xai_grok_config::toml_error_detail(&content, &error)
+            )
+        })?;
+    let root = document
+        .as_table_mut()
+        .with_context(|| format!("{} must contain a TOML table", path.display()))?;
+    edit(root)?;
+    let content = toml::to_string_pretty(&document)
+        .map_err(|error| anyhow::anyhow!("serialize {} for {what}: {error}", path.display()))?;
+    write(path, &destination, &content)
+        .map_err(|error| anyhow::anyhow!("write {} to save {what}: {error}", path.display()))
+}
+
 /// Persist `[ui].combine_queued_prompts` via `update_config`.
 pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.combine_queued_prompts = Some(value)).await
@@ -347,9 +438,12 @@ pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
 
 /// Persist `[ui].follow_up_behavior` (`"queue"` | `"steer"`).
 pub async fn set_follow_up_behavior(value: String) -> Result<()> {
-    // Keep the hot-path cache in sync before the disk write returns.
-    set_follow_up_steer_cache(value == "steer");
-    update_config(|cfg| cfg.ui.follow_up_behavior = Some(value)).await
+    let steer = value == "steer";
+    update_config_and_then(
+        |cfg| cfg.ui.follow_up_behavior = Some(value),
+        move || set_follow_up_steer_cache(steer),
+    )
+    .await
 }
 
 /// Persist `[ui].enter_steers` via `update_config`.
@@ -367,12 +461,6 @@ pub async fn set_simple_mode(value: bool) -> Result<()> {
 /// so explicit settings changes are stored as `Some(value)`.
 pub async fn set_swarm_mode(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.swarm_mode = Some(value)).await
-}
-
-/// Persist `[ui].antigravity_subagents` via `update_config`. Same `Option<bool>`
-/// shape as `swarm_mode` (`None` = default off).
-pub async fn set_antigravity_subagents(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.ui.antigravity_subagents = Some(value)).await
 }
 
 /// Persist `[ui.contextual_hints].undo` via `update_config`. The nested struct
@@ -469,7 +557,10 @@ pub async fn set_default_model(value: String) -> Result<()> {
 /// Runtime clients apply the same selection through the ACP extension after
 /// this write succeeds, so they can own rollback if live application fails.
 pub async fn set_kimi_endpoint(endpoint: crate::kimi_models::KimiApiEndpoint) -> Result<()> {
-    update_config(|cfg| cfg.models.kimi_endpoint = endpoint).await
+    update_config_fields(&["models.kimi_endpoint"], |cfg| {
+        cfg.models.kimi_endpoint = endpoint
+    })
+    .await
 }
 
 /// String boundary for Settings clients. Only canonical `platform` and `code`
@@ -510,6 +601,50 @@ pub async fn set_privacy_banner_acked(acked_at_rfc3339: String) -> Result<()> {
     .await
 }
 
+/// Persist or remove a registry `[features]` key in the user `config.toml`.
+/// `None` deletes the key so the remote and default tiers apply again.
+pub async fn set_feature_override(feature: Feature, value: Option<bool>) -> Result<()> {
+    rewrite_user_config_locked(feature.path(), move |path| {
+        write_feature_override(
+            path,
+            feature,
+            value,
+            crate::util::config::persist::atomic_write_follow_bound,
+        )
+    })
+    .await
+}
+
+pub(super) fn write_feature_override(
+    path: &Path,
+    feature: Feature,
+    value: Option<bool>,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+) -> Result<()> {
+    rewrite_user_config_table(path, feature.path(), write, |root| {
+        match value {
+            Some(flag) => {
+                let features = root
+                    .entry("features".to_owned())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .with_context(|| format!("{} [features] must be a table", path.display()))?;
+                features.insert(feature.key().to_owned(), toml::Value::Boolean(flag));
+            }
+            None => {
+                let table = root.get_mut("features").and_then(toml::Value::as_table_mut);
+                if let Some(features) = table {
+                    features.remove(feature.key());
+                    if features.is_empty() {
+                        root.remove("features");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Persist `[ui].fork_secondary_model` via `update_config`.
 ///
 /// Caller must validate against the model catalog. Empty string
@@ -522,7 +657,7 @@ pub async fn set_fork_secondary_model(value: String) -> Result<()> {
             MAX_DEFAULT_MODEL_LEN
         );
     }
-    update_config(|cfg| {
+    update_config_fields(&["ui.fork_secondary_model"], |cfg| {
         cfg.ui.fork_secondary_model = if value.is_empty() {
             crate::models::default_model().to_string()
         } else {
@@ -541,7 +676,10 @@ const MAX_THOUGHTS_WIDTH_SHELL_MAX: i64 = 500;
 /// Defensively clamps to `[40, 500]` at the shell boundary.
 pub async fn set_max_thoughts_width(value: i64) -> Result<()> {
     let clamped = value.clamp(MAX_THOUGHTS_WIDTH_SHELL_MIN, MAX_THOUGHTS_WIDTH_SHELL_MAX) as u16;
-    update_config(|cfg| cfg.ui.max_thoughts_width = clamped).await
+    update_config_fields(&["ui.max_thoughts_width"], |cfg| {
+        cfg.ui.max_thoughts_width = clamped
+    })
+    .await
 }
 
 /// Persist `[ui].scroll_speed` via `update_config`.
@@ -589,6 +727,14 @@ pub async fn set_code_mode(value: crate::agent::config::ToolModePreference) -> R
     update_config(|cfg| cfg.ui.code_mode = Some(value)).await
 }
 
+pub async fn set_codex_persistent_mode(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.codex_persistent_mode = Some(value)).await
+}
+
+pub async fn set_codex_guardian_review(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.codex_guardian_review = Some(value)).await
+}
+
 /// Persist the restart-required `[ui].image_generation_provider` route.
 pub async fn set_image_generation_provider(
     value: crate::agent::config::ImageGenerationProvider,
@@ -606,6 +752,22 @@ const STREAM_TOOL_CALLS_OFF: u8 = 0;
 const STREAM_TOOL_CALLS_ON: u8 = 1;
 
 static STREAM_TOOL_CALLS_PREFERENCE: AtomicU8 = AtomicU8::new(STREAM_TOOL_CALLS_UNSET);
+
+#[cfg(test)]
+pub(super) fn setting_cache_snapshot() -> (u8, u64, u8) {
+    (
+        FOLLOW_UP_STEER_CACHE.load(Ordering::Relaxed),
+        FOLLOW_UP_STEER_MTIME_NS.load(Ordering::Relaxed),
+        STREAM_TOOL_CALLS_PREFERENCE.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn restore_setting_cache_snapshot(snapshot: (u8, u64, u8)) {
+    FOLLOW_UP_STEER_CACHE.store(snapshot.0, Ordering::Relaxed);
+    FOLLOW_UP_STEER_MTIME_NS.store(snapshot.1, Ordering::Relaxed);
+    STREAM_TOOL_CALLS_PREFERENCE.store(snapshot.2, Ordering::Relaxed);
+}
 
 /// Live user preference for requesting incremental tool-call argument
 /// streaming. Defaults ON. `[ui].stream_tool_calls` wins; `[models].stream_tool_calls`
@@ -664,8 +826,11 @@ fn parse_env_bool(name: &str) -> Option<bool> {
 
 /// Persist `[ui].stream_tool_calls` and update the live preference.
 pub async fn set_stream_tool_calls(value: bool) -> Result<()> {
-    set_stream_tool_calls_preference(value);
-    update_config(|cfg| cfg.ui.stream_tool_calls = Some(value)).await
+    update_config_and_then(
+        |cfg| cfg.ui.stream_tool_calls = Some(value),
+        move || set_stream_tool_calls_preference(value),
+    )
+    .await
 }
 
 /// Persist `[ui].prompt_suggestions` via `update_config`.
@@ -782,17 +947,57 @@ pub async fn upsert_custom_model(
     Option<String>,
 )> {
     let (record, warning) = crate::custom_models::normalize_custom_model(record)?;
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let path = user_config_path();
     let model = super::persist::persist_custom_model_upsert_at(&path, &record)?;
     Ok((record, model, warning))
 }
 
 /// Remove one `[model.<key>]` table. Missing keys are a no-op.
+/// Write a whole batch of custom models in one config transaction.
+///
+/// Returns the written overrides in input order, skipping records the schema
+/// rejects (each rejection is returned as a warning string instead of
+/// aborting the batch).
+pub async fn upsert_custom_models(
+    records: Vec<crate::custom_models::CustomModelRecord>,
+) -> Result<(
+    Vec<(String, crate::agent::config::ConfigModelOverride)>,
+    Vec<String>,
+)> {
+    let _guard = lock_config_writes().await?;
+    let path = user_config_path();
+    let mut accepted = Vec::new();
+    let mut warnings = Vec::new();
+    for record in records {
+        match crate::custom_models::normalize_custom_model(record) {
+            Ok((record, warning)) => {
+                accepted.push(record);
+                if let Some(warning) = warning {
+                    warnings.push(format!(
+                        "{}: {warning}",
+                        accepted.last().map(|r| r.key.as_str()).unwrap_or("")
+                    ));
+                }
+            }
+            Err(error) => warnings.push(error.to_string()),
+        }
+    }
+    if accepted.is_empty() {
+        return Ok((Vec::new(), warnings));
+    }
+    let written = tokio::task::spawn_blocking(move || {
+        crate::util::config::persist_custom_model_upserts_at(&path, &accepted)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("persist_custom_models join: {e}"))??;
+    Ok((written, warnings))
+}
+
 pub async fn delete_custom_model(key: &str) -> Result<bool> {
     let key = key.trim();
     crate::custom_models::validate_model_key(key)?;
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     super::persist::persist_custom_model_delete_at(&user_config_path(), key)
 }
 
@@ -898,6 +1103,7 @@ mod tests {
             local_feature_flag_default("suggestions.ai_enabled"),
             Some(false)
         );
+        assert_eq!(local_feature_flag_default("sandbox.profile"), Some(false));
         assert_eq!(
             local_feature_flag_default("sandbox.auto_allow_bash"),
             Some(false)
@@ -907,6 +1113,23 @@ mod tests {
             Some(false)
         );
         assert_eq!(local_feature_flag_default("features.unknown"), None);
+    }
+
+    #[test]
+    fn sandbox_toggle_reads_profiles_and_writes_profile_strings() {
+        let mut root = TomlValue::Table(TomlMap::new());
+        assert_eq!(read_nested_bool(&root, "sandbox.profile"), None);
+        for (enabled, profile) in [(true, "workspace"), (false, "off")] {
+            set_nested_bool(&mut root, "sandbox.profile", enabled);
+            assert_eq!(root["sandbox"]["profile"].as_str(), Some(profile));
+            assert_eq!(read_nested_bool(&root, "sandbox.profile"), Some(enabled));
+        }
+        for profile in ["workspace", "strict", "read-only", "devbox", "custom"] {
+            root["sandbox"]["profile"] = TomlValue::String(profile.to_owned());
+            assert_eq!(read_nested_bool(&root, "sandbox.profile"), Some(true));
+        }
+        root["sandbox"]["profile"] = TomlValue::String("none".to_owned());
+        assert_eq!(read_nested_bool(&root, "sandbox.profile"), Some(false));
     }
 
     #[test]

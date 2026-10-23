@@ -21,6 +21,8 @@ textwrap = { workspace = true }
 regex = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
+unicode-bidi = "0.3"
+unicode-bidi-mirroring = "0.4"
 linkify = { workspace = true }
 tui-scrollbar = { workspace = true }
 
@@ -94,12 +96,13 @@ libc = { workspace = true }
 
 # EnumDisplaySettingsW for primary-display refresh probe (host/display_refresh).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+xai-grok-env = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = []

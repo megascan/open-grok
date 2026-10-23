@@ -845,12 +845,32 @@ pub(crate) fn parse_remote_model_value(
         .or_else(|| get_string(obj, "base_url"))
         .unwrap_or_else(|| default_base_url.to_owned());
     let name = get_string(obj, "name").or_else(|| Some(model.clone()));
-    let context_window = get_u64(obj, "contextWindow")
+    let listed = obj
+        .get("contextWindows")
+        .or_else(|| obj.get("context_windows"))
+        .or_else(|| meta.and_then(|m| m.get("contextWindows")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().and_then(std::num::NonZeroU64::new))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let scalar = get_u64(obj, "contextWindow")
         .or_else(|| get_u64(obj, "context_window"))
         .or_else(|| meta.and_then(|m| get_u64(m, "contextWindow")))
-        .or_else(|| meta.and_then(|m| get_u64(m, "totalContextTokens")))
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let context_window = std::num::NonZeroU64::new(context_window)?;
+        .or_else(|| meta.and_then(|m| get_u64(m, "totalContextTokens")));
+    let scalar = match scalar {
+        Some(n) => Some(std::num::NonZeroU64::new(n)?),
+        None => None,
+    };
+    let (context_window, context_windows) =
+        crate::agent::config::context_window_choices(scalar, &listed).unwrap_or_else(|| {
+            (
+                std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW).unwrap(),
+                Vec::new(),
+            )
+        });
     let agent_type = get_string(obj, "systemPromptType")
         .or_else(|| get_string(obj, "system_prompt_type"))
         .or_else(|| get_string(obj, "agent_type"))
@@ -900,12 +920,29 @@ pub(crate) fn parse_remote_model_value(
     .flatten()
     .find(|value| !value.is_null())
     .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let (reasoning_efforts, reasoning_effort_server_default) = obj
+        .get("reasoningEfforts")
+        .or_else(|| obj.get("reasoning_efforts"))
+        .or_else(|| meta.and_then(|m| m.get("reasoningEfforts")))
+        .and_then(|v| v.as_array())
+        .map(|arr| xai_grok_sampling_types::parse_reasoning_effort_options(arr, "reasoningEfforts"))
+        .filter(|options| !options.is_empty())
+        .map(|options| (options, false))
+        .or_else(|| {
+            obj.get("capabilities")
+                .and_then(|v| v.as_object())
+                .and_then(parse_capabilities_reasoning_efforts)
+        })
+        .unwrap_or_default();
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
         base_url,
         name,
         description: get_string(obj, "description"),
+        notice: obj.get(xai_grok_sampling_types::MODEL_NOTICE_META_KEY)
+            .or_else(|| meta.and_then(|m| m.get(xai_grok_sampling_types::MODEL_NOTICE_META_KEY)))
+            .and_then(xai_grok_sampling_types::ModelNotice::from_value),
         max_completion_tokens: get_u64(obj, "maxCompletionTokens")
             .or_else(|| get_u64(obj, "max_completion_tokens"))
             .and_then(|v| u32::try_from(v).ok()),
@@ -918,10 +955,15 @@ pub(crate) fn parse_remote_model_value(
         tool_mode,
         subagent_context_default,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         apply_patch_tool_type: None,
         context_window,
+        context_windows,
+        max_request_bytes: get_u64(obj, "maxRequestBytes")
+            .or_else(|| get_u64(obj, "max_request_bytes"))
+            .and_then(std::num::NonZeroU64::new),
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
             .and_then(|v| u8::try_from(v).ok()),
@@ -942,6 +984,9 @@ pub(crate) fn parse_remote_model_value(
         max_retries: get_u64(obj, "maxRetries")
             .or_else(|| get_u64(obj, "max_retries"))
             .and_then(|v| u32::try_from(v).ok()),
+        subagent_rate_limit_max_attempts: get_u64(obj, "subagentRateLimitMaxAttempts")
+            .or_else(|| get_u64(obj, "subagent_rate_limit_max_attempts"))
+            .and_then(|attempts| u32::try_from(attempts).ok()),
         hidden: obj
             .get("hidden")
             .or_else(|| meta.and_then(|m| m.get("hidden")))
@@ -964,12 +1009,23 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportsReasoningEffort")))
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        reasoning_efforts: obj
-            .get("reasoningEfforts")
-            .or_else(|| obj.get("reasoning_efforts"))
-            .or_else(|| meta.and_then(|m| m.get("reasoningEfforts")))
+        reasoning_efforts,
+        reasoning_effort_server_default,
+        variants: obj
+            .get("variants")
             .and_then(|v| v.as_array())
-            .map(|arr| xai_grok_sampling_types::parse_reasoning_effort_options(arr))
+            .map(|arr| {
+                arr
+                    .iter()
+                    .filter_map(|value| match serde_json::from_value(value.clone()) {
+                        Ok(variant) => Some(variant),
+                        Err(e) => {
+                            tracing::warn!("Dropping a model variant this build cannot read: {e}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
         supports_reasoning_summary_parameter: false,
         default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
@@ -1033,6 +1089,37 @@ pub(crate) fn parse_remote_model_value(
 }
 fn get_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+/// Effort menu from a `/v1/models` `capabilities` block: `reasoning_effort` is a bare-string list, `default_reasoning_effort` names the marked entry.
+/// The second value is true when no entry got marked, so the request omits the effort and the server applies its own.
+fn parse_capabilities_reasoning_efforts(
+    caps: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(Vec<xai_grok_sampling_types::ReasoningEffortOption>, bool)> {
+    let arr = caps.get("reasoning_effort")?.as_array()?;
+    let mut options = xai_grok_sampling_types::parse_reasoning_effort_options(
+        arr,
+        "capabilities.reasoning_effort",
+    );
+    let mut marked = false;
+    if let Some(default) = caps
+        .get("default_reasoning_effort")
+        .filter(|v| !v.is_null())
+    {
+        let level = default
+            .as_str()
+            .and_then(|s| s.parse::<xai_grok_sampling_types::ReasoningEffort>().ok());
+        for option in &mut options {
+            option.default = level == Some(option.value);
+            marked |= option.default;
+        }
+        if !marked {
+            tracing::warn!(
+                value = %default,
+                "capabilities.default_reasoning_effort is not a listed level; leaving the server default"
+            );
+        }
+    }
+    Some((options, !marked))
 }
 /// Parse `env_key` / `envKey` as a single string or a string array.
 fn get_env_keys(
@@ -1439,6 +1526,7 @@ mod tests {
             team_blocked_reasons: vec![],
             coding_data_retention_opt_out: false,
             has_grok_code_access: None,
+            can_administer_team: None,
             refresh_token: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             oidc_issuer: None,
@@ -1583,12 +1671,101 @@ mod tests {
     }
 
     #[test]
+    fn parse_subagent_rate_limit_attempts_accepts_aliases_and_u32_boundaries() {
+        for field in [
+            "subagentRateLimitMaxAttempts",
+            "subagent_rate_limit_max_attempts",
+        ] {
+            for attempts in [0, 8, u32::MAX] {
+                let mut value = serde_json::json!({"model": "retry-model"});
+                value[field] = serde_json::json!(attempts);
+                let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+                assert_eq!(parsed.subagent_rate_limit_max_attempts, Some(attempts));
+            }
+        }
+        let parsed = parse_remote_model_value(
+            &serde_json::json!({"model": "retry-model"}),
+            "https://model.invalid/v1",
+        )
+        .unwrap();
+        assert_eq!(parsed.subagent_rate_limit_max_attempts, None);
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_ignores_invalid_values_without_rejecting_model() {
+        for field in [
+            "subagentRateLimitMaxAttempts",
+            "subagent_rate_limit_max_attempts",
+        ] {
+            for invalid in [
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("8"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::Value::Null,
+            ] {
+                let mut value = serde_json::json!({"model": "retry-model"});
+                value[field] = invalid;
+                let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+                assert_eq!(parsed.subagent_rate_limit_max_attempts, None, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_preserves_alias_precedence() {
+        for (camel, expected) in [
+            (serde_json::json!(0), Some(0)),
+            (serde_json::json!(8), Some(8)),
+            (serde_json::Value::Null, Some(12)),
+            (serde_json::json!("invalid"), Some(12)),
+            (serde_json::json!(u64::from(u32::MAX) + 1), None),
+        ] {
+            let value = serde_json::json!({
+                "model": "retry-model",
+                "subagentRateLimitMaxAttempts": camel,
+                "subagent_rate_limit_max_attempts": 12,
+            });
+            let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+            assert_eq!(parsed.subagent_rate_limit_max_attempts, expected);
+        }
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_preserves_provider_contract() {
+        for provider in ["xai", "openai", "fireworks", "custom"] {
+            let mut value = serde_json::json!({
+                "model": "shared-slug",
+                "provider": provider,
+                "apiBackend": "responses",
+                "baseUrl": "https://model.invalid/v1",
+                "apiBaseUrl": "https://key-route.invalid/v1",
+                "apiKey": "fixture-only-key",
+                "toolMode": "code_mode_only",
+                "subagentContextDefault": "fork",
+            });
+            let mut expected =
+                parse_remote_model_value(&value, "https://fallback.invalid/v1").unwrap();
+            expected.subagent_rate_limit_max_attempts = Some(8);
+            value["subagentRateLimitMaxAttempts"] = serde_json::json!(8);
+            let actual = parse_remote_model_value(&value, "https://fallback.invalid/v1").unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_explicit_unknown_tool_mode() {
         for tool_mode in [serde_json::json!("automatic"), serde_json::json!(42)] {
             let value = serde_json::json!({
                 "model": "future-model",
                 "apiBackend": "responses",
                 "toolMode": tool_mode,
+                "subagentRateLimitMaxAttempts": 8,
                 "provider": "xai"
             });
             assert!(
@@ -1632,6 +1809,7 @@ mod tests {
     fn parse_rejects_explicit_unknown_provider_or_backend() {
         let unknown_provider = serde_json::json!({
             "model": "future-model",
+            "subagentRateLimitMaxAttempts": 8,
             "provider": "misspelled-provider"
         });
         assert!(
@@ -1641,6 +1819,7 @@ mod tests {
 
         let unknown_backend = serde_json::json!({
             "model": "future-model",
+            "subagentRateLimitMaxAttempts": 8,
             "apiBackend": "misspelled-backend"
         });
         assert!(
@@ -1726,6 +1905,25 @@ mod tests {
             std::num::NonZeroU64::new(131072).unwrap()
         );
         assert_eq!(result.agent_type, "concise");
+    }
+    #[test]
+    fn remote_context_choices_and_notice_are_normalized() {
+        let value = serde_json::json!({
+            "model": "example",
+            "contextWindows": [500_000, 200_000, 500_000, 0],
+            "notice": { "severity": "warning", "text": "  Moving soon  ", "label": " old " }
+        });
+        let model = parse_remote_model_value(&value, "https://example.invalid").unwrap();
+        assert_eq!(model.context_window.get(), 500_000);
+        assert_eq!(
+            model
+                .context_windows
+                .iter()
+                .map(|x| x.get())
+                .collect::<Vec<_>>(),
+            vec![500_000, 200_000]
+        );
+        assert_eq!(model.notice.unwrap().text, "Moving soon");
     }
     #[test]
     fn parse_remote_model_value_no_laziness_detector_block_yields_default() {

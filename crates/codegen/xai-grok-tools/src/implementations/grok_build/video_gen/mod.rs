@@ -143,7 +143,7 @@ pub struct VideoGenClient {
     base_url: String,
     writer: super::storage::SessionFileWriter,
     zdr_video_output_s3: Option<ZdrVideoOutputS3Config>,
-    api_key_provider: Option<SharedApiKeyProvider>,
+    bearer: super::media_bearer::MediaBearer,
     /// Optional 401-attribution hook. Hosts wire this so a 401 from the
     /// Video Generation API emits an `auth_401_attribution` event with
     /// `consumer` of `"VideoGen.start"` (start request) or
@@ -153,6 +153,10 @@ pub struct VideoGenClient {
     /// (free / X Basic). The video tools short-circuit before any HTTP call
     /// and return the SuperGrok upsell prose. See [`VideoGenClient::is_tier_restricted`].
     tier_restricted: bool,
+    /// See [`VideoGenConfig::Enabled`]'s `zdr_restricted`.
+    zdr_restricted: bool,
+    session_header: Option<HeaderValue>,
+    defaults_have_session_header: bool,
 }
 
 impl VideoGenClient {
@@ -166,6 +170,7 @@ impl VideoGenClient {
             extra_headers,
             zdr_video_output_s3,
             tier_restricted,
+            zdr_restricted,
         } = config
         else {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(
@@ -175,16 +180,6 @@ impl VideoGenClient {
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        // Always bake the static api_key as the default Authorization header.
-        // The dynamic provider overrides per-request; this is the fallback.
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Invalid API key for header: {e}"
-                ))
-            })?,
-        );
 
         extra_headers.into_iter().try_for_each(|(key, value)| {
             let header_name =
@@ -202,21 +197,29 @@ impl VideoGenClient {
             Ok::<(), xai_tool_runtime::ToolError>(())
         })?;
 
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder().default_headers(headers),
-        )
-        .build()
+        let defaults_have_session_header =
+            headers.contains_key(super::image_gen::SESSION_ID_HEADER);
+        let key = crate::util::shared_http::cache_key(&format!("video_gen:{base_url}"), &headers);
+        let http = crate::util::shared_http::cached_client(key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.default_headers(headers.clone())
+            })
+        })
         .map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Failed to build HTTP client: {e}"
             ))
         })?;
 
-        let download_http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS)),
-        )
-        .build()
+        let download_key = crate::util::shared_http::cache_key(
+            "video_gen_download",
+            &reqwest::header::HeaderMap::new(),
+        );
+        let download_http = crate::util::shared_http::cached_client(download_key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.timeout(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS))
+            })
+        })
         .map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Failed to build download client: {e}"
@@ -232,10 +235,38 @@ impl VideoGenClient {
                 .as_ref()
                 .map(|c| (**c).clone())
                 .filter(ZdrVideoOutputS3Config::is_valid),
-            api_key_provider,
+            bearer: super::media_bearer::MediaBearer::new(api_key_provider, api_key.clone()),
             attribution_callback: None,
             tier_restricted: *tier_restricted,
+            zdr_restricted: *zdr_restricted,
+            session_header: None,
+            defaults_have_session_header,
         })
+    }
+
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        if !self.defaults_have_session_header
+            && let Ok(value) = HeaderValue::from_str(session_id)
+        {
+            self.session_header = Some(value);
+        }
+        self
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        sent_bearer: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self
+            .http
+            .request(method, url)
+            .header(AUTHORIZATION, format!("Bearer {sent_bearer}"));
+        if let Some(session) = &self.session_header {
+            request = request.header(super::image_gen::SESSION_ID_HEADER, session.clone());
+        }
+        request
     }
 
     /// Whether the current user's tier (free / X Basic) is zero-limited on
@@ -243,6 +274,11 @@ impl VideoGenClient {
     /// SuperGrok upsell instead of issuing a doomed request.
     pub(crate) fn is_tier_restricted(&self) -> bool {
         self.tier_restricted
+    }
+
+    /// See [`VideoGenConfig::Enabled`]'s `zdr_restricted`.
+    pub(crate) fn is_zdr_restricted(&self) -> bool {
+        self.zdr_restricted
     }
 
     /// Wire a 401-attribution callback into this client. Idempotent;
@@ -255,8 +291,9 @@ impl VideoGenClient {
         self
     }
 
-    async fn current_bearer(&self) -> Option<String> {
-        crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
+    /// `Err` means no request may leave; see `MediaBearer::resolve`.
+    async fn current_bearer(&self) -> Result<String, xai_tool_runtime::ToolError> {
+        self.bearer.resolve().await
     }
 
     fn record_401_attribution(&self, consumer: ToolConsumer, sent_bearer: Option<&str>) {
@@ -274,6 +311,9 @@ impl VideoGenClient {
         reference_images: Vec<String>,
     ) -> Result<VideoOutcome, xai_tool_runtime::ToolError> {
         let start_url = format!("{}/videos/generations", self.base_url.trim_end_matches('/'));
+
+        // Before the ZDR presign, a network call that must not happen on a refused bearer
+        let sent_bearer = self.current_bearer().await?;
 
         let presigned = match &self.zdr_video_output_s3 {
             Some(config) => Some(self.presign_zdr_output_urls(config).await?),
@@ -296,15 +336,10 @@ impl VideoGenClient {
             }),
         };
 
-        let sent_bearer = self.current_bearer().await;
-        let mut req = self
-            .http
-            .post(&start_url)
+        let req = self
+            .request(reqwest::Method::POST, &start_url, &sent_bearer)
             .timeout(std::time::Duration::from_secs(VIDEO_START_TIMEOUT_SECS))
             .json(&payload);
-        if let Some(ref key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
 
         let response = req.send().await.map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -314,7 +349,7 @@ impl VideoGenClient {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(ToolConsumer::VideoGenStart, sent_bearer.as_deref());
+            self.record_401_attribution(ToolConsumer::VideoGenStart, Some(&sent_bearer));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -366,11 +401,10 @@ impl VideoGenClient {
                 )));
             }
 
-            let poll_sent_bearer = self.current_bearer().await;
-            let mut poll_req = self.http.get(&poll_url).timeout(poll_timeout);
-            if let Some(ref key) = poll_sent_bearer {
-                poll_req = poll_req.header(AUTHORIZATION, format!("Bearer {key}"));
-            }
+            let poll_sent_bearer = self.current_bearer().await?;
+            let poll_req = self
+                .request(reqwest::Method::GET, &poll_url, &poll_sent_bearer)
+                .timeout(poll_timeout);
 
             let poll_response = poll_req.send().await.map_err(|e| {
                 xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -380,10 +414,7 @@ impl VideoGenClient {
 
             let poll_status = poll_response.status();
             if poll_status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
-                    ToolConsumer::VideoGenPoll,
-                    poll_sent_bearer.as_deref(),
-                );
+                self.record_401_attribution(ToolConsumer::VideoGenPoll, Some(&poll_sent_bearer));
             }
             if !poll_status.is_success() && poll_status.as_u16() != 202 {
                 let body = poll_response.text().await.unwrap_or_default();
@@ -703,7 +734,8 @@ pub enum VideoGenConfig {
     #[default]
     Disabled,
     Enabled {
-        api_key: String,
+        /// `None`: the per-request provider is the only bearer source.
+        api_key: Option<String>,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
         zdr_video_output_s3: Option<Box<ZdrVideoOutputS3Config>>,
@@ -712,6 +744,10 @@ pub enum VideoGenConfig {
         /// at call time with the SuperGrok upsell prose. Set by the host from
         /// the subscription tier; always `false` for team / API-key / workspace.
         tier_restricted: bool,
+        /// `true` when `tools.disable_zdr_incompatible_tools` is set with no valid
+        /// `[tools.zdr_video_output_s3]` bucket. The video tools stay advertised but fail at call
+        /// time with [`ZDR_RESTRICTED_MESSAGE`] instead of being silently dropped.
+        zdr_restricted: bool,
     },
 }
 
@@ -1077,6 +1113,9 @@ impl xai_tool_runtime::Tool for ImageToVideoTool {
         if client.is_tier_restricted() {
             return Ok(ToolOutput::Text(TIER_RESTRICTED_UPSELL.into()));
         }
+        if client.is_zdr_restricted() {
+            return Err(zdr_restricted_error());
+        }
 
         let outcome = client
             .generate_with_images(
@@ -1195,6 +1234,9 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
         // the upsell prose instead of a doomed request.
         if client.is_tier_restricted() {
             return Ok(ToolOutput::Text(TIER_RESTRICTED_UPSELL.into()));
+        }
+        if client.is_zdr_restricted() {
+            return Err(zdr_restricted_error());
         }
 
         let outcome = client

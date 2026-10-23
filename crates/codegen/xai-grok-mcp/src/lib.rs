@@ -2,7 +2,7 @@
 //!
 //! Two responsibilities:
 //!
-//! 1. **Quarantines `rmcp` 2.1 and `reqwest` 0.13.** `rmcp` 2.1 requires
+//! 1. **Quarantines `rmcp` 3.2 and `reqwest` 0.13.** `rmcp` 3.x requires
 //!    `reqwest >= 0.13.2`. The rest of the workspace consumes `reqwest` 0.12
 //!    and a transitive ecosystem (`opentelemetry-otlp`, `oauth2`,
 //!    `xai-mixpanel`, `xai-grok-tools`, ...) also pinned to 0.12. Bumping every
@@ -14,7 +14,7 @@
 //!    (`xai_grok_mcp::rmcp::*`).
 //!
 //! 2. **Owns MCP-specific integration code**:
-//!    - [`credentials`] -- on-disk `$GROK_HOME/mcp_credentials.json` store and
+//!    - [`credentials`] -- on-disk `$OPENGROK_HOME/mcp_credentials.json` store and
 //!      the rmcp `CredentialStore` adapter.
 //!    - [`oauth`] -- browser-based OAuth flow with cross-process + in-process
 //!      dedup.
@@ -28,11 +28,34 @@
 
 pub use rmcp;
 
+#[doc(hidden)]
+pub fn isolate_grok_home_for_tests() {
+    static HOME: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let directory = tempfile::TempDir::new()
+            .expect("test Open Grok home")
+            .keep();
+        unsafe { std::env::set_var("OPENGROK_HOME", &directory) };
+        let memo = xai_grok_config::grok_home();
+        assert!(
+            memo.starts_with(&directory),
+            "Open Grok home memo was warmed before test isolation: {}",
+            memo.display()
+        );
+    });
+}
+
 pub mod acp_transport;
+mod auth_status;
+pub mod bearer_token_file;
+mod call_result;
 pub mod credentials;
+pub mod elicitation;
 pub mod liveness;
 pub mod mcp_http_client;
 pub mod oauth;
 pub mod oauth_config;
+pub mod owned_clients;
 pub mod servers;
+mod tool_name;
 pub mod wire;

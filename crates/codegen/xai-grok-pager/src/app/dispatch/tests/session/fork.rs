@@ -2,8 +2,6 @@
 
 use super::*;
 
-// ── Worktree session tests ───────────────────────────────────────
-
 #[test]
 fn open_new_worktree_dialog_sets_dialog_state() {
     let mut app = test_app();
@@ -1551,4 +1549,148 @@ fn handle_ask_user_question_pushes_system_block_when_displaced_local_fork_modal(
         scrollback_len_before + 1,
         "exactly one system block pushed"
     );
+}
+
+#[test]
+fn fork_refuses_pending_interactions_for_all_worktree_choices() {
+    for choice in [None, Some(false), Some(true)] {
+        let mut app = fork_test_app();
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .prompt
+            .set_text("keep my draft");
+        let _response = push_synthetic_permission(
+            app.agents.get_mut(&AgentId(0)).unwrap(),
+            1,
+            vec![("allow", "Allow")],
+        );
+        let before_id = app.next_agent_id;
+        let effects = dispatch(Action::Fork(fork_args(choice, None)), &mut app);
+        assert!(effects.is_empty());
+        assert_eq!(app.next_agent_id, before_id);
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents[&AgentId(0)].prompt.text(), "keep my draft");
+        assert_eq!(app.agents[&AgentId(0)].permission_queue.len(), 1);
+        assert!(app.agents[&AgentId(0)].question_view.is_none());
+    }
+}
+
+#[test]
+fn fork_answer_does_not_fork_or_persist_if_approval_arrives_after_dialog() {
+    let mut app = fork_test_app();
+    app.fork_worktree_mode = crate::app::app_view::WorktreeMode::Ask;
+    assert!(dispatch(Action::Fork(fork_args(None, None)), &mut app).is_empty());
+    assert!(app.agents[&AgentId(0)].question_view.is_some());
+    // The real local-question submission removes its card before dispatching ForkAnswered.
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .question_view
+        .take();
+    let _response = push_synthetic_permission(
+        app.agents.get_mut(&AgentId(0)).unwrap(),
+        1,
+        vec![("allow", "Allow")],
+    );
+    let before_id = app.next_agent_id;
+    let effects = dispatch(
+        Action::ForkAnswered {
+            worktree: true,
+            directive: None,
+            persist_mode: Some(crate::app::app_view::WorktreeMode::Always),
+        },
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(app.next_agent_id, before_id);
+    assert_eq!(app.agents.len(), 1);
+    assert_eq!(
+        app.fork_worktree_mode,
+        crate::app::app_view::WorktreeMode::Ask
+    );
+    assert_eq!(app.agents[&AgentId(0)].permission_queue.len(), 1);
+}
+
+#[test]
+fn startup_fork_blocks_only_matching_loaded_parent_with_pending_approval() {
+    let mut app = fork_test_app();
+    let parent_sid = app.agents[&AgentId(0)]
+        .session
+        .session_id
+        .as_ref()
+        .unwrap()
+        .0
+        .to_string();
+    let _response = push_synthetic_permission(
+        app.agents.get_mut(&AgentId(0)).unwrap(),
+        1,
+        vec![("allow", "Allow")],
+    );
+    let before_id = app.next_agent_id;
+    let effects = dispatch(
+        Action::StartupForkSession {
+            parent_session_id: parent_sid,
+            parent_cwd: None,
+            new_session_id: None,
+        },
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(app.next_agent_id, before_id);
+    assert_eq!(app.agents.len(), 1);
+    assert_eq!(app.agents[&AgentId(0)].permission_queue.len(), 1);
+    let effects = dispatch(
+        Action::StartupForkSession {
+            parent_session_id: "unloaded-other".into(),
+            parent_cwd: None,
+            new_session_id: None,
+        },
+        &mut app,
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::ForkSession { .. }))
+    );
+}
+
+#[test]
+fn fork_refuses_question_plan_and_elicitation_cards() {
+    use crate::views::elicitation_view::ElicitationViewState;
+    use crate::views::question_view::QuestionViewState;
+    use xai_grok_tools::mcp_elicitation::McpElicitExtRequest;
+    for card in ["question", "plan", "elicitation"] {
+        let mut app = fork_test_app();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        match card {
+            "question" => {
+                agent.question_view = Some(QuestionViewState::new(
+                    "q".into(),
+                    vec![],
+                    agent.prompt.stash(),
+                ));
+            }
+            "plan" => {
+                agent.plan_approval_view =
+                    Some(crate::app::agent_view::test_fixtures::make_plan_approval_view_state())
+            }
+            _ => {
+                let request: McpElicitExtRequest = serde_json::from_value(serde_json::json!({
+                    "sessionId": "test-session", "toolCallId": "elicit", "serverName": "server",
+                    "message": "Confirm", "mode": "form",
+                    "requestedSchema": { "type": "object", "properties": {} }
+                }))
+                .unwrap();
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                agent.elicitation_view =
+                    Some(ElicitationViewState::from_request(request, None, Some(tx)));
+            }
+        }
+        let before_id = app.next_agent_id;
+        let effects = dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
+        assert!(effects.is_empty(), "{card}");
+        assert_eq!(app.next_agent_id, before_id, "{card}");
+        assert_eq!(app.agents.len(), 1, "{card}");
+    }
 }

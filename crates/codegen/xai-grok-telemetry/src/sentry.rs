@@ -18,7 +18,7 @@ pub struct Config {
     pub client: &'static str,
     pub client_version: &'static str,
     pub release: &'static str,
-    /// When `true`, [`init`] returns a no-op guard regardless of `SENTRY_DSN`.
+    /// When `true`, [`init`] disables reporting regardless of `SENTRY_DSN`.
     pub disabled: bool,
 }
 
@@ -27,24 +27,50 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 // ─── Public API ────────────────────────────────────────────────────────────
 
 /// Init Sentry + apply the process-wide scope tags. Call once at process
-/// start; the returned guard must outlive the process. No-op guard when
-/// `config.disabled`.
-pub fn init(config: Config) -> ClientInitGuard {
+/// start; keep the returned guard alive until shutdown. Returns `None` when
+/// reporting is disabled or there is no usable DSN.
+pub fn init(config: Config) -> Option<ClientInitGuard> {
     let config = CONFIG.get_or_init(|| config);
 
     if config.disabled {
-        return sentry::init(ClientOptions::default());
+        return disable_reporting();
     }
 
     let dsn = std::env::var("SENTRY_DSN")
         .ok()
         .or_else(|| option_env!("SENTRY_DSN").map(|s| s.to_string()))
         .unwrap_or_default();
+    init_with_dsn(config, &dsn)
+}
+
+fn disable_reporting() -> Option<ClientInitGuard> {
+    // sentry::init(ClientOptions::default()) applies the ambient SENTRY_DSN
+    // even when dsn is None. Do not call it on disabled paths.
+    sentry::Hub::with(|hub| hub.bind_client(None));
+    None
+}
+
+fn init_with_dsn(config: &Config, dsn: &str) -> Option<ClientInitGuard> {
+    if dsn.is_empty() {
+        return disable_reporting();
+    }
+    let dsn = match dsn.parse::<sentry::types::Dsn>() {
+        Ok(dsn) => dsn,
+        Err(_) => {
+            // The DSN can contain credentials; never include its value in the warning.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "warning: invalid SENTRY_DSN; Sentry reporting is disabled"
+            );
+            return disable_reporting();
+        }
+    };
 
     let scrubber = Scrubber::from_env();
 
     let guard = sentry::init((
-        dsn.as_str(),
+        dsn,
         ClientOptions {
             release: Some(config.release.into()),
             send_default_pii: false,
@@ -64,7 +90,7 @@ pub fn init(config: Config) -> ClientInitGuard {
         scope.set_tag("arch", std::env::consts::ARCH);
     });
 
-    guard
+    Some(guard)
 }
 
 /// Flush in-flight events. Call before `std::process::exit` in signal handlers.
@@ -265,6 +291,61 @@ fn environment() -> &'static str {
 mod tests {
     use super::*;
     use sentry::protocol::{Breadcrumb, Exception, Frame, Stacktrace};
+
+    #[test]
+    fn disabled_sentry_paths_ignore_ambient_dsn() {
+        const CHILD_ENV: &str = "OPEN_GROK_TEST_DISABLED_SENTRY_CHILD";
+        const BAD_DSN: &str = "invalid-secret-dsn-value";
+        const VALID_DSN: &str = "https://public@example.invalid/123";
+        if let Ok(mode) = std::env::var(CHILD_ENV) {
+            let config = Config {
+                client: "test",
+                client_version: "test",
+                release: "test",
+                disabled: mode == "disabled",
+            };
+            let guard = match mode.as_str() {
+                "disabled" | "invalid_env" => init(config),
+                // Simulate an unusable selected/compiled value even when a
+                // valid ambient value exists: neither path may call init
+                // with default options and accidentally re-read the env.
+                "invalid_selected" => init_with_dsn(&config, BAD_DSN),
+                "empty_selected" => init_with_dsn(&config, ""),
+                _ => panic!("unknown child mode"),
+            };
+            assert!(guard.is_none());
+            assert!(sentry::Hub::current().client().is_none());
+            assert!(sentry::capture_message("must stay local", sentry::Level::Error).is_nil());
+            return;
+        }
+
+        // Avoid mutating the process environment while other tests are running.
+        for (mode, ambient, warns) in [
+            ("disabled", VALID_DSN, false),
+            ("invalid_env", BAD_DSN, true),
+            ("invalid_selected", VALID_DSN, true),
+            ("empty_selected", VALID_DSN, false),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sentry::tests::disabled_sentry_paths_ignore_ambient_dsn",
+                ])
+                .env(CHILD_ENV, mode)
+                .env("SENTRY_DSN", ambient)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{mode} child failed: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{mode} child did not run the test: {output:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.contains("invalid SENTRY_DSN"), warns, "{stderr}");
+            assert!(!stderr.contains(BAD_DSN), "DSN value leaked: {stderr}");
+            assert!(!stderr.contains(VALID_DSN), "DSN value leaked: {stderr}");
+        }
+    }
 
     fn make_scrubber() -> Scrubber {
         Scrubber {

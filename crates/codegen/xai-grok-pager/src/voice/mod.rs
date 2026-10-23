@@ -24,9 +24,12 @@
 mod auth;
 mod handle;
 
-pub use auth::build_voice_auth;
-pub use handle::handle_voice_event;
+pub use auth::{build_stt_routes, build_voice_auth};
+pub(crate) use handle::{
+    RECORDING_DISCARDED_TOAST, TRANSCRIPTION_TIMED_OUT_KEPT_TOAST, TRANSCRIPTION_TIMED_OUT_TOAST,
+};
 pub(crate) use handle::{combine_prompt_with_voice_text, commit_interim_into_prompt};
+pub use handle::{handle_tagged_voice_event, handle_voice_event};
 // Hidden `__mic-capture` helper intercept (macOS out-of-process capture),
 // re-exported for the composition-root binary, which links the pager library
 // rather than the voice crate. Called at the very top of `main`.

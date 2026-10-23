@@ -105,6 +105,10 @@ impl crate::types::tool_metadata::ToolMetadata for ReadTool {
         ToolNamespace::OpenCode
     }
 
+    fn lock_path_param(&self) -> Option<&'static str> {
+        Some("filePath")
+    }
+
     fn description_template(&self) -> &str {
         DESCRIPTION
     }
@@ -285,14 +289,14 @@ impl xai_tool_runtime::Tool for ReadTool {
 
             if raw_lines.len() >= limit {
                 has_more_lines = true;
-                continue; // keep counting total lines
+                break; // total_lines was counted before selecting the window
             }
 
             // Truncate long lines.
             let line = if line_text.len() > MAX_LINE_LENGTH {
                 format!(
                     "{}... (line truncated to {} chars)",
-                    &line_text[..MAX_LINE_LENGTH],
+                    crate::util::truncate::truncate_str(line_text, MAX_LINE_LENGTH),
                     MAX_LINE_LENGTH
                 )
             } else {
@@ -911,6 +915,82 @@ mod tests {
                 );
             }
             other => panic!("Expected re-encoded ImageContent, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_line_utf8_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("boundary.txt");
+        let mut lossy = vec![b'a'; 1999];
+        lossy.extend_from_slice(&[0xff, b'z']);
+        let cases = [
+            (vec![b'a'; 2000], false, 2000),
+            (vec![b'a'; 2001], true, 2000),
+            (format!("{}🦀z", "a".repeat(1999)).into_bytes(), true, 1999),
+            (lossy, true, 1999),
+        ];
+        for (bytes, truncated, prefix_len) in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let result = xai_tool_runtime::Tool::run(
+                &ReadTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                ReadInput {
+                    file_path: path.to_string_lossy().into_owned(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+            let ReadFileOutput::FileContent(fc) = result else {
+                panic!("expected file content");
+            };
+            assert!(fc.raw_output.starts_with(&"a".repeat(prefix_len)));
+            assert_eq!(
+                fc.raw_output.contains("... (line truncated to 2000 chars)"),
+                truncated
+            );
+            if truncated {
+                assert_eq!(
+                    fc.raw_output,
+                    format!(
+                        "{}... (line truncated to 2000 chars)",
+                        "a".repeat(prefix_len)
+                    )
+                );
+            }
+            assert_eq!(fc.total_lines, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn line_limit_footer_counts_exact_fit_and_remaining_lines() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("lines.txt");
+        std::fs::write(&path, "one\r\ntwo\r\nthree").unwrap();
+        for (offset, limit, raw, footer) in [
+            (2, 2, "two\nthree", "End of file - total 3 lines"),
+            (2, 1, "two", "Showing lines 2-2 of 3. Use offset=3"),
+            (2, 0, "", "Showing lines 2-2 of 3. Use offset=3"),
+        ] {
+            let result = xai_tool_runtime::Tool::run(
+                &ReadTool,
+                test_ctx(test_resources(tmp.path()).into_shared()),
+                ReadInput {
+                    file_path: path.to_string_lossy().into_owned(),
+                    offset: Some(offset),
+                    limit: Some(limit),
+                },
+            )
+            .await
+            .unwrap();
+            let ReadFileOutput::FileContent(fc) = result else {
+                panic!("expected file content");
+            };
+            assert_eq!(fc.raw_output, raw);
+            assert_eq!(fc.total_lines, 3);
+            assert!(fc.content.contains(footer), "{}", fc.content);
         }
     }
 

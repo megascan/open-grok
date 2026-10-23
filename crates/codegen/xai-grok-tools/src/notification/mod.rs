@@ -2,11 +2,17 @@ pub mod handle;
 pub mod types;
 
 pub use handle::AcknowledgedToolNotification;
+pub use handle::AdmittedSubagent;
+pub use handle::BackgroundDeliveryGuard;
+pub use handle::BackgroundDeliveryScope;
+pub use handle::BackgroundStartReservation;
+pub use handle::BridgeToolNotification;
 pub use handle::CappedToolNotificationReceiver;
 pub use handle::DurableNotificationTargets;
 pub use handle::NotificationAcknowledgementBatch;
 pub use handle::NotificationAcknowledgementError;
 pub use handle::PerCallNotificationSink;
+pub use handle::SubagentAdmissionReservation;
 pub use handle::ToolNotificationHandle;
 pub use types::ALL_NOTIFICATION_TAGS;
 pub use types::BashExecutionBackgrounded;

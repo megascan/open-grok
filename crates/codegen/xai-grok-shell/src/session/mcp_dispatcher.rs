@@ -256,6 +256,7 @@ pub(crate) struct CoalescedWindow {
     /// All `TransportClosed` client identities per server seen in the
     /// window.
     pub closed: HashMap<McpServerName, HashSet<u64>>,
+    pub completes: Vec<(McpServerName, String)>,
 }
 
 /// Coalesce the buffered events for one window flush.
@@ -322,6 +323,12 @@ fn insert_event(win: &mut CoalescedWindow, ev: McpClientEvent) {
                 );
             }
         }
+        McpClientEvent::ElicitationComplete {
+            server,
+            elicitation_id,
+        } => {
+            win.completes.push((server, elicitation_id));
+        }
         ev => {
             if let McpClientEvent::TransportClosed { server, client_id } = &ev {
                 win.closed
@@ -357,6 +364,7 @@ fn kind_of(ev: &McpClientEvent) -> McpClientEventKind {
         McpClientEvent::HandshakeFailed { .. } => McpClientEventKind::HandshakeFailed,
         McpClientEvent::ToolsChanged { .. } => McpClientEventKind::ToolsChanged,
         McpClientEvent::ResourcesChanged { .. } => McpClientEventKind::ResourcesChanged,
+        McpClientEvent::ElicitationComplete { .. } => McpClientEventKind::ElicitationComplete,
         McpClientEvent::Ready { .. } => McpClientEventKind::Ready,
         McpClientEvent::ConfigAdded { .. } => McpClientEventKind::ConfigAdded,
         McpClientEvent::ConfigRemoved { .. } => McpClientEventKind::ConfigRemoved,
@@ -405,6 +413,9 @@ pub(crate) fn build_payload(
             McpServerStatusReason::ConfigChanged,
             None,
         ),
+        (McpClientEventKind::ElicitationComplete, _) => {
+            unreachable!("ElicitationComplete is diverted into win.completes by insert_event")
+        }
         (McpClientEventKind::ResourcesChanged, _) => (
             McpServerStatus::Ready,
             McpServerStatusReason::ConfigChanged,
@@ -499,6 +510,35 @@ pub(crate) fn flush_window(
         };
         gateway
             .forward_fire_and_forget(acp::ExtNotification::new(SERVER_STATUS_METHOD, raw.into()));
+    }
+}
+
+fn flush_elicitation_completes(
+    session_id: &str,
+    completes: Vec<(McpServerName, String)>,
+    gateway: &xai_acp_lib::AcpAgentGatewaySender,
+) {
+    for (server, elicitation_id) in completes {
+        let payload = xai_grok_tools::mcp_elicitation::McpElicitCompletePayload {
+            session_id: session_id.to_string(),
+            elicitation_id,
+            server_name: Some(server.clone()),
+        };
+        match serde_json::value::to_raw_value(&payload) {
+            Ok(raw) => {
+                gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE,
+                    raw.into(),
+                ));
+            }
+            Err(value_e) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %value_e,
+                    "failed to serialize mcp/elicit_complete"
+                );
+            }
+        }
     }
 }
 
@@ -630,6 +670,82 @@ pub(crate) async fn drop_dead_clients(
     stale
 }
 
+/// Drop queued HTTP closures when their client was replaced or its current
+/// service has already recovered. HTTP clients survive in-place recovery, so
+/// client identity alone cannot distinguish successive connections.
+async fn strip_stale_http_closes(
+    win: &mut CoalescedWindow,
+    http_servers: &HashSet<McpServerName>,
+    mcp_state: &Arc<TokioMutex<McpState>>,
+) {
+    let candidates: Vec<_> = {
+        let state = mcp_state.lock().await;
+        win.buf
+            .iter()
+            .filter_map(|((server, kind), event)| {
+                if !http_servers.contains(server) || *kind != McpClientEventKind::TransportClosed {
+                    return None;
+                }
+                let McpClientEvent::TransportClosed { client_id, .. } = event else {
+                    return None;
+                };
+                state
+                    .get_client(server)
+                    .cloned()
+                    .map(|client| (server.clone(), *client_id, client))
+            })
+            .collect()
+    };
+    for (server, closed_id, client) in candidates {
+        if client.client_id() != closed_id || client.is_healthy().await {
+            win.buf
+                .remove(&(server, McpClientEventKind::TransportClosed));
+        }
+    }
+}
+
+/// Session-owned catalog reconciliation, independent of automatic restart.
+#[async_trait::async_trait(?Send)]
+pub(crate) trait McpCatalogRefresh {
+    async fn refresh_catalog(&self, server: &str);
+}
+
+/// Coalesce refreshes per server while retaining notifications that arrive
+/// during a list request. Never hold a RefCell borrow across the await.
+fn schedule_catalog_refresh(
+    actions: Rc<dyn McpCatalogRefresh>,
+    pending: Rc<std::cell::RefCell<HashMap<McpServerName, bool>>>,
+    server: McpServerName,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    {
+        let mut pending = pending.borrow_mut();
+        if let Some(dirty) = pending.get_mut(&server) {
+            *dirty = true;
+            return;
+        }
+        pending.insert(server.clone(), false);
+    }
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    pending.borrow_mut().remove(&server);
+                    return;
+                }
+                _ = actions.refresh_catalog(&server) => {}
+            }
+            let mut pending = pending.borrow_mut();
+            if pending.get(&server).copied().unwrap_or(false) {
+                pending.insert(server.clone(), false);
+            } else {
+                pending.remove(&server);
+                return;
+            }
+        }
+    });
+}
+
 /// Drive the dispatcher loop. Runs until `rx` is closed.
 ///
 /// Spawned via `tokio::task::spawn_local` from the session actor's
@@ -658,6 +774,7 @@ pub(crate) async fn run_dispatcher(
     mcp_state: Arc<TokioMutex<McpState>>,
     shutdown: SharedShutdownState,
     restart_actions: Option<Rc<dyn crate::session::mcp_restart::RestartActions>>,
+    catalog_refresh: Option<Rc<dyn McpCatalogRefresh>>,
     cwd: std::path::PathBuf,
 ) {
     // Cancellation source for spawned `auto_restart_stdio` tasks. The
@@ -667,6 +784,8 @@ pub(crate) async fn run_dispatcher(
     // gateway that is already tearing down. Tasks select on this token
     // during their backoff (see `mcp_restart::auto_restart_stdio`).
     let restart_cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = restart_cancel.clone().drop_guard();
+    let pending_catalogs = Rc::new(std::cell::RefCell::new(HashMap::new()));
     loop {
         let Some(mut win) = collect_window(&mut rx, COALESCE_WINDOW).await else {
             tracing::debug!(
@@ -675,6 +794,9 @@ pub(crate) async fn run_dispatcher(
             );
             break;
         };
+        let completes = std::mem::take(&mut win.completes);
+
+        flush_elicitation_completes(&session_id, completes, &gateway);
         if win.buf.is_empty() {
             continue;
         }
@@ -710,6 +832,8 @@ pub(crate) async fn run_dispatcher(
             (HashSet::new(), HashMap::new())
         };
 
+        strip_stale_http_closes(&mut win, &http_servers, &mcp_state).await;
+
         // Evict dead stdio clients, gated on client identity (see
         // [`collect_close_candidates`]). HTTP `TransportClosed` clients
         // are KEPT for in-place recovery; `ConfigRemoved` is not evicted
@@ -723,6 +847,27 @@ pub(crate) async fn run_dispatcher(
         for server in &stale {
             win.buf
                 .remove(&(server.clone(), McpClientEventKind::TransportClosed));
+        }
+        if let Some(actions) = catalog_refresh.as_ref() {
+            let servers: HashSet<_> = win
+                .buf
+                .keys()
+                .filter(|(_, kind)| {
+                    matches!(
+                        kind,
+                        McpClientEventKind::ToolsChanged | McpClientEventKind::Ready
+                    )
+                })
+                .map(|(server, _)| server.clone())
+                .collect();
+            for server in servers {
+                schedule_catalog_refresh(
+                    Rc::clone(actions),
+                    Rc::clone(&pending_catalogs),
+                    server,
+                    restart_cancel.clone(),
+                );
+            }
         }
         let buf = win.buf;
         if buf.is_empty() {
@@ -804,6 +949,57 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc::unbounded_channel;
 
+    /// Notifications received during an in-flight list must trigger one
+    /// follow-up list; collapsing them into the first refresh loses changes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_changes_during_refresh_schedule_one_follow_up() {
+        struct Refresh {
+            started: std::cell::Cell<usize>,
+            gate: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait(?Send)]
+        impl McpCatalogRefresh for Refresh {
+            async fn refresh_catalog(&self, _server: &str) {
+                self.started.set(self.started.get() + 1);
+                self.gate.acquire().await.unwrap().forget();
+            }
+        }
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let actions = Rc::new(Refresh {
+                    started: std::cell::Cell::new(0),
+                    gate: tokio::sync::Semaphore::new(0),
+                });
+                let pending = Rc::new(std::cell::RefCell::new(HashMap::new()));
+                let dyn_actions: Rc<dyn McpCatalogRefresh> = actions.clone();
+                let cancel = tokio_util::sync::CancellationToken::new();
+                schedule_catalog_refresh(
+                    dyn_actions.clone(),
+                    pending.clone(),
+                    "svr".into(),
+                    cancel.clone(),
+                );
+                tokio::task::yield_now().await;
+                assert_eq!(actions.started.get(), 1);
+                for _ in 0..3 {
+                    schedule_catalog_refresh(
+                        dyn_actions.clone(),
+                        pending.clone(),
+                        "svr".into(),
+                        cancel.clone(),
+                    );
+                }
+                actions.gate.add_permits(1);
+                tokio::task::yield_now().await;
+                assert_eq!(actions.started.get(), 2);
+                actions.gate.add_permits(1);
+                tokio::task::yield_now().await;
+                assert!(pending.borrow().is_empty());
+                assert_eq!(actions.started.get(), 2);
+            })
+            .await;
+    }
+
     /// Contract: 100 ToolsChanged events for the same server within
     /// 10 ms coalesce into exactly one buffer entry.
     #[tokio::test(start_paused = true)]
@@ -828,6 +1024,92 @@ mod tests {
         assert_eq!(win.buf.len(), 1, "100 ToolsChanged collapse to one");
         let key = ("github".to_string(), McpClientEventKind::ToolsChanged);
         assert!(win.buf.contains_key(&key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_completes_accumulate_in_window() {
+        let (tx, mut rx) = unbounded_channel::<McpClientEvent>();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "a".to_string(),
+        })
+        .unwrap();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "b".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let win = collect_window(&mut rx, COALESCE_WINDOW)
+            .await
+            .expect("events arrived");
+        assert!(win.buf.is_empty());
+        assert_eq!(
+            win.completes,
+            vec![
+                ("github".to_string(), "a".to_string()),
+                ("github".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    /// End-to-end: an `ElicitationComplete`-only window has an empty status buffer (`win.buf`).
+    /// The complete notification must still be forwarded to the client.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn run_dispatcher_forwards_completes_when_buf_is_empty() {
+        use xai_grok_mcp::servers::McpState;
+
+        let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
+        let shutdown = new_shutdown_state();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gw_tx, mut gw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = xai_acp_lib::AcpAgentGatewaySender::new(gw_tx);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let dispatcher = tokio::task::spawn_local(run_dispatcher(
+                    "sess-1".to_string(),
+                    rx,
+                    gateway,
+                    mcp_state,
+                    shutdown,
+                    None,
+                    None,
+                    std::path::PathBuf::from("."),
+                ));
+
+                tx.send(McpClientEvent::ElicitationComplete {
+                    server: "github".to_string(),
+                    elicitation_id: "e-1".to_string(),
+                })
+                .unwrap();
+
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(60)).await;
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+
+                let msg = gw_rx
+                    .try_recv()
+                    .expect("complete must be forwarded even with an empty status buffer");
+                let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
+                    panic!("expected ExtNotification");
+                };
+                assert_eq!(
+                    args.request.method.as_ref(),
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE
+                );
+                let v: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
+                assert_eq!(v["sessionId"], "sess-1");
+                assert_eq!(v["elicitationId"], "e-1");
+                assert_eq!(v["serverName"], "github");
+
+                dispatcher.abort();
+            })
+            .await;
     }
 
     /// Contract: events for different servers don't collapse,
@@ -1489,6 +1771,7 @@ mod tests {
                     mcp_state,
                     shutdown,
                     Some(restart_actions),
+                    None,
                     std::path::PathBuf::from("."),
                 ));
 
@@ -1573,6 +1856,7 @@ mod tests {
                     state_for_dispatcher,
                     Arc::clone(&shutdown),
                     Some(restart_actions),
+                    None,
                     std::path::PathBuf::from("."),
                 ));
 

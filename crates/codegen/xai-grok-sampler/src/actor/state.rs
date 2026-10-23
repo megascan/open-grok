@@ -81,6 +81,7 @@ mod tests {
     /// Minimal config builder for tests in this module.
     fn cfg() -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: None,
             base_url: "https://example.test".into(),
             model: "test-model".into(),
@@ -111,6 +112,7 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,

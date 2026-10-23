@@ -735,6 +735,32 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn make_git_rec(root: &Path, id: &str, path: PathBuf, kind: WorktreeKind) -> WorktreeRecord {
+        let source = root.join("source");
+        if !source.exists() {
+            std::fs::create_dir(&source).unwrap();
+            xai_test_utils::git::init_git_repo(&source);
+            std::fs::write(source.join("tracked"), "original").unwrap();
+            xai_test_utils::git::git_commit_all(&source, "initial");
+        }
+        let output = std::process::Command::new("git")
+            .current_dir(&source)
+            .args(["worktree", "add", "--detach"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut rec = make_rec(id, path, kind, 1);
+        rec.source_repo = source;
+        rec.session_id = Some("fixture".into());
+        rec
+    }
+
     fn opts_enabled_no_orphans(dry_run: bool) -> AutoGcOptions {
         AutoGcOptions {
             min_interval_secs: 0,
@@ -938,6 +964,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn maybe_auto_gc_real_expires_unguarded_protects_live_creator() {
+        xai_test_utils::require_git!();
         // Age path needs a successful CWD scan — serialize with chdir tests.
         let _g = env_guard();
         let _cwd_lock = crate::api::cwd_test_guard();
@@ -946,18 +973,16 @@ mod tests {
         let db = WorktreeDb::open(tmp.path()).unwrap();
 
         let doomed = tmp.path().join("doomed-session");
-        std::fs::create_dir(&doomed).unwrap();
-        db.register(&make_rec(
+        db.register(&make_git_rec(
+            tmp.path(),
             "doomed",
             doomed.clone(),
             WorktreeKind::Session,
-            1,
         ))
         .unwrap();
 
         let kept = tmp.path().join("kept-session");
-        std::fs::create_dir(&kept).unwrap();
-        let mut live = make_rec("kept", kept.clone(), WorktreeKind::Session, 1);
+        let mut live = make_git_rec(tmp.path(), "kept", kept.clone(), WorktreeKind::Session);
         live.creator_pid = Some(std::process::id());
         db.register(&live).unwrap();
 
@@ -990,6 +1015,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn maybe_auto_gc_default_never_expires_manual() {
+        xai_test_utils::require_git!();
         let _g = env_guard();
         let _cwd_lock = crate::api::cwd_test_guard();
         clear_auto_gc_env();
@@ -998,10 +1024,14 @@ mod tests {
 
         let session = tmp.path().join("sess");
         let manual = tmp.path().join("man");
-        std::fs::create_dir(&session).unwrap();
         std::fs::create_dir(&manual).unwrap();
-        db.register(&make_rec("s", session.clone(), WorktreeKind::Session, 1))
-            .unwrap();
+        db.register(&make_git_rec(
+            tmp.path(),
+            "s",
+            session.clone(),
+            WorktreeKind::Session,
+        ))
+        .unwrap();
         db.register(&make_rec("m", manual.clone(), WorktreeKind::Manual, 1))
             .unwrap();
 

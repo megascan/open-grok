@@ -16,10 +16,12 @@ mod auth;
 mod billing;
 mod cta;
 mod ctx;
+mod custom_provider;
 mod dashboard;
 mod dashboard_telemetry;
 pub(crate) mod external_editor;
 mod import_claude;
+mod inline_feedback;
 mod interject;
 mod jump;
 mod modes;
@@ -40,7 +42,9 @@ mod working_dirs;
 
 pub(crate) use auth::scrollback_has_recent_disk_full;
 pub(in crate::app) use auth::scrollback_has_recent_error_banner;
-pub(crate) use billing::{UPSELL_URL_PAYG, UPSELL_URL_UPGRADE, is_credit_limit_error};
+pub(crate) use billing::{
+    CREDIT_LIMIT_RETRY_OPTION_ID, UPSELL_URL_PAYG, UPSELL_URL_UPGRADE, is_credit_limit_error,
+};
 pub(crate) use modes::{downgrade_displayed_auto_if_gated, effective_auto};
 #[cfg(test)]
 pub(crate) use notes::FEEDBACK_QUESTION_LABEL;
@@ -50,13 +54,14 @@ pub(crate) use prompt::dispatch_initial_prompt;
 pub(in crate::app) use prompt::{show_small_screen_tip, show_ssh_wrap_tip};
 pub(crate) use queue::maybe_drain_queue;
 pub(super) use queue::{
-    apply_turn_start_shim, arm_send_now_and_paint, maybe_drain_queue_and_note_peek,
-    note_peek_page_flip, shim_renders_own_user_block,
+    apply_turn_start_shim, arm_send_now_and_paint, flush_held_local_queue_into_wait,
+    maybe_drain_queue_and_note_peek, note_peek_page_flip, shim_renders_own_user_block,
 };
-pub(in crate::app) use rewind::{find_user_prompt_entry_for_shell_index, shell_prompt_index_at};
-pub(crate) use router::dispatch;
+pub(in crate::app) use rewind::find_user_prompt_entry_for_shell_index;
+pub(crate) use router::{dispatch, flush_image_notices};
 pub(crate) use settings::ui::refresh_open_settings_modals;
 pub(crate) use status::commit_minimal_update_notice;
+pub(super) use task_result::resume_focused_deferred_paste;
 pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};
 
 // Test-only consumers (cfg(test) mods elsewhere in the crate); a plain

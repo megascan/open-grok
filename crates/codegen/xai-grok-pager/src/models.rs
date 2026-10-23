@@ -4,6 +4,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::cli_models::{AuthStatus, list_models};
+use xai_tty_utils::cli_println as println;
 
 use crate::client_identity::{PAGER_CLIENT_TYPE, pager_client_version};
 
