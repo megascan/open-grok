@@ -401,6 +401,11 @@ select one of the provider-owned entries:
 | `deepseek:deepseek-v4-flash` | Responses | Stable API ID for DeepSeek-V4-Flash-0731; native hosted web search; 1M context |
 | `deepseek:deepseek-v4-pro` | Chat Completions | Remains on Chat Completions until DeepSeek enables Responses support |
 
+Once a key is set, Open Grok also lists every other text model that DeepSeek's
+`GET /models` returns (for example `deepseek:deepseek-flash`), using the
+endpoint's own name, context window, output limit, and `effort` levels. Models
+without a built-in entry use Chat Completions.
+
 `DEEPSEEK_API_KEY` is the environment alternative. The Flash model keeps the
 stable wire ID `deepseek-v4-flash`, so it automatically reaches the current
 0731 release without a versioned slug. Its Responses route is stateless: Open

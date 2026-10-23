@@ -405,7 +405,8 @@ context_window = 1040000
 
 DeepSeek API direct is a separate API-key-only provider. Configure it from
 Settings or `/login deepseek`, or export `DEEPSEEK_API_KEY`. Open Grok refreshes
-the curated direct catalog against DeepSeek's models endpoint and keeps these
+the model list from DeepSeek's `GET /models` endpoint (names, context windows,
+output limits, and reasoning levels included) and keeps these
 credentials isolated from Fireworks-hosted DeepSeek models. V4 Pro uses Chat
 Completions; V4 Flash (0731) uses DeepSeek's native Responses API:
 

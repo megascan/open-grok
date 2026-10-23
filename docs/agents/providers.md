@@ -211,7 +211,7 @@ Fireworks AI
   auth/storage.rs                               # fireworks::api_key (generic provider scope)
 
 DeepSeek direct
-  xai-grok-shell/src/deepseek_models.rs         # curated direct catalog, live availability, trusted host
+  xai-grok-shell/src/deepseek_models.rs         # live /models catalog + curated backend overlay, trusted host
   auth/storage.rs                               # deepseek::api_key (generic provider scope)
 
 Meta API

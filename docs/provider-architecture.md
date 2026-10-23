@@ -58,8 +58,10 @@ remove models. The DeepSeek adapter keeps V4 Pro on Chat Completions and routes
 `deepseek-v4-flash` through DeepSeek's stateless Responses dialect. It
 normalizes Open Grok's reasoning menu to `none`/`low`/`high`/`max`, exposes the
 OpenAI-shaped hosted `web_search`, and never inherits Codex cache, turn-state,
-OAuth, or compaction behavior. Its live catalog intersects DeepSeek's `/models`
-response with curated direct entries.
+OAuth, or compaction behavior. Its live catalog takes every text-in/text-out
+model from DeepSeek's `GET /models` with that payload's name, context window,
+output cap, and `effort` levels; curated entries only add the backend and hosted
+search for known ids. Uncurated ids use Chat Completions.
 The Meta adapter routes Muse Spark through Meta's stateless OpenAI-compatible
 Responses endpoint. It preserves the provider's `low`/`medium`/`high`/`xhigh`
 reasoning efforts, declares OpenAI-shaped hosted `web_search`, strips unsupported
